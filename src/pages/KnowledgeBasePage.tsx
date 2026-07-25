@@ -264,12 +264,42 @@ function KnowledgeBaseSection() {
     setKbTab("documents");
   };
 
+  // Keep selectedKb in sync with kbs list (so counts refresh after upload/etc)
+  useEffect(() => {
+    if (selectedKb) {
+      const updated = kbs.find((k) => k.id === selectedKb.id);
+      if (updated && (updated.doc_count !== selectedKb.doc_count || updated.chunk_count !== selectedKb.chunk_count || updated.total_tokens !== selectedKb.total_tokens || updated.status !== selectedKb.status || updated.mcp_enabled !== selectedKb.mcp_enabled)) {
+        setSelectedKb(updated);
+      }
+    }
+  }, [kbs, selectedKb]);
+
   const handleDelete = async (id: string) => {
     if (!confirm("确定删除此知识库？所有文档和切片将一并删除。")) return;
     try {
       await kbApi.delete(id);
       await fetchKbs();
       if (selectedKb?.id === id) setSelectedKb(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  // Toggle KB status (enable/disable) from list view
+  const handleToggleStatus = async (kb: KnowledgeBase, newStatus: number) => {
+    try {
+      await kbApi.update(kb.id, { status: newStatus });
+      await fetchKbs();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  // Toggle MCP exposure from list view
+  const handleToggleMcp = async (kb: KnowledgeBase, newMcp: number) => {
+    try {
+      await kbApi.update(kb.id, { mcp_enabled: newMcp });
+      await fetchKbs();
     } catch (e) {
       setError(String(e));
     }
@@ -299,6 +329,8 @@ function KnowledgeBaseSection() {
           onSelect={handleSelectKb}
           onDelete={handleDelete}
           onCreate={() => setShowCreate(true)}
+          onToggleStatus={handleToggleStatus}
+          onToggleMcp={handleToggleMcp}
         />
       )}
 
@@ -323,12 +355,16 @@ function KbList({
   onSelect,
   onDelete,
   onCreate,
+  onToggleStatus,
+  onToggleMcp,
 }: {
   kbs: KnowledgeBase[];
   loading: boolean;
   onSelect: (kb: KnowledgeBase) => void;
   onDelete: (id: string) => void;
   onCreate: () => void;
+  onToggleStatus: (kb: KnowledgeBase, newStatus: number) => void;
+  onToggleMcp: (kb: KnowledgeBase, newMcp: number) => void;
 }) {
   if (loading && kbs.length === 0) {
     return (
@@ -359,53 +395,97 @@ function KbList({
           新建知识库
         </button>
       </div>
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+      <div className="space-y-3">
         {kbs.map((kb) => (
           <div
             key={kb.id}
-            className="surface group rounded-2xl p-5 transition-all hover:shadow-[0_12px_36px_rgba(15,23,42,0.08)] hover:-translate-y-0.5 cursor-pointer"
-            onClick={() => onSelect(kb)}
+            className="surface group rounded-2xl p-5 transition-all hover:shadow-[0_8px_24px_rgba(15,23,42,0.06)] border border-slate-100"
           >
-            <div className="flex items-start justify-between">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-50">
-                <BookOpen className="h-5 w-5 text-blue-600" />
+            <div className="flex items-start gap-4">
+              {/* Icon */}
+              <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${kb.status === 1 ? "bg-blue-50" : "bg-slate-100"}`}>
+                <BookOpen className={`h-5 w-5 ${kb.status === 1 ? "text-blue-600" : "text-slate-400"}`} />
               </div>
-              <button
-                onClick={(e) => { e.stopPropagation(); onDelete(kb.id); }}
-                className="rounded-lg p-1.5 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-red-50"
+
+              {/* Main content - clickable */}
+              <div
+                className="min-w-0 flex-1 cursor-pointer"
+                onClick={() => onSelect(kb)}
               >
-                <Trash2 className="h-4 w-4 text-slate-400 hover:text-red-500" />
-              </button>
-            </div>
+                <div className="flex items-center gap-2">
+                  <h3 className="text-base font-semibold text-slate-900">{kb.name}</h3>
+                  {kb.status === 1 ? (
+                    <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-600">活跃</span>
+                  ) : (
+                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">已禁用</span>
+                  )}
+                </div>
+                <p className="mt-0.5 text-xs text-slate-500 line-clamp-1">
+                  {kb.description || "暂无描述"}
+                </p>
+                <div className="mt-2 flex items-center gap-4 text-xs text-slate-500">
+                  <span className="flex items-center gap-1">
+                    <FileText size={12} /> {kb.doc_count} 文档
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <Hash size={12} /> {kb.chunk_count} 切片
+                  </span>
+                  {kb.embedding_model && (
+                    <span className="truncate" title={kb.embedding_model}>
+                      {kb.embedding_model}
+                    </span>
+                  )}
+                </div>
+              </div>
 
-            <h3 className="mt-4 text-base font-semibold text-slate-900">{kb.name}</h3>
-            <p className="mt-1 text-xs text-slate-500 line-clamp-2">
-              {kb.description || "暂无描述"}
-            </p>
+              {/* Right side: toggles + actions */}
+              <div className="flex flex-col items-end gap-2 shrink-0">
+                <div className="flex items-center gap-3">
+                  {/* MCP toggle */}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onToggleMcp(kb, kb.mcp_enabled === 1 ? 0 : 1);
+                    }}
+                    className={`flex items-center gap-1.5 rounded-lg px-2 py-1 text-[10px] font-medium transition-colors ${
+                      kb.mcp_enabled === 1
+                        ? "bg-violet-50 text-violet-600 hover:bg-violet-100"
+                        : "bg-slate-100 text-slate-400 hover:bg-slate-200"
+                    }`}
+                    title="MCP 暴露开关"
+                  >
+                    <Terminal size={11} />
+                    MCP {kb.mcp_enabled === 1 ? "已暴露" : "未暴露"}
+                  </button>
 
-            <div className="mt-4 flex items-center gap-4 text-xs text-slate-500">
-              <span className="flex items-center gap-1">
-                <FileText size={13} /> {kb.doc_count} 文档
-              </span>
-              <span className="flex items-center gap-1">
-                <Hash size={13} /> {kb.chunk_count} 切片
-              </span>
-              {kb.embedding_model && (
-                <span className="truncate" title={kb.embedding_model}>
-                  {kb.embedding_model}
-                </span>
-              )}
-            </div>
+                  {/* Status toggle */}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onToggleStatus(kb, kb.status === 1 ? 0 : 1);
+                    }}
+                    className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                      kb.status === 1 ? "bg-emerald-500" : "bg-slate-300"
+                    }`}
+                    title="知识库开关"
+                  >
+                    <span
+                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
+                        kb.status === 1 ? "translate-x-4" : "translate-x-1"
+                      }`}
+                    />
+                  </button>
 
-            <div className="mt-4 flex items-center justify-between">
-              <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
-                kb.status === 1
-                  ? "bg-emerald-50 text-emerald-600"
-                  : "bg-slate-100 text-slate-500"
-              }`}>
-                {kb.status === 1 ? "活跃" : "已禁用"}
-              </span>
-              <ChevronRight size={16} className="text-slate-300 group-hover:text-blue-500" />
+                  {/* Delete */}
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onDelete(kb.id); }}
+                    className="rounded-lg p-1.5 text-slate-400 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-red-50 hover:text-red-500"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </div>
+                <ChevronRight size={16} className="text-slate-300 group-hover:text-blue-500" />
+              </div>
             </div>
           </div>
         ))}
@@ -514,7 +594,7 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
     let active = true;
     (async () => {
       const { listen } = await import("@tauri-apps/api/event");
-      unlisten = await listen<{ doc_id: string; filename: string; error: string }>(
+      unlisten = await listen<{ doc_id: string; kb_id: string; filename: string; error: string }>(
         "kb-document-error",
         (event) => {
           if (!active) return;
@@ -558,6 +638,8 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
               delete next[p.doc_id];
               return next;
             });
+            fetchDocs();
+            onRefresh();
           } else {
             setProgressMap((prev) => ({
               ...prev,
@@ -571,7 +653,7 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
       active = false;
       if (unlisten) unlisten();
     };
-  }, [kb.id]);
+  }, [kb.id, fetchDocs, onRefresh]);
 
   const handleUploadBatch = async (files: File[]) => {
     if (files.length === 0) return;
@@ -847,18 +929,52 @@ function AskTab({ kb }: { kb: KnowledgeBase }) {
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [conversation, setConversation] = useState<Array<{ role: "user" | "assistant"; content: string; sources?: KbRagAnswer["sources"] }>>([]);
 
+  // Persistence key for this KB's ask preferences
+  const storageKey = `kb_ask_prefs_${kb.id}`;
+
   useEffect(() => {
     channelApi.getAll().then((chs) => {
       const active = chs.filter((c) => c.status === 1);
       setChannels(active);
-      // Auto-select first channel with models
+
+      // Load saved preferences from localStorage
+      try {
+        const saved = localStorage.getItem(storageKey);
+        if (saved) {
+          const prefs = JSON.parse(saved);
+          // Validate that saved channel still exists and is active
+          const savedCh = active.find(c => c.id === prefs.channelId);
+          if (savedCh) {
+            setSelectedChannelId(savedCh.id);
+            // Validate saved model exists in that channel
+            if (prefs.model && savedCh.models.includes(prefs.model)) {
+              setSelectedModel(prefs.model);
+            } else {
+              setSelectedModel(savedCh.models[0] || "");
+            }
+            return;
+          }
+        }
+      } catch {}
+
+      // Fallback: auto-select first channel with models
       const first = active.find((c) => c.models.length > 0);
       if (first) {
         setSelectedChannelId(first.id);
         setSelectedModel(first.models[0]);
       }
     }).catch(console.error);
-  }, []);
+  }, [storageKey]);
+
+  // Persist preferences when they change
+  useEffect(() => {
+    if (selectedChannelId && selectedModel) {
+      localStorage.setItem(storageKey, JSON.stringify({
+        channelId: selectedChannelId,
+        model: selectedModel,
+      }));
+    }
+  }, [storageKey, selectedChannelId, selectedModel]);
 
   // Models from selected channel
   const selectedChannel = channels.find((c) => c.id === selectedChannelId);
@@ -1125,10 +1241,14 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
   const [mcpEnabled, setMcpEnabled] = useState(kb.mcp_enabled ?? 1);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [showChannelPicker, setShowChannelPicker] = useState(false);
 
   useEffect(() => {
     channelApi.getAll().then(setChannels).catch(console.error);
   }, []);
+
+  const activeChannels = channels.filter(c => c.status === 1);
+  const selectedEmbeddingChannel = activeChannels.find(c => c.id === embeddingChannelId);
 
   const handleSave = async () => {
     setSaving(true);
@@ -1140,6 +1260,7 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
         embedding_model: embeddingModel.trim() || undefined,
         embedding_channel_id: embeddingChannelId || undefined,
         status,
+        mcp_enabled: mcpEnabled,
       });
       setSaved(true);
       onRefresh();
@@ -1221,18 +1342,66 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
 
           <div>
             <label className="mb-1 block text-sm font-medium text-slate-700">绑定渠道（可选）</label>
-            <select
-              value={embeddingChannelId}
-              onChange={(e) => setEmbeddingChannelId(e.target.value)}
-              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
-            >
-              <option value="">自动选择（默认）</option>
-              {channels.filter(c => c.status === 1).map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name} ({c.type})
-                </option>
-              ))}
-            </select>
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setShowChannelPicker(!showChannelPicker)}
+                className="flex w-full items-center justify-between rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+              >
+                <span className={selectedEmbeddingChannel ? "text-slate-900" : "text-slate-400"}>
+                  {selectedEmbeddingChannel
+                    ? `${selectedEmbeddingChannel.name} (${selectedEmbeddingChannel.type})`
+                    : "自动选择（默认）"}
+                </span>
+                <ChevronDown size={15} className={`shrink-0 text-slate-400 transition-transform ${showChannelPicker ? "rotate-180" : ""}`} />
+              </button>
+
+              {showChannelPicker && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setShowChannelPicker(false)} />
+                  <div className="absolute left-0 top-full z-50 mt-1.5 w-full rounded-2xl border border-slate-200 bg-white p-2 shadow-xl max-h-[280px] overflow-auto">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEmbeddingChannelId("");
+                        setShowChannelPicker(false);
+                      }}
+                      className={`flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-sm transition-all ${
+                        embeddingChannelId === ""
+                          ? "bg-blue-50 text-blue-600 font-semibold"
+                          : "text-slate-700 hover:bg-slate-50"
+                      }`}
+                    >
+                      <span>自动选择（默认）</span>
+                      {embeddingChannelId === "" && <Check size={14} className="shrink-0" />}
+                    </button>
+                    {activeChannels.map((c) => (
+                      <button
+                        key={c.id}
+                        type="button"
+                        onClick={() => {
+                          setEmbeddingChannelId(c.id);
+                          setShowChannelPicker(false);
+                        }}
+                        className={`flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-sm transition-all ${
+                          embeddingChannelId === c.id
+                            ? "bg-blue-50 text-blue-600 font-semibold"
+                            : "text-slate-700 hover:bg-slate-50"
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="truncate">{c.name}</span>
+                          <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500 shrink-0">
+                            {c.type}
+                          </span>
+                        </div>
+                        {embeddingChannelId === c.id && <Check size={14} className="shrink-0" />}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
             <p className="mt-1 text-xs text-slate-400">
               指定后，embedding 请求会优先使用该渠道。不指定则自动调度。
             </p>

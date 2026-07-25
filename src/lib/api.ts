@@ -186,7 +186,7 @@ export const kbApi = {
   getAll: () => invoke<KnowledgeBase[]>("get_knowledge_bases"),
   create: (input: { name: string; description?: string; embedding_model?: string }) =>
     invoke<KnowledgeBase>("create_knowledge_base", { input }),
-  update: (id: string, input: Partial<{ name: string; description: string; embedding_model: string; embedding_channel_id: string; status: number }>) =>
+  update: (id: string, input: Partial<{ name: string; description: string; embedding_model: string; embedding_channel_id: string; status: number; mcp_enabled: number }>) =>
     invoke<KnowledgeBase>("update_knowledge_base", { id, input }),
   delete: (id: string) => invoke<void>("delete_knowledge_base", { id }),
   getDocuments: (kbId: string) => invoke<KbDocument[]>("get_kb_documents", { kbId }),
