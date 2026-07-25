@@ -1616,7 +1616,7 @@ function SearchTab({ kb }: { kb: KnowledgeBase }) {
             tags.map((tag) => (
               <button
                 key={tag.word}
-                onClick={() => handleSearch(tag.word)}
+                onClick={() => setQuery(tag.word)}
                 className="inline-flex items-center rounded-full border border-slate-200 bg-gradient-to-br from-slate-50 to-white px-3 py-1 text-xs font-medium text-slate-600 transition-all hover:border-blue-200 hover:bg-blue-50 hover:text-blue-600 hover:shadow-sm"
               >
                 {tag.word}
