@@ -1,3 +1,4 @@
+use super::code_parser;
 use super::embedder;
 use super::parser;
 use super::splitter;
@@ -104,7 +105,22 @@ async fn process_document_inner(
         ..Default::default()
     };
 
-    let chunks = splitter::split(&text, &file_type_label, &config, &base_metadata);
+    // 符号感知分块：代码文件且语言受支持时，按 AST 符号边界切分
+    let chunks = match &parsed {
+        parser::ParsedContent::Code { text, language } => {
+            if code_parser::is_supported_language(language) {
+                let symbols = code_parser::extract_symbols(filename, text);
+                emit_progress(
+                    app, doc_id, kb_id, filename, "splitting", 18,
+                    &format!("AST 解析：提取到 {} 个符号", symbols.len()),
+                );
+                splitter::split_code_by_symbols(text, &symbols, &config, &base_metadata)
+            } else {
+                splitter::split(text, &file_type_label, &config, &base_metadata)
+            }
+        }
+        _ => splitter::split(&text, &file_type_label, &config, &base_metadata),
+    };
 
     if chunks.is_empty() {
         repo.update_document_status(doc_id, "ready", None)

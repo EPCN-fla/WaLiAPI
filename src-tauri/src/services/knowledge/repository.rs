@@ -261,9 +261,14 @@ impl KbRepository {
     // ==================== Chunk ====================
 
     pub async fn create_chunk(&self, chunk: &ChunkInsert) -> Result<(), sqlx::Error> {
+        // 从 metadata JSON 中提取 symbol_name / symbol_kind
+        let meta: serde_json::Value = serde_json::from_str(&chunk.metadata).unwrap_or_default();
+        let symbol_name = meta.get("symbol_name").and_then(|v| v.as_str());
+        let symbol_kind = meta.get("symbol_kind").and_then(|v| v.as_str());
+
         sqlx::query(
-            "INSERT INTO kb_chunks (id, doc_id, kb_id, chunk_index, content, token_count, embedding, embedding_dim, metadata, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO kb_chunks (id, doc_id, kb_id, chunk_index, content, token_count, embedding, embedding_dim, metadata, symbol_name, symbol_kind, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&chunk.id)
         .bind(&chunk.doc_id)
@@ -274,6 +279,8 @@ impl KbRepository {
         .bind(&chunk.embedding)
         .bind(chunk.embedding_dim)
         .bind(&chunk.metadata)
+        .bind(symbol_name)
+        .bind(symbol_kind)
         .bind(&chunk.created_at)
         .execute(&self.pool)
         .await?;

@@ -13,6 +13,36 @@ use crate::db::repository::Repository;
 use crate::services::knowledge::{repository::KbRepository, embedder, retriever, rag};
 use tauri::{Manager, Emitter};
 
+/// MCP server instructions — agent 首次连接时注入 system prompt
+const MCP_INSTRUCTIONS: &str = r#"# WaLiAPI 知识库 — 本地 RAG + 向量检索
+
+知识库已预建索引：文档已解析、分块、向量化并存入本地 SQLite + HNSW 索引。
+所有检索都是本地操作，亚秒级响应。
+
+## 工具使用优先级
+
+1. **ask_knowledge_base** — 首选。直接提问，返回 AI 生成的回答 + 来源引用。
+   适合：任何问题、概念理解、代码含义、流程梳理。
+
+2. **search_knowledge_base** — 当需要看原始文本片段，或 ask_knowledge_base 回答不够时使用。
+   返回匹配的 chunk 原文 + 相似度分数。
+
+3. **list_knowledge_bases** — 首次使用时调用一次，获取可用知识库 ID。
+   之后无需重复调用。
+
+4. **其他工具** — 按需使用（上传文档、管理索引等）。
+
+## 反模式
+
+- ❌ 不要先 search 再自己总结 — 直接用 ask_knowledge_base，它内部已做 RAG
+- ❌ 不要每次都调 list_knowledge_bases — 缓存第一次的结果
+- ❌ 不要对同一问题反复 search 不同关键词 — 一次 ask_knowledge_base 通常足够
+
+## 代码文件
+
+知识库中的代码文件按符号边界分块（函数/类/方法），每个 chunk 是完整符号。
+chunk metadata 包含 symbol_name、symbol_kind、signature，可用于精确过滤。"#;
+
 // ── Session management for SSE transport ──────────────────────────
 // Each SSE client gets a unique session_id. The POST handler uses
 // the session_id to push JSON-RPC responses back through the SSE stream.
@@ -146,14 +176,14 @@ fn get_tools() -> Vec<serde_json::Value> {
         // ── Write tools: Knowledge Base lifecycle ──────────────────
         serde_json::json!({
             "name": "create_knowledge_base",
-            "description": "Create a new knowledge base. After creation, you can upload documents or import sources to populate it. The KB will be created with MCP enabled by default so it's immediately accessible via MCP tools.",
+            "description": "创建新知识库。⚠️ 使用前请先调用 list_knowledge_bases 查看已有知识库，避免重复创建。仅当用户明确要求创建新库，或现有库都不适用时才创建。创建后可通过 upload_document 或 import_source 添加内容。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "Knowledge base name (1-100 characters)" },
-                    "description": { "type": "string", "description": "Optional description of the knowledge base purpose" },
-                    "embedding_model": { "type": "string", "description": "Embedding model to use (default: text-embedding-3-small)" },
-                    "embedding_channel_id": { "type": "string", "description": "Optional embedding channel ID for custom providers" }
+                    "name": { "type": "string", "description": "知识库名称（1-100字符）" },
+                    "description": { "type": "string", "description": "知识库用途描述（可选）" },
+                    "embedding_model": { "type": "string", "description": "嵌入模型（默认: text-embedding-3-small）" },
+                    "embedding_channel_id": { "type": "string", "description": "自定义嵌入渠道 ID（可选）" }
                 },
                 "required": ["name"]
             }
@@ -191,15 +221,15 @@ fn get_tools() -> Vec<serde_json::Value> {
         // ── Write tools: Document management ───────────────────────
         serde_json::json!({
             "name": "upload_document",
-            "description": "Upload a document to a knowledge base. The content will be automatically parsed, chunked, embedded, and indexed. Supported file types: .txt, .md, .pdf, .docx, .doc, .pptx, .xlsx, .csv, .json, .html, .rs, .py, .js, .ts, .go, .java, .c, .cpp, .h, .sh, .yaml, .yml, .toml. The document is processed asynchronously — use get_knowledge_base_stats to check progress.",
+            "description": "上传文档到知识库。⚠️ 如果未指定 kb_id，将返回已有知识库列表供选择——请先调用 list_knowledge_bases 让用户选择目标库，或确认创建新库。文档上传后会自动解析、分块、向量化并建立索引。支持格式: .txt .md .pdf .docx .doc .pptx .xlsx .csv .json .html .rs .py .js .ts .go .java .c .cpp .h .sh .yaml .yml .toml",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "kb_id": { "type": "string", "description": "Target knowledge base ID" },
-                    "filename": { "type": "string", "description": "Document filename including extension (e.g. 'report.pdf')" },
-                    "content": { "type": "string", "description": "Base64-encoded file content" }
+                    "kb_id": { "type": "string", "description": "目标知识库 ID。如果未提供，将返回已有知识库列表供用户选择" },
+                    "filename": { "type": "string", "description": "文档文件名（含扩展名，如 'report.pdf'）" },
+                    "content": { "type": "string", "description": "Base64 编码的文件内容" }
                 },
-                "required": ["kb_id", "filename", "content"]
+                "required": ["filename", "content"]
             }
         }),
         serde_json::json!({
@@ -280,7 +310,8 @@ async fn dispatch_jsonrpc_async(
                 "serverInfo": {
                     "name": "WaLiAPI Knowledge Base",
                     "version": "0.1.0"
-                }
+                },
+                "instructions": MCP_INSTRUCTIONS
             }))
         }
         "notifications/initialized" => {
@@ -475,7 +506,7 @@ async fn handle_tool_call(
             let results = if kb_id.is_empty() {
                 retriever::search_all(pool, &embeddings[0], top_k, true).await?
             } else {
-                retriever::search(pool, kb_id, &embeddings[0], top_k).await?
+                retriever::hybrid_search(pool, kb_id, query, &embeddings[0], top_k, 0.7, 0.3).await?
             };
 
             let content: Vec<serde_json::Value> = results.iter().map(|r| {
@@ -694,10 +725,53 @@ async fn handle_tool_call(
         // ── Write tools: Document management ───────────────────────
 
         "upload_document" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
             let filename = args.get("filename").and_then(|f| f.as_str()).ok_or("Missing filename")?;
             let content_b64 = args.get("content").and_then(|c| c.as_str()).ok_or("Missing content")?;
-            let kb_id = kb_id.to_string();
+
+            let kb_repo = KbRepository::new(pool.clone());
+
+            // If kb_id not provided, return available KBs for user to choose
+            let kb_id = match args.get("kb_id").and_then(|k| k.as_str()) {
+                Some(id) if !id.is_empty() => id.to_string(),
+                _ => {
+                    let kbs = kb_repo.get_all_kbs().await.map_err(|e| e.to_string())?;
+                    let exposed: Vec<_> = kbs.iter().filter(|kb| kb.mcp_enabled == 1).collect();
+
+                    if exposed.is_empty() {
+                        return Ok(serde_json::json!({
+                            "content": [{
+                                "type": "text",
+                                "text": "⚠️ 未指定知识库，且当前没有任何可用的知识库。\n\n请先调用 create_knowledge_base 创建一个知识库，然后再上传文档。"
+                            }],
+                            "isError": false
+                        }));
+                    }
+
+                    let mut lines = vec!["⚠️ 未指定目标知识库。请选择一个已有知识库，或确认创建新库。\n\n已有知识库列表:".to_string()];
+                    for (i, kb) in exposed.iter().enumerate() {
+                        lines.push(format!(
+                            "\n[{}] ID: {}\n    名称: {}\n    文档数: {} | 切片数: {} | Tokens: {}\n    描述: {}",
+                            i + 1,
+                            kb.id,
+                            kb.name,
+                            kb.doc_count,
+                            kb.chunk_count,
+                            kb.total_tokens,
+                            kb.description.as_deref().unwrap_or("无")
+                        ));
+                    }
+                    lines.push("\n\n请告诉 AI 你要上传到哪个知识库（提供 ID 或名称），或者要求创建新知识库。".to_string());
+
+                    return Ok(serde_json::json!({
+                        "content": [{
+                            "type": "text",
+                            "text": lines.join("\n")
+                        }],
+                        "isError": false
+                    }));
+                }
+            };
+
             let filename = filename.to_string();
 
             let content = {

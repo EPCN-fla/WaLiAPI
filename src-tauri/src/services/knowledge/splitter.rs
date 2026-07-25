@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+use super::code_parser::Symbol;
+
 #[derive(Debug, Clone)]
 pub struct SplitConfig {
-    pub chunk_size: usize,      // target token count
-    pub chunk_overlap: usize,   // overlap token count
+    pub chunk_size: usize,
+    pub chunk_overlap: usize,
 }
 
 impl Default for SplitConfig {
@@ -29,6 +31,10 @@ pub struct ChunkMetadata {
     pub line_end: usize,
     pub heading: Option<String>,
     pub language: Option<String>,
+    // ── tree-sitter 符号感知字段 ──
+    pub symbol_name: Option<String>,
+    pub symbol_kind: Option<String>,
+    pub signature: Option<String>,
 }
 
 /// Split text into chunks by approximate token count.
@@ -183,6 +189,124 @@ pub fn split_markdown(content: &str, config: &SplitConfig, metadata: &ChunkMetad
     }
 
     result
+}
+
+/// Split code by symbol boundaries (function/class/method).
+/// Falls back to `split_text` for unsupported languages or empty symbol lists.
+pub fn split_code_by_symbols(
+    content: &str,
+    symbols: &[Symbol],
+    config: &SplitConfig,
+    metadata: &ChunkMetadata,
+) -> Vec<Chunk> {
+    if symbols.is_empty() {
+        return split_text(content, config, metadata);
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut chunks = Vec::new();
+    let mut covered_lines = std::collections::HashSet::new();
+
+    for sym in symbols {
+        let start = sym.start_line.min(lines.len().saturating_sub(1));
+        let end = sym.end_line.min(lines.len().saturating_sub(1));
+        if end < start {
+            continue;
+        }
+
+        let chunk_content: String = lines[start..=end].join("\n");
+        let token_count = estimate_tokens(&chunk_content);
+
+        // 超大符号内部再切分
+        if token_count > config.chunk_size * 3 {
+            let sub_meta = ChunkMetadata {
+                line_start: start,
+                line_end: end,
+                heading: Some(format!("{}: {}", sym.kind.as_str(), sym.name)),
+                language: metadata.language.clone(),
+                file_path: metadata.file_path.clone(),
+                symbol_name: Some(sym.name.clone()),
+                symbol_kind: Some(sym.kind.as_str().to_string()),
+                signature: sym.signature.clone(),
+            };
+            let sub_chunks = split_text(&chunk_content, config, &sub_meta);
+            chunks.extend(sub_chunks);
+        } else {
+            chunks.push(Chunk {
+                content: chunk_content,
+                token_count,
+                metadata: ChunkMetadata {
+                    line_start: start,
+                    line_end: end,
+                    heading: Some(format!("{}: {}", sym.kind.as_str(), sym.name)),
+                    language: metadata.language.clone(),
+                    file_path: metadata.file_path.clone(),
+                    symbol_name: Some(sym.name.clone()),
+                    symbol_kind: Some(sym.kind.as_str().to_string()),
+                    signature: sym.signature.clone(),
+                },
+            });
+        }
+
+        for i in start..=end {
+            covered_lines.insert(i);
+        }
+    }
+
+    // 收集未被符号覆盖的行（import / 全局变量 / 注释）
+    let mut orphan = String::new();
+    let mut orphan_start: Option<usize> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        if !covered_lines.contains(&idx) {
+            if orphan_start.is_none() {
+                orphan_start = Some(idx);
+            }
+            orphan.push_str(line);
+            orphan.push('\n');
+        } else if !orphan.is_empty() {
+            let tokens = estimate_tokens(&orphan);
+            if tokens > 10 {
+                chunks.push(Chunk {
+                    content: orphan.trim().to_string(),
+                    token_count: tokens,
+                    metadata: ChunkMetadata {
+                        line_start: orphan_start.unwrap(),
+                        line_end: idx,
+                        language: metadata.language.clone(),
+                        file_path: metadata.file_path.clone(),
+                        ..Default::default()
+                    },
+                });
+            }
+            orphan.clear();
+            orphan_start = None;
+        }
+    }
+    if !orphan.is_empty() {
+        let tokens = estimate_tokens(&orphan);
+        if tokens > 10 {
+            chunks.push(Chunk {
+                content: orphan.trim().to_string(),
+                token_count: tokens,
+                metadata: ChunkMetadata {
+                    line_start: orphan_start.unwrap_or(0),
+                    line_end: lines.len(),
+                    language: metadata.language.clone(),
+                    file_path: metadata.file_path.clone(),
+                    ..Default::default()
+                },
+            });
+        }
+    }
+
+    // 按 line_start 排序
+    chunks.sort_by_key(|c| c.metadata.line_start);
+    chunks
+}
+
+/// Estimate token count from text (~4 chars per token)
+fn estimate_tokens(text: &str) -> usize {
+    (text.chars().count() + 3) / 4
 }
 
 /// Main split dispatcher

@@ -3,6 +3,7 @@ pub mod repository;
 pub mod processor;
 pub mod parser;
 pub mod splitter;
+pub mod code_parser;
 pub mod embedder;
 pub mod retriever;
 pub mod rag;

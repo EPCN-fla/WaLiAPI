@@ -373,6 +373,119 @@ pub async fn get_index_status(pool: &SqlitePool, kb_id: &str) -> Result<Option<s
 }
 
 // ════════════════════════════════════════════════════════
+// FTS5 hybrid search
+// ════════════════════════════════════════════════════════
+
+/// FTS5 full-text search
+async fn fts5_search(
+    pool: &SqlitePool,
+    kb_id: &str,
+    query: &str,
+    top_k: usize,
+) -> Result<Vec<SearchResult>, String> {
+    let fts_query = build_fts_query(query);
+
+    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT c.id, c.content, c.metadata, d.filename, c.doc_id \
+         FROM kb_chunks_fts fts \
+         JOIN kb_chunks c ON fts.chunk_id = c.id \
+         JOIN kb_documents d ON c.doc_id = d.id \
+         WHERE c.kb_id = ? AND d.status = 'ready' AND kb_chunks_fts MATCH ? \
+         ORDER BY rank \
+         LIMIT ?"
+    )
+    .bind(kb_id)
+    .bind(&fts_query)
+    .bind(top_k as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("FTS5 search failed: {}", e))?;
+
+    let results = rows.into_iter().enumerate().map(|(idx, (id, content, metadata, filename, doc_id))| {
+        let score = 1.0 / (1.0 + idx as f32 * 0.1);
+        let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap_or_default();
+        SearchResult {
+            chunk_id: id,
+            doc_id,
+            filename,
+            content,
+            score,
+            metadata: meta,
+        }
+    }).collect();
+
+    Ok(results)
+}
+
+/// Build FTS5 query string from user query
+fn build_fts_query(query: &str) -> String {
+    let tokens: Vec<&str> = query
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    if tokens.is_empty() {
+        return query.to_string();
+    }
+
+    tokens.iter()
+        .map(|t| format!("{}*", t))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Hybrid search: vector + FTS5 weighted merge
+pub async fn hybrid_search(
+    pool: &SqlitePool,
+    kb_id: &str,
+    query: &str,
+    query_embedding: &[f32],
+    top_k: usize,
+    vector_weight: f32,
+    keyword_weight: f32,
+) -> Result<Vec<SearchResult>, String> {
+    let (vector_results, keyword_results) = tokio::join!(
+        search(pool, kb_id, query_embedding, top_k * 2),
+        fts5_search(pool, kb_id, query, top_k * 2),
+    );
+
+    let vector_results = vector_results.unwrap_or_default();
+    let keyword_results = keyword_results.unwrap_or_default();
+
+    // Merge & deduplicate with weighted scoring
+    let mut merged: std::collections::HashMap<String, SearchResult> = std::collections::HashMap::new();
+    let mut scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+
+    for r in &vector_results {
+        scores.insert(r.chunk_id.clone(), r.score * vector_weight);
+        merged.insert(r.chunk_id.clone(), r.clone());
+    }
+
+    for r in &keyword_results {
+        let current = scores.entry(r.chunk_id.clone()).or_insert(0.0);
+        *current += r.score * keyword_weight;
+        merged.entry(r.chunk_id.clone()).or_insert_with(|| r.clone());
+    }
+
+    // Sort by weighted score descending
+    let mut ranked: Vec<(String, f32)> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(top_k);
+
+    let final_results: Vec<SearchResult> = ranked.into_iter()
+        .filter_map(|(id, score)| {
+            merged.get(&id).map(|r| {
+                let mut r = r.clone();
+                r.score = score;
+                r
+            })
+        })
+        .collect();
+
+    Ok(final_results)
+}
+
+// ════════════════════════════════════════════════════════
 // Utility functions
 // ════════════════════════════════════════════════════════
 

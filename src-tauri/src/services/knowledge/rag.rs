@@ -35,11 +35,11 @@ pub async fn ask(
 
     let query_emb = &embeddings[0];
 
-    // 2. Vector search
+    // 2. Hybrid search (vector + FTS5)
     let results = if kb_id.is_empty() {
         retriever::search_all(pool, query_emb, top_k, mcp_only).await?
     } else {
-        retriever::search(pool, kb_id, query_emb, top_k).await?
+        retriever::hybrid_search(pool, kb_id, query, query_emb, top_k, 0.7, 0.3).await?
     };
 
     if results.is_empty() {
@@ -168,16 +168,33 @@ pub async fn ask(
 }
 
 /// Build context string from search results
+/// Enhanced with symbol metadata (name, kind, signature)
 fn build_context(results: &[super::models::SearchResult]) -> String {
     results
         .iter()
         .enumerate()
         .map(|(i, r)| {
+            // 从 metadata 中提取符号信息
+            let symbol_info = r.metadata
+                .get("symbol_name")
+                .and_then(|n| n.as_str())
+                .map(|name| {
+                    let kind = r.metadata.get("symbol_kind").and_then(|k| k.as_str()).unwrap_or("");
+                    let sig = r.metadata.get("signature").and_then(|s| s.as_str()).unwrap_or("");
+                    if sig.is_empty() {
+                        format!(" [{}: {}]", kind, name)
+                    } else {
+                        format!(" [{}: {} {}]", kind, name, sig)
+                    }
+                })
+                .unwrap_or_default();
+
             format!(
-                "--- 文档 {} [{}] (相似度: {:.2}) ---\n{}",
+                "--- 文档 {} [{}] (相似度: {:.2}){} ---\n{}",
                 i + 1,
                 r.filename,
                 r.score,
+                symbol_info,
                 r.content
             )
         })
