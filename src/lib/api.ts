@@ -232,6 +232,11 @@ export interface KbRagAnswer {
   usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null;
 }
 
+export interface KbTag {
+  word: string;
+  count: number;
+}
+
 // Knowledge Base commands
 export const kbApi = {
   getAll: () => invoke<KnowledgeBase[]>("get_knowledge_bases"),
@@ -264,6 +269,7 @@ export const kbApi = {
   getIndexStatus: (kbId: string) => invoke<KbIndexMeta | null>("get_kb_index_status", { kbId }),
   buildIndex: (kbId: string) => invoke<void>("build_kb_index", { kbId }),
   dropIndex: (kbId: string) => invoke<void>("drop_kb_index", { kbId }),
+  getTags: (kbId: string, limit?: number) => invoke<KbTag[]>("get_kb_tags", { kbId, limit }),
 };
 
 // Service status

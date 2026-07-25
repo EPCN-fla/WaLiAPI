@@ -6,6 +6,7 @@ import {
   KbRagAnswer,
   KbSource,
   KbIndexMeta,
+  KbTag,
   ConversationMessage,
   kbApi,
   channelApi,
@@ -42,6 +43,7 @@ import {
   FolderOpen,
   Sparkles,
   Database,
+  Tag,
 } from "lucide-react";
 
 type ServiceTab = "knowledge" | "mcp";
@@ -383,6 +385,62 @@ function KnowledgeBaseSection() {
   );
 }
 
+// ─── KB Tags Bar (high-frequency words) ─────────────────────────────
+
+function KbTagsBar({ kbId, chunkCount }: { kbId: string; chunkCount: number }) {
+  const [tags, setTags] = useState<KbTag[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (chunkCount === 0) return;
+    let active = true;
+    setLoading(true);
+    kbApi.getTags(kbId, 12)
+      .then((data) => { if (active) setTags(data); })
+      .catch(() => {})
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [kbId, chunkCount]);
+
+  if (loading && tags.length === 0) {
+    return (
+      <div className="mt-2.5 flex items-center gap-1.5">
+        {[...Array(5)].map((_, i) => (
+          <div key={i} className="h-5 w-12 animate-pulse rounded-full bg-slate-100" />
+        ))}
+      </div>
+    );
+  }
+
+  if (tags.length === 0) return null;
+
+  // Color palette for tags - gradient blues/purples for visual appeal
+  const tagColors = [
+    "bg-blue-50 text-blue-600 border-blue-100",
+    "bg-violet-50 text-violet-600 border-violet-100",
+    "bg-emerald-50 text-emerald-600 border-emerald-100",
+    "bg-amber-50 text-amber-600 border-amber-100",
+    "bg-rose-50 text-rose-500 border-rose-100",
+    "bg-cyan-50 text-cyan-600 border-cyan-100",
+    "bg-indigo-50 text-indigo-600 border-indigo-100",
+    "bg-teal-50 text-teal-600 border-teal-100",
+  ];
+
+  return (
+    <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+      <Tag size={11} className="text-slate-400 shrink-0" />
+      {tags.map((tag, i) => (
+        <span
+          key={tag.word}
+          className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium ${tagColors[i % tagColors.length]}`}
+        >
+          {tag.word}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 // ─── KB List ────────────────────────────────────────────────────────────
 
 function KbList({
@@ -472,6 +530,8 @@ function KbList({
                     </span>
                   )}
                 </div>
+                {/* Tags */}
+                <KbTagsBar kbId={kb.id} chunkCount={kb.chunk_count} />
               </div>
 
               {/* Right side: toggles + actions */}
@@ -1487,13 +1547,29 @@ function SearchTab({ kb }: { kb: KnowledgeBase }) {
   const [results, setResults] = useState<KbSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [searched, setSearched] = useState(false);
+  const [tags, setTags] = useState<KbTag[]>([]);
+  const [tagsLoading, setTagsLoading] = useState(false);
 
-  const handleSearch = async () => {
-    if (!query.trim()) return;
+  // Load tags for preset search terms
+  useEffect(() => {
+    if (kb.chunk_count === 0) return;
+    let active = true;
+    setTagsLoading(true);
+    kbApi.getTags(kb.id, 8)
+      .then((data) => { if (active) setTags(data); })
+      .catch(() => {})
+      .finally(() => { if (active) setTagsLoading(false); });
+    return () => { active = false; };
+  }, [kb.id, kb.chunk_count]);
+
+  const handleSearch = async (searchQuery?: string) => {
+    const q = (searchQuery ?? query).trim();
+    if (!q) return;
+    if (searchQuery) setQuery(searchQuery);
     setSearching(true);
     setSearched(true);
     try {
-      const data = await kbApi.search({ query, kb_id: kb.id, top_k: 10 });
+      const data = await kbApi.search({ query: q, kb_id: kb.id, top_k: 10 });
       setResults(data);
     } catch (e) {
       console.error(e);
@@ -1514,7 +1590,7 @@ function SearchTab({ kb }: { kb: KnowledgeBase }) {
           className="flex-1 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
         />
         <button
-          onClick={handleSearch}
+          onClick={() => handleSearch()}
           disabled={searching || !query.trim()}
           className="action-primary disabled:opacity-50"
         >
@@ -1522,6 +1598,33 @@ function SearchTab({ kb }: { kb: KnowledgeBase }) {
           搜索
         </button>
       </div>
+
+      {/* Preset search terms */}
+      {(tagsLoading || tags.length > 0) && (
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="flex items-center gap-1 text-[11px] font-medium text-slate-400">
+            <Sparkles size={12} />
+            快速检索
+          </span>
+          {tagsLoading ? (
+            <>
+              {[...Array(5)].map((_, i) => (
+                <div key={i} className="h-6 w-16 animate-pulse rounded-full bg-slate-100" />
+              ))}
+            </>
+          ) : (
+            tags.map((tag) => (
+              <button
+                key={tag.word}
+                onClick={() => handleSearch(tag.word)}
+                className="inline-flex items-center rounded-full border border-slate-200 bg-gradient-to-br from-slate-50 to-white px-3 py-1 text-xs font-medium text-slate-600 transition-all hover:border-blue-200 hover:bg-blue-50 hover:text-blue-600 hover:shadow-sm"
+              >
+                {tag.word}
+              </button>
+            ))
+          )}
+        </div>
+      )}
 
       {searched && !searching && results.length === 0 && (
         <div className="surface empty-state rounded-2xl">

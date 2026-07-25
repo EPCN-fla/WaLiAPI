@@ -79,6 +79,128 @@ pub async fn reindex_kb_document(
         .map_err(|e| e)
 }
 
+#[tauri::command]
+pub async fn get_kb_tags(
+    state: State<'_, Arc<AppState>>,
+    kb_id: String,
+    #[allow(unused_variables)]
+    limit: Option<usize>,
+) -> Result<Vec<KbTag>, String> {
+    let pool = &state.db.pool;
+    let limit = limit.unwrap_or(15);
+
+    // Sample chunk contents for keyword extraction
+    let chunks: Vec<(String,)> = sqlx::query_as(
+        "SELECT content FROM kb_chunks WHERE kb_id = ? ORDER BY RANDOM() LIMIT 200"
+    )
+    .bind(&kb_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if chunks.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Simple word frequency analysis
+    let mut word_freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    // Common stopwords (Chinese + English + code)
+    const STOPWORDS: &[&str] = &[
+        // English
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "must", "shall", "can", "need",
+        "of", "to", "in", "for", "on", "at", "by", "with", "from",
+        "as", "into", "through", "during", "before", "after", "above", "below",
+        "up", "down", "out", "off", "over", "under", "again", "further",
+        "then", "once", "here", "there", "when", "where", "why", "how",
+        "all", "each", "every", "both", "few", "more", "most", "other",
+        "some", "such", "no", "nor", "not", "only", "own", "same", "so",
+        "than", "too", "very", "just", "also", "if", "or", "and", "but",
+        // Code / tech common
+        "function", "return", "const", "let", "var", "class", "import",
+        "export", "default", "pub", "fn", "use", "mod", "struct",
+        "impl", "self", "crate", "async", "await", "type", "enum",
+        "true", "false", "null", "none", "some", "ok", "err",
+        "string", "vec", "option", "result",
+        // Chinese
+        "的", "了", "在", "是", "我", "有", "和", "就", "不", "人",
+        "都", "一", "一个", "上", "也", "很", "到", "说", "要", "去",
+        "你", "会", "着", "没有", "看", "好", "自己", "这", "那",
+        "与", "或", "但", "而", "且", "则", "于", "以", "及", "为",
+        "可", "能", "对", "中", "等", "使", "其", "之", "所",
+    ];
+
+    let stopword_set: std::collections::HashSet<&str> = STOPWORDS.iter().copied().collect();
+
+    for (content,) in &chunks {
+        // Extract words: English words (2+ chars), Chinese bigrams
+        let chars: Vec<char> = content.chars().collect();
+
+        // English words
+        let mut current_word = String::new();
+        for &ch in &chars {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                current_word.push(ch);
+            } else {
+                if current_word.len() >= 4 {
+                    let word_lower = current_word.to_lowercase();
+                    if !stopword_set.contains(word_lower.as_str()) {
+                        *word_freq.entry(word_lower).or_insert(0) += 1;
+                    }
+                }
+                current_word.clear();
+            }
+        }
+        if current_word.len() >= 4 {
+            let word_lower = current_word.to_lowercase();
+            if !stopword_set.contains(word_lower.as_str()) {
+                *word_freq.entry(word_lower).or_insert(0) += 1;
+            }
+        }
+
+        // Chinese bigrams (2-char sequences of CJK characters)
+        let mut prev_cjk: Option<char> = None;
+        for &ch in &chars {
+            let is_cjk = (ch >= '\u{4e00}' && ch <= '\u{9fff}')
+                || (ch >= '\u{3400}' && ch <= '\u{4dbf}');
+            if is_cjk {
+                if let Some(prev) = prev_cjk {
+                    let bigram = format!("{}{}", prev, ch);
+                    // Filter out bigrams where both chars are common stopwords
+                    let prev_s = prev.to_string();
+                    let ch_s = ch.to_string();
+                    if !stopword_set.contains(prev_s.as_str()) && !stopword_set.contains(ch_s.as_str()) {
+                        *word_freq.entry(bigram).or_insert(0) += 1;
+                    }
+                }
+                prev_cjk = Some(ch);
+            } else {
+                prev_cjk = None;
+            }
+        }
+    }
+
+    // Sort by frequency and take top N
+    let mut freq_vec: Vec<(String, usize)> = word_freq.into_iter().collect();
+    freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let tags: Vec<KbTag> = freq_vec
+        .into_iter()
+        .take(limit)
+        .map(|(word, count)| KbTag { word, count })
+        .collect();
+
+    Ok(tags)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KbTag {
+    pub word: String,
+    pub count: usize,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct KbSearchInput {
     pub query: String,

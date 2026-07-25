@@ -184,6 +184,7 @@ pub fn run() {
             commands::knowledge_base::get_kb_index_status,
             commands::knowledge_base::build_kb_index,
             commands::knowledge_base::drop_kb_index,
+            commands::knowledge_base::get_kb_tags,
             commands::services::get_service_statuses,
         ])
         .build(tauri::generate_context!())

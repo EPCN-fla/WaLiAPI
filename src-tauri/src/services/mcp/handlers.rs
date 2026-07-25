@@ -433,7 +433,12 @@ pub async fn handle_mcp(
         return StatusCode::ACCEPTED.into_response();
     }
 
-    // No session_id — return JSON directly (backwards compatible)
+    // No session_id — notifications get 202 with no body
+    if is_notification {
+        return StatusCode::ACCEPTED.into_response();
+    }
+
+    // Direct POST: return JSON response
     Json(response).into_response()
 }
 
@@ -534,7 +539,6 @@ async fn handle_tool_call(
             let question = args.get("question").and_then(|q| q.as_str()).ok_or("Missing question")?;
             let kb_id = args.get("kb_id").and_then(|k| k.as_str()).unwrap_or("");
             let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(5) as usize;
-            let chat_model = args.get("model").and_then(|m| m.as_str()).unwrap_or("gpt-4o");
 
             let emb_model = if !kb_id.is_empty() {
                 let kb_repo = KbRepository::new(pool.clone());
@@ -545,7 +549,25 @@ async fn handle_tool_call(
                 "text-embedding-3-small".to_string()
             };
 
-            let answer = rag::ask(pool, kb_id, question, &emb_model, chat_model, top_k, true, &[], &shared.app).await?;
+            // Auto-select chat model from available channels if not specified
+            let chat_model = if let Some(m) = args.get("model").and_then(|m| m.as_str()) {
+                m.to_string()
+            } else {
+                let main_repo = Repository::new(pool.clone());
+                let channels = main_repo.get_enabled_channels().await.unwrap_or_default();
+                let embedding_models = ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002", "bge-large-zh", "bge-small-zh"];
+                let mut picked: Option<String> = None;
+                for ch in &channels {
+                    let models: Vec<String> = serde_json::from_str(&ch.models).unwrap_or_default();
+                    if let Some(m) = models.iter().find(|m| !embedding_models.contains(&m.as_str())) {
+                        picked = Some(m.clone());
+                        break;
+                    }
+                }
+                picked.unwrap_or_else(|| "gpt-4o".to_string())
+            };
+
+            let answer = rag::ask(pool, kb_id, question, &emb_model, &chat_model, top_k, true, &[], &shared.app).await?;
 
             let mut content = vec![serde_json::json!({
                 "type": "text",

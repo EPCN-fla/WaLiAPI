@@ -49,7 +49,11 @@ impl Service for McpService {
 
     fn routes(&self, _state: Arc<AppState>) -> Router<SharedState> {
         Router::new()
-            .route("/mcp", axum::routing::post(handlers::handle_mcp))
-            .route("/mcp/sse", axum::routing::get(handlers::handle_mcp_sse))
+            // Primary Streamable HTTP endpoint (POST = JSON-RPC, GET = SSE upgrade)
+            .route("/mcp", axum::routing::post(handlers::handle_mcp).get(handlers::handle_mcp_sse))
+            // Trailing-slash variant — some clients send /mcp/
+            .route("/mcp/", axum::routing::post(handlers::handle_mcp).get(handlers::handle_mcp_sse))
+            // Legacy SSE endpoint — keep for backwards compat
+            .route("/mcp/sse", axum::routing::get(handlers::handle_mcp_sse).post(handlers::handle_mcp))
     }
 }
