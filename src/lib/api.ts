@@ -141,6 +141,7 @@ export interface KnowledgeBase {
   total_tokens: number;
   embedding_model: string | null;
   embedding_channel_id: string | null;
+  mcp_enabled: number;
   created_at: string;
   updated_at: string;
 }

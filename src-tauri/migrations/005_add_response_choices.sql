@@ -1,1 +1,0 @@
-ALTER TABLE request_logs ADD COLUMN response_choices TEXT;
