@@ -90,6 +90,22 @@ export function KnowledgeBasePage() {
 
 // ─── MCP Service Section ─────────────────────────────────────────────────
 
+const TOOL_ICONS: Record<string, typeof Terminal> = {
+  search_knowledge_base: Search,
+  list_knowledge_bases: BookOpen,
+  read_document: FileText,
+  ask_knowledge_base: MessageCircle,
+  get_knowledge_base_stats: Database,
+  create_knowledge_base: Plus,
+  update_knowledge_base: SettingsIcon,
+  delete_knowledge_base: Trash2,
+  upload_document: Upload,
+  delete_document: Trash2,
+  list_documents: Layers,
+  build_index: Sparkles,
+  import_source: GitBranch,
+};
+
 function McpSection() {
   const [services, setServices] = useState<ServiceStatus[]>([]);
   const [loading, setLoading] = useState(true);
@@ -115,7 +131,7 @@ function McpSection() {
   const baseUrl = serverUrl;
   const mcpEndpoint = `${baseUrl}/mcp`;
   const sseEndpoint = `${baseUrl}/mcp/sse`;
-  const tools = (mcpService?.stats?.tools as string[]) || [];
+  const tools = (mcpService?.stats?.tools as { name: string; label: string; desc: string }[]) || [];
 
   const handleCopy = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -212,13 +228,25 @@ function McpSection() {
           <Terminal size={18} className="text-slate-700" />
           <h3 className="text-sm font-semibold text-slate-900">可用工具 ({tools.length})</h3>
         </div>
-        <div className="space-y-2">
-          {tools.map((tool) => (
-            <div key={tool} className="flex items-center gap-3 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5">
-              <ChevronRight size={14} className="text-slate-400" />
-              <code className="text-xs font-medium text-slate-700">{tool}</code>
-            </div>
-          ))}
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          {tools.map((tool) => {
+            const icon = TOOL_ICONS[tool.name] || Terminal;
+            const Icon = icon;
+            return (
+              <div key={tool.name} className="group flex items-start gap-3 rounded-xl border border-slate-100 bg-gradient-to-br from-white to-slate-50 px-3 py-2.5 transition-all hover:border-slate-200 hover:shadow-sm">
+                <div className="mt-0.5 flex-shrink-0 rounded-lg bg-slate-100 p-1.5 text-slate-600 transition-colors group-hover:bg-slate-200">
+                  <Icon size={14} />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold text-slate-800">{tool.label}</span>
+                    <code className="truncate text-[10px] font-normal text-slate-400">{tool.name}</code>
+                  </div>
+                  <p className="mt-0.5 text-[11px] leading-relaxed text-slate-500">{tool.desc}</p>
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
 
