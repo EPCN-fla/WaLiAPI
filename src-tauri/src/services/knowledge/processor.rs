@@ -6,10 +6,30 @@ use super::retriever;
 use crate::db::models::now_iso;
 use crate::db::repository::Repository;
 use sqlx::SqlitePool;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 /// Default embedding model
 const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+
+/// Emit progress event to frontend
+fn emit_progress(
+    app: &AppHandle,
+    doc_id: &str,
+    kb_id: &str,
+    filename: &str,
+    stage: &str,
+    progress: u8,
+    detail: &str,
+) {
+    let _ = app.emit("kb-document-progress", serde_json::json!({
+        "doc_id": doc_id,
+        "kb_id": kb_id,
+        "filename": filename,
+        "stage": stage,
+        "progress": progress,
+        "detail": detail,
+    }));
+}
 
 /// Process an uploaded document: parse → split → embed → store
 pub async fn process_document(
@@ -28,6 +48,8 @@ pub async fn process_document(
         .await
         .map_err(|e| e.to_string())?;
 
+    emit_progress(app, doc_id, kb_id, filename, "processing", 0, "开始处理");
+
     let result = process_document_inner(
         pool, app, kb_id, doc_id, filename, content, embedding_model,
     ).await;
@@ -35,14 +57,14 @@ pub async fn process_document(
     if let Err(ref e) = result {
         let err_msg = format!("文档「{}」处理失败: {}", filename, e);
         let _ = repo.update_document_status(doc_id, "failed", Some(&err_msg)).await;
-        // Emit error event to frontend
-        use tauri::Emitter;
         let _ = app.emit("kb-document-error", serde_json::json!({
             "doc_id": doc_id,
             "kb_id": kb_id,
             "filename": filename,
             "error": e,
         }));
+    } else {
+        emit_progress(app, doc_id, kb_id, filename, "done", 100, "处理完成");
     }
 
     result
@@ -50,7 +72,7 @@ pub async fn process_document(
 
 async fn process_document_inner(
     pool: &SqlitePool,
-    _app: &AppHandle,
+    app: &AppHandle,
     kb_id: &str,
     doc_id: &str,
     filename: &str,
@@ -60,6 +82,7 @@ async fn process_document_inner(
     let repo = KbRepository::new(pool.clone());
 
     // 1. Parse file
+    emit_progress(app, doc_id, kb_id, filename, "parsing", 5, "解析文件");
     let parsed = parser::parse_file(filename, content)?;
 
     let (text, file_type_label): (String, String) = match &parsed {
@@ -70,6 +93,7 @@ async fn process_document_inner(
     };
 
     // 2. Split into chunks
+    emit_progress(app, doc_id, kb_id, filename, "splitting", 15, "文本分块");
     let config = splitter::SplitConfig::default();
     let base_metadata = splitter::ChunkMetadata {
         file_path: Some(filename.to_string()),
@@ -96,16 +120,34 @@ async fn process_document_inner(
     let main_repo = Repository::new(pool.clone());
 
     let batch_size = 32;
+    let total_batches = ((chunks.len() as f64) / batch_size as f64).ceil() as usize;
     let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+    let mut batch_done = 0usize;
 
     for batch in chunks.chunks(batch_size) {
         let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
         let embeddings = embedder::embed(&texts, emb_model, &main_repo).await?;
         all_embeddings.extend(embeddings);
+        batch_done += 1;
+        // Embedding progress: 20% ~ 80%
+        let pct = 20 + ((batch_done as f64 / total_batches as f64) * 60.0) as u8;
+        emit_progress(
+            app, doc_id, kb_id, filename, "embedding", pct,
+            &format!("向量化 {}/{}", batch_done, total_batches),
+        );
     }
 
     // 4. Store chunks with embeddings
+    let chunks_total = chunks.len();
     for (i, chunk) in chunks.iter().enumerate() {
+        // Storing progress: 80% ~ 95%
+        if i % 10 == 0 || i == chunks_total - 1 {
+            let pct = 80 + ((i as f64 + 1.0) / chunks_total as f64 * 15.0) as u8;
+            emit_progress(
+                app, doc_id, kb_id, filename, "storing", pct,
+                &format!("存储切片 {}/{}", i + 1, chunks_total),
+            );
+        }
         let embedding_bytes = retriever::encode_embedding(&all_embeddings[i]);
         let chunk_insert = ChunkInsert {
             id: uuid::Uuid::new_v4().to_string(),
@@ -125,6 +167,7 @@ async fn process_document_inner(
     }
 
     // 5. Update document and KB counts
+    emit_progress(app, doc_id, kb_id, filename, "finalizing", 98, "更新统计");
     repo.update_document_counts(doc_id, total_chunks, total_tokens)
         .await
         .map_err(|e| e.to_string())?;

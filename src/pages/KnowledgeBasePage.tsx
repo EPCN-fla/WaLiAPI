@@ -488,6 +488,7 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
   const [uploadingCount, setUploadingCount] = useState(0);
   const [uploadTotal, setUploadTotal] = useState(0);
   const [errorNotices, setErrorNotices] = useState<{ doc_id: string; filename: string; error: string }[]>([]);
+  const [progressMap, setProgressMap] = useState<Record<string, { stage: string; progress: number; detail: string }>>({});
 
   const fetchDocs = useCallback(async () => {
     setLoading(true);
@@ -520,7 +521,11 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
           const payload = event.payload;
           if (payload.kb_id !== kb.id) return;
           setErrorNotices((prev) => [...prev, payload]);
-          // Auto-dismiss after 8 seconds
+          setProgressMap((prev) => {
+            const next = { ...prev };
+            delete next[payload.doc_id];
+            return next;
+          });
           setTimeout(() => {
             setErrorNotices((prev) => prev.filter((n) => n.doc_id !== payload.doc_id));
           }, 8000);
@@ -534,6 +539,39 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
       if (unlisten) unlisten();
     };
   }, [kb.id, fetchDocs, onRefresh]);
+
+  // Listen for document processing progress from backend
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let active = true;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      unlisten = await listen<{ doc_id: string; kb_id: string; filename: string; stage: string; progress: number; detail: string }>(
+        "kb-document-progress",
+        (event) => {
+          if (!active) return;
+          const p = event.payload;
+          if (p.kb_id !== kb.id) return;
+          if (p.stage === "done") {
+            setProgressMap((prev) => {
+              const next = { ...prev };
+              delete next[p.doc_id];
+              return next;
+            });
+          } else {
+            setProgressMap((prev) => ({
+              ...prev,
+              [p.doc_id]: { stage: p.stage, progress: p.progress, detail: p.detail },
+            }));
+          }
+        }
+      );
+    })();
+    return () => {
+      active = false;
+      if (unlisten) unlisten();
+    };
+  }, [kb.id]);
 
   const handleUploadBatch = async (files: File[]) => {
     if (files.length === 0) return;
@@ -651,12 +689,14 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
         </div>
       ) : (
         <div className="space-y-2">
-          {docs.map((doc) => (
+          {docs.map((doc) => {
+            const prog = progressMap[doc.id];
+            return (
             <div
               key={doc.id}
               className="surface flex items-center gap-3 rounded-xl px-4 py-3"
             >
-              <DocStatusIcon status={doc.status} />
+              <DocStatusIcon status={prog ? "processing" : doc.status} />
 
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
@@ -667,16 +707,32 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
                     {doc.file_type}
                   </span>
                 </div>
-                <div className="mt-1 flex items-center gap-3 text-xs text-slate-500">
-                  <span>{formatSize(doc.file_size)}</span>
-                  {doc.chunk_count > 0 && <span>{doc.chunk_count} 切片</span>}
-                  {doc.token_count > 0 && <span>{doc.token_count} tokens</span>}
-                  {doc.error_message && (
-                    <span className="text-red-500" title={doc.error_message}>
-                      {doc.error_message.slice(0, 50)}
-                    </span>
-                  )}
-                </div>
+                {prog ? (
+                  <div className="mt-1.5">
+                    <div className="flex items-center gap-2">
+                      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-200">
+                        <div
+                          className="h-full rounded-full bg-blue-500 transition-all duration-300"
+                          style={{ width: `${prog.progress}%` }}
+                        />
+                      </div>
+                      <span className="shrink-0 text-[11px] text-blue-600">
+                        {prog.detail} · {prog.progress}%
+                      </span>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-1 flex items-center gap-3 text-xs text-slate-500">
+                    <span>{formatSize(doc.file_size)}</span>
+                    {doc.chunk_count > 0 && <span>{doc.chunk_count} 切片</span>}
+                    {doc.token_count > 0 && <span>{doc.token_count} tokens</span>}
+                    {doc.error_message && (
+                      <span className="text-red-500" title={doc.error_message}>
+                        {doc.error_message.slice(0, 50)}
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div className="flex items-center gap-1">
@@ -696,7 +752,8 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
                 </button>
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
