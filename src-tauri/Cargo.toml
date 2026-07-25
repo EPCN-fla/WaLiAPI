@@ -57,3 +57,10 @@ bytes = "1"
 
 # Logging
 log = "0.4"
+
+# Knowledge Base dependencies
+sha2 = "0.10"
+hex = "0.4"
+bincode = "1"
+base64 = "0.22"
+pdf-extract = "0.7"

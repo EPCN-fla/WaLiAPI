@@ -1,5 +1,4 @@
-use super::{RiskLevel, SecurityFinding, SecuritySettings};
-use serde::{Deserialize, Serialize};
+use super::SecuritySettings;
 
 /// Redact sensitive tokens in a JSON value, returning a new JSON with secrets replaced.
 /// Only applies when settings.redact_secrets is true AND mode is "redact".

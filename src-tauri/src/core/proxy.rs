@@ -9,6 +9,7 @@ use std::time::Instant;
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
+#[allow(dead_code)]
 pub struct ProxyResult {
     pub status: u16,
     pub body: serde_json::Value,

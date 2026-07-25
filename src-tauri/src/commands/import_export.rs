@@ -48,6 +48,7 @@ impl From<Channel> for ExportedChannel {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct WalicodeBackup {
     pub version: serde_json::Value,
     pub r#type: Option<String>,
@@ -57,6 +58,7 @@ pub struct WalicodeBackup {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct WalicodeAiSettings {
     #[serde(default)]
     pub provider: Option<String>,
@@ -76,6 +78,7 @@ pub struct WalicodeAiSettings {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct WalicodeProvider {
     pub name: String,
     #[serde(default)]

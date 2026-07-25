@@ -73,11 +73,11 @@ select option {
 }
 
 code {
-  color: #16202b;
+  color: inherit;
 }
 
 pre {
-  color: #16202b;
+  color: inherit;
 }
 
 input::placeholder,

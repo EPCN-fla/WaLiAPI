@@ -12,6 +12,7 @@ import {
   ChevronRight,
   ExternalLink,
   Link,
+  Database,
 } from "lucide-react";
 import { serverApi } from "../../lib/api";
 import type { ServerStatus } from "../../types";
@@ -23,6 +24,7 @@ const navItems = [
   { to: "/usage", icon: BookOpen, label: "使用" },
   { to: "/channels", icon: Radio, label: "渠道" },
   { to: "/api-keys", icon: Key, label: "密钥" },
+  { to: "/services", icon: Database, label: "服务" },
   { to: "/logs", icon: ScrollText, label: "日志" },
   { to: "/settings", icon: Settings, label: "设置" },
 ];

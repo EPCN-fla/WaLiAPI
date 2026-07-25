@@ -17,6 +17,10 @@ pub fn create_router(app: AppHandle, state: Arc<AppState>) -> Router {
         .allow_headers(Any)
         .expose_headers(Any);
 
+    // Service registry — merge all service routes
+    let registry = crate::services::ServiceRegistry::new();
+    let service_router = registry.merge_routes(state.clone());
+
     Router::new()
         // OpenAI Chat Completions
         .route("/v1/chat/completions", post(handle_chat_completions))
@@ -37,6 +41,8 @@ pub fn create_router(app: AppHandle, state: Arc<AppState>) -> Router {
         .route("/v1/messages", post(handle_messages))
         // Health check
         .route("/health", get(handle_health))
+        // Service routes (Knowledge Base, MCP, etc.)
+        .merge(service_router)
         .layer(cors)
         .with_state(shared)
 }

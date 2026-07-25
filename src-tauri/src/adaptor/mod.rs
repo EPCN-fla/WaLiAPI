@@ -39,8 +39,11 @@ pub struct TokenUsage {
 
 #[async_trait]
 pub trait Adaptor: Send + Sync {
+    #[allow(dead_code)]
     fn channel_type(&self) -> &'static str;
+    #[allow(dead_code)]
     fn default_models(&self) -> Vec<&'static str>;
+    #[allow(dead_code)]
     fn default_base_url(&self) -> &str;
 
     async fn test(&self, config: &ChannelConfig) -> Result<TestResult, anyhow::Error>;
@@ -69,6 +72,7 @@ pub fn get_adaptor(channel_type: &str) -> Box<dyn Adaptor> {
     }
 }
 
+#[allow(dead_code)]
 pub fn channel_types() -> Vec<ChannelTypeInfo> {
     vec![
         ChannelTypeInfo { value: "openai", label: "OpenAI", category: "international", default_base_url: "https://api.openai.com/v1", models: vec!["gpt-5.4", "gpt-5.5", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"] },
@@ -85,6 +89,7 @@ pub fn channel_types() -> Vec<ChannelTypeInfo> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ChannelTypeInfo {
     pub value: &'static str,
     pub label: &'static str,

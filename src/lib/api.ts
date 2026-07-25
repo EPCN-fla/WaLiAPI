@@ -129,3 +129,89 @@ export const securityApi = {
   toggleCustomRule: (id: string, enabled: boolean) => invoke<void>("toggle_custom_security_rule", { id, enabled }),
   deleteCustomRule: (id: string) => invoke<void>("delete_custom_security_rule", { id }),
 };
+
+// Knowledge Base types
+export interface KnowledgeBase {
+  id: string;
+  name: string;
+  description: string | null;
+  status: number;
+  doc_count: number;
+  chunk_count: number;
+  total_tokens: number;
+  embedding_model: string | null;
+  embedding_channel_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface KbDocument {
+  id: string;
+  kb_id: string;
+  filename: string;
+  file_path: string | null;
+  file_type: string;
+  file_size: number;
+  content_hash: string;
+  chunk_count: number;
+  token_count: number;
+  status: string;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface KbSearchResult {
+  chunk_id: string;
+  doc_id: string;
+  filename: string;
+  content: string;
+  score: number;
+  metadata: Record<string, unknown>;
+}
+
+export interface KbRagAnswer {
+  answer: string;
+  sources: Array<{
+    filename: string;
+    score: number;
+    snippet: string;
+  }>;
+  usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null;
+}
+
+// Knowledge Base commands
+export const kbApi = {
+  getAll: () => invoke<KnowledgeBase[]>("get_knowledge_bases"),
+  create: (input: { name: string; description?: string; embedding_model?: string }) =>
+    invoke<KnowledgeBase>("create_knowledge_base", { input }),
+  update: (id: string, input: Partial<{ name: string; description: string; embedding_model: string; embedding_channel_id: string; status: number }>) =>
+    invoke<KnowledgeBase>("update_knowledge_base", { id, input }),
+  delete: (id: string) => invoke<void>("delete_knowledge_base", { id }),
+  getDocuments: (kbId: string) => invoke<KbDocument[]>("get_kb_documents", { kbId }),
+  uploadDocument: (input: { kb_id: string; filename: string; content: string }) =>
+    invoke<KbDocument>("upload_kb_document", { input }),
+  deleteDocument: (docId: string, kbId: string) =>
+    invoke<void>("delete_kb_document", { docId, kbId }),
+  reindexDocument: (docId: string) =>
+    invoke<void>("reindex_kb_document", { docId }),
+  search: (input: { query: string; kb_id?: string; top_k?: number }) =>
+    invoke<KbSearchResult[]>("search_knowledge_base", { input }),
+  ask: (input: { question: string; kb_id?: string; top_k?: number; model?: string }) =>
+    invoke<KbRagAnswer>("ask_knowledge_base", { input }),
+  getStats: (kbId: string) => invoke<Record<string, unknown>>("get_kb_stats", { kbId }),
+};
+
+// Service status
+export interface ServiceStatus {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  running: boolean;
+  stats: Record<string, unknown>;
+}
+
+export const serviceApi = {
+  getStatuses: () => invoke<ServiceStatus[]>("get_service_statuses"),
+};
