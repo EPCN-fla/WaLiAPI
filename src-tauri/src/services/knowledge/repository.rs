@@ -32,8 +32,8 @@ impl KbRepository {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
         sqlx::query(
-            "INSERT INTO kb_knowledge_bases (id, name, description, status, doc_count, chunk_count, total_tokens, embedding_model, embedding_channel_id, created_at, updated_at)
-             VALUES (?, ?, ?, 1, 0, 0, 0, ?, ?, ?, ?)"
+            "INSERT INTO kb_knowledge_bases (id, name, description, status, doc_count, chunk_count, total_tokens, embedding_model, embedding_channel_id, mcp_enabled, chunk_size, chunk_overlap, excluded_dirs, excluded_files, included_files, embedding_dim, index_status, created_at, updated_at)
+             VALUES (?, ?, ?, 1, 0, 0, 0, ?, ?, 1, 512, 64, '', '', '', 0, 'none', ?, ?)"
         )
         .bind(&id)
         .bind(&input.name)
@@ -71,6 +71,21 @@ impl KbRepository {
         if let Some(mcp_enabled) = input.mcp_enabled {
             q.push(", mcp_enabled = ").push_bind(mcp_enabled);
         }
+        if let Some(chunk_size) = input.chunk_size {
+            q.push(", chunk_size = ").push_bind(chunk_size);
+        }
+        if let Some(chunk_overlap) = input.chunk_overlap {
+            q.push(", chunk_overlap = ").push_bind(chunk_overlap);
+        }
+        if let Some(excluded_dirs) = &input.excluded_dirs {
+            q.push(", excluded_dirs = ").push_bind(excluded_dirs);
+        }
+        if let Some(excluded_files) = &input.excluded_files {
+            q.push(", excluded_files = ").push_bind(excluded_files);
+        }
+        if let Some(included_files) = &input.included_files {
+            q.push(", included_files = ").push_bind(included_files);
+        }
 
         q.push(" WHERE id = ").push_bind(id);
         q.build().execute(&self.pool).await?;
@@ -79,7 +94,6 @@ impl KbRepository {
     }
 
     pub async fn delete_kb(&self, id: &str) -> Result<(), sqlx::Error> {
-        // Cascade delete will handle documents and chunks
         sqlx::query("DELETE FROM kb_knowledge_bases WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
@@ -119,6 +133,28 @@ impl KbRepository {
         Ok(())
     }
 
+    pub async fn update_kb_index_status(&self, kb_id: &str, status: &str) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        sqlx::query("UPDATE kb_knowledge_bases SET index_status = ?, updated_at = ? WHERE id = ?")
+            .bind(status)
+            .bind(&now)
+            .bind(kb_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_kb_embedding_dim(&self, kb_id: &str, dim: i64) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        sqlx::query("UPDATE kb_knowledge_bases SET embedding_dim = ?, updated_at = ? WHERE id = ?")
+            .bind(dim)
+            .bind(&now)
+            .bind(kb_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     // ==================== Document ====================
 
     pub async fn get_documents(&self, kb_id: &str) -> Result<Vec<KbDocument>, sqlx::Error> {
@@ -147,8 +183,8 @@ impl KbRepository {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
         sqlx::query(
-            "INSERT INTO kb_documents (id, kb_id, filename, file_path, file_type, file_size, content_hash, chunk_count, token_count, status, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 'pending', ?, ?)"
+            "INSERT INTO kb_documents (id, kb_id, filename, file_path, file_type, file_size, content_hash, chunk_count, token_count, status, source_type, doc_meta, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 'pending', 'upload', '{}', ?, ?)"
         )
         .bind(&id)
         .bind(kb_id)
@@ -157,6 +193,31 @@ impl KbRepository {
         .bind(file_type)
         .bind(file_size)
         .bind(content_hash)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_document(&id).await
+    }
+
+    pub async fn create_document_with_source(&self, kb_id: &str, filename: &str, file_path: Option<&str>, file_type: &str, file_size: i64, content_hash: &str, source_type: &str, source_url: Option<&str>, source_path: Option<&str>) -> Result<KbDocument, sqlx::Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO kb_documents (id, kb_id, filename, file_path, file_type, file_size, content_hash, chunk_count, token_count, status, source_type, source_url, source_path, doc_meta, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 'pending', ?, ?, ?, '{}', ?, ?)"
+        )
+        .bind(&id)
+        .bind(kb_id)
+        .bind(filename)
+        .bind(file_path)
+        .bind(file_type)
+        .bind(file_size)
+        .bind(content_hash)
+        .bind(source_type)
+        .bind(source_url)
+        .bind(source_path)
         .bind(&now)
         .bind(&now)
         .execute(&self.pool)
@@ -210,7 +271,7 @@ impl KbRepository {
         .bind(chunk.chunk_index)
         .bind(&chunk.content)
         .bind(chunk.token_count)
-        .bind(&chunk.embedding)  // BLOB
+        .bind(&chunk.embedding)
         .bind(chunk.embedding_dim)
         .bind(&chunk.metadata)
         .bind(&chunk.created_at)
@@ -230,6 +291,18 @@ impl KbRepository {
     pub async fn get_chunks_by_kb(&self, kb_id: &str) -> Result<Vec<(String, String, String, Vec<u8>, String, String)>, sqlx::Error> {
         sqlx::query_as(
             "SELECT c.id, c.content, c.metadata, c.embedding, d.filename, c.doc_id
+             FROM kb_chunks c
+             JOIN kb_documents d ON c.doc_id = d.id
+             WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'"
+        )
+        .bind(kb_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_chunks_by_kb_with_dim(&self, kb_id: &str) -> Result<Vec<ChunkWithEmbedding>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT c.id, c.content, c.metadata, c.embedding, c.embedding_dim, d.filename, c.doc_id
              FROM kb_chunks c
              JOIN kb_documents d ON c.doc_id = d.id
              WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'"
@@ -299,6 +372,133 @@ impl KbRepository {
             .fetch_all(&self.pool)
             .await
     }
+
+    // ==================== Conversation History ====================
+
+    pub async fn get_conversations(&self, kb_id: &str) -> Result<Vec<KbConversation>, sqlx::Error> {
+        sqlx::query_as::<_, KbConversation>(
+            "SELECT * FROM kb_conversations WHERE kb_id = ? ORDER BY created_at ASC"
+        )
+        .bind(kb_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn add_conversation(&self, kb_id: &str, role: &str, content: &str, sources: Option<&str>, model: Option<&str>, tokens_used: i64) -> Result<(), sqlx::Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO kb_conversations (id, kb_id, role, content, sources, model, tokens_used, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&id)
+        .bind(kb_id)
+        .bind(role)
+        .bind(content)
+        .bind(sources)
+        .bind(model)
+        .bind(tokens_used)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn clear_conversations(&self, kb_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM kb_conversations WHERE kb_id = ?")
+            .bind(kb_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ==================== Sources ====================
+
+    pub async fn get_sources(&self, kb_id: &str) -> Result<Vec<KbSource>, sqlx::Error> {
+        sqlx::query_as::<_, KbSource>(
+            "SELECT * FROM kb_sources WHERE kb_id = ? ORDER BY created_at DESC"
+        )
+        .bind(kb_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn create_source(&self, kb_id: &str, source_type: &str, source_url: Option<&str>, source_path: Option<&str>, branch: Option<&str>) -> Result<KbSource, sqlx::Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO kb_sources (id, kb_id, source_type, source_url, source_path, branch, status, file_count, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'fetching', 0, ?, ?)"
+        )
+        .bind(&id)
+        .bind(kb_id)
+        .bind(source_type)
+        .bind(source_url)
+        .bind(source_path)
+        .bind(branch)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query_as::<_, KbSource>("SELECT * FROM kb_sources WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    pub async fn update_source_status(&self, id: &str, status: &str, file_count: i64, error: Option<&str>) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        sqlx::query("UPDATE kb_sources SET status = ?, file_count = ?, error = ?, updated_at = ? WHERE id = ?")
+            .bind(status)
+            .bind(file_count)
+            .bind(error)
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_source(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM kb_sources WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ==================== Index Meta ====================
+
+    pub async fn get_index_meta(&self, kb_id: &str) -> Result<Option<KbIndexMeta>, sqlx::Error> {
+        sqlx::query_as::<_, KbIndexMeta>("SELECT * FROM kb_index_meta WHERE kb_id = ?")
+            .bind(kb_id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    pub async fn upsert_index_meta(&self, kb_id: &str, dim: i64, chunk_count: i64, index_path: Option<&str>, status: &str) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO kb_index_meta (kb_id, index_type, embedding_dim, chunk_count, index_path, built_at, status)
+             VALUES (?, 'hnsw', ?, ?, ?, ?, ?)
+             ON CONFLICT(kb_id) DO UPDATE SET embedding_dim = ?, chunk_count = ?, index_path = ?, built_at = ?, status = ?"
+        )
+        .bind(kb_id)
+        .bind(dim)
+        .bind(chunk_count)
+        .bind(index_path)
+        .bind(&now)
+        .bind(status)
+        .bind(dim)
+        .bind(chunk_count)
+        .bind(index_path)
+        .bind(&now)
+        .bind(status)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 pub struct ChunkInsert {
@@ -312,4 +512,15 @@ pub struct ChunkInsert {
     pub embedding_dim: i64,
     pub metadata: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ChunkWithEmbedding {
+    pub id: String,
+    pub content: String,
+    pub metadata: String,
+    pub embedding: Vec<u8>,
+    pub embedding_dim: i64,
+    pub filename: String,
+    pub doc_id: String,
 }

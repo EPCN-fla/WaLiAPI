@@ -92,9 +92,13 @@ async fn process_document_inner(
         parser::ParsedContent::Structured(t) => (t.clone(), "structured".to_string()),
     };
 
-    // 2. Split into chunks
+    // 2. Split into chunks — use KB-level config if available
     emit_progress(app, doc_id, kb_id, filename, "splitting", 15, "文本分块");
-    let config = splitter::SplitConfig::default();
+    let kb = repo.get_kb(kb_id).await.map_err(|e| e.to_string())?;
+    let config = splitter::SplitConfig {
+        chunk_size: if kb.chunk_size > 0 { kb.chunk_size as usize } else { 512 },
+        chunk_overlap: if kb.chunk_overlap > 0 { kb.chunk_overlap as usize } else { 64 },
+    };
     let base_metadata = splitter::ChunkMetadata {
         file_path: Some(filename.to_string()),
         ..Default::default()
@@ -119,6 +123,9 @@ async fn process_document_inner(
     let emb_model = embedding_model.unwrap_or(DEFAULT_EMBEDDING_MODEL);
     let main_repo = Repository::new(pool.clone());
 
+    // Detect expected embedding dimension from KB config
+    let expected_dim = if kb.embedding_dim > 0 { Some(kb.embedding_dim as usize) } else { None };
+
     let batch_size = 32;
     let total_batches = ((chunks.len() as f64) / batch_size as f64).ceil() as usize;
     let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
@@ -127,6 +134,19 @@ async fn process_document_inner(
     for batch in chunks.chunks(batch_size) {
         let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
         let embeddings = embedder::embed(&texts, emb_model, &main_repo).await?;
+
+        // Validate embedding dimensions
+        if let Some(dim) = expected_dim {
+            for (i, emb) in embeddings.iter().enumerate() {
+                if emb.len() != dim {
+                    tracing::warn!(
+                        "Embedding dim mismatch in batch {}: expected {}, got {} (chunk {})",
+                        batch_done, dim, emb.len(), i
+                    );
+                }
+            }
+        }
+
         all_embeddings.extend(embeddings);
         batch_done += 1;
         // Embedding progress: 20% ~ 80%
@@ -135,6 +155,13 @@ async fn process_document_inner(
             app, doc_id, kb_id, filename, "embedding", pct,
             &format!("向量化 {}/{}", batch_done, total_batches),
         );
+    }
+
+    // Auto-detect and update KB embedding dimension if not set
+    if expected_dim.is_none() && !all_embeddings.is_empty() {
+        let detected_dim = all_embeddings[0].len() as i64;
+        tracing::info!("Auto-detected embedding dim {} for KB {}", detected_dim, kb_id);
+        repo.update_kb_embedding_dim(kb_id, detected_dim).await.ok();
     }
 
     // 4. Store chunks with embeddings
@@ -177,6 +204,31 @@ async fn process_document_inner(
     repo.update_kb_counts(kb_id)
         .await
         .map_err(|e| e.to_string())?;
+
+    // 6. Rebuild HNSW index (best-effort, non-blocking on failure)
+    emit_progress(app, doc_id, kb_id, filename, "indexing", 99, "更新向量索引");
+    let pool_clone = pool.clone();
+    let kb_id_clone = kb_id.to_string();
+    let app_clone = app.clone();
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            if let Err(e) = retriever::build_index(&pool_clone, &kb_id_clone, &app_clone).await {
+                tracing::warn!("Failed to rebuild HNSW index for KB {} after doc: {}", kb_id_clone, e);
+                let _ = app_clone.emit("kb-index-progress", serde_json::json!({
+                    "kb_id": &kb_id_clone,
+                    "status": "error",
+                    "message": format!("索引构建失败: {}", e)
+                }));
+            } else {
+                let _ = app_clone.emit("kb-index-progress", serde_json::json!({
+                    "kb_id": &kb_id_clone,
+                    "status": "ready",
+                    "message": "索引构建完成"
+                }));
+            }
+        });
+    });
 
     Ok(())
 }

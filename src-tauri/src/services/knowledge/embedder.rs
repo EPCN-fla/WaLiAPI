@@ -32,9 +32,21 @@ pub async fn embed(
 
     for channel in &candidates {
         match try_embed_with_channel(texts, model, channel).await {
-            Ok(embeddings) => return Ok(embeddings),
+            Ok(embeddings) => {
+                // Log success and validate dimensions
+                if !embeddings.is_empty() {
+                    tracing::info!(
+                        "Embedding success: channel={}, model={}, texts={}, dim={}",
+                        channel.name, model, texts.len(), embeddings[0].len()
+                    );
+                }
+                return Ok(embeddings);
+            }
             Err(e) => {
-                tracing::warn!("Embedding failed on channel {}: {}", channel.name, e);
+                tracing::warn!(
+                    "Embedding failed on channel {} (model={}): {} — trying next channel",
+                    channel.name, model, e
+                );
                 continue;
             }
         }
@@ -106,6 +118,23 @@ async fn try_embed_with_channel(
             texts.len(),
             embeddings.len()
         ));
+    }
+
+    // Validate all embeddings have same dimension
+    if !embeddings.is_empty() {
+        let dim = embeddings[0].len();
+        for (i, emb) in embeddings.iter().enumerate().skip(1) {
+            if emb.len() != dim {
+                return Err(format!(
+                    "Inconsistent embedding dimensions: item 0 has dim {}, item {} has dim {}",
+                    dim, i, emb.len()
+                ));
+            }
+        }
+        tracing::debug!(
+            "Embeddings validated: {} items, dim {}",
+            embeddings.len(), dim
+        );
     }
 
     Ok(embeddings)

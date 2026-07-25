@@ -19,4 +19,11 @@ pub fn create_router(_state: Arc<AppState>) -> Router<SharedState> {
         // Search & RAG
         .route("/api/kb/search", get(handlers::search))
         .route("/api/kb/ask", post(handlers::ask))
+        // Conversation History
+        .route("/api/kb/{kb_id}/conversations", get(handlers::list_conversations).delete(handlers::clear_conversations))
+        // Sources (Multi-source import)
+        .route("/api/kb/{kb_id}/sources", get(handlers::list_sources).post(handlers::import_source))
+        .route("/api/kb/{kb_id}/sources/{source_id}", axum::routing::delete(handlers::delete_source))
+        // Index Management
+        .route("/api/kb/{kb_id}/index", get(handlers::get_index_status).post(handlers::build_index).delete(handlers::drop_index))
 }

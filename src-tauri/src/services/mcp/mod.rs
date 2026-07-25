@@ -13,7 +13,7 @@ pub struct McpService;
 impl Service for McpService {
     fn id(&self) -> &'static str { "mcp" }
     fn name(&self) -> &'static str { "MCP Server" }
-    fn description(&self) -> &'static str { "Model Context Protocol Server，对外暴露知识库工具" }
+    fn description(&self) -> &'static str { "Model Context Protocol Server，对外暴露知识库工具（支持创建/更新/删除知识库、上传/删除文档、导入源、构建索引、搜索、RAG问答）" }
 
     async fn status(&self, state: &Arc<AppState>) -> ServiceStatus {
         let pool = &state.db.pool;
@@ -28,7 +28,7 @@ impl Service for McpService {
             running: true,
             stats: serde_json::json!({
                 "available_knowledge_bases": kb_count,
-                "tools": ["search_knowledge_base", "list_knowledge_bases", "read_document", "ask_knowledge_base", "get_knowledge_base_stats"],
+                "tools": ["search_knowledge_base", "list_knowledge_bases", "read_document", "ask_knowledge_base", "get_knowledge_base_stats", "create_knowledge_base", "update_knowledge_base", "delete_knowledge_base", "upload_document", "delete_document", "list_documents", "build_index", "import_source"],
             }),
         }
     }

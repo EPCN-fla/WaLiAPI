@@ -8,6 +8,8 @@ pub mod retriever;
 pub mod rag;
 pub mod handlers;
 pub mod routes;
+pub mod importer;
+pub mod index;
 
 use async_trait::async_trait;
 use axum::Router;
@@ -22,7 +24,7 @@ pub struct KnowledgeService;
 impl Service for KnowledgeService {
     fn id(&self) -> &'static str { "knowledge" }
     fn name(&self) -> &'static str { "知识库" }
-    fn description(&self) -> &'static str { "本地知识库：文件上传、文本切片、Embedding、向量检索、RAG 问答" }
+    fn description(&self) -> &'static str { "本地知识库：创建私有知识库，上传文档自动向量化并构建 HNSW 索引，通过 MCP 协议对外提供检索和 RAG 问答工具，支持任意 AI Agent 对接" }
 
     async fn status(&self, state: &Arc<AppState>) -> ServiceStatus {
         let pool = &state.db.pool;

@@ -146,8 +146,8 @@ async fn handle_stream(
             trace_id: trace_id.clone(),
         };
         let log_id = log.id.clone();
-        let _ = repo.create_log(&log).await;
-        let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+        if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+        if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
         let err_body = serde_json::json!({"error": {"message": security_result.summary, "type": "security_blocked", "code": "security.blocked"}});
         return (StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, Json(err_body)).into_response();
     }
@@ -396,12 +396,12 @@ async fn handle_stream(
                         trace_id: trace_id_clone,
                     };
                     let log_id = log.id.clone();
-                    let _ = repo_clone.create_log(&log).await;
-                    let _ = repo_clone.create_security_findings(&log_id, &security_result_clone.findings, security_result_clone.action.as_str()).await;
+                    if let Err(e) = repo_clone.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                    if let Err(e) = repo_clone.create_security_findings(&log_id, &security_result_clone.findings, security_result_clone.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
 
                     // Increment quota if we got token counts
                     if quota_to_add > 0 {
-                        let _ = repo_clone.increment_quota(&key_id_for_quota, quota_to_add).await;
+                        if let Err(e) = repo_clone.increment_quota(&key_id_for_quota, quota_to_add).await { eprintln!("[WARN] increment_quota failed: {}", e); }
                     }
                 };
 
@@ -445,8 +445,8 @@ async fn handle_stream(
                     trace_id: trace_id.clone(),
                 };
                 let log_id = log.id.clone();
-                let _ = repo.create_log(&log).await;
-                let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
                 last_error = Some(format!("{}: {}", channel.name, error_message));
             }
         }
@@ -595,8 +595,8 @@ async fn handle_messages_stream(
             trace_id: trace_id.clone(),
         };
         let log_id = log.id.clone();
-        let _ = repo.create_log(&log).await;
-        let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+        if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+        if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
         let err_body = serde_json::json!({"type": "error", "error": {"type": "api_error", "message": security_result.summary}});
         return (StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, Json(err_body)).into_response();
     }
@@ -757,10 +757,10 @@ async fn handle_messages_stream(
                         trace_id: trace_id_clone,
                     };
                     let log_id = log.id.clone();
-                    let _ = repo_clone.create_log(&log).await;
-                    let _ = repo_clone.create_security_findings(&log_id, &security_result_clone.findings, security_result_clone.action.as_str()).await;
+                    if let Err(e) = repo_clone.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                    if let Err(e) = repo_clone.create_security_findings(&log_id, &security_result_clone.findings, security_result_clone.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
                     if usage_total > 0 {
-                        let _ = repo_clone.increment_quota(&api_key_id_clone, usage_total).await;
+                        if let Err(e) = repo_clone.increment_quota(&api_key_id_clone, usage_total).await { eprintln!("[WARN] increment_quota failed: {}", e); }
                     }
                 };
 
@@ -804,8 +804,8 @@ async fn handle_messages_stream(
                     trace_id: trace_id.clone(),
                 };
                 let log_id = log.id.clone();
-                let _ = repo.create_log(&log).await;
-                let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
                 last_error = Some(format!("{}: {}", channel.name, error_message));
             }
         }
@@ -939,8 +939,8 @@ async fn handle_responses_stream(
             trace_id: trace_id.clone(),
         };
         let log_id = log.id.clone();
-        let _ = repo.create_log(&log).await;
-        let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+        if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+        if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
         let err_body = serde_json::json!({"error": {"message": security_result.summary, "type": "security_blocked"}});
         return (StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, Json(err_body)).into_response();
     }
@@ -1100,10 +1100,10 @@ async fn handle_responses_stream(
                         trace_id: trace_id_clone,
                     };
                     let log_id = log.id.clone();
-                    let _ = repo_clone.create_log(&log).await;
-                    let _ = repo_clone.create_security_findings(&log_id, &security_result_clone.findings, security_result_clone.action.as_str()).await;
+                    if let Err(e) = repo_clone.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                    if let Err(e) = repo_clone.create_security_findings(&log_id, &security_result_clone.findings, security_result_clone.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
                     if usage_total > 0 {
-                        let _ = repo_clone.increment_quota(&api_key_id_clone, usage_total).await;
+                        if let Err(e) = repo_clone.increment_quota(&api_key_id_clone, usage_total).await { eprintln!("[WARN] increment_quota failed: {}", e); }
                     }
                 };
 
@@ -1147,8 +1147,8 @@ async fn handle_responses_stream(
                     trace_id: trace_id.clone(),
                 };
                 let log_id = log.id.clone();
-                let _ = repo.create_log(&log).await;
-                let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
                 last_error = Some(format!("{}: {}", channel.name, error_message));
             }
         }
@@ -1238,8 +1238,8 @@ pub async fn handle_embeddings(
             trace_id: trace_id.clone(),
         };
         let log_id = log.id.clone();
-        let _ = repo.create_log(&log).await;
-        let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+        if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+        if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
         return (StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, Json(serde_json::json!({
             "error": {"message": security_result.summary, "type": "security_blocked"}
         }))).into_response();
@@ -1330,8 +1330,8 @@ pub async fn handle_embeddings(
                         trace_id: trace_id.clone(),
                     };
                     let log_id = log.id.clone();
-                    let _ = repo.create_log(&log).await;
-                    let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+                    if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                    if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
                     last_error = Some(error_message);
                     continue;
                 }
@@ -1370,10 +1370,10 @@ pub async fn handle_embeddings(
                     trace_id: trace_id.clone(),
                 };
                 let log_id = log.id.clone();
-                let _ = repo.create_log(&log).await;
-                let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
                 if usage_total > 0 {
-                    let _ = repo.increment_quota(&key_record.id, usage_total).await;
+                    if let Err(e) = repo.increment_quota(&key_record.id, usage_total).await { eprintln!("[WARN] increment_quota failed: {}", e); }
                 }
 
                 return (StatusCode::OK, Json(resp_body)).into_response();
@@ -1410,8 +1410,8 @@ pub async fn handle_embeddings(
                     trace_id: trace_id.clone(),
                 };
                 let log_id = log.id.clone();
-                let _ = repo.create_log(&log).await;
-                let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
                 last_error = Some(error_message);
             }
         }

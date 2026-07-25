@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, RwLock};
 use crate::server::router::SharedState;
 use crate::db::repository::Repository;
 use crate::services::knowledge::{repository::KbRepository, embedder, retriever, rag};
+use tauri::{Manager, Emitter};
 
 // ── Session management for SSE transport ──────────────────────────
 // Each SSE client gets a unique session_id. The POST handler uses
@@ -72,23 +73,24 @@ impl McpResponse {
 
 fn get_tools() -> Vec<serde_json::Value> {
     vec![
+        // ── Read-only tools (existing) ───────────────────────────
         serde_json::json!({
             "name": "search_knowledge_base",
-            "description": "Search the local knowledge base for relevant content. Returns matching text chunks with similarity scores.",
+            "description": "Semantic search across a local knowledge base. Uses HNSW vector index for O(log n) retrieval. Returns matching text chunks with cosine similarity scores (0-1). Searches a specific KB if kb_id provided, otherwise searches all MCP-enabled KBs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search query to find relevant content in the knowledge base"
+                        "description": "Natural language search query. Will be embedded and matched against document chunks."
                     },
                     "kb_id": {
                         "type": "string",
-                        "description": "Knowledge base ID. If not provided, searches all active knowledge bases."
+                        "description": "Specific knowledge base ID to search. If omitted, searches all MCP-enabled KBs."
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "Number of top results to return (default: 5)",
+                        "description": "Maximum number of results to return (default: 5)",
                         "default": 5
                     }
                 },
@@ -97,7 +99,7 @@ fn get_tools() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "list_knowledge_bases",
-            "description": "List all available knowledge bases.",
+            "description": "List all MCP-enabled knowledge bases. Returns KB ID, name, document count, chunk count, and description. Use this first to discover available knowledge bases before searching or asking questions.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -105,38 +107,157 @@ fn get_tools() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "read_document",
-            "description": "Read the full content of a specific document in a knowledge base.",
+            "description": "Read the full content of a specific document in a knowledge base. Use after search_knowledge_base to get the complete text of a matched chunk's source document.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "kb_id": { "type": "string", "description": "Knowledge base ID" },
-                    "doc_id": { "type": "string", "description": "Document ID" }
+                    "doc_id": { "type": "string", "description": "Document ID (from search results)" }
                 },
                 "required": ["kb_id", "doc_id"]
             }
         }),
         serde_json::json!({
             "name": "ask_knowledge_base",
-            "description": "Ask a question to the knowledge base and get an AI-generated answer based on retrieved context.",
+            "description": "Ask a question to the knowledge base and get an AI-generated answer based on retrieved context (RAG). Uses the configured LLM channel to generate a response grounded in the KB content. Returns the answer plus source citations with similarity scores.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "question": { "type": "string", "description": "The question to ask" },
-                    "kb_id": { "type": "string", "description": "Knowledge base ID. If not provided, uses all active KBs." },
-                    "top_k": { "type": "integer", "description": "Number of chunks to retrieve (default: 5)", "default": 5 }
+                    "question": { "type": "string", "description": "The question to ask. The answer will be grounded in retrieved document chunks." },
+                    "kb_id": { "type": "string", "description": "Knowledge base ID. If omitted, uses all MCP-enabled KBs." },
+                    "top_k": { "type": "integer", "description": "Number of chunks to retrieve as context (default: 5)", "default": 5 },
+                    "model": { "type": "string", "description": "LLM model to use for answer generation (default: uses channel default)" }
                 },
                 "required": ["question"]
             }
         }),
         serde_json::json!({
             "name": "get_knowledge_base_stats",
-            "description": "Get statistics about a specific knowledge base.",
+            "description": "Get detailed statistics about a knowledge base: document count, ready documents, chunk count, total tokens, embedding model, and index status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "kb_id": { "type": "string", "description": "Knowledge base ID" }
                 },
                 "required": ["kb_id"]
+            }
+        }),
+
+        // ── Write tools: Knowledge Base lifecycle ──────────────────
+        serde_json::json!({
+            "name": "create_knowledge_base",
+            "description": "Create a new knowledge base. After creation, you can upload documents or import sources to populate it. The KB will be created with MCP enabled by default so it's immediately accessible via MCP tools.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Knowledge base name (1-100 characters)" },
+                    "description": { "type": "string", "description": "Optional description of the knowledge base purpose" },
+                    "embedding_model": { "type": "string", "description": "Embedding model to use (default: text-embedding-3-small)" },
+                    "embedding_channel_id": { "type": "string", "description": "Optional embedding channel ID for custom providers" }
+                },
+                "required": ["name"]
+            }
+        }),
+        serde_json::json!({
+            "name": "update_knowledge_base",
+            "description": "Update knowledge base configuration: name, description, embedding model, chunk size, MCP enabled status, etc. Only provided fields will be updated.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kb_id": { "type": "string", "description": "Knowledge base ID" },
+                    "name": { "type": "string", "description": "New name" },
+                    "description": { "type": "string", "description": "New description" },
+                    "embedding_model": { "type": "string", "description": "New embedding model (changing this requires re-indexing all documents)" },
+                    "embedding_channel_id": { "type": "string", "description": "New embedding channel ID" },
+                    "mcp_enabled": { "type": "integer", "description": "1 to enable MCP access, 0 to disable" },
+                    "chunk_size": { "type": "integer", "description": "Chunk size in tokens (default: 512)" },
+                    "chunk_overlap": { "type": "integer", "description": "Chunk overlap in tokens (default: 64)" }
+                },
+                "required": ["kb_id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "delete_knowledge_base",
+            "description": "Permanently delete a knowledge base and all its documents, chunks, and index. This action cannot be undone.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kb_id": { "type": "string", "description": "Knowledge base ID to delete" }
+                },
+                "required": ["kb_id"]
+            }
+        }),
+
+        // ── Write tools: Document management ───────────────────────
+        serde_json::json!({
+            "name": "upload_document",
+            "description": "Upload a document to a knowledge base. The content will be automatically parsed, chunked, embedded, and indexed. Supported file types: .txt, .md, .pdf, .docx, .doc, .pptx, .xlsx, .csv, .json, .html, .rs, .py, .js, .ts, .go, .java, .c, .cpp, .h, .sh, .yaml, .yml, .toml. The document is processed asynchronously — use get_knowledge_base_stats to check progress.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kb_id": { "type": "string", "description": "Target knowledge base ID" },
+                    "filename": { "type": "string", "description": "Document filename including extension (e.g. 'report.pdf')" },
+                    "content": { "type": "string", "description": "Base64-encoded file content" }
+                },
+                "required": ["kb_id", "filename", "content"]
+            }
+        }),
+        serde_json::json!({
+            "name": "delete_document",
+            "description": "Delete a document from a knowledge base. This removes the document, its chunks, and its embeddings. The HNSW index will be rebuilt automatically.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kb_id": { "type": "string", "description": "Knowledge base ID" },
+                    "doc_id": { "type": "string", "description": "Document ID to delete" }
+                },
+                "required": ["kb_id", "doc_id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "list_documents",
+            "description": "List all documents in a knowledge base with their status (pending, processing, ready, failed), chunk count, and token count.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kb_id": { "type": "string", "description": "Knowledge base ID" }
+                },
+                "required": ["kb_id"]
+            }
+        }),
+
+        // ── Write tools: Index management ──────────────────────────
+        serde_json::json!({
+            "name": "build_index",
+            "description": "Build or rebuild the HNSW vector index for a knowledge base. This should be called after uploading multiple documents to optimize search performance. The build runs asynchronously.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kb_id": { "type": "string", "description": "Knowledge base ID" }
+                },
+                "required": ["kb_id"]
+            }
+        }),
+
+        // ── Write tools: Source import ─────────────────────────────
+        serde_json::json!({
+            "name": "import_source",
+            "description": "Import documents from an external source (Git repo, URL, or local directory) into a knowledge base. The import runs asynchronously — use list_documents or get_knowledge_base_stats to check progress.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kb_id": { "type": "string", "description": "Target knowledge base ID" },
+                    "source_type": { "type": "string", "enum": ["git", "url", "local_dir"], "description": "Type of source to import from" },
+                    "repo_url": { "type": "string", "description": "Git repository URL (for source_type=git)" },
+                    "branch": { "type": "string", "description": "Git branch to clone (for source_type=git, default: main)" },
+                    "token": { "type": "string", "description": "Git access token for private repos (for source_type=git)" },
+                    "url": { "type": "string", "description": "URL to fetch content from (for source_type=url)" },
+                    "dir_path": { "type": "string", "description": "Local directory path (for source_type=local_dir)" },
+                    "excluded_dirs": { "type": "array", "items": { "type": "string" }, "description": "Directory names to exclude (e.g. ['node_modules', '.git'])" },
+                    "included_files": { "type": "array", "items": { "type": "string" }, "description": "File extensions to include (e.g. ['.md', '.txt'])" },
+                    "max_file_size": { "type": "integer", "description": "Max file size in bytes (default: 1MB)" }
+                },
+                "required": ["kb_id", "source_type"]
             }
         }),
     ]
@@ -424,7 +545,7 @@ async fn handle_tool_call(
                 "text-embedding-3-small".to_string()
             };
 
-            let answer = rag::ask(pool, kb_id, question, &emb_model, chat_model, top_k, true, &shared.app).await?;
+            let answer = rag::ask(pool, kb_id, question, &emb_model, chat_model, top_k, true, &[], &shared.app).await?;
 
             let mut content = vec![serde_json::json!({
                 "type": "text",
@@ -461,6 +582,356 @@ async fn handle_tool_call(
                         docs.iter().filter(|d| d.status == "ready").count(),
                         kb.chunk_count,
                         kb.total_tokens
+                    )
+                }],
+                "isError": false
+            }))
+        }
+
+        // ── Write tools: Knowledge Base lifecycle ──────────────────
+
+        "create_knowledge_base" => {
+            let name = args.get("name").and_then(|n| n.as_str()).ok_or("Missing name")?;
+            let description = args.get("description").and_then(|d| d.as_str());
+            let embedding_model = args.get("embedding_model").and_then(|m| m.as_str());
+            let embedding_channel_id = args.get("embedding_channel_id").and_then(|c| c.as_str());
+
+            let input = crate::services::knowledge::models::CreateKbInput {
+                name: name.to_string(),
+                description: description.map(|s| s.to_string()),
+                embedding_model: embedding_model.map(|s| s.to_string()),
+                embedding_channel_id: embedding_channel_id.map(|s| s.to_string()),
+            };
+
+            let kb_repo = KbRepository::new(pool.clone());
+            let kb = kb_repo.create_kb(&input).await.map_err(|e| e.to_string())?;
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Knowledge base created successfully.\nID: {}\nName: {}\nDescription: {}\nEmbedding model: {}\nMCP enabled: true",
+                        kb.id,
+                        kb.name,
+                        kb.description.as_deref().unwrap_or("N/A"),
+                        kb.embedding_model.as_deref().unwrap_or("text-embedding-3-small")
+                    )
+                }],
+                "isError": false
+            }))
+        }
+
+        "update_knowledge_base" => {
+            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+
+            let input = crate::services::knowledge::models::UpdateKbInput {
+                name: args.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()),
+                description: args.get("description").and_then(|d| d.as_str()).map(|s| s.to_string()),
+                embedding_model: args.get("embedding_model").and_then(|m| m.as_str()).map(|s| s.to_string()),
+                embedding_channel_id: args.get("embedding_channel_id").and_then(|c| c.as_str()).map(|s| s.to_string()),
+                status: args.get("status").and_then(|s| s.as_i64()),
+                mcp_enabled: args.get("mcp_enabled").and_then(|m| m.as_i64()),
+                chunk_size: args.get("chunk_size").and_then(|c| c.as_i64()),
+                chunk_overlap: args.get("chunk_overlap").and_then(|c| c.as_i64()),
+                excluded_dirs: args.get("excluded_dirs").and_then(|e| e.as_str()).map(|s| s.to_string()),
+                excluded_files: args.get("excluded_files").and_then(|e| e.as_str()).map(|s| s.to_string()),
+                included_files: args.get("included_files").and_then(|i| i.as_str()).map(|s| s.to_string()),
+            };
+
+            let kb_repo = KbRepository::new(pool.clone());
+            let kb = kb_repo.update_kb(kb_id, &input).await.map_err(|e| e.to_string())?;
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Knowledge base updated.\nID: {}\nName: {}\nMCP enabled: {}\nChunk size: {}\nChunk overlap: {}",
+                        kb.id, kb.name, kb.mcp_enabled, kb.chunk_size, kb.chunk_overlap
+                    )
+                }],
+                "isError": false
+            }))
+        }
+
+        "delete_knowledge_base" => {
+            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+
+            let kb_repo = KbRepository::new(pool.clone());
+            let kb = kb_repo.get_kb(kb_id).await.map_err(|e| e.to_string())?;
+            kb_repo.delete_kb(kb_id).await.map_err(|e| e.to_string())?;
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Knowledge base '{}' ({}) has been permanently deleted.", kb.name, kb_id)
+                }],
+                "isError": false
+            }))
+        }
+
+        // ── Write tools: Document management ───────────────────────
+
+        "upload_document" => {
+            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+            let filename = args.get("filename").and_then(|f| f.as_str()).ok_or("Missing filename")?;
+            let content_b64 = args.get("content").and_then(|c| c.as_str()).ok_or("Missing content")?;
+            let kb_id = kb_id.to_string();
+            let filename = filename.to_string();
+
+            let content = {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.decode(content_b64)
+                    .map_err(|e| format!("Invalid base64: {}", e))?
+            };
+
+            use sha2::Digest;
+            let hash = sha2::Sha256::digest(&content);
+            let hash_hex = hex::encode(hash);
+
+            let kb_repo = KbRepository::new(pool.clone());
+
+            // Check duplicate
+            if let Ok(Some(_)) = kb_repo.find_document_by_hash(&kb_id, &hash_hex).await {
+                return Ok(serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!("Document '{}' already exists in this knowledge base (same content hash).", filename)
+                    }],
+                    "isError": false
+                }));
+            }
+
+            let file_type = crate::services::knowledge::parser::get_file_type(&filename);
+            let file_size = content.len() as i64;
+
+            // Save file to disk
+            let app_data_dir = shared.app.path().app_data_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let kb_dir = app_data_dir.join("kb_files").join(&kb_id);
+            std::fs::create_dir_all(&kb_dir).ok();
+            let doc_id = uuid::Uuid::new_v4().to_string();
+            let file_path = kb_dir.join(format!("{}_{}", &doc_id, &filename));
+            std::fs::write(&file_path, &content).ok();
+            let file_path_str = file_path.to_string_lossy().to_string();
+
+            let doc = kb_repo.create_document(
+                &kb_id, &filename, Some(&file_path_str),
+                &file_type, file_size, &hash_hex
+            ).await.map_err(|e| e.to_string())?;
+
+            let kb = kb_repo.get_kb(&kb_id).await.map_err(|e| e.to_string())?;
+            let emb_model = kb.embedding_model.clone();
+
+            // Spawn async processing
+            let pool_clone = pool.clone();
+            let app_clone = shared.app.clone();
+            let doc_id_clone = doc.id.clone();
+            let filename_clone = filename.clone();
+            let kb_id_clone = kb_id.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = crate::services::knowledge::processor::process_document(
+                    &pool_clone, &app_clone, &kb_id_clone, &doc_id_clone,
+                    &filename_clone, &content, emb_model.as_deref()
+                ).await {
+                    tracing::error!("Document processing failed: {}", e);
+                }
+            });
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Document '{}' uploaded to knowledge base.\nDoc ID: {}\nFile type: {}\nSize: {} bytes\nStatus: processing (will be automatically chunked, embedded, and indexed)",
+                        filename, doc.id, file_type, file_size
+                    )
+                }],
+                "isError": false
+            }))
+        }
+
+        "delete_document" => {
+            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+            let doc_id = args.get("doc_id").and_then(|d| d.as_str()).ok_or("Missing doc_id")?;
+
+            let kb_repo = KbRepository::new(pool.clone());
+            let doc = kb_repo.get_document(doc_id).await.map_err(|e| e.to_string())?;
+
+            // Delete file from disk
+            if let Some(path) = &doc.file_path {
+                std::fs::remove_file(path).ok();
+            }
+
+            // Delete chunks and document record
+            kb_repo.delete_chunks_by_doc(doc_id).await.ok();
+            kb_repo.delete_document(doc_id).await.map_err(|e| e.to_string())?;
+            kb_repo.update_kb_counts(kb_id).await.map_err(|e| e.to_string())?;
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Document '{}' ({}) has been deleted from the knowledge base.", doc.filename, doc_id)
+                }],
+                "isError": false
+            }))
+        }
+
+        "list_documents" => {
+            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+
+            let kb_repo = KbRepository::new(pool.clone());
+            let docs = kb_repo.get_documents(kb_id).await.map_err(|e| e.to_string())?;
+
+            if docs.is_empty() {
+                return Ok(serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": "No documents in this knowledge base yet."
+                    }],
+                    "isError": false
+                }));
+            }
+
+            let lines: Vec<String> = docs.iter().map(|d| {
+                format!("- {} | ID: {} | Status: {} | Chunks: {} | Tokens: {} | Size: {} bytes",
+                    d.filename, d.id, d.status, d.chunk_count, d.token_count, d.file_size)
+            }).collect();
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Documents in knowledge base ({} total):\n{}", docs.len(), lines.join("\n"))
+                }],
+                "isError": false
+            }))
+        }
+
+        // ── Write tools: Index management ──────────────────────────
+
+        "build_index" => {
+            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+
+            let kb_repo = KbRepository::new(pool.clone());
+            kb_repo.update_kb_index_status(kb_id, "building").await.ok();
+
+            let pool_clone = pool.clone();
+            let app_clone = shared.app.clone();
+            let kb_id_clone = kb_id.to_string();
+
+            tokio::task::spawn_blocking(move || {
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(async {
+                    let _ = app_clone.emit("kb-index-progress", serde_json::json!({
+                        "kb_id": &kb_id_clone,
+                        "status": "building",
+                        "message": "Building HNSW index…"
+                    }));
+
+                    match crate::services::knowledge::retriever::build_index(
+                        &pool_clone, &kb_id_clone, &app_clone
+                    ).await {
+                        Ok(()) => {
+                            tracing::info!("HNSW index built for KB {}", kb_id_clone);
+                            let _ = app_clone.emit("kb-index-progress", serde_json::json!({
+                                "kb_id": &kb_id_clone,
+                                "status": "ready",
+                                "message": "Index build complete"
+                            }));
+                        }
+                        Err(e) => {
+                            tracing::error!("Index build failed for KB {}: {}", kb_id_clone, e);
+                            let repo = KbRepository::new(pool_clone.clone());
+                            repo.update_kb_index_status(&kb_id_clone, "error").await.ok();
+                            let _ = app_clone.emit("kb-index-progress", serde_json::json!({
+                                "kb_id": &kb_id_clone,
+                                "status": "error",
+                                "message": format!("Index build failed: {}", e)
+                            }));
+                        }
+                    }
+                });
+            });
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Index build started for knowledge base {}. Use get_knowledge_base_stats to check progress.", kb_id)
+                }],
+                "isError": false
+            }))
+        }
+
+        // ── Write tools: Source import ─────────────────────────────
+
+        "import_source" => {
+            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+            let source_type = args.get("source_type").and_then(|s| s.as_str()).ok_or("Missing source_type")?;
+            let kb_id = kb_id.to_string();
+
+            let input = crate::services::knowledge::models::ImportSourceInput {
+                source_type: source_type.to_string(),
+                repo_url: args.get("repo_url").and_then(|r| r.as_str()).map(|s| s.to_string()),
+                branch: args.get("branch").and_then(|b| b.as_str()).map(|s| s.to_string()),
+                token: args.get("token").and_then(|t| t.as_str()).map(|s| s.to_string()),
+                url: args.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()),
+                dir_path: args.get("dir_path").and_then(|d| d.as_str()).map(|s| s.to_string()),
+                excluded_dirs: args.get("excluded_dirs").and_then(|e| e.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
+                included_files: args.get("included_files").and_then(|i| i.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
+                max_file_size: args.get("max_file_size").and_then(|m| m.as_u64()).map(|v| v as usize),
+            };
+
+            let kb_repo = KbRepository::new(pool.clone());
+            let source = kb_repo.create_source(
+                &kb_id,
+                &input.source_type,
+                input.repo_url.as_deref().or(input.url.as_deref()),
+                input.dir_path.as_deref(),
+                input.branch.as_deref(),
+            ).await.map_err(|e| e.to_string())?;
+
+            let source_id = source.id.clone();
+            let source_type_clone = input.source_type.clone();
+            let pool_clone = pool.clone();
+            let app_clone = shared.app.clone();
+            let kb_id_clone = kb_id.clone();
+
+            tokio::spawn(async move {
+                let result = if source_type_clone == "git" {
+                    crate::services::knowledge::importer::import_git_repo(
+                        &pool_clone, &app_clone, &kb_id_clone, &source_id, &input
+                    ).await
+                } else if source_type_clone == "url" {
+                    crate::services::knowledge::importer::import_url(
+                        &pool_clone, &app_clone, &kb_id_clone, &source_id, &input
+                    ).await
+                } else if source_type_clone == "local_dir" {
+                    crate::services::knowledge::importer::import_local_dir(
+                        &pool_clone, &app_clone, &kb_id_clone, &source_id, &input
+                    ).await
+                } else {
+                    Err(format!("Unknown source type: {}", source_type_clone))
+                };
+
+                let repo = KbRepository::new(pool_clone.clone());
+                match result {
+                    Ok(count) => {
+                        repo.update_source_status(&source_id, "done", count as i64, None).await.ok();
+                    }
+                    Err(e) => {
+                        repo.update_source_status(&source_id, "error", 0, Some(&e)).await.ok();
+                        tracing::error!("Import failed: {}", e);
+                    }
+                }
+            });
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Import started.\nSource ID: {}\nType: {}\nKnowledge base: {}\nThe import runs asynchronously. Use list_documents or get_knowledge_base_stats to check progress.",
+                        source.id, source_type, kb_id
                     )
                 }],
                 "isError": false

@@ -176,6 +176,14 @@ pub fn run() {
             commands::knowledge_base::ask_knowledge_base,
             commands::knowledge_base::get_kb_stats,
             commands::knowledge_base::upload_kb_document,
+            commands::knowledge_base::get_kb_conversations,
+            commands::knowledge_base::clear_kb_conversations,
+            commands::knowledge_base::get_kb_sources,
+            commands::knowledge_base::delete_kb_source,
+            commands::knowledge_base::import_kb_source,
+            commands::knowledge_base::get_kb_index_status,
+            commands::knowledge_base::build_kb_index,
+            commands::knowledge_base::drop_kb_index,
             commands::services::get_service_statuses,
         ])
         .build(tauri::generate_context!())

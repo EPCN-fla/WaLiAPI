@@ -4,6 +4,9 @@ import {
   KbDocument,
   KbSearchResult,
   KbRagAnswer,
+  KbSource,
+  KbIndexMeta,
+  ConversationMessage,
   kbApi,
   channelApi,
   serviceApi,
@@ -34,10 +37,15 @@ import {
   Wifi,
   Copy,
   Layers,
+  GitBranch,
+  Link,
+  FolderOpen,
+  Sparkles,
+  Database,
 } from "lucide-react";
 
 type ServiceTab = "knowledge" | "mcp";
-type KbTab = "documents" | "search" | "ask" | "settings" | "mcp";
+type KbTab = "documents" | "sources" | "search" | "ask" | "settings" | "index" | "mcp";
 
 export function KnowledgeBasePage() {
   const [serviceTab, setServiceTab] = useState<ServiceTab>("knowledge");
@@ -53,7 +61,7 @@ export function KnowledgeBasePage() {
       <div className="page-header sticky top-0 z-30 -mx-7 -mt-7 mb-2 bg-white/90 px-7 py-5 backdrop-blur-md border-b border-slate-100">
         <div>
           <h1 className="page-title">服务</h1>
-          <p className="page-subtitle">本地知识库 · MCP 工具服务 · 文档向量化 · RAG 问答</p>
+          <p className="page-subtitle">本地知识库 · MCP Server · 文档向量化 + HNSW 索引 · RAG 问答 · 支持 AI Agent 对接</p>
         </div>
         <div className="flex items-center gap-2">
           {serviceTabs.map(({ key, label, icon: Icon }) => (
@@ -389,7 +397,7 @@ function KbList({
 
   return (
     <>
-      <div className="flex justify-end">
+      <div className="flex justify-end mb-4">
         <button onClick={onCreate} className="action-primary">
           <Plus size={16} />
           新建知识库
@@ -511,8 +519,10 @@ function KbDetail({
 }) {
   const tabs: { key: KbTab; label: string; icon: typeof FileText }[] = [
     { key: "documents", label: "文档", icon: FileText },
+    { key: "sources", label: "来源", icon: GitBranch },
     { key: "search", label: "检索", icon: Search },
     { key: "ask", label: "问答", icon: MessageCircle },
+    { key: "index", label: "索引", icon: Database },
     { key: "settings", label: "设置", icon: SettingsIcon },
     { key: "mcp", label: "MCP", icon: Terminal },
   ];
@@ -552,10 +562,610 @@ function KbDetail({
       </div>
 
       {tab === "documents" && <DocumentsTab kb={kb} onRefresh={onRefresh} />}
+      {tab === "sources" && <SourcesTab kb={kb} onRefresh={onRefresh} />}
       {tab === "search" && <SearchTab kb={kb} />}
       {tab === "ask" && <AskTab kb={kb} />}
+      {tab === "index" && <IndexTab kb={kb} />}
       {tab === "settings" && <SettingsTab kb={kb} onRefresh={onRefresh} />}
       {tab === "mcp" && <McpTab kb={kb} />}
+    </div>
+  );
+}
+
+// ─── Sources Tab (Multi-source import) ────────────────────────────────
+
+function SourcesTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => void }) {
+  const [sources, setSources] = useState<KbSource[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const [progressMap, setProgressMap] = useState<Record<string, { progress: number; detail: string }>>({});
+
+  const fetchSources = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await kbApi.getSources(kb.id);
+      setSources(data);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  }, [kb.id]);
+
+  useEffect(() => {
+    fetchSources();
+    const interval = setInterval(fetchSources, 3000);
+    return () => clearInterval(interval);
+  }, [fetchSources]);
+
+  // Listen for import progress
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let active = true;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      unlisten = await listen<{ kb_id: string; source_id: string; progress: number; detail: string }>(
+        "kb-import-progress",
+        (event) => {
+          if (!active) return;
+          const p = event.payload;
+          if (p.kb_id !== kb.id) return;
+          if (p.progress >= 100) {
+            setProgressMap((prev) => {
+              const next = { ...prev };
+              delete next[p.source_id];
+              return next;
+            });
+            fetchSources();
+            onRefresh();
+          } else {
+            setProgressMap((prev) => ({
+              ...prev,
+              [p.source_id]: { progress: p.progress, detail: p.detail },
+            }));
+          }
+        }
+      );
+    })();
+    return () => {
+      active = false;
+      if (unlisten) unlisten();
+    };
+  }, [kb.id, fetchSources, onRefresh]);
+
+  const handleDelete = async (sourceId: string) => {
+    if (!confirm("删除此来源？关联的文档将保留但不再标记来源。")) return;
+    try {
+      await kbApi.deleteSource(sourceId, kb.id);
+      await fetchSources();
+      onRefresh();
+    } catch (e) {
+      alert(`删除失败: ${e}`);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex justify-end">
+        <button onClick={() => setShowImport(true)} className="action-primary">
+          <Plus size={16} />
+          导入来源
+        </button>
+      </div>
+
+      {loading && sources.length === 0 ? (
+        <div className="flex items-center justify-center py-12">
+          <Loader2 className="h-6 w-6 animate-spin text-slate-400" />
+        </div>
+      ) : sources.length === 0 ? (
+        <div className="surface empty-state rounded-2xl">
+          <GitBranch className="h-8 w-8 text-slate-300" />
+          <p className="text-sm text-slate-500">暂无导入来源</p>
+          <p className="text-xs text-slate-400 mt-1">从 Git 仓库、URL 或本地目录导入文档</p>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {sources.map((src) => {
+            const prog = progressMap[src.id];
+            return (
+              <div key={src.id} className="surface flex items-center gap-3 rounded-xl px-4 py-3">
+                <SourceIcon type={src.source_type} />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-sm font-medium text-slate-900">
+                      {src.source_url || src.source_path || src.source_type}
+                    </span>
+                    {src.branch && src.source_type === "git" && (
+                      <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">
+                        {src.branch}
+                      </span>
+                    )}
+                  </div>
+                  {prog ? (
+                    <div className="mt-1.5">
+                      <div className="flex items-center gap-2">
+                        <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-200">
+                          <div
+                            className="h-full rounded-full bg-blue-500 transition-all duration-300"
+                            style={{ width: `${prog.progress}%` }}
+                          />
+                        </div>
+                        <span className="shrink-0 text-[11px] text-blue-600">
+                          {prog.detail} · {prog.progress}%
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="mt-1 flex items-center gap-3 text-xs text-slate-500">
+                      <SourceStatusBadge status={src.status} />
+                      {src.file_count > 0 && <span>{src.file_count} 文件</span>}
+                      {src.error && (
+                        <span className="text-red-500 truncate" title={src.error}>
+                          {src.error.slice(0, 60)}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+                <button
+                  onClick={() => handleDelete(src.id)}
+                  className="rounded-lg p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-500"
+                  title="删除"
+                >
+                  <Trash2 size={15} />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {showImport && (
+        <ImportSourceModal
+          kbId={kb.id}
+          onClose={() => setShowImport(false)}
+          onImported={async () => {
+            setShowImport(false);
+            await fetchSources();
+            onRefresh();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function SourceIcon({ type }: { type: string }) {
+  const cls = "h-5 w-5 shrink-0 text-slate-400";
+  switch (type) {
+    case "git":
+      return <GitBranch className={cls} />;
+    case "url":
+      return <Link className={cls} />;
+    case "local_dir":
+      return <FolderOpen className={cls} />;
+    default:
+      return <FileText className={cls} />;
+  }
+}
+
+function SourceStatusBadge({ status }: { status: string }) {
+  switch (status) {
+    case "done":
+      return <span className="flex items-center gap-1 text-emerald-600"><CheckCircle2 size={12} /> 完成</span>;
+    case "processing":
+      return <span className="flex items-center gap-1 text-blue-600"><Loader2 size={12} className="animate-spin" /> 处理中</span>;
+    case "error":
+      return <span className="flex items-center gap-1 text-red-500"><XCircle size={12} /> 失败</span>;
+    default:
+      return <span className="flex items-center gap-1 text-slate-400"><Clock size={12} /> 等待中</span>;
+  }
+}
+
+function IndexStatusBadge({ status }: { status: string }) {
+  switch (status) {
+    case "ready":
+      return <span className="flex items-center gap-1 text-emerald-600"><CheckCircle2 size={12} /> 就绪</span>;
+    case "building":
+      return <span className="flex items-center gap-1 text-blue-600"><Loader2 size={12} className="animate-spin" /> 构建中</span>;
+    case "error":
+      return <span className="flex items-center gap-1 text-red-500"><XCircle size={12} /> 失败</span>;
+    case "none":
+      return <span className="flex items-center gap-1 text-slate-400"><Clock size={12} /> 未构建</span>;
+    default:
+      return <span className="flex items-center gap-1 text-slate-400"><Clock size={12} /> {status}</span>;
+  }
+}
+
+function ImportSourceModal({
+  kbId,
+  onClose,
+  onImported,
+}: {
+  kbId: string;
+  onClose: () => void;
+  onImported: () => void;
+}) {
+  const [sourceType, setSourceType] = useState<"git" | "url" | "local_dir">("git");
+  const [repoUrl, setRepoUrl] = useState("");
+  const [branch, setBranch] = useState("main");
+  const [token, setToken] = useState("");
+  const [url, setUrl] = useState("");
+  const [dirPath, setDirPath] = useState("");
+  const [excludedDirs, setExcludedDirs] = useState("");
+  const [includedFiles, setIncludedFiles] = useState("");
+  const [maxFileSize, setMaxFileSize] = useState(1);
+  const [importing, setImporting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleImport = async () => {
+    setImporting(true);
+    setError(null);
+    try {
+      const input: Record<string, unknown> = {
+        source_type: sourceType,
+        excluded_dirs: excludedDirs ? excludedDirs.split(",").map((s) => s.trim()) : [],
+        included_files: includedFiles ? includedFiles.split(",").map((s) => s.trim()) : [],
+        max_file_size: maxFileSize * 1024 * 1024,
+      };
+
+      if (sourceType === "git") {
+        if (!repoUrl.trim()) { setError("请输入仓库 URL"); setImporting(false); return; }
+        input.repo_url = repoUrl.trim();
+        input.branch = branch.trim() || "main";
+        if (token.trim()) input.token = token.trim();
+      } else if (sourceType === "url") {
+        if (!url.trim()) { setError("请输入 URL"); setImporting(false); return; }
+        input.url = url.trim();
+      } else if (sourceType === "local_dir") {
+        if (!dirPath.trim()) { setError("请输入目录路径"); setImporting(false); return; }
+        input.dir_path = dirPath.trim();
+      }
+
+      await kbApi.importSource(kbId, input as Parameters<typeof kbApi.importSource>[1]);
+      onImported();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" onClick={onClose}>
+      <div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl" onClick={(e) => e.stopPropagation()}>
+        <h3 className="text-lg font-semibold text-slate-900">导入来源</h3>
+
+        {/* Source type tabs */}
+        <div className="mt-4 flex gap-2">
+          {([
+            { key: "git" as const, label: "Git 仓库", icon: GitBranch },
+            { key: "url" as const, label: "URL", icon: Link },
+            { key: "local_dir" as const, label: "本地目录", icon: FolderOpen },
+          ]).map(({ key, label, icon: Icon }) => (
+            <button
+              key={key}
+              onClick={() => setSourceType(key)}
+              className={`flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium transition-all ${
+                sourceType === key
+                  ? "border border-blue-100 bg-white text-slate-900 shadow-sm"
+                  : "text-slate-500 hover:bg-white/70"
+              }`}
+            >
+              <Icon size={15} />
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <div className="mt-4 space-y-4">
+          {sourceType === "git" && (
+            <>
+              <div>
+                <label className="mb-1 block text-sm font-medium text-slate-700">仓库 URL</label>
+                <input
+                  type="text"
+                  value={repoUrl}
+                  onChange={(e) => setRepoUrl(e.target.value)}
+                  placeholder="https://github.com/owner/repo"
+                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-slate-700">分支</label>
+                  <input
+                    type="text"
+                    value={branch}
+                    onChange={(e) => setBranch(e.target.value)}
+                    placeholder="main"
+                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-slate-700">Access Token（可选）</label>
+                  <input
+                    type="password"
+                    value={token}
+                    onChange={(e) => setToken(e.target.value)}
+                    placeholder="私有仓库需要"
+                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+                  />
+                </div>
+              </div>
+            </>
+          )}
+
+          {sourceType === "url" && (
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">URL</label>
+              <input
+                type="text"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                placeholder="https://example.com/doc.md"
+                className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+              />
+            </div>
+          )}
+
+          {sourceType === "local_dir" && (
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">目录路径</label>
+              <input
+                type="text"
+                value={dirPath}
+                onChange={(e) => setDirPath(e.target.value)}
+                placeholder="/path/to/project/docs"
+                className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+              />
+            </div>
+          )}
+
+          {/* Common filter options */}
+          <div className="rounded-xl bg-slate-50 p-3 space-y-3">
+            <div className="text-xs font-semibold text-slate-500">过滤选项（可选）</div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="mb-1 block text-xs text-slate-600">排除目录（逗号分隔）</label>
+                <input
+                  type="text"
+                  value={excludedDirs}
+                  onChange={(e) => setExcludedDirs(e.target.value)}
+                  placeholder="tests, examples, docs"
+                  className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs outline-none focus:border-blue-400"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-slate-600">包含文件类型（逗号分隔，空=全部）</label>
+                <input
+                  type="text"
+                  value={includedFiles}
+                  onChange={(e) => setIncludedFiles(e.target.value)}
+                  placeholder="md, rs, ts, py"
+                  className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs outline-none focus:border-blue-400"
+                />
+              </div>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs text-slate-600">最大文件大小 (MB)</label>
+              <input
+                type="number"
+                value={maxFileSize}
+                onChange={(e) => setMaxFileSize(Number(e.target.value) || 1)}
+                min={0.1}
+                step={0.1}
+                className="w-24 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs outline-none focus:border-blue-400"
+              />
+            </div>
+          </div>
+
+          {error && (
+            <div className="rounded-lg bg-red-50 p-3 text-sm text-red-600">{error}</div>
+          )}
+        </div>
+
+        <div className="mt-6 flex justify-end gap-2">
+          <button onClick={onClose} className="rounded-xl px-4 py-2 text-sm text-slate-500 hover:bg-slate-100">
+            取消
+          </button>
+          <button
+            onClick={handleImport}
+            disabled={importing}
+            className="action-primary disabled:opacity-50"
+          >
+            {importing ? "导入中..." : "开始导入"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Index Tab ─────────────────────────────────────────────────────────
+
+function IndexTab({ kb }: { kb: KnowledgeBase }) {
+  const [indexMeta, setIndexMeta] = useState<KbIndexMeta | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [building, setBuilding] = useState(false);
+  const [buildMsg, setBuildMsg] = useState("");
+  const [buildProgress, setBuildProgress] = useState(0);
+
+  const fetchIndex = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await kbApi.getIndexStatus(kb.id);
+      setIndexMeta(data);
+      // Sync building state with DB status
+      if (data?.status === "building") setBuilding(true);
+      else setBuilding(false);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  }, [kb.id]);
+
+  useEffect(() => {
+    fetchIndex();
+
+    // Listen for real-time index build progress
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      unlisten = await listen<{ kb_id: string; status: string; message: string; progress?: number; current?: number; total?: number }>(
+        "kb-index-progress",
+        (event) => {
+          const payload = event.payload;
+          if (payload.kb_id !== kb.id) return;
+
+          setBuildMsg(payload.message);
+
+          if (payload.status === "ready") {
+            setBuilding(false);
+            setBuildProgress(100);
+            setBuildMsg("");
+            fetchIndex();
+          } else if (payload.status === "error") {
+            setBuilding(false);
+            setBuildProgress(0);
+            // Keep error message visible
+          } else if (payload.status === "building") {
+            setBuilding(true);
+            setBuildProgress(payload.progress ?? 0);
+          }
+        }
+      );
+    })();
+
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [fetchIndex, kb.id]);
+
+  const handleBuild = async () => {
+    setBuilding(true);
+    setBuildProgress(0);
+    setBuildMsg("正在构建 HNSW 向量索引…");
+    try {
+      await kbApi.buildIndex(kb.id);
+      // Progress will come via Tauri event listener
+    } catch (e) {
+      setBuilding(false);
+      setBuildMsg("");
+      alert(`构建失败: ${e}`);
+    }
+  };
+
+  const handleDrop = async () => {
+    if (!confirm("确定删除索引？删除后需重新构建。")) return;
+    try {
+      await kbApi.dropIndex(kb.id);
+      await fetchIndex();
+    } catch (e) {
+      alert(`删除失败: ${e}`);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <Loader2 className="h-6 w-6 animate-spin text-slate-400" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid gap-4 lg:grid-cols-2">
+      {/* Index status */}
+      <div className="surface data-card rounded-2xl">
+        <div className="mb-4 flex items-center gap-2">
+          <Database size={18} className="text-slate-700" />
+          <h3 className="text-sm font-semibold text-slate-900">索引状态</h3>
+        </div>
+        {indexMeta ? (
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 gap-3">
+              <div className="rounded-xl bg-slate-50 p-3">
+                <div className="text-xs text-slate-500">索引类型</div>
+                <div className="text-sm font-medium text-slate-900 mt-1">{indexMeta.index_type || "linear"}</div>
+              </div>
+              <div className="rounded-xl bg-slate-50 p-3">
+                <div className="text-xs text-slate-500">状态</div>
+                <div className="text-sm font-medium mt-1">
+                  <IndexStatusBadge status={indexMeta.status} />
+                </div>
+              </div>
+              <div className="rounded-xl bg-slate-50 p-3">
+                <div className="text-xs text-slate-500">Embedding 维度</div>
+                <div className="text-sm font-medium text-slate-900 mt-1">{indexMeta.embedding_dim || "未检测"}</div>
+              </div>
+              <div className="rounded-xl bg-slate-50 p-3">
+                <div className="text-xs text-slate-500">切片数量</div>
+                <div className="text-sm font-medium text-slate-900 mt-1">{indexMeta.chunk_count}</div>
+              </div>
+            </div>
+            {indexMeta.built_at && (
+              <div className="text-xs text-slate-400">构建时间: {indexMeta.built_at}</div>
+            )}
+          </div>
+        ) : (
+          <div className="text-sm text-slate-500">暂无索引信息</div>
+        )}
+      </div>
+
+      {/* Actions */}
+      <div className="surface data-card rounded-2xl">
+        <div className="mb-4 flex items-center gap-2">
+          <SettingsIcon size={18} className="text-slate-700" />
+          <h3 className="text-sm font-semibold text-slate-900">索引操作</h3>
+        </div>
+        <div className="space-y-3">
+          {building && buildMsg && (
+            <div className="rounded-lg bg-blue-50 border border-blue-100 px-3 py-2.5 text-xs text-blue-600">
+              <div className="flex items-center gap-2 mb-1.5">
+                <Loader2 className="h-3 w-3 animate-spin shrink-0" />
+                <span>{buildMsg}</span>
+              </div>
+              {buildProgress >= 0 && buildProgress < 100 && (
+                <div className="mt-1 h-1.5 w-full rounded-full bg-blue-100 overflow-hidden">
+                  <div
+                    className="h-full bg-blue-500 rounded-full transition-all duration-300"
+                    style={{ width: `${Math.max(buildProgress, 3)}%` }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+          {!building && buildMsg && (
+            <div className="rounded-lg bg-red-50 border border-red-100 px-3 py-2 text-xs text-red-600">
+              {buildMsg}
+            </div>
+          )}
+          <button
+            onClick={handleBuild}
+            disabled={building}
+            className="action-primary w-full disabled:opacity-50"
+          >
+            {building ? (
+              <><Loader2 className="h-4 w-4 animate-spin" /> 构建中...</>
+            ) : (
+              <><Database size={16} /> 构建索引</>
+            )}
+          </button>
+          <button
+            onClick={handleDrop}
+            disabled={!indexMeta || indexMeta.status === "none"}
+            className="w-full rounded-xl border border-red-200 px-4 py-2 text-sm text-red-600 hover:bg-red-50 disabled:opacity-50"
+          >
+            <Trash2 size={16} />
+            删除索引
+          </button>
+          <div className="rounded-lg bg-blue-50 border border-blue-100 px-3 py-2 text-xs text-blue-600">
+            ℹ️ 使用 HNSW 图索引，平均查询复杂度 O(log n)。构建后自动用于检索加速。
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -871,7 +1481,7 @@ function SearchTab({ kb }: { kb: KnowledgeBase }) {
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+          onKeyDown={(e) => e.key === "Enter" && !e.nativeEvent.isComposing && handleSearch()}
           placeholder="输入搜索内容..."
           className="flex-1 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
         />
@@ -928,6 +1538,7 @@ function AskTab({ kb }: { kb: KnowledgeBase }) {
   const [showChannelPicker, setShowChannelPicker] = useState(false);
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [conversation, setConversation] = useState<Array<{ role: "user" | "assistant"; content: string; sources?: KbRagAnswer["sources"] }>>([]);
+  const [deepResearch, setDeepResearch] = useState(false);
 
   // Persistence key for this KB's ask preferences
   const storageKey = `kb_ask_prefs_${kb.id}`;
@@ -1003,11 +1614,20 @@ function AskTab({ kb }: { kb: KnowledgeBase }) {
     setQuestion("");
     setConversation((prev) => [...prev, { role: "user", content: userMsg }]);
     try {
+      // Build history from current conversation (last 20 messages)
+      const history: ConversationMessage[] = conversation.slice(-20).map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
+
       const result = await kbApi.ask({
         question: userMsg,
         kb_id: kb.id,
         top_k: 5,
         model: selectedModel || undefined,
+        history,
+        deep_research: deepResearch,
+        max_rounds: 5,
       });
       setAnswer(result);
       setConversation((prev) => [
@@ -1127,6 +1747,19 @@ function AskTab({ kb }: { kb: KnowledgeBase }) {
                 {selectedModel}
               </span>
             )}
+            {/* Deep Research toggle */}
+            <button
+              onClick={() => setDeepResearch(!deepResearch)}
+              className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                deepResearch
+                  ? "bg-violet-50 text-violet-600 hover:bg-violet-100"
+                  : "bg-slate-100 text-slate-400 hover:bg-slate-200"
+              }`}
+              title="Deep Research: 多轮迭代检索+综合分析"
+            >
+              <Sparkles size={12} />
+              Deep Research
+            </button>
             {conversation.length > 0 && (
               <button
                 onClick={() => { setConversation([]); setAnswer(null); }}
@@ -1196,7 +1829,7 @@ function AskTab({ kb }: { kb: KnowledgeBase }) {
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
+                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
                   handleAsk();
                 }
@@ -1239,6 +1872,11 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
   const [embeddingChannelId, setEmbeddingChannelId] = useState(kb.embedding_channel_id || "");
   const [status, setStatus] = useState(kb.status);
   const [mcpEnabled, setMcpEnabled] = useState(kb.mcp_enabled ?? 1);
+  const [chunkSize, setChunkSize] = useState(kb.chunk_size || 512);
+  const [chunkOverlap, setChunkOverlap] = useState(kb.chunk_overlap || 64);
+  const [excludedDirs, setExcludedDirs] = useState(kb.excluded_dirs || "");
+  const [excludedFiles, setExcludedFiles] = useState(kb.excluded_files || "");
+  const [includedFiles, setIncludedFiles] = useState(kb.included_files || "");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [showChannelPicker, setShowChannelPicker] = useState(false);
@@ -1261,6 +1899,11 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
         embedding_channel_id: embeddingChannelId || undefined,
         status,
         mcp_enabled: mcpEnabled,
+        chunk_size: chunkSize,
+        chunk_overlap: chunkOverlap,
+        excluded_dirs: excludedDirs,
+        excluded_files: excludedFiles,
+        included_files: includedFiles,
       });
       setSaved(true);
       onRefresh();
@@ -1409,6 +2052,74 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
         </div>
       </div>
 
+      {/* Chunking & Filtering config */}
+      <div className="surface data-card rounded-2xl">
+        <h3 className="mb-4 text-sm font-semibold text-slate-900">分块与过滤</h3>
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">分块大小 (tokens)</label>
+              <input
+                type="number"
+                value={chunkSize}
+                onChange={(e) => setChunkSize(Number(e.target.value) || 512)}
+                min={50}
+                max={2000}
+                step={50}
+                className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+              />
+              <p className="mt-1 text-xs text-slate-400">默认 512，越大上下文越完整但消耗更多 token</p>
+            </div>
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">分块重叠 (tokens)</label>
+              <input
+                type="number"
+                value={chunkOverlap}
+                onChange={(e) => setChunkOverlap(Number(e.target.value) || 64)}
+                min={0}
+                max={500}
+                step={16}
+                className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+              />
+              <p className="mt-1 text-xs text-slate-400">默认 64，保持上下文连续性</p>
+            </div>
+          </div>
+          <div>
+            <label className="mb-1 block text-sm font-medium text-slate-700">排除目录（逗号分隔）</label>
+            <input
+              type="text"
+              value={excludedDirs}
+              onChange={(e) => setExcludedDirs(e.target.value)}
+              placeholder="tests, examples, vendor"
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+            />
+            <p className="mt-1 text-xs text-slate-400">导入 Git/本地目录时跳过这些目录（默认排除 .git, node_modules 等）</p>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">排除文件（逗号分隔）</label>
+              <input
+                type="text"
+                value={excludedFiles}
+                onChange={(e) => setExcludedFiles(e.target.value)}
+                placeholder="*.lock, *.min.js"
+                className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">包含文件类型（逗号分隔，空=全部）</label>
+              <input
+                type="text"
+                value={includedFiles}
+                onChange={(e) => setIncludedFiles(e.target.value)}
+                placeholder="md, rs, ts, py"
+                className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* Stats */}
       <div className="surface data-card rounded-2xl">
         <h3 className="mb-4 text-sm font-semibold text-slate-900">统计</h3>
@@ -1452,6 +2163,7 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
 
 function McpTab({ kb }: { kb: KnowledgeBase }) {
   const [serverUrl, setServerUrl] = useState("http://127.0.0.1:8777");
+  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     serverApi.getStatus().then(s => {
@@ -1461,7 +2173,6 @@ function McpTab({ kb }: { kb: KnowledgeBase }) {
 
   const baseUrl = serverUrl;
   const mcpEndpoint = `${baseUrl}/mcp`;
-  const [copied, setCopied] = useState(false);
 
   const handleCopy = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -1469,21 +2180,32 @@ function McpTab({ kb }: { kb: KnowledgeBase }) {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const mcpTools = [
+    { name: "search_knowledge_base", desc: "语义检索知识库，返回匹配文本片段和相似度评分", required: ["query"] },
+    { name: "list_knowledge_bases", desc: "列出所有已暴露的知识库（ID/名称/文档数）", required: [] },
+    { name: "ask_knowledge_base", desc: "RAG 问答，基于检索内容生成回答并返回来源引用", required: ["question"] },
+    { name: "read_document", desc: "读取指定文档的完整内容", required: ["kb_id", "doc_id"] },
+    { name: "get_knowledge_base_stats", desc: "获取知识库统计信息（文档数/切片数/token数）", required: ["kb_id"] },
+  ];
+
   return (
-    <div className="grid gap-4 lg:grid-cols-2">
+    <div className="space-y-4">
+      {/* 接入说明 */}
       <div className="surface data-card rounded-2xl">
         <div className="mb-4 flex items-center gap-2">
           <Terminal size={18} className="text-slate-700" />
-          <h3 className="text-sm font-semibold text-slate-900">MCP 端点</h3>
+          <h3 className="text-sm font-semibold text-slate-900">MCP 对接</h3>
           {kb.mcp_enabled === 1 ? (
             <span className="ml-auto rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-600">已暴露</span>
           ) : (
             <span className="ml-auto rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">未暴露</span>
           )}
         </div>
+
         <div className="space-y-3">
+          {/* 端点地址 */}
           <div>
-            <label className="mb-1 block text-xs font-medium text-slate-500">JSON-RPC（仅 POST）</label>
+            <label className="mb-1 block text-xs font-medium text-slate-500">MCP 端点（JSON-RPC over HTTP）</label>
             <div className="flex items-center gap-2">
               <code className="flex-1 truncate rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-xs font-mono text-slate-800">{mcpEndpoint}</code>
               <button onClick={() => handleCopy(mcpEndpoint)} className="rounded-lg border border-slate-200 p-2 hover:bg-slate-50">
@@ -1491,36 +2213,112 @@ function McpTab({ kb }: { kb: KnowledgeBase }) {
               </button>
             </div>
           </div>
-          <div className="rounded-lg bg-amber-50 border border-amber-100 px-3 py-2 text-xs text-amber-700">
-            ⚠️ 仅接受 POST 请求，浏览器直接打开会 405。
+
+          {/* 协议说明 */}
+          <div className="rounded-lg bg-blue-50 border border-blue-100 px-3 py-2.5 text-xs text-blue-700">
+            <div className="font-medium mb-1">📡 MCP (Model Context Protocol) 对接</div>
+            <div className="text-blue-600">
+              其他 AI Agent / 工具可通过 MCP 协议接入此知识库。将上方端点配置到支持 MCP 的客户端（如 Claude Desktop、Cursor、自定义 Agent），即可让 AI 自动检索和问答你的私有知识库。
+            </div>
           </div>
+
+          {/* 未暴露提示 */}
           {kb.mcp_enabled !== 1 && (
-            <div className="rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-xs text-slate-500">
-              ℹ️ 该知识库已关闭 MCP 暴露。不会出现在 MCP 工具列表中，全局搜索也不会命中。如需启用，请在「设置」中开启「MCP 暴露」。
+            <div className="rounded-lg bg-amber-50 border border-amber-100 px-3 py-2 text-xs text-amber-700">
+              ⚠️ 该知识库未开启 MCP 暴露。外部 Agent 无法检索到此知识库。请在「设置」中开启「MCP 暴露」。
             </div>
           )}
         </div>
       </div>
 
+      {/* 可用工具列表 */}
       <div className="surface data-card rounded-2xl">
         <div className="mb-4 flex items-center gap-2">
           <Layers size={18} className="text-slate-700" />
+          <h3 className="text-sm font-semibold text-slate-900">可用 MCP 工具</h3>
+          <span className="ml-auto text-xs text-slate-400">{mcpTools.length} 个工具</span>
+        </div>
+        <div className="space-y-2">
+          {mcpTools.map((tool) => (
+            <div key={tool.name} className="flex items-start gap-3 rounded-xl bg-slate-50 px-3 py-2.5">
+              <code className="shrink-0 rounded bg-slate-200 px-1.5 py-0.5 text-[11px] font-mono font-medium text-slate-700">{tool.name}</code>
+              <div className="min-w-0">
+                <p className="text-xs text-slate-600">{tool.desc}</p>
+                {tool.required.length > 0 && (
+                  <p className="mt-0.5 text-[10px] text-slate-400">
+                    必填: {tool.required.join(", ")}
+                  </p>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* 调用示例 */}
+      <div className="surface data-card rounded-2xl">
+        <div className="mb-4 flex items-center gap-2">
+          <Server size={18} className="text-slate-700" />
           <h3 className="text-sm font-semibold text-slate-900">调用示例</h3>
         </div>
-        <pre className="overflow-x-auto rounded-xl bg-slate-50 border border-slate-200 p-4 text-xs"><code className="text-slate-800">{`curl -X POST ${mcpEndpoint} \\
+
+        <div className="space-y-3">
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-500">1. 列出可用知识库</label>
+            <pre className="overflow-x-auto rounded-xl bg-slate-50 border border-slate-200 p-3 text-[11px]"><code className="text-slate-800">{`curl -X POST ${mcpEndpoint} \\
   -H "Content-Type: application/json" \\
   -d '{
     "jsonrpc": "2.0",
     "id": 1,
     "method": "tools/call",
     "params": {
+      "name": "list_knowledge_bases",
+      "arguments": {}
+    }
+  }'`}</code></pre>
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-500">2. 语义检索</label>
+            <pre className="overflow-x-auto rounded-xl bg-slate-50 border border-slate-200 p-3 text-[11px]"><code className="text-slate-800">{`curl -X POST ${mcpEndpoint} \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {
       "name": "search_knowledge_base",
       "arguments": {
-        "query": "你的问题",
+        "query": "你的检索内容",
+        "kb_id": "${kb.id}",
+        "top_k": 5
+      }
+    }
+  }'`}</code></pre>
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-500">3. RAG 问答</label>
+            <pre className="overflow-x-auto rounded-xl bg-slate-50 border border-slate-200 p-3 text-[11px]"><code className="text-slate-800">{`curl -X POST ${mcpEndpoint} \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "tools/call",
+    "params": {
+      "name": "ask_knowledge_base",
+      "arguments": {
+        "question": "你的问题",
         "kb_id": "${kb.id}"
       }
     }
   }'`}</code></pre>
+          </div>
+        </div>
+
+        <div className="mt-3 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-xs text-slate-500">
+          ℹ️ 仅接受 POST 请求。所有工具遵循 MCP JSON-RPC 2.0 规范。
+        </div>
       </div>
     </div>
   );

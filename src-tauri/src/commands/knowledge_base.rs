@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{State, Emitter};
 use std::sync::Arc;
 use crate::AppState;
 use crate::db::repository::Repository;
@@ -57,7 +57,6 @@ pub async fn delete_kb_document(
     kb_id: String,
 ) -> Result<(), String> {
     let repo = KbRepository::new(state.db.pool.clone());
-    // Get doc to find file path
     if let Ok(doc) = repo.get_document(&doc_id).await {
         if let Some(path) = &doc.file_path {
             std::fs::remove_file(path).ok();
@@ -98,7 +97,6 @@ pub async fn search_knowledge_base(
     let pool = &state.db.pool;
     let repo = Repository::new(pool.clone());
 
-    // Get embedding model
     let emb_model = if let Some(kb_id) = &input.kb_id {
         let kb_repo = KbRepository::new(pool.clone());
         kb_repo.get_kb(kb_id).await.ok()
@@ -133,9 +131,16 @@ pub struct KbAskInput {
     pub top_k: usize,
     #[serde(default = "default_chat_model")]
     pub model: String,
+    #[serde(default)]
+    pub history: Option<Vec<ConversationMessage>>,
+    #[serde(default)]
+    pub deep_research: bool,
+    #[serde(default = "default_max_rounds")]
+    pub max_rounds: usize,
 }
 
 fn default_chat_model() -> String { "gpt-4o".to_string() }
+fn default_max_rounds() -> usize { 5 }
 
 #[tauri::command]
 pub async fn ask_knowledge_base(
@@ -144,7 +149,7 @@ pub async fn ask_knowledge_base(
     input: KbAskInput,
 ) -> Result<RagAnswer, String> {
     let pool = &state.db.pool;
-    let kb_id = input.kb_id.unwrap_or_default();
+    let kb_id = input.kb_id.clone().unwrap_or_default();
 
     let emb_model = if !kb_id.is_empty() {
         let kb_repo = KbRepository::new(pool.clone());
@@ -155,9 +160,18 @@ pub async fn ask_knowledge_base(
         "text-embedding-3-small".to_string()
     };
 
-    crate::services::knowledge::rag::ask(
-        pool, &kb_id, &input.question, &emb_model, &input.model, input.top_k, false, &app
-    ).await.map_err(|e| e)
+    if input.deep_research && !kb_id.is_empty() {
+        crate::services::knowledge::rag::deep_research(
+            pool, &kb_id, &input.question, &emb_model, &input.model,
+            input.top_k, input.max_rounds, &app,
+        ).await.map_err(|e| e)
+    } else {
+        let history = input.history.unwrap_or_default();
+        crate::services::knowledge::rag::ask(
+            pool, &kb_id, &input.question, &emb_model, &input.model,
+            input.top_k, false, &history, &app,
+        ).await.map_err(|e| e)
+    }
 }
 
 #[tauri::command]
@@ -172,6 +186,8 @@ pub async fn get_kb_stats(
     let processing = docs.iter().filter(|d| d.status == "processing").count();
     let failed = docs.iter().filter(|d| d.status == "failed").count();
 
+    let index_meta = repo.get_index_meta(&kb_id).await.ok().flatten();
+
     Ok(serde_json::json!({
         "kb": kb,
         "documents": {
@@ -179,7 +195,8 @@ pub async fn get_kb_stats(
             "ready": ready,
             "processing": processing,
             "failed": failed,
-        }
+        },
+        "index": index_meta,
     }))
 }
 
@@ -202,16 +219,13 @@ pub async fn upload_kb_document(
     let pool = &state.db.pool;
     let repo = KbRepository::new(pool.clone());
 
-    // Decode base64
     let content = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD, &input.content
     ).map_err(|e| format!("Invalid base64: {}", e))?;
 
-    // Hash
     let hash = sha2::Sha256::digest(&content);
     let hash_hex = hex::encode(hash);
 
-    // Check duplicate
     if let Ok(Some(_)) = repo.find_document_by_hash(&input.kb_id, &hash_hex).await {
         return Err("Document with same content already exists".to_string());
     }
@@ -219,7 +233,6 @@ pub async fn upload_kb_document(
     let file_type = crate::services::knowledge::parser::get_file_type(&input.filename);
     let file_size = content.len() as i64;
 
-    // Save file
     let app_data_dir = app.path().app_data_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let kb_dir = app_data_dir.join("kb_files").join(&input.kb_id);
@@ -229,17 +242,14 @@ pub async fn upload_kb_document(
     std::fs::write(&file_path, &content).ok();
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    // Create doc record
     let doc = repo.create_document(
         &input.kb_id, &input.filename, Some(&file_path_str),
         &file_type, file_size, &hash_hex
     ).await.map_err(|e| e.to_string())?;
 
-    // Get KB embedding model
     let kb = repo.get_kb(&input.kb_id).await.map_err(|e| e.to_string())?;
     let emb_model = kb.embedding_model.clone();
 
-    // Spawn processing task
     let pool_clone = pool.clone();
     let app_clone = app.clone();
     let doc_id_clone = doc.id.clone();
@@ -255,4 +265,173 @@ pub async fn upload_kb_document(
     });
 
     Ok(doc)
+}
+
+// ════════════════════════════════════════════════════════
+// New commands: Conversations, Sources, Index, Import
+// ════════════════════════════════════════════════════════
+
+#[tauri::command]
+pub async fn get_kb_conversations(
+    state: State<'_, Arc<AppState>>,
+    kb_id: String,
+) -> Result<Vec<KbConversation>, String> {
+    let repo = KbRepository::new(state.db.pool.clone());
+    repo.get_conversations(&kb_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn clear_kb_conversations(
+    state: State<'_, Arc<AppState>>,
+    kb_id: String,
+) -> Result<(), String> {
+    let repo = KbRepository::new(state.db.pool.clone());
+    repo.clear_conversations(&kb_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_kb_sources(
+    state: State<'_, Arc<AppState>>,
+    kb_id: String,
+) -> Result<Vec<KbSource>, String> {
+    let repo = KbRepository::new(state.db.pool.clone());
+    repo.get_sources(&kb_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_kb_source(
+    state: State<'_, Arc<AppState>>,
+    source_id: String,
+    kb_id: String,
+) -> Result<(), String> {
+    let repo = KbRepository::new(state.db.pool.clone());
+    repo.delete_source(&source_id).await.map_err(|e| e.to_string())?;
+    repo.update_kb_counts(&kb_id).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn import_kb_source(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    kb_id: String,
+    input: ImportSourceInput,
+) -> Result<KbSource, String> {
+    let pool = state.db.pool.clone();
+    let repo = KbRepository::new(pool.clone());
+
+    let source = repo.create_source(
+        &kb_id,
+        &input.source_type,
+        input.repo_url.as_deref().or(input.url.as_deref()),
+        input.dir_path.as_deref(),
+        input.branch.as_deref(),
+    ).await.map_err(|e| e.to_string())?;
+
+    let source_id = source.id.clone();
+    let source_type = input.source_type.clone();
+
+    tokio::spawn(async move {
+        let result = if source_type == "git" {
+            crate::services::knowledge::importer::import_git_repo(
+                &pool, &app, &kb_id, &source_id, &input,
+            ).await
+        } else if source_type == "url" {
+            crate::services::knowledge::importer::import_url(
+                &pool, &app, &kb_id, &source_id, &input,
+            ).await
+        } else if source_type == "local_dir" {
+            crate::services::knowledge::importer::import_local_dir(
+                &pool, &app, &kb_id, &source_id, &input,
+            ).await
+        } else {
+            Err(format!("Unknown source type: {}", source_type))
+        };
+
+        let repo = KbRepository::new(pool.clone());
+        match result {
+            Ok(count) => {
+                repo.update_source_status(&source_id, "done", count as i64, None).await.ok();
+            }
+            Err(e) => {
+                repo.update_source_status(&source_id, "error", 0, Some(&e)).await.ok();
+                tracing::error!("Import failed: {}", e);
+            }
+        }
+    });
+
+    Ok(source)
+}
+
+#[tauri::command]
+pub async fn get_kb_index_status(
+    state: State<'_, Arc<AppState>>,
+    kb_id: String,
+) -> Result<Option<KbIndexMeta>, String> {
+    let repo = KbRepository::new(state.db.pool.clone());
+    repo.get_index_meta(&kb_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn build_kb_index(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    kb_id: String,
+) -> Result<(), String> {
+    let pool = state.db.pool.clone();
+
+    // Update status to building immediately
+    let repo = KbRepository::new(pool.clone());
+    repo.update_kb_index_status(&kb_id, "building").await.ok();
+
+    // Spawn the actual HNSW index build
+    tokio::spawn(async move {
+        let app = app.clone();
+        let kb_id_clone = kb_id.clone();
+
+        // Emit starting event
+        let _ = app.emit("kb-index-progress", serde_json::json!({
+            "kb_id": &kb_id_clone,
+            "status": "building",
+            "progress": 0,
+            "current": 0,
+            "total": 0,
+            "message": "正在加载切片数据…"
+        }));
+
+        match crate::services::knowledge::retriever::build_index(&pool, &kb_id_clone, &app).await {
+            Ok(()) => {
+                tracing::info!("HNSW index built successfully for KB {}", kb_id_clone);
+                let _ = app.emit("kb-index-progress", serde_json::json!({
+                    "kb_id": &kb_id_clone,
+                    "status": "ready",
+                    "progress": 100,
+                    "message": "索引构建完成"
+                }));
+            }
+            Err(e) => {
+                tracing::error!("Failed to build HNSW index for KB {}: {}", kb_id_clone, e);
+                let repo = KbRepository::new(pool.clone());
+                repo.update_kb_index_status(&kb_id_clone, "error").await.ok();
+                let _ = app.emit("kb-index-progress", serde_json::json!({
+                    "kb_id": &kb_id_clone,
+                    "status": "error",
+                    "message": format!("索引构建失败: {}", e)
+                }));
+            }
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn drop_kb_index(
+    state: State<'_, Arc<AppState>>,
+    kb_id: String,
+) -> Result<(), String> {
+    let repo = KbRepository::new(state.db.pool.clone());
+    repo.upsert_index_meta(&kb_id, 0, 0, None, "none").await.map_err(|e| e.to_string())?;
+    repo.update_kb_index_status(&kb_id, "none").await.map_err(|e| e.to_string())?;
+    Ok(())
 }
