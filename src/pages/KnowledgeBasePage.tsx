@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
+import { useLocation } from "react-router-dom";
 import {
   KnowledgeBase,
   KbDocument,
@@ -50,7 +51,9 @@ type ServiceTab = "knowledge" | "mcp";
 type KbTab = "documents" | "sources" | "search" | "ask" | "settings" | "index" | "mcp";
 
 export function KnowledgeBasePage() {
-  const [serviceTab, setServiceTab] = useState<ServiceTab>("knowledge");
+  const location = useLocation();
+  const initialTab: ServiceTab = location.pathname.includes("/mcp") ? "mcp" : "knowledge";
+  const [serviceTab, setServiceTab] = useState<ServiceTab>(initialTab);
 
   const serviceTabs: { key: ServiceTab; label: string; icon: typeof BookOpen }[] = [
     { key: "knowledge", label: "知识库", icon: BookOpen },

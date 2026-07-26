@@ -18,6 +18,9 @@ import {
   HelpCircle,
   X,
   Check,
+  Database,
+  Layers,
+  Terminal,
 } from "lucide-react";
 
 export function DashboardPage() {
@@ -37,7 +40,7 @@ export function DashboardPage() {
 
   const availability = stats.total_channels > 0 ? Math.round((stats.active_channels / stats.total_channels) * 100) : 0;
 
-  // 统一 6 卡片网格：今日请求 / 今日Token / 累计请求 / 累计Token / 活跃渠道 / 平均延迟
+  // 统一 8 卡片网格：今日请求 / 今日Token / 累计请求 / 累计Token / 活跃渠道 / 平均延迟 / 知识库 / 文档数
   const metrics = [
     { label: "今日请求", value: formatNumber(stats.today_requests), icon: Activity, color: "text-blue-600", tone: "bg-blue-50" },
     { label: "今日 Token", value: formatNumber(stats.today_total_tokens), icon: Zap, color: "text-amber-600", tone: "bg-amber-50" },
@@ -45,15 +48,19 @@ export function DashboardPage() {
     { label: "累计 Token", value: formatNumber(stats.total_tokens), icon: Zap, color: "text-orange-600", tone: "bg-orange-50" },
     { label: "活跃渠道", value: `${stats.active_channels}/${stats.total_channels}`, icon: Radio, color: "text-emerald-600", tone: "bg-emerald-50" },
     { label: "平均延迟", value: formatDuration(Math.round(stats.avg_latency_ms)), icon: Workflow, color: "text-violet-600", tone: "bg-violet-50" },
+    { label: "知识库", value: formatNumber(stats.total_knowledge_bases), icon: Database, color: "text-cyan-600", tone: "bg-cyan-50" },
+    { label: "知识库文档", value: formatNumber(stats.total_kb_documents), icon: Layers, color: "text-teal-600", tone: "bg-teal-50" },
   ];
 
   const quickActions = [
     { title: "新建渠道", icon: Plus, action: () => navigate("/channels") },
     { title: "管理密钥", icon: Key, action: () => navigate("/api-keys") },
+    { title: "创建知识库", icon: Database, action: () => navigate("/services/knowledge-base") },
     { title: "接入示例", icon: BookOpen, action: () => navigate("/usage") },
     { title: "审计日志", icon: FileText, action: () => navigate("/logs") },
     { title: "安全设置", icon: ShieldCheck, action: () => navigate("/settings") },
     { title: "渠道管理", icon: Globe, action: () => navigate("/channels") },
+    { title: "MCP 服务", icon: Terminal, action: () => navigate("/services/mcp") },
   ];
 
   return (
@@ -108,7 +115,7 @@ export function DashboardPage() {
       </section>
 
       {/* 统一指标卡片 */}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-8">
         {metrics.map(({ label, value, icon: Icon, color, tone }) => (
           <div key={label} className="surface data-card">
             <div className="flex items-center justify-between">
@@ -131,7 +138,7 @@ export function DashboardPage() {
           </div>
           <TrendingUp className="h-5 w-5 text-slate-400" />
         </div>
-        <div className="mt-5 grid grid-cols-1 gap-3 md:grid-cols-3">
+        <div className="mt-5 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
           <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
             <div className="flex items-center gap-2">
               <Radio className="h-4 w-4 text-emerald-600" />
@@ -165,6 +172,17 @@ export function DashboardPage() {
               {stats.avg_latency_ms < 2000
                 ? `平均延迟 ${formatDuration(Math.round(stats.avg_latency_ms))}，响应正常。`
                 : `平均延迟 ${formatDuration(Math.round(stats.avg_latency_ms))}，建议查看日志排查慢请求。`}
+            </p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+            <div className="flex items-center gap-2">
+              <Database className="h-4 w-4 text-cyan-600" />
+              <span className="text-sm font-medium text-slate-900">知识库</span>
+            </div>
+            <p className="mt-1.5 text-sm text-slate-500">
+              {stats.total_knowledge_bases > 0
+                ? `${stats.total_knowledge_bases} 个知识库 · ${stats.total_kb_documents} 篇文档 · ${stats.total_kb_chunks} 个切片`
+                : "尚未创建知识库，点击上方「创建知识库」开始。"}
             </p>
           </div>
         </div>
