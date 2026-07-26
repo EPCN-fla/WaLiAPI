@@ -51,6 +51,7 @@ function App() {
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/services" element={<KnowledgeBasePage />} />
           <Route path="/services/knowledge-base" element={<KnowledgeBasePage />} />
+          <Route path="/services/mcp" element={<KnowledgeBasePage />} />
         </Routes>
       </Layout>
       {showUpdater && (
