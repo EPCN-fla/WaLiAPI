@@ -222,6 +222,17 @@ export interface KbSearchResult {
   metadata: Record<string, unknown>;
 }
 
+export interface KbRetrievalDetail {
+  chunk_id: string;
+  filename: string;
+  score: number;
+  vector_score: number | null;
+  keyword_score: number | null;
+  snippet: string;
+  symbol_name: string | null;
+  symbol_kind: string | null;
+}
+
 export interface KbRagAnswer {
   answer: string;
   sources: Array<{
@@ -230,6 +241,7 @@ export interface KbRagAnswer {
     snippet: string;
   }>;
   usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null;
+  retrieval_details: KbRetrievalDetail[] | null;
 }
 
 export interface KbTag {
@@ -252,9 +264,9 @@ export const kbApi = {
     invoke<void>("delete_kb_document", { docId, kbId }),
   reindexDocument: (docId: string) =>
     invoke<void>("reindex_kb_document", { docId }),
-  search: (input: { query: string; kb_id?: string; top_k?: number }) =>
+  search: (input: { query: string; kb_id?: string; top_k?: number; vector_weight?: number; keyword_weight?: number; search_mode?: string }) =>
     invoke<KbSearchResult[]>("search_knowledge_base", { input }),
-  ask: (input: { question: string; kb_id?: string; top_k?: number; model?: string; history?: ConversationMessage[]; deep_research?: boolean; max_rounds?: number }) =>
+  ask: (input: { question: string; kb_id?: string; top_k?: number; model?: string; history?: ConversationMessage[]; deep_research?: boolean; max_rounds?: number; vector_weight?: number; keyword_weight?: number; search_mode?: string }) =>
     invoke<KbRagAnswer>("ask_knowledge_base", { input }),
   getStats: (kbId: string) => invoke<Record<string, unknown>>("get_kb_stats", { kbId }),
   // Conversation history

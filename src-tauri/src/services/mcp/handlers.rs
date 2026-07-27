@@ -106,7 +106,7 @@ fn get_tools() -> Vec<serde_json::Value> {
         // ── Read-only tools (existing) ───────────────────────────
         serde_json::json!({
             "name": "search_knowledge_base",
-            "description": "Semantic search across a local knowledge base. Uses HNSW vector index for O(log n) retrieval. Returns matching text chunks with cosine similarity scores (0-1). Searches a specific KB if kb_id provided, otherwise searches all MCP-enabled KBs.",
+            "description": "Search across a local knowledge base using hybrid (vector + keyword), vector-only, or keyword-only retrieval. Returns matching text chunks with similarity scores and per-component score breakdowns. Searches a specific KB if kb_id provided, otherwise searches all MCP-enabled KBs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -122,6 +122,22 @@ fn get_tools() -> Vec<serde_json::Value> {
                         "type": "integer",
                         "description": "Maximum number of results to return (default: 5)",
                         "default": 5
+                    },
+                    "search_mode": {
+                        "type": "string",
+                        "enum": ["hybrid", "vector", "keyword"],
+                        "description": "Retrieval mode: hybrid (vector+keyword, default), vector (semantic only), keyword (FTS5 only). CJK bigram tokenization is used for Chinese queries.",
+                        "default": "hybrid"
+                    },
+                    "vector_weight": {
+                        "type": "number",
+                        "description": "Weight for vector similarity score in hybrid mode (0.0-1.0, default: 0.7). Only effective when search_mode=hybrid.",
+                        "default": 0.7
+                    },
+                    "keyword_weight": {
+                        "type": "number",
+                        "description": "Weight for keyword (FTS5) score in hybrid mode (0.0-1.0, default: 0.3). Only effective when search_mode=hybrid.",
+                        "default": 0.3
                     }
                 },
                 "required": ["query"]
@@ -149,14 +165,30 @@ fn get_tools() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "ask_knowledge_base",
-            "description": "Ask a question to the knowledge base and get an AI-generated answer based on retrieved context (RAG). Uses the configured LLM channel to generate a response grounded in the KB content. Returns the answer plus source citations with similarity scores.",
+            "description": "Ask a question to the knowledge base and get an AI-generated answer based on retrieved context (RAG). Uses the configured LLM channel to generate a response grounded in the KB content. Returns the answer, source citations, and per-chunk retrieval score breakdowns (vector score, keyword score, symbol info).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "question": { "type": "string", "description": "The question to ask. The answer will be grounded in retrieved document chunks." },
                     "kb_id": { "type": "string", "description": "Knowledge base ID. If omitted, uses all MCP-enabled KBs." },
                     "top_k": { "type": "integer", "description": "Number of chunks to retrieve as context (default: 5)", "default": 5 },
-                    "model": { "type": "string", "description": "LLM model to use for answer generation (default: uses channel default)" }
+                    "model": { "type": "string", "description": "LLM model to use for answer generation (default: uses channel default)" },
+                    "search_mode": {
+                        "type": "string",
+                        "enum": ["hybrid", "vector", "keyword"],
+                        "description": "Retrieval mode: hybrid (vector+keyword, default), vector (semantic only), keyword (FTS5 only). CJK bigram tokenization is used for Chinese queries.",
+                        "default": "hybrid"
+                    },
+                    "vector_weight": {
+                        "type": "number",
+                        "description": "Weight for vector similarity in hybrid mode (0.0-1.0, default: 0.7). Only effective when search_mode=hybrid.",
+                        "default": 0.7
+                    },
+                    "keyword_weight": {
+                        "type": "number",
+                        "description": "Weight for keyword (FTS5) in hybrid mode (0.0-1.0, default: 0.3). Only effective when search_mode=hybrid.",
+                        "default": 0.3
+                    }
                 },
                 "required": ["question"]
             }
@@ -487,6 +519,9 @@ async fn handle_tool_call(
             let query = args.get("query").and_then(|q| q.as_str()).ok_or("Missing query")?;
             let kb_id = args.get("kb_id").and_then(|k| k.as_str()).unwrap_or("");
             let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(5) as usize;
+            let search_mode = args.get("search_mode").and_then(|s| s.as_str()).unwrap_or("hybrid");
+            let vector_weight = args.get("vector_weight").and_then(|w| w.as_f64()).unwrap_or(0.7) as f32;
+            let keyword_weight = args.get("keyword_weight").and_then(|w| w.as_f64()).unwrap_or(0.3) as f32;
 
             let emb_model = if !kb_id.is_empty() {
                 let kb_repo = KbRepository::new(pool.clone());
@@ -498,28 +533,52 @@ async fn handle_tool_call(
             };
 
             let repo = Repository::new(pool.clone());
+
+            // Keyword-only mode: no embedding needed
+            if search_mode == "keyword" && !kb_id.is_empty() {
+                let results = retriever::keyword_only_search(pool, kb_id, query, top_k).await?;
+                let content: Vec<serde_json::Value> = results.iter().map(|r| {
+                    serde_json::json!({
+                        "type": "text",
+                        "text": format!("[{}] (score: {:.2}) [keyword]\n{}", r.filename, r.score, r.content)
+                    })
+                }).collect();
+                return Ok(serde_json::json!({ "content": content, "isError": false }));
+            }
+
             let embeddings = embedder::embed(&[query.to_string()], &emb_model, &repo).await?;
             if embeddings.is_empty() {
                 return Err("Failed to embed query".to_string());
             }
 
-            let results = if kb_id.is_empty() {
-                retriever::search_all(pool, &embeddings[0], top_k, true).await?
+            if kb_id.is_empty() {
+                // Cross-KB search: always hybrid (search_all doesn't support mode selection)
+                let results = retriever::search_all(pool, &embeddings[0], top_k, true).await?;
+                let content: Vec<serde_json::Value> = results.iter().map(|r| {
+                    serde_json::json!({
+                        "type": "text",
+                        "text": format!("[{}] (score: {:.2})\n{}", r.filename, r.score, r.content)
+                    })
+                }).collect();
+                Ok(serde_json::json!({ "content": content, "isError": false }))
             } else {
-                retriever::hybrid_search(pool, kb_id, query, &embeddings[0], top_k, 0.7, 0.3).await?
-            };
+                // Single-KB search with details
+                let scored = retriever::hybrid_search_with_details(
+                    pool, kb_id, query, &embeddings[0], top_k, vector_weight, keyword_weight,
+                ).await?;
 
-            let content: Vec<serde_json::Value> = results.iter().map(|r| {
-                serde_json::json!({
-                    "type": "text",
-                    "text": format!("[{}] (score: {:.2})\n{}", r.filename, r.score, r.content)
-                })
-            }).collect();
+                let content: Vec<serde_json::Value> = scored.iter().map(|s| {
+                    let r = &s.result;
+                    let mut line = format!("[{}] (score: {:.2}", r.filename, r.score);
+                    if let Some(vs) = s.vector_score { line.push_str(&format!(", vec: {:.2}", vs)); }
+                    if let Some(ks) = s.keyword_score { line.push_str(&format!(", kw: {:.2}", ks)); }
+                    line.push_str(")\n");
+                    line.push_str(&r.content);
+                    serde_json::json!({ "type": "text", "text": line })
+                }).collect();
 
-            Ok(serde_json::json!({
-                "content": content,
-                "isError": false
-            }))
+                Ok(serde_json::json!({ "content": content, "isError": false }))
+            }
         }
 
         "list_knowledge_bases" => {
@@ -570,6 +629,9 @@ async fn handle_tool_call(
             let question = args.get("question").and_then(|q| q.as_str()).ok_or("Missing question")?;
             let kb_id = args.get("kb_id").and_then(|k| k.as_str()).unwrap_or("");
             let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(5) as usize;
+            let search_mode = args.get("search_mode").and_then(|s| s.as_str()).unwrap_or("hybrid");
+            let vector_weight = args.get("vector_weight").and_then(|w| w.as_f64()).unwrap_or(0.7) as f32;
+            let keyword_weight = args.get("keyword_weight").and_then(|w| w.as_f64()).unwrap_or(0.3) as f32;
 
             let emb_model = if !kb_id.is_empty() {
                 let kb_repo = KbRepository::new(pool.clone());
@@ -598,17 +660,44 @@ async fn handle_tool_call(
                 picked.unwrap_or_else(|| "gpt-4o".to_string())
             };
 
-            let answer = rag::ask(pool, kb_id, question, &emb_model, &chat_model, top_k, true, &[], &shared.app).await?;
+            let answer = rag::ask_with_config(
+                pool, kb_id, question, &emb_model, &chat_model, top_k, true, &[], &shared.app,
+                vector_weight, keyword_weight, search_mode,
+            ).await?;
 
             let mut content = vec![serde_json::json!({
                 "type": "text",
                 "text": answer.answer
             })];
 
+            // Source citations
             for source in &answer.sources {
                 content.push(serde_json::json!({
                     "type": "text",
                     "text": format!("Source: {} (score: {:.2})\n{}", source.filename, source.score, source.snippet)
+                }));
+            }
+
+            // Retrieval details: per-chunk score breakdown
+            if let Some(details) = &answer.retrieval_details {
+                let mut detail_lines = String::from("\n--- Retrieval Details ---\n");
+                for d in details {
+                    let mut line = format!("• {} (score: {:.2}", d.filename, d.score);
+                    if let Some(vs) = d.vector_score { line.push_str(&format!(", vec: {:.2}", vs)); }
+                    if let Some(ks) = d.keyword_score { line.push_str(&format!(", kw: {:.2}", ks)); }
+                    if let Some(sym) = &d.symbol_name {
+                        line.push_str(&format!(", symbol: {}", sym));
+                        if let Some(kind) = &d.symbol_kind {
+                            line.push_str(&format!(" ({})", kind));
+                        }
+                    }
+                    line.push_str(")");
+                    detail_lines.push_str(&line);
+                    detail_lines.push('\n');
+                }
+                content.push(serde_json::json!({
+                    "type": "text",
+                    "text": detail_lines
                 }));
             }
 

@@ -296,10 +296,13 @@ pub async fn ask(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Deep research failed: {}", e)).into_response(),
         }
     } else {
-        // Normal RAG with history
+        // Normal RAG with history and configurable search
         let history = input.history.unwrap_or_default();
+        let vector_weight = input.vector_weight.unwrap_or(0.7);
+        let keyword_weight = input.keyword_weight.unwrap_or(0.3);
+        let search_mode = input.search_mode.as_deref().unwrap_or("hybrid");
 
-        match rag::ask(
+        match rag::ask_with_config(
             &shared.state.db.pool,
             &kb_id,
             &input.question,
@@ -309,6 +312,9 @@ pub async fn ask(
             false,
             &history,
             &shared.app,
+            vector_weight,
+            keyword_weight,
+            search_mode,
         ).await {
             Ok(answer) => Json(answer).into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("RAG failed: {}", e)).into_response(),

@@ -101,6 +101,20 @@ pub struct RagAnswer {
     pub answer: String,
     pub sources: Vec<SourceInfo>,
     pub usage: Option<UsageInfo>,
+    #[serde(default)]
+    pub retrieval_details: Option<Vec<RetrievalDetail>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalDetail {
+    pub chunk_id: String,
+    pub filename: String,
+    pub score: f32,
+    pub vector_score: Option<f32>,
+    pub keyword_score: Option<f32>,
+    pub snippet: String,
+    pub symbol_name: Option<String>,
+    pub symbol_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +181,12 @@ pub struct AskInput {
     pub deep_research: bool,
     #[serde(default = "default_max_rounds")]
     pub max_rounds: usize,
+    #[serde(default)]
+    pub vector_weight: Option<f32>,
+    #[serde(default)]
+    pub keyword_weight: Option<f32>,
+    #[serde(default)]
+    pub search_mode: Option<String>,
 }
 
 fn default_top_k() -> usize { 5 }

@@ -1,6 +1,6 @@
 use super::embedder;
 use super::retriever;
-use super::models::{RagAnswer, SourceInfo, UsageInfo, ConversationMessage};
+use super::models::{RagAnswer, RetrievalDetail, SourceInfo, UsageInfo, ConversationMessage};
 use super::repository::KbRepository;
 use crate::core::proxy;
 use crate::db::repository::Repository;
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use sqlx::SqlitePool;
 
 /// RAG: Retrieve relevant chunks, then generate answer via WaLiAPI proxy
-/// Enhanced with conversation history and token limit fallback
+/// Enhanced with conversation history, token limit fallback, and configurable search modes.
 pub async fn ask(
     pool: &SqlitePool,
     kb_id: &str,
@@ -21,26 +21,107 @@ pub async fn ask(
     history: &[ConversationMessage],
     app: &AppHandle,
 ) -> Result<RagAnswer, String> {
+    ask_with_config(
+        pool, kb_id, query, embedding_model, chat_model, top_k,
+        mcp_only, history, app,
+        0.7, 0.3, "hybrid",
+    ).await
+}
+
+/// RAG with configurable search parameters.
+pub async fn ask_with_config(
+    pool: &SqlitePool,
+    kb_id: &str,
+    query: &str,
+    embedding_model: &str,
+    chat_model: &str,
+    top_k: usize,
+    mcp_only: bool,
+    history: &[ConversationMessage],
+    app: &AppHandle,
+    vector_weight: f32,
+    keyword_weight: f32,
+    search_mode: &str,
+) -> Result<RagAnswer, String> {
     let repo = Repository::new(pool.clone());
     let kb_repo = KbRepository::new(pool.clone());
 
-    // 1. Embed the query
-    let embeddings = embedder::embed(&[query.to_string()], embedding_model, &repo)
-        .await
-        .map_err(|e| format!("Embedding failed: {}", e))?;
-
-    if embeddings.is_empty() {
-        return Err("Failed to embed query".to_string());
-    }
-
-    let query_emb = &embeddings[0];
-
-    // 2. Hybrid search (vector + FTS5)
-    let results = if kb_id.is_empty() {
-        retriever::search_all(pool, query_emb, top_k, mcp_only).await?
+    // 1. Embed the query (needed for vector and hybrid modes)
+    let query_emb_opt = if search_mode != "keyword" {
+        let embeddings = embedder::embed(&[query.to_string()], embedding_model, &repo)
+            .await
+            .map_err(|e| format!("Embedding failed: {}", e))?;
+        if embeddings.is_empty() {
+            return Err("Failed to embed query".to_string());
+        }
+        Some(embeddings[0].clone())
     } else {
-        retriever::hybrid_search(pool, kb_id, query, query_emb, top_k, 0.7, 0.3).await?
+        None
     };
+
+    // 2. Search based on mode
+    let scored_results = if search_mode == "keyword" {
+        // Keyword-only search
+        let kw_results = if kb_id.is_empty() {
+            // For search_all with keyword mode, we still need embeddings for cross-KB search
+            // Fallback: embed and use hybrid
+            let embeddings = embedder::embed(&[query.to_string()], embedding_model, &repo)
+                .await
+                .map_err(|e| format!("Embedding failed: {}", e))?;
+            retriever::hybrid_search_with_details(
+                pool, kb_id, query, &embeddings[0], top_k, vector_weight, keyword_weight,
+            ).await?
+        } else {
+            let kw = retriever::keyword_only_search(pool, kb_id, query, top_k).await?;
+            kw.into_iter().map(|r| {
+                let score = r.score;
+                retriever::ScoredSearchResult {
+                    result: r,
+                    vector_score: None,
+                    keyword_score: Some(score),
+                }
+            }).collect()
+        };
+        kw_results
+    } else if search_mode == "vector" {
+        // Vector-only search
+        let query_emb = query_emb_opt.as_ref().ok_or("Embedding required for vector search")?;
+        let v_results = if kb_id.is_empty() {
+            retriever::search_all(pool, query_emb, top_k, mcp_only).await?
+        } else {
+            retriever::search(pool, kb_id, query_emb, top_k).await?
+        };
+        v_results.into_iter().map(|r| {
+                let score = r.score;
+                retriever::ScoredSearchResult {
+                    result: r,
+                    vector_score: Some(score),
+                    keyword_score: None,
+                }
+            }).collect()
+    } else {
+        // Hybrid search (default)
+        let query_emb = query_emb_opt.as_ref().ok_or("Embedding required for hybrid search")?;
+        if kb_id.is_empty() {
+            // Cross-KB: use search_all then compute details
+            let results = retriever::search_all(pool, query_emb, top_k, mcp_only).await?;
+            results.into_iter().map(|r| {
+                let score = r.score;
+                retriever::ScoredSearchResult {
+                    result: r,
+                    vector_score: Some(score),
+                    keyword_score: None,
+                }
+            }).collect()
+        } else {
+            retriever::hybrid_search_with_details(
+                pool, kb_id, query, query_emb, top_k, vector_weight, keyword_weight,
+            ).await?
+        }
+    };
+
+    // Extract plain results for context building
+    let results: Vec<super::models::SearchResult> = scored_results.iter().map(|s| s.result.clone()).collect();
 
     if results.is_empty() {
         // Save to conversation history
@@ -52,12 +133,14 @@ pub async fn ask(
                 answer,
                 sources: vec![],
                 usage: None,
+                retrieval_details: Some(vec![]),
             });
         }
         return Ok(RagAnswer {
             answer: "知识库中没有找到相关内容。".to_string(),
             sources: vec![],
             usage: None,
+            retrieval_details: Some(vec![]),
         });
     }
 
@@ -149,6 +232,24 @@ pub async fn ask(
                 })
                 .collect();
 
+            // Build retrieval details for visualization
+            let retrieval_details: Vec<RetrievalDetail> = scored_results
+                .iter()
+                .map(|s| {
+                    let meta = &s.result.metadata;
+                    RetrievalDetail {
+                        chunk_id: s.result.chunk_id.clone(),
+                        filename: s.result.filename.clone(),
+                        score: s.result.score,
+                        vector_score: s.vector_score,
+                        keyword_score: s.keyword_score,
+                        snippet: s.result.content.chars().take(200).collect(),
+                        symbol_name: meta.get("symbol_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        symbol_kind: meta.get("symbol_kind").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    }
+                })
+                .collect();
+
             // Save to conversation history
             if !kb_id.is_empty() {
                 let sources_json = serde_json::to_string(&sources).ok();
@@ -161,6 +262,7 @@ pub async fn ask(
                 answer,
                 sources,
                 usage,
+                retrieval_details: Some(retrieval_details),
             })
         }
         Err((code, msg)) => Err(format!("LLM request failed ({}): {}", code, msg)),
@@ -543,6 +645,7 @@ pub async fn deep_research(
                 answer,
                 sources,
                 usage,
+                retrieval_details: None,
             })
         }
         Err((code, msg)) => Err(format!("Final synthesis failed ({}): {}", code, msg)),

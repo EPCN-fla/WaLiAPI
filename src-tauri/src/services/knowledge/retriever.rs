@@ -417,24 +417,108 @@ async fn fts5_search(
     Ok(results)
 }
 
-/// Build FTS5 query string from user query
+/// Build FTS5 query string from user query using improved tokenization
 fn build_fts_query(query: &str) -> String {
-    let tokens: Vec<&str> = query
-        .split_whitespace()
-        .filter(|t| !t.is_empty())
-        .collect();
+    let tokens = tokenize_query(query);
 
     if tokens.is_empty() {
         return query.to_string();
     }
 
+    // FTS5: OR-connected prefix terms for broader recall
     tokens.iter()
-        .map(|t| format!("{}*", t))
+        .map(|t| format!("\"{}\"*", t.replace('"', "")))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" OR ")
+}
+
+/// Tokenize a query string for FTS5 search.
+/// - English/numbers: split by whitespace and punctuation, keep tokens with 2+ chars
+/// - Chinese (CJK): extract continuous CJK character runs and generate 2-grams (bigrams)
+/// - Mixed: process each segment independently, then merge
+fn tokenize_query(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let chars: Vec<char> = query.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
+
+        // Check if CJK character
+        let is_cjk = (ch >= '\u{4e00}' && ch <= '\u{9fff}')
+            || (ch >= '\u{3400}' && ch <= '\u{4dbf}')
+            || (ch >= '\u{f900}' && ch <= '\u{faff}');
+
+        if is_cjk {
+            // Collect continuous CJK characters
+            let mut cjk_run = Vec::new();
+            while i < chars.len() {
+                let c = chars[i];
+                let cjk = (c >= '\u{4e00}' && c <= '\u{9fff}')
+                    || (c >= '\u{3400}' && c <= '\u{4dbf}')
+                    || (c >= '\u{f900}' && c <= '\u{faff}');
+                if !cjk {
+                    break;
+                }
+                cjk_run.push(c);
+                i += 1;
+            }
+
+            // Generate bigrams from CJK run
+            if cjk_run.len() == 1 {
+                // Single CJK char: use as-is
+                tokens.push(cjk_run[0].to_string());
+            } else {
+                for w in cjk_run.windows(2) {
+                    tokens.push(format!("{}{}", w[0], w[1]));
+                }
+            }
+        } else {
+            // Collect non-CJK characters as a word
+            let mut word = String::new();
+            while i < chars.len() {
+                let c = chars[i];
+                let cjk = (c >= '\u{4e00}' && c <= '\u{9fff}')
+                    || (c >= '\u{3400}' && c <= '\u{4dbf}')
+                    || (c >= '\u{f900}' && c <= '\u{faff}');
+                if cjk {
+                    break;
+                }
+                // Split on whitespace and common punctuation
+                if c.is_whitespace() || matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '`' | '/' | '\\' | '|' | '<' | '>') {
+                    break;
+                }
+                word.push(c);
+                i += 1;
+            }
+
+            // Only keep tokens with 2+ characters
+            if word.chars().count() >= 2 {
+                tokens.push(word);
+            }
+
+            // Skip whitespace/punctuation separator
+            if i < chars.len() && !chars[i].is_alphanumeric() {
+                i += 1;
+            }
+        }
+    }
+
+    // Deduplicate while preserving order
+    let mut seen = std::collections::HashSet::new();
+    tokens.into_iter().filter(|t| seen.insert(t.clone())).collect()
+}
+
+/// Search result with individual score breakdowns for retrieval visualization.
+#[derive(Debug, Clone)]
+pub struct ScoredSearchResult {
+    pub result: SearchResult,
+    pub vector_score: Option<f32>,
+    pub keyword_score: Option<f32>,
 }
 
 /// Hybrid search: vector + FTS5 weighted merge
+/// Returns results with individual score breakdowns for visualization.
 pub async fn hybrid_search(
     pool: &SqlitePool,
     kb_id: &str,
@@ -444,6 +528,23 @@ pub async fn hybrid_search(
     vector_weight: f32,
     keyword_weight: f32,
 ) -> Result<Vec<SearchResult>, String> {
+    let scored = hybrid_search_with_details(
+        pool, kb_id, query, query_embedding, top_k, vector_weight, keyword_weight,
+    )
+    .await?;
+    Ok(scored.into_iter().map(|s| s.result).collect())
+}
+
+/// Hybrid search returning detailed score breakdowns.
+pub async fn hybrid_search_with_details(
+    pool: &SqlitePool,
+    kb_id: &str,
+    query: &str,
+    query_embedding: &[f32],
+    top_k: usize,
+    vector_weight: f32,
+    keyword_weight: f32,
+) -> Result<Vec<ScoredSearchResult>, String> {
     let (vector_results, keyword_results) = tokio::join!(
         search(pool, kb_id, query_embedding, top_k * 2),
         fts5_search(pool, kb_id, query, top_k * 2),
@@ -452,37 +553,63 @@ pub async fn hybrid_search(
     let vector_results = vector_results.unwrap_or_default();
     let keyword_results = keyword_results.unwrap_or_default();
 
-    // Merge & deduplicate with weighted scoring
-    let mut merged: std::collections::HashMap<String, SearchResult> = std::collections::HashMap::new();
-    let mut scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-
+    // Build lookup maps: chunk_id -> (SearchResult, raw_score)
+    let mut vector_map: std::collections::HashMap<String, (SearchResult, f32)> = std::collections::HashMap::new();
     for r in &vector_results {
-        scores.insert(r.chunk_id.clone(), r.score * vector_weight);
-        merged.insert(r.chunk_id.clone(), r.clone());
+        vector_map.insert(r.chunk_id.clone(), (r.clone(), r.score));
     }
 
+    let mut keyword_map: std::collections::HashMap<String, (SearchResult, f32)> = std::collections::HashMap::new();
     for r in &keyword_results {
-        let current = scores.entry(r.chunk_id.clone()).or_insert(0.0);
-        *current += r.score * keyword_weight;
-        merged.entry(r.chunk_id.clone()).or_insert_with(|| r.clone());
+        keyword_map.insert(r.chunk_id.clone(), (r.clone(), r.score));
+    }
+
+    // Collect all unique chunk IDs
+    let mut all_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    all_ids.extend(vector_map.keys().cloned());
+    all_ids.extend(keyword_map.keys().cloned());
+
+    // Compute weighted scores
+    let mut scored: Vec<(String, f32, Option<f32>, Option<f32>)> = Vec::new();
+    for id in &all_ids {
+        let v_score = vector_map.get(id).map(|(_, s)| *s);
+        let k_score = keyword_map.get(id).map(|(_, s)| *s);
+        let weighted = v_score.unwrap_or(0.0) * vector_weight
+            + k_score.unwrap_or(0.0) * keyword_weight;
+        scored.push((id.clone(), weighted, v_score, k_score));
     }
 
     // Sort by weighted score descending
-    let mut ranked: Vec<(String, f32)> = scores.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    ranked.truncate(top_k);
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(top_k);
 
-    let final_results: Vec<SearchResult> = ranked.into_iter()
-        .filter_map(|(id, score)| {
-            merged.get(&id).map(|r| {
-                let mut r = r.clone();
-                r.score = score;
-                r
-            })
-        })
-        .collect();
+    // Build final results with score breakdowns
+    let mut results = Vec::with_capacity(scored.len());
+    for (id, final_score, v_score, k_score) in scored {
+        // Prefer vector result (has embedding metadata), fallback to keyword result
+        let base = vector_map.get(&id).map(|(r, _)| r.clone())
+            .or_else(|| keyword_map.get(&id).map(|(r, _)| r.clone()));
+        if let Some(mut r) = base {
+            r.score = final_score;
+            results.push(ScoredSearchResult {
+                result: r,
+                vector_score: v_score,
+                keyword_score: k_score,
+            });
+        }
+    }
 
-    Ok(final_results)
+    Ok(results)
+}
+
+/// Keyword-only search using FTS5 (no vector search).
+pub async fn keyword_only_search(
+    pool: &SqlitePool,
+    kb_id: &str,
+    query: &str,
+    top_k: usize,
+) -> Result<Vec<SearchResult>, String> {
+    fts5_search(pool, kb_id, query, top_k).await
 }
 
 // ════════════════════════════════════════════════════════

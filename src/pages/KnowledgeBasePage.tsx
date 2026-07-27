@@ -5,6 +5,7 @@ import {
   KbDocument,
   KbSearchResult,
   KbRagAnswer,
+  KbRetrievalDetail,
   KbSource,
   KbIndexMeta,
   KbTag,
@@ -42,9 +43,12 @@ import {
   GitBranch,
   Link,
   FolderOpen,
+  FolderInput,
   Sparkles,
   Database,
   Tag,
+  Sliders,
+  ChevronUp,
 } from "lucide-react";
 
 type ServiceTab = "knowledge" | "mcp";
@@ -1003,13 +1007,37 @@ function ImportSourceModal({
           {sourceType === "local_dir" && (
             <div>
               <label className="mb-1 block text-sm font-medium text-slate-700">目录路径</label>
-              <input
-                type="text"
-                value={dirPath}
-                onChange={(e) => setDirPath(e.target.value)}
-                placeholder="/path/to/project/docs"
-                className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
-              />
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={dirPath}
+                  onChange={(e) => setDirPath(e.target.value)}
+                  placeholder="/path/to/project/docs"
+                  className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+                />
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const { open } = await import("@tauri-apps/plugin-dialog");
+                      const selected = await open({
+                        directory: true,
+                        multiple: false,
+                        title: "选择导入目录",
+                      });
+                      if (typeof selected === "string") {
+                        setDirPath(selected);
+                      }
+                    } catch {
+                      // 对话框取消或不可用，忽略
+                    }
+                  }}
+                  className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-medium text-slate-600 transition-colors hover:bg-slate-100 hover:text-slate-900"
+                >
+                  <FolderInput size={15} />
+                  浏览
+                </button>
+              </div>
             </div>
           )}
 
@@ -1671,8 +1699,14 @@ function AskTab({ kb }: { kb: KnowledgeBase }) {
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [showChannelPicker, setShowChannelPicker] = useState(false);
   const [showModelPicker, setShowModelPicker] = useState(false);
-  const [conversation, setConversation] = useState<Array<{ role: "user" | "assistant"; content: string; sources?: KbRagAnswer["sources"] }>>([]);
+  const [conversation, setConversation] = useState<Array<{ role: "user" | "assistant"; content: string; sources?: KbRagAnswer["sources"]; retrievalDetails?: KbRetrievalDetail[] | null }>>([]);
   const [deepResearch, setDeepResearch] = useState(false);
+  const [showSearchConfig, setShowSearchConfig] = useState(false);
+  const [searchMode, setSearchMode] = useState<"hybrid" | "vector" | "keyword">("hybrid");
+  const [vectorWeight, setVectorWeight] = useState(0.7);
+  const [keywordWeight, setKeywordWeight] = useState(0.3);
+  const [topK, setTopK] = useState(5);
+  const [showRetrievalDetails, setShowRetrievalDetails] = useState<number | null>(null);
 
   // Persistence key for this KB's ask preferences
   const storageKey = `kb_ask_prefs_${kb.id}`;
@@ -1757,20 +1791,23 @@ function AskTab({ kb }: { kb: KnowledgeBase }) {
       const result = await kbApi.ask({
         question: userMsg,
         kb_id: kb.id,
-        top_k: 5,
+        top_k: topK,
         model: selectedModel || undefined,
         history,
         deep_research: deepResearch,
         max_rounds: 5,
+        vector_weight: searchMode === "hybrid" ? vectorWeight : undefined,
+        keyword_weight: searchMode === "hybrid" ? keywordWeight : undefined,
+        search_mode: searchMode,
       });
       setAnswer(result);
       setConversation((prev) => [
         ...prev,
-        { role: "assistant", content: result.answer, sources: result.sources },
+        { role: "assistant", content: result.answer, sources: result.sources, retrievalDetails: result.retrieval_details },
       ]);
     } catch (e) {
       const errMsg = `请求失败: ${e}`;
-      setAnswer({ answer: errMsg, sources: [], usage: null });
+      setAnswer({ answer: errMsg, sources: [], usage: null, retrieval_details: null });
       setConversation((prev) => [...prev, { role: "assistant", content: errMsg }]);
     } finally {
       setAsking(false);
@@ -1888,11 +1925,26 @@ function AskTab({ kb }: { kb: KnowledgeBase }) {
                 deepResearch
                   ? "bg-violet-50 text-violet-600 hover:bg-violet-100"
                   : "bg-slate-100 text-slate-400 hover:bg-slate-200"
-              }`}
+              }`
+              }
               title="Deep Research: 多轮迭代检索+综合分析"
             >
               <Sparkles size={12} />
               Deep Research
+            </button>
+            {/* Search config toggle */}
+            <button
+              onClick={() => setShowSearchConfig(!showSearchConfig)}
+              className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                showSearchConfig
+                  ? "bg-blue-50 text-blue-600 hover:bg-blue-100"
+                  : "bg-slate-100 text-slate-400 hover:bg-slate-200"
+              }`
+              }
+              title="检索配置: 模式/权重/top_k"
+            >
+              <Sliders size={12} />
+              检索配置
             </button>
             {conversation.length > 0 && (
               <button
@@ -1904,6 +1956,84 @@ function AskTab({ kb }: { kb: KnowledgeBase }) {
             )}
           </div>
         </div>
+
+        {/* Search config panel */}
+        {showSearchConfig && (
+          <div className="border-b border-border bg-slate-50/50 px-4 py-3 space-y-3 shrink-0">
+            <div className="flex items-center gap-4 flex-wrap">
+              {/* Search mode */}
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-medium text-muted-foreground">检索模式</span>
+                <div className="flex rounded-lg border border-border overflow-hidden">
+                  {(["hybrid", "vector", "keyword"] as const).map((m) => (
+                    <button
+                      key={m}
+                      onClick={() => setSearchMode(m)}
+                      className={`px-2.5 py-1 text-xs transition-colors ${
+                        searchMode === m
+                          ? "bg-primary text-white"
+                          : "bg-white text-muted-foreground hover:bg-slate-100"
+                      }`}
+                    >
+                      {m === "hybrid" ? "混合" : m === "vector" ? "向量" : "关键词"}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {/* Top K */}
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-medium text-muted-foreground">Top K</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={topK}
+                  onChange={(e) => setTopK(Math.max(1, Math.min(20, Number(e.target.value) || 5)))}
+                  className="w-14 rounded-lg border border-border bg-white px-2 py-1 text-xs text-center outline-none focus:border-primary"
+                />
+              </div>
+            </div>
+            {/* Weights (only for hybrid) */}
+            {searchMode === "hybrid" && (
+              <div className="flex items-center gap-4 flex-wrap">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-medium text-muted-foreground">向量权重</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.1}
+                    value={vectorWeight}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setVectorWeight(v);
+                      setKeywordWeight(Math.round((1 - v) * 10) / 10);
+                    }}
+                    className="w-24 accent-primary"
+                  />
+                  <span className="text-xs text-muted-foreground w-8">{vectorWeight.toFixed(1)}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-medium text-muted-foreground">关键词权重</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.1}
+                    value={keywordWeight}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setKeywordWeight(v);
+                      setVectorWeight(Math.round((1 - v) * 10) / 10);
+                    }}
+                    className="w-24 accent-primary"
+                  />
+                  <span className="text-xs text-muted-foreground w-8">{keywordWeight.toFixed(1)}</span>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Conversation area — flexible middle, scrollable */}
         <div className="flex-1 min-h-0 overflow-y-auto px-4 py-4 space-y-4">
@@ -1938,6 +2068,45 @@ function AskTab({ kb }: { kb: KnowledgeBase }) {
                           <p className="mt-0.5 text-muted-foreground line-clamp-2">{s.snippet}</p>
                         </div>
                       ))}
+                    </div>
+                  )}
+                  {msg.retrievalDetails && msg.retrievalDetails.length > 0 && (
+                    <div className="mt-2 border-t border-border/40 pt-2">
+                      <button
+                        onClick={() => setShowRetrievalDetails(showRetrievalDetails === i ? null : i)}
+                        className="flex items-center gap-1 text-[10px] font-medium text-muted-foreground hover:text-foreground transition-colors"
+                      >
+                        {showRetrievalDetails === i ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
+                        检索详情 ({msg.retrievalDetails.length})
+                      </button>
+                      {showRetrievalDetails === i && (
+                        <div className="mt-1.5 space-y-1">
+                          {msg.retrievalDetails.map((rd, rdi) => (
+                            <div key={rdi} className="rounded-lg bg-white/60 p-2 text-xs border border-border/40">
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-1.5 min-w-0">
+                                  <span className="font-medium text-foreground truncate">{rd.filename}</span>
+                                  {rd.symbol_name && (
+                                    <span className="shrink-0 rounded bg-primary/10 px-1 py-0.5 text-[9px] text-primary">
+                                      {rd.symbol_name}
+                                    </span>
+                                  )}
+                                </div>
+                                <span className="shrink-0 text-muted-foreground">{(rd.score * 100).toFixed(1)}%</span>
+                              </div>
+                              <div className="mt-1 flex items-center gap-3 text-[9px] text-muted-foreground">
+                                {rd.vector_score != null && (
+                                  <span className="text-blue-500">向量: {(rd.vector_score * 100).toFixed(1)}%</span>
+                                )}
+                                {rd.keyword_score != null && (
+                                  <span className="text-green-500">关键词: {(rd.keyword_score * 100).toFixed(1)}%</span>
+                                )}
+                              </div>
+                              <p className="mt-0.5 text-muted-foreground line-clamp-2 text-[10px]">{rd.snippet}</p>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

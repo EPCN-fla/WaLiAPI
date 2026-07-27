@@ -207,6 +207,12 @@ pub struct KbSearchInput {
     pub kb_id: Option<String>,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
+    #[serde(default)]
+    pub vector_weight: Option<f32>,
+    #[serde(default)]
+    pub keyword_weight: Option<f32>,
+    #[serde(default)]
+    pub search_mode: Option<String>,
 }
 
 fn default_top_k() -> usize { 5 }
@@ -259,6 +265,12 @@ pub struct KbAskInput {
     pub deep_research: bool,
     #[serde(default = "default_max_rounds")]
     pub max_rounds: usize,
+    #[serde(default)]
+    pub vector_weight: Option<f32>,
+    #[serde(default)]
+    pub keyword_weight: Option<f32>,
+    #[serde(default)]
+    pub search_mode: Option<String>,
 }
 
 fn default_chat_model() -> String { "gpt-4o".to_string() }
@@ -289,9 +301,13 @@ pub async fn ask_knowledge_base(
         ).await.map_err(|e| e)
     } else {
         let history = input.history.unwrap_or_default();
-        crate::services::knowledge::rag::ask(
+        let vector_weight = input.vector_weight.unwrap_or(0.7);
+        let keyword_weight = input.keyword_weight.unwrap_or(0.3);
+        let search_mode = input.search_mode.as_deref().unwrap_or("hybrid");
+        crate::services::knowledge::rag::ask_with_config(
             pool, &kb_id, &input.question, &emb_model, &input.model,
             input.top_k, false, &history, &app,
+            vector_weight, keyword_weight, search_mode,
         ).await.map_err(|e| e)
     }
 }
