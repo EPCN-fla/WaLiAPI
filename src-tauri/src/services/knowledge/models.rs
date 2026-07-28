@@ -19,6 +19,7 @@ pub struct KbKnowledgeBase {
     pub included_files: String,
     pub embedding_dim: i64,
     pub index_status: String,
+    pub embedding_batch_size: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -44,6 +45,7 @@ pub struct UpdateKbInput {
     pub excluded_dirs: Option<String>,
     pub excluded_files: Option<String>,
     pub included_files: Option<String>,
+    pub embedding_batch_size: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

@@ -171,7 +171,8 @@ async fn process_document_inner(
     // Detect expected embedding dimension from KB config
     let expected_dim = if kb.embedding_dim > 0 { Some(kb.embedding_dim as usize) } else { None };
 
-    let batch_size = 32;
+    let batch_size = if kb.embedding_batch_size > 0 { kb.embedding_batch_size as usize } else { 32 };
+    println!("embedding_batch_size: {}", batch_size);
     let total_batches = ((chunks.len() as f64) / batch_size as f64).ceil() as usize;
     let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
     let mut batch_done = 0usize;

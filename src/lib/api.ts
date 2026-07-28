@@ -132,25 +132,26 @@ export const securityApi = {
 
 // Knowledge Base types
 export interface KnowledgeBase {
-  id: string;
-  name: string;
-  description: string | null;
-  status: number;
-  doc_count: number;
-  chunk_count: number;
-  total_tokens: number;
-  embedding_model: string | null;
-  embedding_channel_id: string | null;
-  mcp_enabled: number;
-  chunk_size: number;
-  chunk_overlap: number;
-  excluded_dirs: string;
-  excluded_files: string;
-  included_files: string;
-  embedding_dim: number;
-  index_status: string;
-  created_at: string;
-  updated_at: string;
+    id: string;
+    name: string;
+    description: string | null;
+    status: number;
+    doc_count: number;
+    chunk_count: number;
+    total_tokens: number;
+    embedding_model: string | null;
+    embedding_channel_id: string | null;
+    mcp_enabled: number;
+    chunk_size: number;
+    chunk_overlap: number;
+    excluded_dirs: string;
+    excluded_files: string;
+    included_files: string;
+    embedding_dim: number;
+    index_status: string;
+    embedding_batch_size: number;
+    created_at: string;
+    updated_at: string;
 }
 
 export interface KbDocument {
@@ -254,8 +255,8 @@ export const kbApi = {
   getAll: () => invoke<KnowledgeBase[]>("get_knowledge_bases"),
   create: (input: { name: string; description?: string; embedding_model?: string }) =>
     invoke<KnowledgeBase>("create_knowledge_base", { input }),
-  update: (id: string, input: Partial<{ name: string; description: string; embedding_model: string; embedding_channel_id: string; status: number; mcp_enabled: number; chunk_size: number; chunk_overlap: number; excluded_dirs: string; excluded_files: string; included_files: string }>) =>
-    invoke<KnowledgeBase>("update_knowledge_base", { id, input }),
+  update: (id: string, input: Partial<{ name: string; description: string; embedding_model: string; embedding_channel_id: string; status: number; mcp_enabled: number; chunk_size: number; chunk_overlap: number; excluded_dirs: string; excluded_files: string; included_files: string; embedding_batch_size: number }>) =>
+        invoke<KnowledgeBase>("update_knowledge_base", { id, input }),
   delete: (id: string) => invoke<void>("delete_knowledge_base", { id }),
   getDocuments: (kbId: string) => invoke<KbDocument[]>("get_kb_documents", { kbId }),
   uploadDocument: (input: { kb_id: string; filename: string; content: string }) =>
