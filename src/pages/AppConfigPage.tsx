@@ -1,0 +1,376 @@
+import { useEffect, useState, useCallback, useMemo } from "react";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { appConfigApi, serverApi, apiKeyApi, channelApi } from "../lib/api";
+import type { AppInfo, ConfigContent } from "../lib/api";
+import type { ServerStatus, Channel, ApiKey } from "../types";
+import {
+  Terminal,
+  Code2,
+  Sparkles,
+  Boxes,
+  Bot,
+  Wrench,
+  Check,
+  Loader2,
+  AlertCircle,
+  RefreshCw,
+  ArrowRight,
+  FolderOpen,
+  FileText,
+  KeyRound,
+  ChevronDown,
+  Link2,
+} from "lucide-react";
+
+// ── 图标映射 ──
+
+const APP_ICONS: Record<string, React.ComponentType<{ size?: number; className?: string }>> = {
+  "claude-code": Terminal,
+  "claude-desktop": Sparkles,
+  "codex": Code2,
+  "gemini-cli": Boxes,
+  "opencode": Wrench,
+  "openclaw": Bot,
+  "hermes": Code2,
+};
+
+export function getAppIcon(name: string) {
+  return APP_ICONS[name] || Terminal;
+}
+
+// ── 单应用配置面板 ──
+
+export function AppConfigPanel({ appName }: { appName: string }) {
+  const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
+  const [configContent, setConfigContent] = useState<ConfigContent | null>(null);
+  const [ss, setSs] = useState<ServerStatus | null>(null);
+  const [keys, setKeys] = useState<ApiKey[]>([]);
+  const [channels, setChannels] = useState<Channel[]>([]);
+  const [selKey, setSelKey] = useState("");
+  const [selModel, setSelModel] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [applying, setApplying] = useState(false);
+  const [appliedResult, setAppliedResult] = useState<{ success: boolean; message: string } | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const [appList, content, status, ks, chs] = await Promise.all([
+        appConfigApi.getApps(),
+        appConfigApi.getContent(appName),
+        serverApi.getStatus().catch(() => null),
+        apiKeyApi.getAll().catch(() => []),
+        channelApi.getAll().catch(() => []),
+      ]);
+      const info = appList.find(a => a.name === appName);
+      setAppInfo(info || null);
+      setConfigContent(content);
+      setSs(status as ServerStatus | null);
+      const keyList = ks as ApiKey[];
+      const chList = chs as Channel[];
+      setKeys(keyList);
+      setChannels(chList);
+      if (keyList.length > 0 && !selKey) setSelKey(keyList[0].key);
+
+      // 默认选第一个模型
+      const ms: string[] = [];
+      chList.forEach(c => {
+        c.models.forEach(m => { if (!ms.includes(m)) ms.push(m); });
+        if (c.model_mapping) {
+          Object.keys(c.model_mapping).forEach(from => { if (!ms.includes(from)) ms.push(from); });
+        }
+      });
+      if (ms.length > 0 && !selModel) setSelModel(ms[0]);
+    } catch (e) {
+      console.error("Failed to load app config:", e);
+    } finally {
+      setLoading(false);
+    }
+  }, [appName]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => { load(); }, [load]);
+
+  // 模型列表
+  const modelList = useMemo(() => {
+    const seen = new Set<string>();
+    const real: string[] = [];
+    const mapped: string[] = [];
+    channels.forEach(c => {
+      c.models.forEach(m => {
+        if (!seen.has(m)) { seen.add(m); real.push(m); }
+      });
+      if (c.model_mapping) {
+        Object.keys(c.model_mapping).forEach(from => {
+          if (!seen.has(from)) { seen.add(from); mapped.push(from); }
+        });
+      }
+    });
+    return { real, mapped };
+  }, [channels]);
+
+  const allModels = useMemo(() => [...modelList.real, ...modelList.mapped], [modelList]);
+
+  const handleApply = async () => {
+    if (!selKey || !selModel) return;
+    setApplying(true);
+    setAppliedResult(null);
+    try {
+      const result = await appConfigApi.apply(appName, selKey, selModel);
+      setAppliedResult(result);
+      const [appList, content] = await Promise.all([
+        appConfigApi.getApps(),
+        appConfigApi.getContent(appName),
+      ]);
+      setAppInfo(appList.find(a => a.name === appName) || null);
+      setConfigContent(content);
+    } catch (e: any) {
+      setAppliedResult({ success: false, message: String(e) });
+    } finally {
+      setApplying(false);
+    }
+  };
+
+  const handleClear = async () => {
+    setApplying(true);
+    setAppliedResult(null);
+    try {
+      const result = await appConfigApi.clear(appName);
+      setAppliedResult(result);
+      const [appList, content] = await Promise.all([
+        appConfigApi.getApps(),
+        appConfigApi.getContent(appName),
+      ]);
+      setAppInfo(appList.find(a => a.name === appName) || null);
+      setConfigContent(content);
+    } catch (e: any) {
+      setAppliedResult({ success: false, message: String(e) });
+    } finally {
+      setApplying(false);
+    }
+  };
+
+  const handleOpenFolder = async () => {
+    try {
+      await appConfigApi.openFolder(appName);
+    } catch (e) {
+      console.error("Failed to open folder:", e);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-[300px]">
+        <Loader2 className="h-6 w-6 animate-spin text-slate-400" />
+      </div>
+    );
+  }
+
+  if (!appInfo) {
+    return (
+      <div className="surface flex min-h-[300px] items-center justify-center rounded-2xl text-sm text-slate-400">
+        应用信息加载失败
+      </div>
+    );
+  }
+
+  const Icon = getAppIcon(appName);
+  const gatewayUrl = ss?.running ? ss.url : "http://127.0.0.1:8777";
+
+  return (
+    <div className="space-y-4">
+      {/* 应用信息卡片 */}
+      <div className="surface rounded-2xl p-5">
+        <div className="mb-4 flex items-center gap-4 border-b border-slate-100 pb-4">
+          <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-50 to-indigo-50 text-blue-600">
+            <Icon size={20} />
+          </div>
+          <div className="flex-1">
+            <div className="flex items-center gap-2">
+              <h2 className="text-base font-bold tracking-tight text-slate-900">{appInfo.label}</h2>
+              {appInfo.applied && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-600">
+                  <Check size={11} /> 已配置
+                </span>
+              )}
+              {appInfo.available ? (
+                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-600">
+                  已安装
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-600">
+                  未检测到
+                </span>
+              )}
+            </div>
+            <p className="mt-0.5 text-xs text-slate-500">{appInfo.description}</p>
+          </div>
+          <button
+            onClick={load}
+            className="rounded-lg p-2 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
+            title="刷新"
+          >
+            <RefreshCw size={14} />
+          </button>
+        </div>
+
+        {/* 网关地址 + 配置文件路径 */}
+        <div className="mb-4 grid grid-cols-1 gap-3 md:grid-cols-2">
+          <div className="rounded-xl border border-slate-100 bg-slate-50/80 px-4 py-3">
+            <div className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+              <Link2 size={11} /> 网关地址
+            </div>
+            <div className="font-mono text-xs text-slate-600 break-all">{gatewayUrl}</div>
+          </div>
+          <div className="rounded-xl border border-slate-100 bg-slate-50/80 px-4 py-3">
+            <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+              配置文件
+            </div>
+            <div className="font-mono text-xs text-slate-600 break-all">{appInfo.config_path}</div>
+          </div>
+        </div>
+
+        {/* API Key & Model 选择 — 和 API 接口页一致 */}
+        <div className="mb-4 grid grid-cols-1 gap-3 md:grid-cols-2">
+          <div className="rounded-xl border border-slate-100 bg-slate-50/80 px-4 py-3">
+            <div className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+              <KeyRound size={11} /> API Key
+            </div>
+            <div className="relative">
+              <select
+                value={selKey}
+                onChange={e => setSelKey(e.target.value)}
+                className="w-full appearance-none rounded-xl border border-slate-200 bg-white px-3 py-2.5 pr-8 text-sm font-mono text-slate-900 shadow-sm cursor-pointer"
+              >
+                {keys.length === 0 && <option value="">请先创建密钥</option>}
+                {keys.map(k => <option key={k.id} value={k.key}>{k.name} ({k.key.slice(0, 12)}...)</option>)}
+              </select>
+              <ChevronDown size={14} className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-slate-100 bg-slate-50/80 px-4 py-3">
+            <div className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+              <Bot size={11} /> Model
+            </div>
+            <div className="relative">
+              <select
+                value={selModel}
+                onChange={e => setSelModel(e.target.value)}
+                className="w-full appearance-none rounded-xl border border-slate-200 bg-white px-3 py-2.5 pr-8 text-sm font-mono text-slate-900 shadow-sm cursor-pointer"
+              >
+                {allModels.length === 0 && <option value="">请先配置渠道</option>}
+                {modelList.real.length > 0 && (
+                  <optgroup label="实际模型">
+                    {modelList.real.map(m => <option key={m} value={m}>{m}</option>)}
+                  </optgroup>
+                )}
+                {modelList.mapped.length > 0 && (
+                  <optgroup label="映射模型">
+                    {modelList.mapped.map(m => <option key={m} value={m}>{m}</option>)}
+                  </optgroup>
+                )}
+              </select>
+              <ChevronDown size={14} className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+            </div>
+          </div>
+        </div>
+
+        {/* 操作按钮 */}
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleApply}
+            disabled={applying || !selKey || !selModel}
+            className="action-primary"
+          >
+            {applying ? <Loader2 size={15} className="animate-spin" /> : <ArrowRight size={15} />}
+            写入网关配置
+          </button>
+          {appInfo.applied && (
+            <button
+              onClick={handleClear}
+              disabled={applying}
+              className="action-secondary"
+            >
+              恢复原始配置
+            </button>
+          )}
+        </div>
+
+        {/* 操作结果 */}
+        {appliedResult && (
+          <div
+            className={`mt-3 flex items-start gap-2.5 rounded-xl border px-4 py-3 text-sm ${
+              appliedResult.success
+                ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                : "border-red-200 bg-red-50 text-red-700"
+            }`}
+          >
+            {appliedResult.success ? (
+              <Check size={16} className="mt-0.5 shrink-0" />
+            ) : (
+              <AlertCircle size={16} className="mt-0.5 shrink-0" />
+            )}
+            <div className="flex-1">
+              <div className="font-medium">
+                {appliedResult.success ? "配置已写入" : "写入失败"}
+              </div>
+              <div className="mt-0.5 text-xs opacity-80">{appliedResult.message}</div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* 配置文件内容预览 */}
+      <div className="surface rounded-2xl p-5">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 min-w-0">
+            <FileText size={15} className="text-slate-400 shrink-0" />
+            <h3 className="text-sm font-semibold text-slate-700 shrink-0">配置文件</h3>
+            <code className="text-[11px] font-mono text-slate-400 truncate">{appInfo.config_path}</code>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={handleOpenFolder}
+              className="action-secondary flex items-center gap-1.5 px-2.5 py-1.5"
+              title="在文件管理器中打开"
+            >
+              <FolderOpen size={13} />
+              打开
+            </button>
+            <button
+              onClick={load}
+              className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
+              title="刷新"
+            >
+              <RefreshCw size={13} />
+            </button>
+          </div>
+        </div>
+        {configContent?.exists ? (
+          <SyntaxHighlighter
+            language={appInfo.name === "codex" ? "toml" : appInfo.name === "gemini-cli" ? "bash" : "json"}
+            style={oneDark}
+            customStyle={{
+              maxHeight: "20rem",
+              margin: 0,
+              borderRadius: "0.75rem",
+              fontSize: "0.75rem",
+              lineHeight: "1.5rem",
+            }}
+            wrapLongLines
+          >
+            {configContent.content || "(空文件)"}
+          </SyntaxHighlighter>
+        ) : configContent?.error ? (
+          <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-600">
+            {configContent.error}
+          </div>
+        ) : (
+          <div className="rounded-xl border border-dashed border-slate-200 px-4 py-8 text-center text-xs text-slate-400">
+            配置文件尚未创建，选择 API Key 和 Model 后点击"写入网关配置"即可自动生成
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

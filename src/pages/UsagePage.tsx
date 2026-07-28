@@ -3,6 +3,7 @@ import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { channelApi, apiKeyApi, serverApi } from "../lib/api";
 import type { Channel, ApiKey, ServerStatus } from "../types";
+import { AppConfigPanel, getAppIcon } from "./AppConfigPage";
 import {
   BookOpen, Copy, Check, Play, Loader2, Link2, KeyRound, Bot,
   ChevronDown, Terminal, Code2, Coffee, Zap, ArrowRight,
@@ -12,6 +13,17 @@ import {
 type Platform = "curl-mac" | "curl-windows" | "javascript" | "typescript" | "java";
 type TestState = "idle" | "running" | "success" | "error";
 type Protocol = "chat" | "responses" | "anthropic";
+type UsageTab = "api" | "claude-code" | "codex" | "gemini-cli" | "claude-desktop" | "opencode" | "openclaw" | "hermes";
+
+const APP_TABS: { id: UsageTab; label: string }[] = [
+  { id: "codex", label: "Codex" },
+  { id: "claude-code", label: "Claude Code" },
+  { id: "gemini-cli", label: "Gemini CLI" },
+  { id: "claude-desktop", label: "Claude Desktop" },
+  { id: "opencode", label: "OpenCode" },
+  { id: "openclaw", label: "OpenClaw" },
+  { id: "hermes", label: "Hermes" },
+];
 
 const platformTabs: { id: Platform; label: string; shortLabel: string; icon: typeof Terminal; color: string; lang: string }[] = [
   { id: "curl-mac", label: "cURL Mac/Linux", shortLabel: "cURL", icon: Terminal, color: "emerald", lang: "bash" },
@@ -50,6 +62,7 @@ export function UsagePage() {
   const [activeProtocol, setActiveProtocol] = useState<Protocol>("chat");
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [usageTab, setUsageTab] = useState<UsageTab>("api");
 
   useEffect(() => {
     Promise.all([
@@ -365,17 +378,61 @@ public class AnthropicTest {
         </div>
       )}
 
-      {/* Header */}
-      <div className="page-header">
-        <div>
-          <h1 className="page-title flex items-center gap-3">
-            <BookOpen className="h-7 w-7 text-blue-600" />
-            使用
+      {/* 标题 + Tab 栏 — sticky 固定 */}
+      <div className="sticky top-0 z-30 -mx-7 px-7 pb-2 bg-white/90 backdrop-blur-md border-b border-slate-100">
+        {/* 标题 */}
+        <div className="pt-4 pb-3">
+          <h1 className="flex items-center gap-2.5 text-xl font-bold tracking-tight text-slate-900">
+            <BookOpen className="h-6 w-6 text-blue-600" />
+            LLM 使用
           </h1>
-          <p className="page-subtitle">支持三种协议接入，按平台生成代码，并直接验证本地网关连通性</p>
+        </div>
+        {/* Tab 栏 — 彩色 pill 风格 */}
+        <div className="flex items-center gap-1.5 overflow-x-auto pb-2">
+          <button
+            onClick={() => setUsageTab("api")}
+            className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-medium transition-all ${
+              usageTab === "api"
+                ? "bg-blue-500 text-white shadow-sm"
+                : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+            }`}
+          >
+            API 接口
+          </button>
+          <div className="h-4 w-px bg-slate-300 shrink-0" />
+          {APP_TABS.map(app => {
+            const Icon = getAppIcon(app.id);
+            const isActive = usageTab === app.id;
+            const colors: Record<string, { active: string; idle: string }> = {
+              "codex": { active: "bg-emerald-500 text-white", idle: "bg-emerald-50 text-emerald-700 hover:bg-emerald-100" },
+              "claude-code": { active: "bg-violet-500 text-white", idle: "bg-violet-50 text-violet-700 hover:bg-violet-100" },
+              "gemini-cli": { active: "bg-blue-500 text-white", idle: "bg-blue-50 text-blue-700 hover:bg-blue-100" },
+              "claude-desktop": { active: "bg-orange-500 text-white", idle: "bg-orange-50 text-orange-700 hover:bg-orange-100" },
+              "opencode": { active: "bg-amber-500 text-white", idle: "bg-amber-50 text-amber-700 hover:bg-amber-100" },
+              "openclaw": { active: "bg-teal-500 text-white", idle: "bg-teal-50 text-teal-700 hover:bg-teal-100" },
+              "hermes": { active: "bg-rose-500 text-white", idle: "bg-rose-50 text-rose-700 hover:bg-rose-100" },
+            };
+            const c = colors[app.id] || { active: "bg-slate-700 text-white", idle: "bg-slate-100 text-slate-600" };
+            return (
+              <button
+                key={app.id}
+                onClick={() => setUsageTab(app.id)}
+                className={`flex shrink-0 items-center gap-1 rounded-full px-3 py-1.5 text-xs font-medium transition-all ${
+                  isActive ? c.active + " shadow-sm" : c.idle
+                }`}
+              >
+                <Icon size={12} />
+                {app.label}
+              </button>
+            );
+          })}
         </div>
       </div>
 
+      {usageTab !== "api" ? (
+        <AppConfigPanel appName={usageTab} />
+      ) : (
+      <>
       {/* Protocol Cards — 3 张卡片直观展示三种协议 */}
       <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
         {protocolTabs.map(p => {
@@ -670,6 +727,8 @@ public class AnthropicTest {
           </SyntaxHighlighter>
         </div>
       </div>
+      </>
+      )}
     </div>
   );
 }

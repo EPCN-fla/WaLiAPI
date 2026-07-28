@@ -1009,6 +1009,9 @@ async fn handle_responses_stream(
                     let mut usage_completion: i64 = 0;
                     let mut usage_total: i64 = 0;
                     let mut had_error = false;
+                    let mut completed_sent = false;
+                    let mut output_item_added_sent = false;
+                    let mut output_item_done_sent = false;
                     let mut accumulated_content = String::new();
 
                     while let Some(chunk_result) = upstream_stream.next().await {
@@ -1040,8 +1043,15 @@ async fn handle_responses_stream(
                                     }
                                     // Convert OpenAI SSE → Responses SSE events
                                     let events = crate::protocol::responses::convert_openai_sse_to_responses(
-                                        text, &model_clone, &response_id
+                                        text, &model_clone, &response_id, &accumulated_content,
+                                        &mut output_item_added_sent,
+                                        &mut output_item_done_sent,
                                     );
+                                    for event in &events {
+                                        if event.contains("response.completed") {
+                                            completed_sent = true;
+                                        }
+                                    }
                                     for event in events {
                                         yield Ok::<_, std::io::Error>(event.into_bytes().into());
                                     }
@@ -1058,6 +1068,20 @@ async fn handle_responses_stream(
                                 yield Ok::<_, std::io::Error>(err_event.into_bytes().into());
                                 break;
                             }
+                        }
+                    }
+
+                    // If stream ended without response.completed, emit synthetic closing events
+                    if !had_error && !completed_sent {
+                        let synth_events = crate::protocol::responses::create_synthetic_completed_events(
+                            &model_clone,
+                            &response_id,
+                            &accumulated_content,
+                            output_item_added_sent,
+                            output_item_done_sent,
+                        );
+                        for ev in synth_events {
+                            yield Ok::<_, std::io::Error>(ev.into_bytes().into());
                         }
                     }
 

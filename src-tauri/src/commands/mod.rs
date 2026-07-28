@@ -8,3 +8,4 @@ pub mod security;
 pub mod import_export;
 pub mod knowledge_base;
 pub mod services;
+pub mod app_config;

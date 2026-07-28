@@ -186,6 +186,12 @@ pub fn run() {
             commands::knowledge_base::drop_kb_index,
             commands::knowledge_base::get_kb_tags,
             commands::services::get_service_statuses,
+            // App Config (应用配置)
+            commands::app_config::get_app_configs,
+            commands::app_config::apply_app_config,
+            commands::app_config::clear_app_config,
+            commands::app_config::get_app_config_content,
+            commands::app_config::open_config_folder,
         ])
         .build(tauri::generate_context!())
         .expect("error while building WaLiAPI")

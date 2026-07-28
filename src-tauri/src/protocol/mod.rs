@@ -264,6 +264,12 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
                 // message: standard chat message
                 "message" | _ if item.get("role").is_some() => {
                     let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user").to_string();
+                    // Map Roles that some providers don't recognize
+                    // 'developer' is an OpenAI alias for 'system' (used by Codex/Responses API)
+                    let role = match role.as_str() {
+                        "developer" => "system".to_string(),
+                        other => other.to_string(),
+                    };
                     let content = if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
                         // Extract text from content blocks
                         let texts: Vec<String> = content_arr.iter().filter_map(|block| {

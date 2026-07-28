@@ -297,3 +297,34 @@ export interface ServiceStatus {
 export const serviceApi = {
   getStatuses: () => invoke<ServiceStatus[]>("get_service_statuses"),
 };
+
+// ── App Config (应用配置) ──
+export interface AppInfo {
+  name: string;
+  label: string;
+  icon: string;
+  description: string;
+  config_path: string;
+  config_format: string;
+  available: boolean;
+  applied: boolean;
+}
+
+export interface ApplyResult {
+  success: boolean;
+  message: string;
+}
+
+export interface ConfigContent {
+  exists: boolean;
+  content: string;
+  error: string | null;
+}
+
+export const appConfigApi = {
+  getApps: () => invoke<AppInfo[]>("get_app_configs"),
+  apply: (appName: string, apiKey: string, model: string) => invoke<ApplyResult>("apply_app_config", { appName, apiKey, model }),
+  clear: (appName: string) => invoke<ApplyResult>("clear_app_config", { appName }),
+  getContent: (appName: string) => invoke<ConfigContent>("get_app_config_content", { appName }),
+  openFolder: (appName: string) => invoke<void>("open_config_folder", { appName }),
+};
