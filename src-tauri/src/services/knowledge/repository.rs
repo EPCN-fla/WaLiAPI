@@ -300,7 +300,8 @@ impl KbRepository {
             "SELECT c.id, c.content, c.metadata, c.embedding, d.filename, c.doc_id
              FROM kb_chunks c
              JOIN kb_documents d ON c.doc_id = d.id
-             WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'"
+             WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'
+             ORDER BY c.id"
         )
         .bind(kb_id)
         .fetch_all(&self.pool)

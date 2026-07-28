@@ -72,9 +72,10 @@ pub fn split_text(content: &str, config: &SplitConfig, metadata: &ChunkMetadata)
             }
 
             // Overlap: keep last overlap_chars
-            if overlap_chars > 0 && current.len() > overlap_chars {
-                let overlap_start = current.len() - overlap_chars;
-                let overlap_text = current[overlap_start..].to_string();
+            if overlap_chars > 0 && current.chars().count() > overlap_chars {
+                let char_count = current.chars().count();
+                let overlap_start_char_index = char_count - overlap_chars;
+                let overlap_text: String = current.chars().skip(overlap_start_char_index).collect();
                 current_tokens = (overlap_text.chars().count() + 3) / 4;
                 current = overlap_text;
             } else {

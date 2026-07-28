@@ -15,17 +15,17 @@ use std::path::Path;
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct IndexNode {
     /// External ID (maps to chunk ID in SQLite)
-    pub id: usize,
+    pub id: String,
     /// The embedding vector
     pub vector: Vec<f32>,
-    /// Neighbour node IDs (by distance)
+    /// Neighbour node indices (internal, not external IDs)
     pub neighbours: Vec<usize>,
 }
 
 /// Search result item.
 #[derive(Clone, Debug)]
 pub struct SearchResult {
-    pub id: usize,
+    pub id: String,
     pub score: f32,
 }
 
@@ -91,7 +91,7 @@ impl HnswIndex {
     }
 
     /// Build the index from a list of (id, vector) pairs.
-    pub fn build(&mut self, items: &[(usize, Vec<f32>)]) {
+    pub fn build(&mut self, items: &[(String, Vec<f32>)]) {
         self.build_with_progress(items, |_, _| {});
     }
 
@@ -99,7 +99,7 @@ impl HnswIndex {
     /// `callback(current, total)` is called periodically during construction.
     pub fn build_with_progress<F: Fn(usize, usize)>(
         &mut self,
-        items: &[(usize, Vec<f32>)],
+        items: &[(String, Vec<f32>)],
         callback: F,
     ) {
         if items.is_empty() {
@@ -110,7 +110,7 @@ impl HnswIndex {
         self.nodes = items
             .iter()
             .map(|(id, vec)| IndexNode {
-                id: *id,
+                id: id.clone(),
                 vector: vec.clone(),
                 neighbours: Vec::new(),
             })
@@ -189,7 +189,7 @@ impl HnswIndex {
             .into_iter()
             .take(k)
             .map(|r| SearchResult {
-                id: self.nodes[r.id].id,
+                id: self.nodes[r.id].id.clone(),
                 score: 1.0 - r.distance, // Convert distance to similarity score
             })
             .collect()
@@ -364,14 +364,14 @@ mod tests {
         let mut index = HnswIndex::new(3, 8, 50, 20);
 
         // Create 100 random-ish vectors
-        let items: Vec<(usize, Vec<f32>)> = (0..100)
+        let items: Vec<(String, Vec<f32>)> = (0..100)
             .map(|i| {
                 let v = vec![
                     ((i as f32) * 0.1).sin(),
                     ((i as f32) * 0.2).cos(),
                     (i as f32) * 0.01,
                 ];
-                (i, v)
+                (format!("chunk-{}", i), v)
             })
             .collect();
 
@@ -384,6 +384,7 @@ mod tests {
         assert!(!results.is_empty());
         // The most similar should be item 5 itself (or very close)
         assert!(results[0].score > 0.99);
+        assert_eq!(results[0].id, "chunk-5");
     }
 
     #[test]
@@ -396,8 +397,8 @@ mod tests {
     #[test]
     fn test_serialization() {
         let mut index = HnswIndex::new(3, 8, 50, 20);
-        let items: Vec<(usize, Vec<f32>)> = (0..10)
-            .map(|i| (i, vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0]))
+        let items: Vec<(String, Vec<f32>)> = (0..10)
+            .map(|i| (format!("chunk-{}", i), vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0]))
             .collect();
         index.build(&items);
 

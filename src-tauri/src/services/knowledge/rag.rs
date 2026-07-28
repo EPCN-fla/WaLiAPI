@@ -192,7 +192,7 @@ pub async fn ask_with_config(
         ],
         "stream": false
     });
-
+    let chat_request_str: String = serde_json::to_string(&chat_request).unwrap_or_default();
     let proxy_result = proxy::handle_request(
         &Arc::new(repo),
         app,
@@ -200,8 +200,8 @@ pub async fn ask_with_config(
         "知识库RAG",
         chat_request,
         false,
-        None,
-        None,
+        Some(chat_request_str),
+        Some(format!("kb-internal_{}", kb_id)),
     )
     .await;
 
@@ -427,6 +427,7 @@ pub async fn deep_research(
                 "stream": false
             });
 
+            let follow_up_request_str: String = serde_json::to_string(&follow_up_request).unwrap_or_default();
             match proxy::handle_request(
                 &Arc::new(Repository::new(pool.clone())),
                 app,
@@ -434,8 +435,8 @@ pub async fn deep_research(
                 "深度研究",
                 follow_up_request,
                 false,
-                None,
-                None,
+                Some(follow_up_request_str),
+                Some(format!("kb-research_{}", kb_id)),
             ).await {
                 Ok(result) => {
                     result.body
@@ -527,6 +528,7 @@ pub async fn deep_research(
             "stream": false
         });
 
+        let chat_request_str: String = serde_json::to_string(&chat_request).unwrap_or_default();
         let proxy_result = proxy::handle_request(
             &Arc::new(Repository::new(pool.clone())),
             app,
@@ -534,8 +536,8 @@ pub async fn deep_research(
             "深度研究",
             chat_request,
             false,
-            None,
-            None,
+            Some(chat_request_str),
+            Some(format!("kb-research_{}", kb_id)),
         ).await;
 
         let round_answer = match proxy_result {
@@ -554,7 +556,6 @@ pub async fn deep_research(
                 break;
             }
         };
-
         all_findings.push(round_answer.clone());
         history.push(ConversationMessage { role: "user".into(), content: round_query });
         history.push(ConversationMessage { role: "assistant".into(), content: round_answer });
@@ -593,6 +594,7 @@ pub async fn deep_research(
         "stream": false
     });
 
+    let final_request_str: String = serde_json::to_string(&final_request).unwrap_or_default();
     let proxy_result = proxy::handle_request(
         &Arc::new(repo),
         app,
@@ -600,8 +602,8 @@ pub async fn deep_research(
         "深度研究",
         final_request,
         false,
-        None,
-        None,
+        Some(final_request_str),
+        Some(format!("kb-research_{}", kb_id)),
     ).await;
 
     match proxy_result {
