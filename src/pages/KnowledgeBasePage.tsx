@@ -353,7 +353,7 @@ function SkillsSection() {
               <div className="flex-1">
                 <p className="text-xs font-medium text-slate-700">下载技能包</p>
                 <p className="mt-0.5 text-[11px] text-slate-500">从 GitHub 仓库克隆到本地 skills 目录</p>
-                <code className="mt-1.5 block rounded bg-slate-800 px-2 py-1.5 text-[11px] font-mono text-slate-200">git clone https://github.com/fuzhengwei/waliapi-rag-skills.git ~/.qclaw/skills/waliapi-rag</code>
+                <code className="mt-1.5 block rounded-lg border border-slate-200 bg-slate-900 px-2.5 py-1.5 text-[11px] font-mono text-slate-100">git clone https://github.com/fuzhengwei/waliapi-rag-skills.git ~/.qclaw/skills/waliapi-rag</code>
               </div>
             </div>
             <div className="flex items-start gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2.5">
@@ -361,11 +361,11 @@ function SkillsSection() {
               <div className="flex-1">
                 <p className="text-xs font-medium text-slate-700">配置 MCP 服务地址</p>
                 <p className="mt-0.5 text-[11px] text-slate-500">编辑配置文件，填入 WaLiAPI 的 MCP 服务地址</p>
-                <code className="mt-1.5 block rounded bg-slate-800 px-2 py-1.5 text-[11px] font-mono text-slate-200">{`cat > ~/.qclaw/skills/waliapi-rag/config.json << 'EOF'
+                <pre className="mt-1.5 overflow-x-auto rounded-lg border border-slate-200 bg-slate-900 px-2.5 py-1.5 text-[11px] font-mono text-slate-100">{`cat > ~/.qclaw/skills/waliapi-rag/config.json << 'EOF'
 {
   "mcp_url": "${mcpEndpoint}"
 }
-EOF`}</code>
+EOF`}</pre>
                 <p className="mt-1.5 text-[11px] text-slate-400">💡 首次使用时 AI 也会自动询问 MCP 地址，可跳过手动配置</p>
               </div>
             </div>
