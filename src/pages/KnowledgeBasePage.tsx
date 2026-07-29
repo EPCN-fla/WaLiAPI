@@ -352,8 +352,8 @@ function SkillsSection() {
               <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">1</span>
               <div className="flex-1">
                 <p className="text-xs font-medium text-slate-700">下载技能包</p>
-                <p className="mt-0.5 text-[11px] text-slate-500">从 GitHub 仓库克隆到本地 skills 目录</p>
-                <code className="mt-1.5 block rounded-lg border border-slate-200 bg-slate-900 px-2.5 py-1.5 text-[11px] font-mono text-slate-100">git clone https://github.com/fuzhengwei/waliapi-rag-skills.git ~/.qclaw/skills/waliapi-rag</code>
+                <p className="mt-0.5 text-[11px] text-slate-500">从 GitHub 仓库克隆技能包</p>
+                <pre className="mt-1.5 overflow-x-auto rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-[11px] font-mono text-slate-800">git clone https://github.com/fuzhengwei/waliapi-rag-skills.git</pre>
               </div>
             </div>
             <div className="flex items-start gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2.5">
