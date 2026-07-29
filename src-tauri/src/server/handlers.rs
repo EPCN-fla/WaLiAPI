@@ -1009,9 +1009,9 @@ async fn handle_responses_stream(
                     let mut usage_completion: i64 = 0;
                     let mut usage_total: i64 = 0;
                     let mut had_error = false;
-                    let mut output_item_added_sent = false;
-                    let mut output_item_done_sent = false;
+                    let mut stream_state = crate::protocol::responses::StreamState::default();
                     let mut accumulated_content = String::new();
+                    let mut accumulated_reasoning = String::new();
 
                     while let Some(chunk_result) = upstream_stream.next().await {
                         match chunk_result {
@@ -1035,6 +1035,9 @@ async fn handle_responses_stream(
                                                         if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
                                                             accumulated_content.push_str(content);
                                                         }
+                                                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                                                            accumulated_reasoning.push_str(reasoning);
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1043,8 +1046,7 @@ async fn handle_responses_stream(
                                     // Convert OpenAI SSE → Responses SSE events
                                     let events = crate::protocol::responses::convert_openai_sse_to_responses(
                                         text, &model_clone, &response_id, &accumulated_content,
-                                        &mut output_item_added_sent,
-                                        &mut output_item_done_sent,
+                                        &mut stream_state,
                                     );
                                     for event in events {
                                         yield Ok::<_, std::io::Error>(event.into_bytes().into());
@@ -1073,8 +1075,7 @@ async fn handle_responses_stream(
                             &model_clone,
                             &response_id,
                             &accumulated_content,
-                            output_item_added_sent,
-                            output_item_done_sent,
+                            &stream_state,
                             usage_prompt,
                             usage_completion,
                         );
@@ -1086,10 +1087,17 @@ async fn handle_responses_stream(
                     }
 
                     // Build response_choices for logging
-                    let response_choices = if !accumulated_content.is_empty() {
+                    let response_choices = if !accumulated_content.is_empty() || !accumulated_reasoning.is_empty() {
+                        let mut msg = serde_json::json!({"role": "assistant"});
+                        if !accumulated_content.is_empty() {
+                            msg["content"] = serde_json::json!(accumulated_content);
+                        }
+                        if !accumulated_reasoning.is_empty() {
+                            msg["reasoning_content"] = serde_json::json!(accumulated_reasoning);
+                        }
                         Some(serde_json::to_string(&vec![serde_json::json!({
                             "index": 0,
-                            "message": {"role": "assistant", "content": accumulated_content},
+                            "message": msg,
                             "finish_reason": "stop",
                         })]).unwrap_or_default())
                     } else { None };
