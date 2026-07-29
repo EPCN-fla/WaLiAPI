@@ -226,6 +226,26 @@ pub fn responses_to_openai(body: &Value) -> Value {
 /// Handles: message, function_call (assistant tool call), function_call_output (tool result)
 fn convert_responses_input_to_messages(input: &Value) -> Value {
     let messages = if let Some(arr) = input.as_array() {
+        // First pass: collect all function_call call_ids and their matching outputs
+        let mut call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut output_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for item in arr {
+            let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match item_type {
+                "function_call" => {
+                    if let Some(cid) = item.get("call_id").and_then(|c| c.as_str()) {
+                        call_ids.insert(cid.to_string());
+                    }
+                }
+                "function_call_output" => {
+                    if let Some(cid) = item.get("call_id").and_then(|c| c.as_str()) {
+                        output_ids.insert(cid.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let mut msgs = Vec::new();
         for item in arr {
             let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -248,6 +268,15 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
                             }
                         }]
                     }));
+                    // If this function_call has no matching output, synthesize an empty tool response
+                    // to prevent upstream "tool_call_ids did not have response messages" errors
+                    if !output_ids.contains(call_id) {
+                        msgs.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": ""
+                        }));
+                    }
                 }
 
                 // function_call_output: tool result → OpenAI tool message
