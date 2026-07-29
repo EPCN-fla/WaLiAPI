@@ -190,56 +190,91 @@ fn read_json_file<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T, S
 }
 
 fn write_json_file<T: Serialize>(path: &PathBuf, data: &T) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(data).map_err(|e| format!("序列化 JSON 失败: {e}"))?;
-    // serde_json 默认将 non-ASCII 转义为 \uXXXX，解码回 UTF-8 保持中文可读
-    let json = unescape_json_unicode(&json);
+    let json = to_pretty_json(data).map_err(|e| format!("序列化 JSON 失败: {e}"))?;
     atomic_write(path, json.as_bytes())
 }
 
-/// 将 JSON 字符串中的 \\uXXXX 转义序列解码回 UTF-8 字符（含代理对）
-fn unescape_json_unicode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'u' {
-            // 尝试解析 \uXXXX
-            if i + 6 <= bytes.len() {
-                if let Ok(hex) = std::str::from_utf8(&bytes[i + 2..i + 6]) {
-                    if let Ok(code) = u32::from_str_radix(hex, 16) {
-                        // 检查后续是否是代理对（\uXXXX\uXXXX）
-                        if (0xD800..=0xDBFF).contains(&code) && i + 12 <= bytes.len()
-                            && bytes[i + 6] == b'\\' && bytes[i + 7] == b'u' {
-                            if let Ok(hex2) = std::str::from_utf8(&bytes[i + 8..i + 12]) {
-                                if let Ok(code2) = u32::from_str_radix(hex2, 16) {
-                                    if (0xDC00..=0xDFFF).contains(&code2) {
-                                        let cp = 0x10000 + ((code - 0xD800) << 10) + (code2 - 0xDC00);
-                                        if let Some(ch) = char::from_u32(cp) {
-                                            out.push(ch);
-                                            i += 12;
-                                            continue;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(ch) = char::from_u32(code) {
-                            out.push(ch);
-                            i += 6;
-                            continue;
-                        }
+/// 自定义 JSON pretty printer，不转义 non-ASCII 字符
+fn to_pretty_json<T: Serialize>(data: &T) -> Result<String, String> {
+    let value = serde_json::to_value(data).map_err(|e| format!("{e}"))?;
+    let mut out = String::new();
+    write_value(&mut out, &value, 0);
+    Ok(out)
+}
+
+fn write_indent(out: &mut String, depth: usize) {
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+}
+
+fn write_value(out: &mut String, v: &serde_json::Value, depth: usize) {
+    match v {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+        serde_json::Value::String(s) => write_json_string(out, s),
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                out.push_str("[]");
+            } else {
+                out.push('[');
+                for (i, item) in arr.iter().enumerate() {
+                    out.push('\n');
+                    write_indent(out, depth + 1);
+                    write_value(out, item, depth + 1);
+                    if i < arr.len() - 1 {
+                        out.push(',');
                     }
                 }
+                out.push('\n');
+                write_indent(out, depth);
+                out.push(']');
             }
         }
-        // 安全地推送字节：如果是合法 UTF-8 起始字节就正常推，否则推 byte
-        match std::str::from_utf8(&bytes[i..i+1]) {
-            Ok(s) => out.push_str(s),
-            Err(_) => out.push(bytes[i] as char),
+        serde_json::Value::Object(obj) => {
+            if obj.is_empty() {
+                out.push_str("{}");
+            } else {
+                out.push('{');
+                let len = obj.len();
+                for (i, (k, val)) in obj.iter().enumerate() {
+                    out.push('\n');
+                    write_indent(out, depth + 1);
+                    write_json_string(out, k);
+                    out.push_str(": ");
+                    write_value(out, val, depth + 1);
+                    if i < len - 1 {
+                        out.push(',');
+                    }
+                }
+                out.push('\n');
+                write_indent(out, depth);
+                out.push('}');
+            }
         }
-        i += 1;
     }
-    out
+}
+
+/// 写入 JSON 字符串，只转义必要的控制字符，保留 non-ASCII 原文
+fn write_json_string(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if c.is_control() => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c), // 非 ASCII 字符（中文等）直接保留
+        }
+    }
+    out.push('"');
 }
 
 // ── 备份与恢复 ──
@@ -474,24 +509,119 @@ fn write_hermes(config_dir: &PathBuf, waliapi_url: &str, waliapi_key: &str, mode
 }
 
 fn write_walicode(config_dir: &PathBuf, waliapi_url: &str, waliapi_key: &str, model: &str) -> Result<(), String> {
-    let config_path = config_dir.join("ai_settings.json");
-    let mut config: serde_json::Value = if config_path.exists() {
-        read_json_file(&config_path).unwrap_or_else(|_| serde_json::json!({}))
+    let base_url = format!("{}/v1", waliapi_url.trim_end_matches('/'));
+
+    // WaLiCode 有两个可能的配置路径：
+    //   1. 标准路径 ~/.config/walicode/ai_settings.json (settings_write_path 写入位置)
+    //   2. 旧版路径 ~/Library/Application Support/WaLiCode/ai_settings.json (legacy)
+    // WaLiCode 读取时优先查标准路径，fallback 到旧路径
+    // 我们需要同时写入两个路径，确保不管走哪个都能读到
+
+    let standard_dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("walicode");
+    let paths_to_write: Vec<PathBuf> = if *config_dir == standard_dir {
+        vec![standard_dir.join("ai_settings.json")]
     } else {
-        serde_json::json!({})
+        // 两个路径都写
+        vec![
+            standard_dir.join("ai_settings.json"),
+            config_dir.join("ai_settings.json"),
+        ]
     };
 
+    // 读取已有配置：优先标准路径，其次旧路径
+    let existing_config: serde_json::Value = paths_to_write
+        .iter()
+        .find_map(|p| {
+            if p.exists() {
+                read_json_file(p).ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let mut config = existing_config;
+
     if let Some(obj) = config.as_object_mut() {
-        // 写入 WaLiAPI 网关作为 provider 配置
-        obj.insert("provider".to_string(), serde_json::json!("openai"));
+        // 在 customProviders 数组中查找或创建 waliapi provider
+        let providers = obj
+            .entry("customProviders".to_string())
+            .or_insert_with(|| serde_json::json!([]));
+
+        let mut found = false;
+        if let Some(arr) = providers.as_array_mut() {
+            for p in arr.iter_mut() {
+                if p.get("id").and_then(|v| v.as_str()) == Some("waliapi") {
+                    p["name"] = serde_json::json!("WaLiAPI");
+                    p["apiKey"] = serde_json::json!(waliapi_key);
+                    p["baseUrl"] = serde_json::json!(&base_url);
+                    p["model"] = serde_json::json!(model);
+                    p["apiFormat"] = serde_json::json!("openai");
+                    p["enabled"] = serde_json::json!(true);
+                    // 更新 customModels 列表
+                    if let Some(cm) = p.get("customModels").and_then(|v| v.as_array()) {
+                        if !cm.iter().any(|m| m.as_str() == Some(model)) {
+                            if let Some(cm) = p.get_mut("customModels").and_then(|v| v.as_array_mut()) {
+                                cm.insert(0, serde_json::json!(model));
+                            }
+                        }
+                    } else {
+                        p["customModels"] = serde_json::json!([model]);
+                    }
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                arr.push(serde_json::json!({
+                    "id": "waliapi",
+                    "name": "WaLiAPI",
+                    "apiKey": waliapi_key,
+                    "baseUrl": base_url,
+                    "model": model,
+                    "customModels": [model],
+                    "apiFormat": "openai",
+                    "enabled": true
+                }));
+            }
+        }
+
+        // 激活 waliapi provider
+        obj.insert("activeCustomProviderId".to_string(), serde_json::json!("waliapi"));
+        // providerType 必须设为 custom，否则前端不会走 custom provider 分支
         obj.insert("providerType".to_string(), serde_json::json!("custom"));
+        obj.insert("provider".to_string(), serde_json::json!("openai"));
+        // 同步顶级字段（CLI resolve_effective_settings 的 fallback）
         obj.insert("apiKey".to_string(), serde_json::json!(waliapi_key));
-        obj.insert("baseUrl".to_string(), serde_json::json!(format!("{}/v1", waliapi_url.trim_end_matches('/'))));
+        obj.insert("baseUrl".to_string(), serde_json::json!(&base_url));
         obj.insert("model".to_string(), serde_json::json!(model));
         obj.insert("_waliapi".to_string(), serde_json::json!(true));
     }
 
-    write_json_file(&config_path, &config)
+    // 写入所有目标路径
+    let mut errors = Vec::new();
+    for path in &paths_to_write {
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    errors.push(format!("创建目录 {} 失败: {}", parent.display(), e));
+                    continue;
+                }
+            }
+        }
+        if let Err(e) = write_json_file(path, &config) {
+            errors.push(format!("写入 {} 失败: {}", path.display(), e));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 // ── 检测是否已由 WaLiAPI 配置 ──
@@ -533,11 +663,31 @@ fn detect_applied(config_path: &PathBuf, app_name: &str) -> bool {
                 .is_some()
         }
         "walicode" => {
+            // 检查两个可能的路径：旧路径（config_path）和标准路径
+            let standard_path = dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("walicode")
+                .join("ai_settings.json");
+            let check_path = if standard_path.exists() { &standard_path } else { config_path };
+            if !check_path.exists() {
+                return false;
+            }
+            let content = match fs::read_to_string(check_path) {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
             let v: serde_json::Value = match serde_json::from_str(&content) {
                 Ok(v) => v,
                 Err(_) => return false,
             };
-            v.get("_waliapi").and_then(|v| v.as_bool()).unwrap_or(false)
+            // 检查 customProviders 中有 waliapi 且已激活
+            let has_provider = v.get("customProviders")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.iter().find(|p| p.get("id").and_then(|v| v.as_str()) == Some("waliapi")))
+                .is_some();
+            let is_active = v.get("activeCustomProviderId")
+                .and_then(|v| v.as_str()) == Some("waliapi");
+            has_provider && is_active
         }
         _ => false,
     }
@@ -600,10 +750,17 @@ pub async fn apply_app_config(
     };
 
     match result {
-        Ok(()) => Ok(ApplyResult {
-            success: true,
-            message: format!("配置已写入 {}", config_path.display()),
-        }),
+        Ok(()) => {
+            let msg = if app_name == "walicode" {
+                format!("配置已写入。请重启 WaLiCode 使配置生效（WaLiCode 会使用本地缓存覆盖旧配置）")
+            } else {
+                format!("配置已写入 {}", config_path.display())
+            };
+            Ok(ApplyResult {
+                success: true,
+                message: msg,
+            })
+        }
         Err(e) => {
             let _ = restore_config(&config_path);
             Ok(ApplyResult { success: false, message: e })
@@ -637,6 +794,17 @@ pub async fn get_app_config_content(app_name: String) -> Result<ConfigContent, S
 
     let config_dir = (app_def.config_dir_fn)();
     let config_path = config_dir.join(app_def.config_file);
+
+    // WaLiCode 特殊处理：优先读标准路径 ~/.config/walicode/ai_settings.json
+    let config_path = if app_name == "walicode" {
+        let standard_path = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("walicode")
+            .join("ai_settings.json");
+        if standard_path.exists() { standard_path } else { config_path }
+    } else {
+        config_path
+    };
 
     if !config_path.exists() {
         return Ok(ConfigContent { exists: false, content: String::new(), error: None });

@@ -18,12 +18,12 @@ type UsageTab = "api" | "claude-code" | "codex" | "gemini-cli" | "claude-desktop
 const APP_TABS: { id: UsageTab; label: string }[] = [
   { id: "codex", label: "Codex" },
   { id: "claude-code", label: "Claude Code" },
-  { id: "walicode", label: "WaLiCode" },
-  { id: "gemini-cli", label: "Gemini CLI" },
-  { id: "claude-desktop", label: "Claude Desktop" },
-  { id: "opencode", label: "OpenCode" },
-  { id: "openclaw", label: "OpenClaw" },
-  { id: "hermes", label: "Hermes" },
+  // { id: "walicode", label: "WaLiCode" }, // 暂时隐藏，配置写入不生效问题待解决
+  // { id: "gemini-cli", label: "Gemini CLI" },
+  // { id: "claude-desktop", label: "Claude Desktop" },
+  // { id: "opencode", label: "OpenCode" },
+  // { id: "openclaw", label: "OpenClaw" },
+  // { id: "hermes", label: "Hermes" },
 ];
 
 const platformTabs: { id: Platform; label: string; shortLabel: string; icon: typeof Terminal; color: string; lang: string }[] = [

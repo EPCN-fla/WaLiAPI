@@ -22,6 +22,7 @@ import {
   ChevronDown,
   Link2,
   Download,
+  Copy,
 } from "lucide-react";
 
 // ── 图标映射 ──
@@ -54,6 +55,7 @@ export function AppConfigPanel({ appName }: { appName: string }) {
   const [loading, setLoading] = useState(true);
   const [applying, setApplying] = useState(false);
   const [appliedResult, setAppliedResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -352,6 +354,21 @@ export function AppConfigPanel({ appName }: { appName: string }) {
               打开
             </button>
             <button
+              onClick={() => {
+                if (configContent?.content) {
+                  navigator.clipboard.writeText(configContent.content);
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 2000);
+                }
+              }}
+              disabled={!configContent?.content}
+              className="action-secondary flex items-center gap-1.5 px-2.5 py-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+              title="复制配置内容"
+            >
+              {copied ? <Check size={13} /> : <Copy size={13} />}
+              {copied ? "已复制" : "复制"}
+            </button>
+            <button
               onClick={load}
               className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
               title="刷新"
@@ -369,9 +386,10 @@ export function AppConfigPanel({ appName }: { appName: string }) {
               margin: 0,
               borderRadius: "0.75rem",
               fontSize: "0.75rem",
-              lineHeight: "1.5rem",
+              lineHeight: "1.6rem",
+              overflow: "auto",
             }}
-            wrapLongLines
+            wrapLongLines={false}
           >
             {configContent.content || "(空文件)"}
           </SyntaxHighlighter>
