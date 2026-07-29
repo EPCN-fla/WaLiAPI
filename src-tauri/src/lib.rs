@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, RunEvent,
+    AppHandle, Manager,
 };
 use tauri_plugin_store::StoreExt;
 

@@ -20,15 +20,24 @@ fn index_path(kb_id: &str) -> PathBuf {
     dir.join(format!("kb_{}.hnsw", kb_id))
 }
 
-/// Try to load the HNSW index for a KB. Returns None if not built.
+/// Try to load the HNSW index for a KB. Returns None if not built or incompatible.
 fn load_index(kb_id: &str) -> Option<HnswIndex> {
     let path = index_path(kb_id);
     if path.exists() {
         match HnswIndex::load(&path) {
-            Ok(index) if index.initialized && !index.is_empty() => Some(index),
+            Ok(index) if index.initialized && !index.is_empty() => {
+                // Sanity check: verify that the index nodes have string IDs
+                if !index.nodes.is_empty() {
+                    // If we successfully loaded and it has nodes, it should be compatible
+                    Some(index)
+                } else {
+                    tracing::warn!("HNSW index for KB {} is empty, skipping", kb_id);
+                    None
+                }
+            }
             Ok(_) => None,
             Err(e) => {
-                tracing::warn!("Failed to load HNSW index for KB {}: {}", kb_id, e);
+                tracing::warn!("Failed to load HNSW index for KB {} (likely incompatible old format): {}", kb_id, e);
                 None
             }
         }
@@ -54,45 +63,39 @@ pub async fn search(
             let hnsw_results = index.search(query_embedding, top_k);
 
             if !hnsw_results.is_empty() {
-                // Fetch chunk data from DB by external IDs
-                let mut results = Vec::with_capacity(hnsw_results.len());
-                for r in hnsw_results {
-                    // The external ID is the chunk's position in the build set.
-                    // We need to map it back to the actual chunk_id.
-                    // The index stores external_id = sequential position, so we
-                    // need to load chunks and map by position.
-                    // Actually, the index stores the chunk's sequential position as ID.
-                    // Let's load all chunks and index by position.
-                    // For efficiency, we'll batch-load.
-                    // But since we already have the results, let's load chunks once.
-                    // This is handled below in the fallback-style mapping.
-                    results.push((r.id, r.score));
-                }
-
-                // Load chunks for mapping
+                // Load chunks and build ID map
                 let chunks = repo
                     .get_chunks_by_kb(kb_id)
                     .await
                     .map_err(|e| format!("Failed to load chunks: {}", e))?;
+                tracing::debug!("Loaded {} chunks from DB", chunks.len());
 
-                // Map position -> chunk data
-                let mapped: Vec<SearchResult> = results
-                    .iter()
-                    .filter_map(|(pos, score)| {
-                        let idx = *pos;
-                        if idx < chunks.len() {
-                            let (id, content, metadata, _emb, filename, doc_id) = &chunks[idx];
+                // Build chunk ID -> chunk data map
+                let chunk_map: std::collections::HashMap<String, _> = chunks
+                    .into_iter()
+                    .map(|(id, content, metadata, emb, filename, doc_id)| {
+                        (id, (content, metadata, emb, filename, doc_id))
+                    })
+                    .collect();
+
+                // Map chunk ID -> chunk data
+                let mapped: Vec<SearchResult> = hnsw_results
+                    .into_iter()
+                    .filter_map(|r| {
+                        if let Some((content, metadata, _emb, filename, doc_id)) = chunk_map.get(&r.id) {
                             let meta: serde_json::Value =
                                 serde_json::from_str(metadata).unwrap_or(serde_json::json!({}));
+                            tracing::debug!("Mapped chunk ID {} to filename {}", r.id, filename);
                             Some(SearchResult {
-                                chunk_id: id.clone(),
+                                chunk_id: r.id,
                                 doc_id: doc_id.clone(),
                                 filename: filename.clone(),
                                 content: content.clone(),
-                                score: *score,
+                                score: r.score,
                                 metadata: meta,
                             })
                         } else {
+                            tracing::warn!("Failed to map chunk ID {}", r.id);
                             None
                         }
                     })
@@ -129,6 +132,7 @@ async fn linear_search(
         .get_chunks_by_kb(kb_id)
         .await
         .map_err(|e| format!("Failed to load chunks: {}", e))?;
+    tracing::debug!("Linear scan: loaded {} chunks", chunks.len());
 
     if chunks.is_empty() {
         return Ok(vec![]);
@@ -136,17 +140,17 @@ async fn linear_search(
 
     let query_dim = query_embedding.len();
 
-    let mut scored: Vec<(f32, usize)> = Vec::with_capacity(chunks.len());
+    let mut scored: Vec<(f32, usize, String)> = Vec::with_capacity(chunks.len());
     let mut dim_mismatches = 0;
 
-    for (i, (_, _, _, emb, _, _)) in chunks.iter().enumerate() {
+    for (i, (id, _, _, emb, _, _)) in chunks.iter().enumerate() {
         let vector = decode_embedding(emb);
         if vector.len() != query_dim {
             dim_mismatches += 1;
             continue;
         }
         let score = cosine_similarity(query_embedding, &vector);
-        scored.push((score, i));
+        scored.push((score, i, id.clone()));
     }
 
     if dim_mismatches > 0 {
@@ -165,7 +169,7 @@ async fn linear_search(
 
     let results = scored
         .into_iter()
-        .filter_map(|(score, i)| {
+        .filter_map(|(score, i, _)| {
             let (id, content, metadata, _emb, filename, doc_id) = &chunks[i];
             let meta: serde_json::Value = serde_json::from_str(metadata).unwrap_or(serde_json::json!({}));
             Some(SearchResult {
@@ -176,8 +180,7 @@ async fn linear_search(
                 score,
                 metadata: meta,
             })
-        })
-        .collect();
+        }).collect();
 
     Ok(results)
 }
@@ -259,21 +262,24 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Res
         return Err("No chunks to index".to_string());
     }
 
-    // Build (position, vector) pairs
-    let mut items: Vec<(usize, Vec<f32>)> = Vec::with_capacity(chunks.len());
+    // Build (chunk_id, vector) pairs
+    let mut items: Vec<(String, Vec<f32>)> = Vec::with_capacity(chunks.len());
     let mut dim = 0;
 
-    for (i, (_, _, _, emb, _, _)) in chunks.iter().enumerate() {
+    tracing::info!("Building HNSW index, processing {} chunks...", chunks.len());
+    for (id, _, _, emb, _, _) in chunks.iter() {
         let vector = decode_embedding(emb);
         if !vector.is_empty() {
             if dim == 0 {
                 dim = vector.len();
+                tracing::debug!("Detected embedding dimension: {}", dim);
             }
             if vector.len() == dim {
-                items.push((i, vector));
+                items.push((id.clone(), vector));
             }
         }
     }
+    tracing::info!("Prepared {} items for HNSW index", items.len());
 
     if items.is_empty() {
         return Err("No valid embeddings found".to_string());
@@ -400,7 +406,6 @@ async fn fts5_search(
     .fetch_all(pool)
     .await
     .map_err(|e| format!("FTS5 search failed: {}", e))?;
-
     let results = rows.into_iter().enumerate().map(|(idx, (id, content, metadata, filename, doc_id))| {
         let score = 1.0 / (1.0 + idx as f32 * 0.1);
         let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap_or_default();

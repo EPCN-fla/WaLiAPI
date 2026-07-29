@@ -778,6 +778,7 @@ async fn handle_tool_call(
                 excluded_dirs: args.get("excluded_dirs").and_then(|e| e.as_str()).map(|s| s.to_string()),
                 excluded_files: args.get("excluded_files").and_then(|e| e.as_str()).map(|s| s.to_string()),
                 included_files: args.get("included_files").and_then(|i| i.as_str()).map(|s| s.to_string()),
+                embedding_batch_size: args.get("embedding_batch_size").and_then(|b| b.as_i64()),
             };
 
             let kb_repo = KbRepository::new(pool.clone());

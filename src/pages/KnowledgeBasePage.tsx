@@ -2177,6 +2177,7 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
   const [mcpEnabled, setMcpEnabled] = useState(kb.mcp_enabled ?? 1);
   const [chunkSize, setChunkSize] = useState(kb.chunk_size || 512);
   const [chunkOverlap, setChunkOverlap] = useState(kb.chunk_overlap || 64);
+  const [embeddingBatchSize, setEmbeddingBatchSize] = useState(kb.embedding_batch_size || 32);
   const [excludedDirs, setExcludedDirs] = useState(kb.excluded_dirs || "");
   const [excludedFiles, setExcludedFiles] = useState(kb.excluded_files || "");
   const [includedFiles, setIncludedFiles] = useState(kb.included_files || "");
@@ -2204,6 +2205,7 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
         mcp_enabled: mcpEnabled,
         chunk_size: chunkSize,
         chunk_overlap: chunkOverlap,
+        embedding_batch_size: embeddingBatchSize,
         excluded_dirs: excludedDirs,
         excluded_files: excludedFiles,
         included_files: includedFiles,
@@ -2385,6 +2387,21 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
                 className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
               />
               <p className="mt-1 text-xs text-slate-400">默认 64，保持上下文连续性</p>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">Embedding 批次大小</label>
+              <input
+                type="number"
+                value={embeddingBatchSize}
+                onChange={(e) => setEmbeddingBatchSize(Number(e.target.value) || 32)}
+                min={1}
+                max={100}
+                step={1}
+                className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+              />
+              <p className="mt-1 text-xs text-slate-400">默认 32，单次 API 调用处理的最大 chunk 数量</p>
             </div>
           </div>
           <div>

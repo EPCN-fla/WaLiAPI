@@ -106,27 +106,56 @@ async fn process_document_inner(
     };
 
     // 符号感知分块：代码文件且语言受支持时，按 AST 符号边界切分
-    let chunks = match &parsed {
-        parser::ParsedContent::Code { text, language } => {
-            if code_parser::is_supported_language(language) {
-                let symbols = code_parser::extract_symbols(filename, text);
-                emit_progress(
-                    app, doc_id, kb_id, filename, "splitting", 18,
-                    &format!("AST 解析：提取到 {} 个符号", symbols.len()),
-                );
-                splitter::split_code_by_symbols(text, &symbols, &config, &base_metadata)
-            } else {
-                splitter::split(text, &file_type_label, &config, &base_metadata)
-            }
+    // 提前处理代码符号和进度更新（在 catch_unwind 外部，避免传递 AppHandle）
+    let chunks = if let parser::ParsedContent::Code { text, language } = &parsed {
+        if code_parser::is_supported_language(language) {
+            let symbols = code_parser::extract_symbols(filename, text);
+            emit_progress(
+                app, doc_id, kb_id, filename, "splitting", 18, 
+                &format!("AST 解析：提取到 {} 个符号", symbols.len()),
+            );
+            // 使用 catch_unwind 保护分块操作
+            std::panic::catch_unwind({
+                let text = text.clone();
+                let symbols = symbols.clone();
+                let config = config.clone();
+                let base_metadata = base_metadata.clone();
+                move || {
+                    splitter::split_code_by_symbols(&text, &symbols, &config, &base_metadata)
+                }
+            }).map_err(|_| "文本分块过程发生严重错误".to_string())?
+        } else {
+            std::panic::catch_unwind({
+                let text = text.clone();
+                let file_type_label = file_type_label.clone();
+                let config = config.clone();
+                let base_metadata = base_metadata.clone();
+                move || {
+                    splitter::split(&text, &file_type_label, &config, &base_metadata)
+                }
+            }).map_err(|_| "文本分块过程发生严重错误".to_string())?
         }
-        _ => splitter::split(&text, &file_type_label, &config, &base_metadata),
+    } else {
+        std::panic::catch_unwind({
+            let text = text.clone();
+            let file_type_label = file_type_label.clone();
+            let config = config.clone();
+            let base_metadata = base_metadata.clone();
+            move || {
+                splitter::split(&text, &file_type_label, &config, &base_metadata)
+            }
+        }).map_err(|_| "文本分块过程发生严重错误".to_string())?
     };
 
     if chunks.is_empty() {
-        repo.update_document_status(doc_id, "ready", None)
-            .await
-            .map_err(|e| e.to_string())?;
-        repo.update_document_counts(doc_id, 0, 0)
+        // 分块后为空状态改为失败,且失败信息给客户端提示
+        let _ = app.emit("kb-document-error", serde_json::json!({
+            "doc_id": doc_id,
+            "kb_id": kb_id,
+            "filename": filename,
+            "error": "分块后为空，无法继续处理".to_string(),
+        }));
+        repo.update_document_status(doc_id, "failed", None)
             .await
             .map_err(|e| e.to_string())?;
         return Ok(());
@@ -142,7 +171,8 @@ async fn process_document_inner(
     // Detect expected embedding dimension from KB config
     let expected_dim = if kb.embedding_dim > 0 { Some(kb.embedding_dim as usize) } else { None };
 
-    let batch_size = 32;
+    let batch_size = if kb.embedding_batch_size > 0 { kb.embedding_batch_size as usize } else { 32 };
+    println!("embedding_batch_size: {}", batch_size);
     let total_batches = ((chunks.len() as f64) / batch_size as f64).ceil() as usize;
     let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
     let mut batch_done = 0usize;

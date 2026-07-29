@@ -32,8 +32,8 @@ impl KbRepository {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
         sqlx::query(
-            "INSERT INTO kb_knowledge_bases (id, name, description, status, doc_count, chunk_count, total_tokens, embedding_model, embedding_channel_id, mcp_enabled, chunk_size, chunk_overlap, excluded_dirs, excluded_files, included_files, embedding_dim, index_status, created_at, updated_at)
-             VALUES (?, ?, ?, 1, 0, 0, 0, ?, ?, 1, 512, 64, '', '', '', 0, 'none', ?, ?)"
+            "INSERT INTO kb_knowledge_bases (id, name, description, status, doc_count, chunk_count, total_tokens, embedding_model, embedding_channel_id, mcp_enabled, chunk_size, chunk_overlap, excluded_dirs, excluded_files, included_files, embedding_dim, index_status, embedding_batch_size, created_at, updated_at)
+             VALUES (?, ?, ?, 1, 0, 0, 0, ?, ?, 1, 512, 64, '', '', '', 0, 'none', 32, ?, ?)"
         )
         .bind(&id)
         .bind(&input.name)
@@ -85,6 +85,9 @@ impl KbRepository {
         }
         if let Some(included_files) = &input.included_files {
             q.push(", included_files = ").push_bind(included_files);
+        }
+        if let Some(embedding_batch_size) = input.embedding_batch_size {
+            q.push(", embedding_batch_size = ").push_bind(embedding_batch_size);
         }
 
         q.push(" WHERE id = ").push_bind(id);
@@ -300,7 +303,8 @@ impl KbRepository {
             "SELECT c.id, c.content, c.metadata, c.embedding, d.filename, c.doc_id
              FROM kb_chunks c
              JOIN kb_documents d ON c.doc_id = d.id
-             WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'"
+             WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'
+             ORDER BY c.id"
         )
         .bind(kb_id)
         .fetch_all(&self.pool)
