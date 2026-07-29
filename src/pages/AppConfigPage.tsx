@@ -21,6 +21,7 @@ import {
   KeyRound,
   ChevronDown,
   Link2,
+  Download,
 } from "lucide-react";
 
 // ── 图标映射 ──
@@ -33,6 +34,7 @@ const APP_ICONS: Record<string, React.ComponentType<{ size?: number; className?:
   "opencode": Wrench,
   "openclaw": Bot,
   "hermes": Code2,
+  "walicode": Code2,
 };
 
 export function getAppIcon(name: string) {
@@ -200,6 +202,18 @@ export function AppConfigPanel({ appName }: { appName: string }) {
                 <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-600">
                   未检测到
                 </span>
+              )}
+              {appInfo.download_url && (
+                <a
+                  href={appInfo.download_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 rounded-full bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-blue-600 transition-colors hover:bg-blue-100"
+                  title={`下载 ${appInfo.label}`}
+                >
+                  <Download size={11} />
+                  下载
+                </a>
               )}
             </div>
             <p className="mt-0.5 text-xs text-slate-500">{appInfo.description}</p>

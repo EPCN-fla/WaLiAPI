@@ -308,6 +308,7 @@ export interface AppInfo {
   config_format: string;
   available: boolean;
   applied: boolean;
+  download_url: string;
 }
 
 export interface ApplyResult {

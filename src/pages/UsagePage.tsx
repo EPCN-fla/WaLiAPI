@@ -13,11 +13,12 @@ import {
 type Platform = "curl-mac" | "curl-windows" | "javascript" | "typescript" | "java";
 type TestState = "idle" | "running" | "success" | "error";
 type Protocol = "chat" | "responses" | "anthropic";
-type UsageTab = "api" | "claude-code" | "codex" | "gemini-cli" | "claude-desktop" | "opencode" | "openclaw" | "hermes";
+type UsageTab = "api" | "claude-code" | "codex" | "gemini-cli" | "claude-desktop" | "opencode" | "openclaw" | "hermes" | "walicode";
 
 const APP_TABS: { id: UsageTab; label: string }[] = [
   { id: "codex", label: "Codex" },
   { id: "claude-code", label: "Claude Code" },
+  { id: "walicode", label: "WaLiCode" },
   { id: "gemini-cli", label: "Gemini CLI" },
   { id: "claude-desktop", label: "Claude Desktop" },
   { id: "opencode", label: "OpenCode" },
@@ -411,6 +412,7 @@ public class AnthropicTest {
               "opencode": { active: "bg-amber-500 text-white", idle: "bg-amber-50 text-amber-700 hover:bg-amber-100" },
               "openclaw": { active: "bg-teal-500 text-white", idle: "bg-teal-50 text-teal-700 hover:bg-teal-100" },
               "hermes": { active: "bg-rose-500 text-white", idle: "bg-rose-50 text-rose-700 hover:bg-rose-100" },
+              "walicode": { active: "bg-indigo-500 text-white", idle: "bg-indigo-50 text-indigo-700 hover:bg-indigo-100" },
             };
             const c = colors[app.id] || { active: "bg-slate-700 text-white", idle: "bg-slate-100 text-slate-600" };
             return (

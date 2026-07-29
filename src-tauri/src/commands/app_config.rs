@@ -18,6 +18,7 @@ pub struct AppInfo {
     pub config_format: String,
     pub available: bool,
     pub applied: bool,
+    pub download_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +44,7 @@ struct AppDef {
     icon: &'static str,
     description: &'static str,
     config_format: &'static str,
+    download_url: &'static str,
     config_dir_fn: fn() -> PathBuf,
     config_file: &'static str,
     check_installed_fn: fn(&PathBuf) -> bool,
@@ -59,6 +61,7 @@ const APPS: &[AppDef] = &[
         icon: "terminal",
         description: "Anthropic 的命令行 AI 编程助手，读取 ~/.claude/settings.json 中的 env 配置",
         config_format: "JSON (~/.claude/settings.json)",
+        download_url: "https://docs.anthropic.com/en/docs/claude-code/overview",
         config_dir_fn: || home_dir().join(".claude"),
         config_file: "settings.json",
         check_installed_fn: |dir| dir.exists() || home_dir().join(".claude.json").exists(),
@@ -69,6 +72,7 @@ const APPS: &[AppDef] = &[
         icon: "code",
         description: "OpenAI Codex 命令行工具，读取 ~/.codex/auth.json 和 config.toml",
         config_format: "JSON + TOML (~/.codex/)",
+        download_url: "https://github.com/openai/codex",
         config_dir_fn: || home_dir().join(".codex"),
         config_file: "config.toml",
         check_installed_fn: |dir| dir.exists(),
@@ -79,6 +83,7 @@ const APPS: &[AppDef] = &[
         icon: "boxes",
         description: "Google Gemini 命令行工具，读取 ~/.gemini/.env 和 settings.json",
         config_format: "ENV + JSON (~/.gemini/)",
+        download_url: "https://github.com/google-gemini/gemini-cli",
         config_dir_fn: || home_dir().join(".gemini"),
         config_file: ".env",
         check_installed_fn: |dir| dir.exists(),
@@ -89,6 +94,7 @@ const APPS: &[AppDef] = &[
         icon: "sparkles",
         description: "Anthropic 桌面应用，读取 claude_desktop_config.json",
         config_format: "JSON (claude_desktop_config.json)",
+        download_url: "https://claude.ai/download",
         config_dir_fn: || {
             #[cfg(target_os = "macos")]
             {
@@ -112,6 +118,7 @@ const APPS: &[AppDef] = &[
         icon: "wrench",
         description: "开源 AI 编程工具，读取 opencode.json 中的 provider 配置",
         config_format: "JSON (~/.config/opencode/opencode.json)",
+        download_url: "https://opencode.ai",
         config_dir_fn: || home_dir().join(".config/opencode"),
         config_file: "opencode.json",
         check_installed_fn: |dir| dir.exists(),
@@ -122,6 +129,7 @@ const APPS: &[AppDef] = &[
         icon: "bot",
         description: "开源 Agent 框架，读取配置文件中的 provider 段",
         config_format: "JSON (~/.qclaw/)",
+        download_url: "https://openclaw.ai",
         config_dir_fn: || home_dir().join(".qclaw"),
         config_file: "config.json",
         check_installed_fn: |dir| dir.exists(),
@@ -132,8 +140,25 @@ const APPS: &[AppDef] = &[
         icon: "code",
         description: "Hermes Agent 框架，读取配置文件中的 custom_providers 段",
         config_format: "TOML/JSON (Hermes config)",
+        download_url: "https://github.com/openai/hermes",
         config_dir_fn: || home_dir().join(".hermes"),
         config_file: "config.json",
+        check_installed_fn: |dir| dir.exists(),
+    },
+    AppDef {
+        name: "walicode",
+        label: "WaLiCode",
+        icon: "code",
+        description: "AI Coding Assistant，写入 ai_settings.json 中的 provider 和 apiKey 配置",
+        config_format: "JSON (~/Library/Application Support/WaLiCode/ai_settings.json)",
+        download_url: "https://walicode.xiaofuge.cn/",
+        #[cfg(target_os = "macos")]
+        config_dir_fn: || home_dir().join("Library/Application Support/WaLiCode"),
+        #[cfg(target_os = "windows")]
+        config_dir_fn: || home_dir().join("AppData/Roaming/WaLiCode"),
+        #[cfg(target_os = "linux")]
+        config_dir_fn: || home_dir().join(".config/walicode"),
+        config_file: "ai_settings.json",
         check_installed_fn: |dir| dir.exists(),
     },
 ];
@@ -166,7 +191,55 @@ fn read_json_file<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T, S
 
 fn write_json_file<T: Serialize>(path: &PathBuf, data: &T) -> Result<(), String> {
     let json = serde_json::to_string_pretty(data).map_err(|e| format!("序列化 JSON 失败: {e}"))?;
+    // serde_json 默认将 non-ASCII 转义为 \uXXXX，解码回 UTF-8 保持中文可读
+    let json = unescape_json_unicode(&json);
     atomic_write(path, json.as_bytes())
+}
+
+/// 将 JSON 字符串中的 \\uXXXX 转义序列解码回 UTF-8 字符（含代理对）
+fn unescape_json_unicode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'u' {
+            // 尝试解析 \uXXXX
+            if i + 6 <= bytes.len() {
+                if let Ok(hex) = std::str::from_utf8(&bytes[i + 2..i + 6]) {
+                    if let Ok(code) = u32::from_str_radix(hex, 16) {
+                        // 检查后续是否是代理对（\uXXXX\uXXXX）
+                        if (0xD800..=0xDBFF).contains(&code) && i + 12 <= bytes.len()
+                            && bytes[i + 6] == b'\\' && bytes[i + 7] == b'u' {
+                            if let Ok(hex2) = std::str::from_utf8(&bytes[i + 8..i + 12]) {
+                                if let Ok(code2) = u32::from_str_radix(hex2, 16) {
+                                    if (0xDC00..=0xDFFF).contains(&code2) {
+                                        let cp = 0x10000 + ((code - 0xD800) << 10) + (code2 - 0xDC00);
+                                        if let Some(ch) = char::from_u32(cp) {
+                                            out.push(ch);
+                                            i += 12;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(ch) = char::from_u32(code) {
+                            out.push(ch);
+                            i += 6;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        // 安全地推送字节：如果是合法 UTF-8 起始字节就正常推，否则推 byte
+        match std::str::from_utf8(&bytes[i..i+1]) {
+            Ok(s) => out.push_str(s),
+            Err(_) => out.push(bytes[i] as char),
+        }
+        i += 1;
+    }
+    out
 }
 
 // ── 备份与恢复 ──
@@ -400,6 +473,27 @@ fn write_hermes(config_dir: &PathBuf, waliapi_url: &str, waliapi_key: &str, mode
     write_json_file(&config_path, &config)
 }
 
+fn write_walicode(config_dir: &PathBuf, waliapi_url: &str, waliapi_key: &str, model: &str) -> Result<(), String> {
+    let config_path = config_dir.join("ai_settings.json");
+    let mut config: serde_json::Value = if config_path.exists() {
+        read_json_file(&config_path).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    if let Some(obj) = config.as_object_mut() {
+        // 写入 WaLiAPI 网关作为 provider 配置
+        obj.insert("provider".to_string(), serde_json::json!("openai"));
+        obj.insert("providerType".to_string(), serde_json::json!("custom"));
+        obj.insert("apiKey".to_string(), serde_json::json!(waliapi_key));
+        obj.insert("baseUrl".to_string(), serde_json::json!(format!("{}/v1", waliapi_url.trim_end_matches('/'))));
+        obj.insert("model".to_string(), serde_json::json!(model));
+        obj.insert("_waliapi".to_string(), serde_json::json!(true));
+    }
+
+    write_json_file(&config_path, &config)
+}
+
 // ── 检测是否已由 WaLiAPI 配置 ──
 
 fn detect_applied(config_path: &PathBuf, app_name: &str) -> bool {
@@ -438,6 +532,13 @@ fn detect_applied(config_path: &PathBuf, app_name: &str) -> bool {
                 .and_then(|arr| arr.iter().find(|p| p.get("id").and_then(|v| v.as_str()) == Some("waliapi")))
                 .is_some()
         }
+        "walicode" => {
+            let v: serde_json::Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            v.get("_waliapi").and_then(|v| v.as_bool()).unwrap_or(false)
+        }
         _ => false,
     }
 }
@@ -462,6 +563,7 @@ pub async fn get_app_configs(state: tauri::State<'_, Arc<AppState>>) -> Result<V
             config_format: app.config_format.to_string(),
             available,
             applied,
+            download_url: app.download_url.to_string(),
         }
     }).collect();
 
@@ -493,6 +595,7 @@ pub async fn apply_app_config(
         "opencode" => write_opencode(&config_dir, &waliapi_url, &api_key, &model),
         "openclaw" => write_openclaw(&config_dir, &waliapi_url, &api_key, &model),
         "hermes" => write_hermes(&config_dir, &waliapi_url, &api_key, &model),
+        "walicode" => write_walicode(&config_dir, &waliapi_url, &api_key, &model),
         _ => return Err(format!("不支持的应用: {app_name}")),
     };
 
