@@ -9,6 +9,7 @@ use std::time::Instant;
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
+#[allow(dead_code)]
 pub struct ProxyResult {
     pub status: u16,
     pub body: serde_json::Value,
@@ -74,8 +75,8 @@ pub async fn handle_request(
             trace_id: trace_id.clone(),
         };
         let log_id = log.id.clone();
-        let _ = repo.create_log(&log).await;
-        let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+        if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+        if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
         return Err((451, security_result.summary));
     }
 
@@ -127,7 +128,7 @@ pub async fn handle_request(
                 // Extract and log choices
                 let response_choices = resp_body.get("choices").and_then(|c| serde_json::to_string(c).ok());
                 if let Some(ref choices) = response_choices {
-                    println!("Response choices: {}", choices);
+//                     println!("Response choices: {}", choices);
                 }
 
                 // Scan response for risks
@@ -173,11 +174,11 @@ pub async fn handle_request(
                     trace_id: trace_id.clone(),
                 };
                 let log_id = log.id.clone();
-                let _ = repo.create_log(&log).await;
-                let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
 
                 if let Some(ref u) = usage {
-                    let _ = repo.increment_quota(api_key_id, u.total_tokens as i64).await;
+                    if let Err(e) = repo.increment_quota(api_key_id, u.total_tokens as i64).await { eprintln!("[WARN] increment_quota failed: {}", e); }
                 }
 
                 return Ok(ProxyResult {
@@ -220,8 +221,8 @@ pub async fn handle_request(
                     trace_id: trace_id.clone(),
                 };
                 let log_id = log.id.clone();
-                let _ = repo.create_log(&log).await;
-                let _ = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await;
+                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
                 last_error = Some(error_message);
             }
         }

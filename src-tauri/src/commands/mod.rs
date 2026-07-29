@@ -6,3 +6,5 @@ pub mod settings;
 pub mod server;
 pub mod security;
 pub mod import_export;
+pub mod knowledge_base;
+pub mod services;

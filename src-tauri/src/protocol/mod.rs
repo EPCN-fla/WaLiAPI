@@ -25,6 +25,7 @@ pub fn extract_api_key(headers: &axum::http::HeaderMap) -> Option<String> {
 }
 
 /// Detect if a request is in Anthropic format by checking headers and body.
+#[allow(dead_code)]
 pub fn is_anthropic_request(headers: &axum::http::HeaderMap, body: &Value) -> bool {
     // Check for anthropic-version header
     if headers.contains_key("anthropic-version") {
@@ -43,6 +44,7 @@ pub fn is_anthropic_request(headers: &axum::http::HeaderMap, body: &Value) -> bo
 }
 
 /// Detect if a request targets the Responses API format.
+#[allow(dead_code)]
 pub fn is_responses_request(body: &Value) -> bool {
     // Responses API uses "input" instead of "messages"
     body.get("input").is_some() && body.get("messages").is_none()

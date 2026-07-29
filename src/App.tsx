@@ -9,6 +9,7 @@ import { ApiKeysPage } from "./pages/ApiKeysPage";
 import { LogsPage } from "./pages/LogsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { UsagePage } from "./pages/UsagePage";
+import { KnowledgeBasePage } from "./pages/KnowledgeBasePage";
 import { settingsApi } from "./lib/api";
 
 function App() {
@@ -48,6 +49,9 @@ function App() {
           <Route path="/api-keys" element={<ApiKeysPage />} />
           <Route path="/logs" element={<LogsPage />} />
           <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/services" element={<KnowledgeBasePage />} />
+          <Route path="/services/knowledge-base" element={<KnowledgeBasePage />} />
+          <Route path="/services/mcp" element={<KnowledgeBasePage />} />
         </Routes>
       </Layout>
       {showUpdater && (

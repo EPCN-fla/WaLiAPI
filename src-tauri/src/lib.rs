@@ -6,13 +6,14 @@ mod db;
 mod utils;
 mod security;
 mod protocol;
+pub mod services;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, RunEvent,
+    AppHandle, Manager,
 };
 use tauri_plugin_store::StoreExt;
 
@@ -163,6 +164,28 @@ pub fn run() {
             commands::import_export::import_scanned_sources,
             commands::import_export::pick_import_file,
             commands::import_export::save_export_file,
+            // Knowledge Base
+            commands::knowledge_base::get_knowledge_bases,
+            commands::knowledge_base::create_knowledge_base,
+            commands::knowledge_base::update_knowledge_base,
+            commands::knowledge_base::delete_knowledge_base,
+            commands::knowledge_base::get_kb_documents,
+            commands::knowledge_base::delete_kb_document,
+            commands::knowledge_base::reindex_kb_document,
+            commands::knowledge_base::search_knowledge_base,
+            commands::knowledge_base::ask_knowledge_base,
+            commands::knowledge_base::get_kb_stats,
+            commands::knowledge_base::upload_kb_document,
+            commands::knowledge_base::get_kb_conversations,
+            commands::knowledge_base::clear_kb_conversations,
+            commands::knowledge_base::get_kb_sources,
+            commands::knowledge_base::delete_kb_source,
+            commands::knowledge_base::import_kb_source,
+            commands::knowledge_base::get_kb_index_status,
+            commands::knowledge_base::build_kb_index,
+            commands::knowledge_base::drop_kb_index,
+            commands::knowledge_base::get_kb_tags,
+            commands::services::get_service_statuses,
         ])
         .build(tauri::generate_context!())
         .expect("error while building WaLiAPI")

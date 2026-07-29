@@ -12,17 +12,18 @@ import {
   ChevronRight,
   ExternalLink,
   Link,
+  Database,
 } from "lucide-react";
 import { serverApi } from "../../lib/api";
 import type { ServerStatus } from "../../types";
 import packageJson from "../../../package.json";
-import { Download } from "lucide-react";
 
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "仪表盘" },
   { to: "/usage", icon: BookOpen, label: "使用" },
   { to: "/channels", icon: Radio, label: "渠道" },
   { to: "/api-keys", icon: Key, label: "密钥" },
+  { to: "/services", icon: Database, label: "服务" },
   { to: "/logs", icon: ScrollText, label: "日志" },
   { to: "/settings", icon: Settings, label: "设置" },
 ];
@@ -58,9 +59,22 @@ export function Sidebar({
           <div className="min-w-0 flex-1">
             <div className="flex items-center justify-between gap-2">
               <div className="text-[20px] font-bold tracking-[-0.04em] text-slate-900 leading-none">WaLiAPI</div>
-              <span className="rounded-full border border-blue-100 bg-blue-50 px-2 py-0.5 text-[10px] font-semibold text-blue-600">
+              <button
+                onClick={onCheckUpdate}
+                className={`relative rounded-full border px-2 py-0.5 text-[10px] font-semibold transition-colors ${
+                  hasUpdate
+                    ? "border-emerald-300 bg-emerald-50 text-emerald-600"
+                    : "border-blue-100 bg-blue-50 text-blue-600 hover:bg-blue-100"
+                }`}
+              >
+                {hasUpdate && (
+                  <span className="absolute -right-0.5 -top-0.5 flex h-2.5 w-2.5">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                    <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-white" />
+                  </span>
+                )}
                 v{appVersion}
-              </span>
+              </button>
             </div>
             <div className="mt-1.5 text-[11px] font-medium text-slate-500">AI 网关 · 统一模型配置和负载</div>
           </div>
@@ -123,32 +137,6 @@ export function Sidebar({
             <span className="block truncate text-xs text-slate-500">github.com/fuzhengwei/WaLiAPI</span>
           </span>
           <ExternalLink size={14} className="text-slate-400" />
-        </button>
-
-        <button
-          onClick={onCheckUpdate}
-          className="flex w-full items-center gap-3 rounded-[18px] border border-slate-200 bg-white/70 px-4 py-3 text-left text-sm text-slate-600 transition-all hover:bg-white hover:text-slate-900 hover:shadow-[0_8px_18px_rgba(15,23,42,0.05)]"
-        >
-          <span className="relative flex h-9 w-9 items-center justify-center rounded-xl border border-slate-200 bg-white">
-            <Download size={17} />
-            {hasUpdate && (
-              <span className="absolute -right-1 -top-1 flex h-3.5 w-3.5">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-rose-400 opacity-75" />
-                <span className="relative inline-flex h-3.5 w-3.5 rounded-full bg-rose-500 ring-2 ring-white" />
-              </span>
-            )}
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="flex items-center gap-1.5 font-medium">
-              检查更新
-              {hasUpdate && (
-                <span className="rounded-full bg-rose-500 px-1.5 py-0.5 text-[10px] font-semibold text-white">
-                  新版本
-                </span>
-              )}
-            </span>
-            <span className="block truncate text-xs text-slate-500">当前版本 v{appVersion}</span>
-          </span>
         </button>
       </div>
     </aside>

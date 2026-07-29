@@ -232,6 +232,7 @@ fn add(
     });
 }
 
+#[allow(dead_code)]
 pub fn add_finding(
     f: &mut Vec<SecurityFinding>,
     phase: &str,
@@ -289,7 +290,7 @@ fn mask_evidence(e: &str) -> String {
 
 fn snippet(text: &str) -> &str {
     let max = 160;
-    if text.len() <= max { text } else { &text[..max] }
+    if text.len() <= max { text } else { &text[..text.floor_char_boundary(max)] }
 }
 
 fn first_url(text: &str) -> Option<String> {
