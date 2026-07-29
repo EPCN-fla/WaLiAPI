@@ -577,7 +577,28 @@ function LogDetail({ log }: { log: RequestLog }) {
   const byteSize = log.request_body ? new Blob([log.request_body]).size : 0;
   const sizeLabel = byteSize > 1024 ? `${(byteSize / 1024).toFixed(1)} KB` : `${byteSize} B`;
 
-  const messages: Array<Record<string, unknown>> = parsed && Array.isArray(parsed.messages) ? parsed.messages : [];
+  // Support both Chat Completions (messages) and Responses API (input) formats
+  const rawMessages: Array<Record<string, unknown>> = parsed && Array.isArray(parsed.messages) ? parsed.messages : [];
+  const rawInput: Array<Record<string, unknown>> = parsed && Array.isArray(parsed.input) ? parsed.input : [];
+  // Normalize Responses API input items to a common message-like structure for display
+  const messages: Array<Record<string, unknown>> = rawMessages.length > 0
+    ? rawMessages
+    : rawInput.map((item, idx) => {
+        // Responses API input items have: role, content (array of {type, text})
+        const role = item.role as string || 'user';
+        const contentArr = Array.isArray(item.content) ? item.content as Array<Record<string, unknown>> : [];
+        // Extract text from content parts (input_text / output_text / text types)
+        const textParts = contentArr
+          .filter(p => p.type === 'input_text' || p.type === 'output_text' || p.type === 'text')
+          .map(p => p.text as string)
+          .join('\n');
+        return {
+          role,
+          content: textParts || '',
+          _source: 'responses' as const,
+          _index: idx,
+        };
+      });
   const [messagesExpanded, setMessagesExpanded] = useState(messages.length <= 5);
   const allToolNames = useMemo(() => collectAllToolNames(messages), [messages]);
   const modelRequested = (parsed?.model as string) || log.model;

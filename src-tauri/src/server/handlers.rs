@@ -1009,7 +1009,6 @@ async fn handle_responses_stream(
                     let mut usage_completion: i64 = 0;
                     let mut usage_total: i64 = 0;
                     let mut had_error = false;
-                    let mut completed_sent = false;
                     let mut output_item_added_sent = false;
                     let mut output_item_done_sent = false;
                     let mut accumulated_content = String::new();
@@ -1047,11 +1046,6 @@ async fn handle_responses_stream(
                                         &mut output_item_added_sent,
                                         &mut output_item_done_sent,
                                     );
-                                    for event in &events {
-                                        if event.contains("response.completed") {
-                                            completed_sent = true;
-                                        }
-                                    }
                                     for event in events {
                                         yield Ok::<_, std::io::Error>(event.into_bytes().into());
                                     }
@@ -1071,18 +1065,24 @@ async fn handle_responses_stream(
                         }
                     }
 
-                    // If stream ended without response.completed, emit synthetic closing events
-                    if !had_error && !completed_sent {
+                    // Stream ended. Emit final response.completed with usage.
+                    // (convert_openai_sse_to_responses sends everything up to output_item.done,
+                    // but NOT response.completed — that's sent here with usage from the final chunk)
+                    if !had_error {
                         let synth_events = crate::protocol::responses::create_synthetic_completed_events(
                             &model_clone,
                             &response_id,
                             &accumulated_content,
                             output_item_added_sent,
                             output_item_done_sent,
+                            usage_prompt,
+                            usage_completion,
                         );
                         for ev in synth_events {
                             yield Ok::<_, std::io::Error>(ev.into_bytes().into());
                         }
+                        // Emit [DONE] after response.completed
+                        yield Ok::<_, std::io::Error>(b"data: [DONE]\n\n".to_vec().into());
                     }
 
                     // Build response_choices for logging

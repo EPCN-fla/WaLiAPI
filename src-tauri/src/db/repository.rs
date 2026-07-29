@@ -231,9 +231,10 @@ impl Repository {
     // ==================== Request Log ====================
 
     pub async fn create_log(&self, log: &RequestLog) -> Result<(), sqlx::Error> {
+        // Insert with seq auto-incremented via subquery (atomic, avoids race condition)
         sqlx::query(
-            "INSERT INTO request_logs (id, api_key_id, api_key_name, channel_id, channel_name, model, upstream_model, mode, status_code, prompt_tokens, completion_tokens, total_tokens, duration_ms, error_message, is_stream, is_retry, created_at, request_body, response_choices, risk_level, risk_score, risk_summary, security_action, sanitized, blocked_reason, trace_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO request_logs (id, seq, api_key_id, api_key_name, channel_id, channel_name, model, upstream_model, mode, status_code, prompt_tokens, completion_tokens, total_tokens, duration_ms, error_message, is_stream, is_retry, created_at, request_body, response_choices, risk_level, risk_score, risk_summary, security_action, sanitized, blocked_reason, trace_id)
+             VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM request_logs), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&log.id)
         .bind(&log.api_key_id)
@@ -263,11 +264,6 @@ impl Repository {
         .bind(&log.trace_id)
         .execute(&self.pool)
         .await?;
-        // Backfill seq with rowid for new rows (seq defaults to 0, so check for 0)
-        sqlx::query("UPDATE request_logs SET seq = rowid WHERE id = ? AND (seq IS NULL OR seq = 0)")
-            .bind(&log.id)
-            .execute(&self.pool)
-            .await?;
         Ok(())
     }
 

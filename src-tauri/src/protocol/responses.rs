@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// State is tracked via `output_item_added_sent` and `output_item_done_sent`.
 pub fn convert_openai_sse_to_responses(
     chunk_text: &str,
-    model: &str,
+    _model: &str,
     response_id: &str,
     accumulated_content: &str,
     output_item_added_sent: &mut bool,
@@ -187,45 +187,15 @@ pub fn convert_openai_sse_to_responses(
                             *output_item_done_sent = true;
                         }
 
-                        let usage_prompt = json.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|t| t.as_u64()).unwrap_or(0);
-                        let usage_completion = json.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|t| t.as_u64()).unwrap_or(0);
-
-                        let completed = serde_json::json!({
-                            "type": "response.completed",
-                            "response": {
-                                "id": response_id,
-                                "object": "response",
-                                "created_at": now_ts(),
-                                "status": "completed",
-                                "model": model,
-                                "output": [{
-                                    "id": msg_id,
-                                    "type": "message",
-                                    "status": "completed",
-                                    "role": "assistant",
-                                    "content": [{
-                                        "type": "output_text",
-                                        "text": accumulated_content,
-                                        "annotations": []
-                                    }]
-                                }],
-                                "usage": {
-                                    "input_tokens": usage_prompt,
-                                    "output_tokens": usage_completion,
-                                    "total_tokens": usage_prompt + usage_completion
-                                }
-                            }
-                        });
-                        events.push(format!("event: response.completed\ndata: {}\n\n", completed));
+                        // Note: response.completed is NOT sent here. It's sent after the stream ends,
+                        // so we can include usage from the final usage chunk (which comes after finish_reason).
                     }
                 }
             }
         }
     }
 
-    if chunk_text.contains("[DONE]") {
-        events.push("data: [DONE]\n\n".to_string());
-    }
+    // Note: [DONE] is NOT sent here. It's sent after response.completed in the stream handler.
 
     events
 }
@@ -267,6 +237,8 @@ pub fn create_synthetic_completed_events(
     accumulated_content: &str,
     output_item_added_sent: bool,
     output_item_done_sent: bool,
+    usage_prompt: i64,
+    usage_completion: i64,
 ) -> Vec<String> {
     let mut events = Vec::new();
     let msg_id = if response_id.starts_with("resp_") { format!("msg_{}", &response_id[5..]) } else { format!("msg_{}", response_id) };
@@ -320,7 +292,7 @@ pub fn create_synthetic_completed_events(
         events.push(format!("event: response.output_item.done\ndata: {}\n\n", item_done));
     }
 
-    // response.completed
+    // response.completed (with usage)
     let completed = serde_json::json!({
         "type": "response.completed",
         "response": {
@@ -343,6 +315,11 @@ pub fn create_synthetic_completed_events(
                 }])
             } else {
                 serde_json::json!([])
+            },
+            "usage": {
+                "input_tokens": usage_prompt,
+                "output_tokens": usage_completion,
+                "total_tokens": usage_prompt + usage_completion
             }
         }
     });
