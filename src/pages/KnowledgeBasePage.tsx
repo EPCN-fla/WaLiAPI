@@ -49,6 +49,11 @@ import {
   Tag,
   Sliders,
   ChevronUp,
+  Code,
+  ExternalLink,
+  Package,
+  Rocket,
+  Puzzle,
 } from "lucide-react";
 
 type ServiceTab = "knowledge" | "mcp";
@@ -273,6 +278,142 @@ function McpSection() {
     "method": "tools/list",
     "params": {}
   }'`}</code></pre>
+      </div>
+
+      {/* Skills 技能配置 */}
+      <div className="surface data-card rounded-2xl lg:col-span-2">
+        <div className="mb-4 flex items-center gap-2">
+          <Puzzle size={18} className="text-slate-700" />
+          <h3 className="text-sm font-semibold text-slate-900">Skills 技能配置</h3>
+          <a
+            href="https://github.com/fuzhengwei/waliapi-rag-skills"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="ml-auto flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 transition-all hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900"
+          >
+            <Code size={13} />
+            GitHub 仓库
+            <ExternalLink size={11} className="text-slate-400" />
+          </a>
+        </div>
+
+        {/* 什么是 Skills 技能 */}
+        <div className="mb-5 rounded-xl bg-gradient-to-br from-blue-50 to-indigo-50 border border-blue-100 px-4 py-3">
+          <div className="flex items-start gap-3">
+            <Package size={16} className="mt-0.5 flex-shrink-0 text-blue-600" />
+            <div>
+              <p className="text-sm font-medium text-slate-800">什么是 WaLiAPI RAG Skills？</p>
+              <p className="mt-1 text-xs leading-relaxed text-slate-600">
+                一个即装即用的 Agent Skill 技能包，通过 MCP 协议连接 WaLiAPI 本地知识库。安装后 AI Agent 可以直接执行语义搜索、RAG 问答、文档管理等操作，无需手写提示词。
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* 安装步骤 */}
+        <div className="mb-5">
+          <div className="mb-3 flex items-center gap-2">
+            <Rocket size={14} className="text-slate-600" />
+            <h4 className="text-xs font-semibold text-slate-800">安装步骤</h4>
+          </div>
+          <div className="space-y-2.5">
+            <div className="flex items-start gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2.5">
+              <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">1</span>
+              <div className="flex-1">
+                <p className="text-xs font-medium text-slate-700">下载技能包</p>
+                <p className="mt-0.5 text-[11px] text-slate-500">从 GitHub 仓库克隆或下载 Release 压缩包</p>
+                <code className="mt-1.5 block rounded bg-slate-800 px-2 py-1 text-[11px] font-mono text-slate-200">git clone https://github.com/fuzhengwei/waliapi-rag-skills.git ~/.qclaw/skills/waliapi-rag</code>
+              </div>
+            </div>
+            <div className="flex items-start gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2.5">
+              <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">2</span>
+              <div className="flex-1">
+                <p className="text-xs font-medium text-slate-700">配置 MCP 服务地址</p>
+                <p className="mt-0.5 text-[11px] text-slate-500">编辑配置文件，填入 WaLiAPI 的 MCP 服务地址</p>
+                <code className="mt-1.5 block rounded bg-slate-800 px-2 py-1 text-[11px] font-mono text-slate-200">{`cat > ~/.qclaw/skills/waliapi-rag/config.json << 'EOF'
+{
+  "mcp_url": "${mcpEndpoint}"
+}
+EOF`}</code>
+                <p className="mt-1 text-[11px] text-slate-400">💡 首次使用时 AI 也会自动询问 MCP 地址，可跳过手动配置</p>
+              </div>
+            </div>
+            <div className="flex items-start gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2.5">
+              <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">3</span>
+              <div className="flex-1">
+                <p className="text-xs font-medium text-slate-700">重启 Agent 客户端</p>
+                <p className="mt-0.5 text-[11px] text-slate-500">重启 QClaw / Claude Code 等 Agent 客户端，技能会在启动时自动加载</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* 使用方式 */}
+        <div className="mb-5">
+          <div className="mb-3 flex items-center gap-2">
+            <Terminal size={14} className="text-slate-600" />
+            <h4 className="text-xs font-semibold text-slate-800">使用方式</h4>
+          </div>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <div className="rounded-lg border border-slate-100 bg-white px-3 py-2.5">
+              <p className="text-xs font-medium text-slate-700">🔍 语义搜索</p>
+              <p className="mt-0.5 text-[11px] text-slate-500">「搜索知识库中关于渠道配置的内容」</p>
+            </div>
+            <div className="rounded-lg border border-slate-100 bg-white px-3 py-2.5">
+              <p className="text-xs font-medium text-slate-700">💬 RAG 问答</p>
+              <p className="mt-0.5 text-[11px] text-slate-500">「问一下知识库，WaLiAPI 支持哪些协议？」</p>
+            </div>
+            <div className="rounded-lg border border-slate-100 bg-white px-3 py-2.5">
+              <p className="text-xs font-medium text-slate-700">📁 文档管理</p>
+              <p className="mt-0.5 text-[11px] text-slate-500">「把这份 PDF 上传到知识库」</p>
+            </div>
+            <div className="rounded-lg border border-slate-100 bg-white px-3 py-2.5">
+              <p className="text-xs font-medium text-slate-700">📦 批量导入</p>
+              <p className="mt-0.5 text-[11px] text-slate-500">「把这个 Git 仓库导入知识库」</p>
+            </div>
+          </div>
+        </div>
+
+        {/* 技术细节 */}
+        <div className="rounded-xl bg-slate-50 border border-slate-100 px-4 py-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div>
+              <p className="text-[11px] font-semibold text-slate-500">协议</p>
+              <p className="mt-0.5 text-xs text-slate-700">MCP JSON-RPC (SSE + POST)</p>
+            </div>
+            <div>
+              <p className="text-[11px] font-semibold text-slate-500">依赖</p>
+              <p className="mt-0.5 text-xs text-slate-700">Python 3.8+（零第三方依赖）</p>
+            </div>
+            <div>
+              <p className="text-[11px] font-semibold text-slate-500">兼容</p>
+              <p className="mt-0.5 text-xs text-slate-700">QClaw · Claude Code · OpenClaw</p>
+            </div>
+          </div>
+        </div>
+
+        {/* 链接 */}
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <a
+            href="https://github.com/fuzhengwei/waliapi-rag-skills"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1.5 rounded-lg bg-slate-800 px-4 py-2 text-xs font-medium text-white transition-all hover:bg-slate-700"
+          >
+            <Code size={13} />
+            查看仓库
+          </a>
+          <a
+            href="https://github.com/fuzhengwei/waliapi-rag-skills#readme"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-4 py-2 text-xs font-medium text-slate-600 transition-all hover:border-slate-300 hover:bg-slate-50"
+          >
+            <FileText size={13} />
+            使用文档
+            <ExternalLink size={11} className="text-slate-400" />
+          </a>
+        </div>
       </div>
     </div>
   );
