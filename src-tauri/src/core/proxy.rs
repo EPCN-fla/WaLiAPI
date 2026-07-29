@@ -127,8 +127,8 @@ pub async fn handle_request(
             Ok((status, resp_body, usage)) => {
                 // Extract and log choices
                 let response_choices = resp_body.get("choices").and_then(|c| serde_json::to_string(c).ok());
-                if let Some(ref choices) = response_choices {
-//                     println!("Response choices: {}", choices);
+                if response_choices.is_some() {
+                    // choices logging disabled
                 }
 
                 // Scan response for risks
