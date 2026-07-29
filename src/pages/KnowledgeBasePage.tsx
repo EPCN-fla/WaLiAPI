@@ -350,7 +350,7 @@ function SkillsSection() {
           <div className="space-y-2.5">
             <div className="flex items-start gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2.5">
               <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">1</span>
-              <div className="flex-1">
+              <div className="min-w-0 flex-1">
                 <p className="text-xs font-medium text-slate-700">下载技能包</p>
                 <p className="mt-0.5 text-[11px] text-slate-500">从 GitHub 仓库克隆技能包</p>
                 <pre className="mt-1.5 overflow-x-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-mono text-slate-800">git clone https://github.com/fuzhengwei/waliapi-rag-skills.git</pre>
@@ -358,7 +358,7 @@ function SkillsSection() {
             </div>
             <div className="flex items-start gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2.5">
               <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">2</span>
-              <div className="flex-1">
+              <div className="min-w-0 flex-1">
                 <p className="text-xs font-medium text-slate-700">配置 MCP 服务地址</p>
                 <p className="mt-0.5 text-[11px] text-slate-500">编辑配置文件，填入 WaLiAPI 的 MCP 服务地址</p>
                 <pre className="mt-1.5 overflow-x-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-mono text-slate-800">{`cat > ~/.qclaw/skills/waliapi-rag/config.json << 'EOF'
@@ -371,7 +371,7 @@ EOF`}</pre>
             </div>
             <div className="flex items-start gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2.5">
               <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">3</span>
-              <div className="flex-1">
+              <div className="min-w-0 flex-1">
                 <p className="text-xs font-medium text-slate-700">重启 Agent 客户端</p>
                 <p className="mt-0.5 text-[11px] text-slate-500">重启 QClaw / Claude Code / OpenClaw 等 Agent 客户端，技能会在启动时自动加载</p>
               </div>
