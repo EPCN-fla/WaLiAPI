@@ -35,156 +35,97 @@ WaLiAPI 作为本地网关，在下游 AI 应用和上游模型供应商之间�
 
 ### 请求转发流程
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         下游 AI 应用                                       │
-│  WaLiCode · Claude Code · Codex · Gemini CLI · OpenClaw · ChatBox       │
-└──────────────────────────┬──────────────────────────────────────────────┘
-                           │  OpenAI / Anthropic / Responses 协议
-                           │  Authorization: Bearer sk-waliapi-*
-                           ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          WaLiAPI 本地网关                                  │
-│                                                                           │
-│  ┌─────────────┐   ┌──────────────┐   ┌─────────────┐   ┌────────────┐ │
-│  │  协议转换层  │──▶│  安全审计引擎  │──▶│  渠道调度器  │──▶│  适配器层   │ │
-│  │             │   │              │   │             │   │            │ │
-│  │ OpenAI Chat │   │ 风险扫描      │   │ 优先级+权重  │   │ OpenAI     │ │
-│  │ Responses   │   │ 脱敏/阻断     │   │ 故障切换     │   │ Claude     │ │
-│  │ Anthropic   │   │ 规则引擎      │   │ 模型映射     │   │ DeepSeek   │ │
-│  │ 双向转换     │   │              │   │             │   │ Gemini     │ │
-│  └─────────────┘   └──────┬───────┘   └─────────────┘   │ Custom     │ │
-│                            │                               └──────┬─────┘ │
-│                            ▼                                      │       │
-│                    ┌──────────────┐                               │       │
-│                    │  审计日志记录  │                               │       │
-│                    │  请求/响应体  │                               │       │
-│                    │  Token 统计   │                               │       │
-│                    │  Trace ID    │                               │       │
-│                    └──────────────┘                               │       │
-│                                                                   │       │
-│  ┌────────────────────────────────────────────────────────────────┐    │       │
-│  │                      知识库 & MCP 服务                         │    │       │
-│  │                                                                │    │       │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐     │    │       │
-│  │  │ 文档解析  │─▶│ 分块器    │─▶│ 向量化   │─▶│ HNSW索引  │     │    │       │
-│  │  │ Markdown  │  │ 滑动窗口  │  │ Embedder │  │ 向量检索  │     │    │       │
-│  │  │ 代码(TS)  │  │ 符号感知  │  │ 复用渠道  │  │ FTS5混合  │     │    │       │
-│  │  │ PDF       │  │ 重叠分块  │  │          │  │          │     │    │       │
-│  │  └──────────┘  └──────────┘  └──────────┘  └────┬─────┘     │    │       │
-│  │                                                   │            │    │       │
-│  │  ┌────────────────────────────────────────────────┘            │    │       │
-│  │  │                                                              │    │       │
-│  │  ▼  检索结果                  ┌──────────────┐                  │    │       │
-│  │  ──────────────────────────▶  │   RAG 引擎   │                  │    │       │
-│  │  Top-K 语义片段 + 对话历史     │ 混合检索→重排  │                  │    │       │
-│  │                               │ 上下文组装    │                  │    │       │
-│  │                               │ 生成回答+引用  │                  │    │       │
-│  │                               └──────────────┘                  │    │       │
-│  │                                                                  │    │       │
-│  │  MCP Server (Streamable HTTP + SSE)                              │    │       │
-│  │  13 个工具: 搜索/问答/CRUD/导入/索引                              │    │       │
-│  └──────────────────────────────────────────────────────────────────┘    │       │
-│                                                                         │       │
-└─────────────────────────────────────────────────────────────────────────┘     │
-                                                                                │
-                           ┌───────────────────────────────────────────────────┘
-                           ▼
-              ┌──────────────────────────────────┐
-              │       上游模型供应商               │
-              │                                    │
-              │  OpenAI · Claude · DeepSeek       │
-              │  Gemini · 通义 · 智谱 · Moonshot   │
-              │  豆包 · Ollama · 自定义            │
-              └──────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph Downstream[下游 AI 应用]
+        A1[WaLiCode]
+        A2[Claude Code]
+        A3[Codex CLI]
+        A4[Gemini CLI]
+        A5[OpenClaw]
+        A6[ChatBox / NextChat]
+    end
+
+    Downstream -->|"OpenAI / Anthropic / Responses 协议<br/>Authorization: Bearer sk-waliapi-*"| Gateway
+
+    subgraph Gateway[WaLiAPI 本地网关]
+        B[协议转换层<br/>OpenAI Chat · Responses · Anthropic<br/>双向转换]
+        C[安全审计引擎<br/>风险扫描 · 脱敏/阻断 · 规则引擎]
+        D[渠道调度器<br/>优先级+权重 · 故障切换 · 模型映射]
+        E[适配器层<br/>OpenAI · Claude · DeepSeek<br/>Gemini · Custom]
+        F[审计日志记录<br/>请求/响应体 · Token 统计 · Trace ID]
+
+        B --> C --> D --> E
+        C --> F
+
+        subgraph KBService[知识库 & MCP 服务]
+            G1[文档解析<br/>Markdown / Code / PDF]
+            G2[智能分块器<br/>滑动窗口 · 符号感知]
+            G3[向量化<br/>复用渠道 Embedding]
+            G4[HNSW 索引<br/>向量检索 + FTS5 混合]
+            G5[RAG 引擎<br/>混合检索 → 重排 → 生成回答]
+            G6[MCP Server<br/>Streamable HTTP + SSE<br/>13 个工具]
+
+            G1 --> G2 --> G3 --> G4
+            G4 --> G5
+            G4 -.-> G6
+        end
+    end
+
+    E -->|HTTPS| Upstream
+
+    subgraph Upstream[上游模型供应商]
+        U1[OpenAI]
+        U2[Claude]
+        U3[DeepSeek]
+        U4[Gemini]
+        U5[通义 · 智谱 · Moonshot · 豆包 · Ollama]
+    end
 ```
 
 ### 知识库 RAG 流程
 
-```
-                        ┌─────────────┐
-                        │  用户上传文档 │
-                        └──────┬──────┘
-                               │
-                               ▼
-                     ┌─────────────────┐
-                     │   文档解析器      │
-                     │ Markdown/Code/   │
-                     │ PDF/JSON/YAML    │
-                     └────────┬────────┘
-                              │
-                              ▼
-                     ┌─────────────────┐
-                     │  tree-sitter      │
-                     │  代码符号提取     │
-                     │ (函数/类/结构体)   │
-                     └────────┬────────┘
-                              │
-                              ▼
-                     ┌─────────────────┐
-                     │  智能分块器       │
-                     │ 滑动窗口 + 重叠   │
-                     │ 符号感知分块      │
-                     └────────┬────────┘
-                              │
-                              ▼
-                     ┌─────────────────┐
-                     │  向量化引擎       │
-                     │ 复用 WaLiAPI 渠道 │
-                     │ text-embedding   │
-                     └────────┬────────┘
-                              │
-                              ▼
-              ┌───────────────────────────┐
-              │     存储 + 索引              │
-              │  ┌────────┐  ┌───────────┐ │
-              │  │ SQLite │  │  HNSW     │ │
-              │  │ chunks │  │  向量索引  │ │
-              │  │ + FTS5 │  │  (文件)   │ │
-              │  └────────┘  └───────────┘ │
-              └───────────────────────────┘
-                              │
-                              ▼
-              ┌───────────────────────────┐
-              │     检索阶段                │
-              │  向量检索 (HNSW)  +          │
-              │  FTS5 全文检索               │
-              │  → 加权混合排序 (Hybrid)     │
-              └───────────────────────────┘
-                              │
-                              ▼
-              ┌───────────────────────────┐
-              │     RAG 生成阶段            │
-              │  组装 Top-K 片段 + 对话历史  │
-              │  → 通过网关转发至 LLM        │
-              │  → 生成回答 + 来源引用       │
-              └───────────────────────────┘
+```mermaid
+flowchart TD
+    A[用户上传文档] --> B[文档解析器<br/>Markdown / Code / PDF / JSON / YAML]
+    B --> C[tree-sitter 代码符号提取<br/>函数 / 类 / 结构体 / 接口]
+    C --> D[智能分块器<br/>滑动窗口 + 重叠分块 · 符号感知]
+    D --> E[向量化引擎<br/>复用 WaLiAPI 渠道调度<br/>text-embedding]
+    E --> F
+
+    subgraph F[存储 + 索引]
+        F1[(SQLite<br/>chunks + FTS5)]
+        F2[(HNSW 向量索引<br/>文件存储)]
+    end
+
+    F --> G[检索阶段<br/>向量检索 HNSW + FTS5 全文检索<br/>→ 加权混合排序 Hybrid]
+    G --> H[RAG 生成阶段<br/>组装 Top-K 片段 + 对话历史<br/>→ 通过网关转发至 LLM<br/>→ 生成回答 + 来源引用]
 ```
 
 ### MCP 工具服务
 
 WaLiAPI 内置 MCP (Model Context Protocol) Server，通过 Streamable HTTP + SSE 端点对外暴露知识库工具，任何支持 MCP 的 AI Agent 均可接入：
 
-```
-┌──────────────────────────────────────────────────┐
-│              AI Agent (Claude / OpenClaw / ...)   │
-│                                                   │
-│  MCP Client ──── POST /mcp ────▶ ┌────────────┐  │
-│             ◀── SSE stream ───  │ MCP Server  │  │
-│                                  │ (WaLiAPI)   │  │
-│  可用工具:                        └──────┬─────┘  │
-│  · list_knowledge_bases                  │        │
-│  · search_knowledge_base                 │        │
-│  · ask_knowledge_base                     │        │
-│  · read_document                         │        │
-│  · get_knowledge_base_stats              │        │
-│  · create / update / delete              │        │
-│  · upload_document                       │        │
-│  · list_documents                        │        │
-│  · build_index                           │        │
-│  · import_source                         │        │
-│  · delete_document                       │        │
-└──────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    Agent[AI Agent<br/>Claude / OpenClaw / ...] -->|"POST /mcp<br/>JSON-RPC"| MCP
+    MCP -->|"SSE Stream"| Agent
+
+    subgraph MCP[MCP Server — WaLiAPI]
+        T1[search_knowledge_base<br/>语义搜索]
+        T2[ask_knowledge_base<br/>RAG 问答]
+        T3[read_document<br/>读取文档]
+        T4[list_knowledge_bases<br/>列出知识库]
+        T5[get_knowledge_base_stats<br/>知识库统计]
+        T6[create / update / delete<br/>知识库 CRUD]
+        T7[upload_document<br/>上传文档]
+        T8[list_documents<br/>文档列表]
+        T9[build_index<br/>构建索引]
+        T10[import_source<br/>多源导入]
+        T11[delete_document<br/>删除文档]
+    end
+
+    MCP --> KB[(知识库<br/>SQLite + HNSW)]
 ```
 
 ---
