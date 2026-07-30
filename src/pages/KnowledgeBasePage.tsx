@@ -347,33 +347,27 @@ function SkillsSection() {
             <Rocket size={18} className="text-slate-700" />
             <h3 className="text-sm font-semibold text-slate-900">安装步骤</h3>
           </div>
-          <div className="space-y-2.5">
-            <div className="flex items-start gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2.5">
+          <div className="space-y-3">
+            <div className="flex items-start gap-3 rounded-lg border border-slate-100 bg-slate-50 px-4 py-4">
               <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">1</span>
               <div className="min-w-0 flex-1">
                 <p className="text-xs font-medium text-slate-700">下载技能包</p>
-                <p className="mt-0.5 text-[11px] text-slate-500">从 GitHub 仓库克隆技能包</p>
-                <pre className="mt-1.5 overflow-x-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-mono text-slate-800">git clone https://github.com/fuzhengwei/waliapi-rag-skills.git</pre>
+                <p className="mt-1 text-[11px] leading-relaxed text-slate-500">从 GitHub 仓库克隆技能包到本地。克隆完成后，技能包会自动安装到 <code className="rounded bg-slate-200 px-1 py-0.5 text-[10px] font-mono text-slate-700">waliapi-rag-skills</code> 目录。</p>
+                <pre className="mt-2 overflow-x-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-mono text-slate-800">git clone https://github.com/fuzhengwei/waliapi-rag-skills.git</pre>
+                <p className="mt-2 text-[11px] leading-relaxed text-slate-500">安装完成后，在 Agent 客户端（如 QClaw、Claude Code、OpenClaw）中即可直接使用以下能力：</p>
+                <div className="mt-1.5 space-y-1">
+                  <p className="text-[11px] text-slate-600">🔍 <span className="font-medium text-slate-700">语义搜索</span> — 搜索知识库中的内容，支持 hybrid/vector/keyword 三种模式</p>
+                  <p className="text-[11px] text-slate-600">💬 <span className="font-medium text-slate-700">RAG 问答</span> — 基于知识库内容生成回答，附带来源引用</p>
+                  <p className="text-[11px] text-slate-600">📁 <span className="font-medium text-slate-700">文档管理</span> — 上传、删除、列举知识库中的文档</p>
+                  <p className="text-[11px] text-slate-600">📦 <span className="font-medium text-slate-700">批量导入</span> — 导入 Git 仓库、URL 或本地目录到知识库</p>
+                </div>
               </div>
             </div>
-            <div className="flex items-start gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2.5">
+            <div className="flex items-start gap-3 rounded-lg border border-slate-100 bg-slate-50 px-4 py-4">
               <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">2</span>
               <div className="min-w-0 flex-1">
-                <p className="text-xs font-medium text-slate-700">配置 MCP 服务地址</p>
-                <p className="mt-0.5 text-[11px] text-slate-500">编辑配置文件，填入 WaLiAPI 的 MCP 服务地址</p>
-                <pre className="mt-1.5 overflow-x-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-mono text-slate-800">{`cat > ~/.qclaw/skills/waliapi-rag/config.json << 'EOF'
-{
-  "mcp_url": "${mcpEndpoint}"
-}
-EOF`}</pre>
-                <p className="mt-1.5 text-[11px] text-slate-400">💡 首次使用时 AI 也会自动询问 MCP 地址，可跳过手动配置</p>
-              </div>
-            </div>
-            <div className="flex items-start gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2.5">
-              <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">3</span>
-              <div className="min-w-0 flex-1">
                 <p className="text-xs font-medium text-slate-700">重启 Agent 客户端</p>
-                <p className="mt-0.5 text-[11px] text-slate-500">重启 QClaw / Claude Code / OpenClaw 等 Agent 客户端，技能会在启动时自动加载</p>
+                <p className="mt-1 text-[11px] leading-relaxed text-slate-500">重启 QClaw / Claude Code / OpenClaw 等 Agent 客户端，技能会在启动时自动加载。首次使用时 AI 会自动询问 MCP 服务地址（<code className="rounded bg-slate-200 px-1 py-0.5 text-[10px] font-mono text-slate-700">${mcpEndpoint}</code>），无需手动配置。</p>
               </div>
             </div>
           </div>
