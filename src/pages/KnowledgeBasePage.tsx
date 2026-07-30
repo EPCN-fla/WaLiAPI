@@ -354,7 +354,7 @@ function SkillsSection() {
                 <p className="text-xs font-medium text-slate-700">下载技能包</p>
                 <p className="mt-1 text-[11px] leading-relaxed text-slate-500">从 GitHub 仓库克隆技能包到本地。克隆完成后，技能包会自动安装到 <code className="rounded bg-slate-200 px-1 py-0.5 text-[10px] font-mono text-slate-700">waliapi-rag-skills</code> 目录。</p>
                 <pre className="mt-2 overflow-x-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-mono text-slate-800">git clone https://github.com/fuzhengwei/waliapi-rag-skills.git</pre>
-                <p className="mt-2 text-[11px] leading-relaxed text-slate-500">安装完成后，在 Agent 客户端（如 QClaw、Claude Code、OpenClaw）中即可直接使用以下能力：</p>
+                <p className="mt-2 text-[11px] leading-relaxed text-slate-500">安装完成后，在 Agent 客户端（如 WaLiCode、Codex、Claude Code）中即可直接使用以下能力：</p>
                 <div className="mt-1.5 space-y-1">
                   <p className="text-[11px] text-slate-600">🔍 <span className="font-medium text-slate-700">语义搜索</span> — 搜索知识库中的内容，支持 hybrid/vector/keyword 三种模式</p>
                   <p className="text-[11px] text-slate-600">💬 <span className="font-medium text-slate-700">RAG 问答</span> — 基于知识库内容生成回答，附带来源引用</p>
@@ -367,7 +367,7 @@ function SkillsSection() {
               <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">2</span>
               <div className="min-w-0 flex-1">
                 <p className="text-xs font-medium text-slate-700">重启 Agent 客户端</p>
-                <p className="mt-1 text-[11px] leading-relaxed text-slate-500">重启 QClaw / Claude Code / OpenClaw 等 Agent 客户端，技能会在启动时自动加载。首次使用时 AI 会自动询问 MCP 服务地址（<code className="rounded bg-slate-200 px-1 py-0.5 text-[10px] font-mono text-slate-700">${mcpEndpoint}</code>），无需手动配置。</p>
+                <p className="mt-1 text-[11px] leading-relaxed text-slate-500">重启 WaLiCode / Codex / Claude Code 等 Agent 客户端，技能会在启动时自动加载。首次使用时 AI 会自动询问 MCP 服务地址（<code className="rounded bg-slate-200 px-1 py-0.5 text-[10px] font-mono text-slate-700">${mcpEndpoint}</code>），无需手动配置。</p>
               </div>
             </div>
           </div>
@@ -435,7 +435,7 @@ function SkillsSection() {
             </div>
             <div className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
               <span className="text-xs font-medium text-slate-500">兼容客户端</span>
-              <span className="text-xs text-slate-800">QClaw · Claude Code · OpenClaw</span>
+              <span className="text-xs text-slate-800">WaLiCode · Codex · Claude Code</span>
             </div>
             <div className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
               <span className="text-xs font-medium text-slate-500">MCP 工具数</span>
