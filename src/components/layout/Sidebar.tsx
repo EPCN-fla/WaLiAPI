@@ -120,7 +120,7 @@ export function Sidebar({
             </div>
             <div className="flex items-center gap-2">
               <NavLink
-                to="/services"
+                to="/settings#server"
                 className="flex h-6 w-6 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-white hover:text-slate-700"
                 title="服务配置"
               >

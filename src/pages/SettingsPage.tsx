@@ -21,7 +21,10 @@ export function SettingsPage() {
   const [newRule, setNewRule] = useState({ rule_type: "blacklist", category: "domain", pattern: "", severity: "medium", action: "warn", description: "" });
   const [editingBuiltin, setEditingBuiltin] = useState<string | null>(null);
   const [editBuiltinData, setEditBuiltinData] = useState({ severity: "", title: "", description: "" });
-  const [activeTab, setActiveTab] = useState<string>("security");
+  const [activeTab, setActiveTab] = useState<string>(() => {
+    const hash = window.location.hash.replace("#", "");
+    return hash || "security";
+  });
 
   useEffect(() => {
     settingsApi.get().then(setSettings).catch(() => {});
