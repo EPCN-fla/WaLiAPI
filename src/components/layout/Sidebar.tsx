@@ -8,6 +8,7 @@ import {
   Key,
   ScrollText,
   Settings,
+  Settings2,
   Server,
   ChevronRight,
   ExternalLink,
@@ -117,7 +118,16 @@ export function Sidebar({
                 {serverStatus?.running ? "运行中" : "未启动"}
               </div>
             </div>
-            <span className={`h-2.5 w-2.5 rounded-full ${serverStatus?.running ? "bg-emerald-500" : "bg-rose-500"}`} />
+            <div className="flex items-center gap-2">
+              <NavLink
+                to="/services"
+                className="flex h-6 w-6 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-white hover:text-slate-700"
+                title="服务配置"
+              >
+                <Settings2 size={14} />
+              </NavLink>
+              <span className={`h-2.5 w-2.5 rounded-full ${serverStatus?.running ? "bg-emerald-500" : "bg-rose-500"}`} />
+            </div>
           </div>
           <div className="flex items-start gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-3 text-xs text-slate-500">
             <Server size={14} className={serverStatus?.running ? "text-emerald-500" : "text-rose-500"} />
