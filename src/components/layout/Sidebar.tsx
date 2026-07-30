@@ -20,7 +20,7 @@ import packageJson from "../../../package.json";
 
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "仪表盘" },
-  { to: "/usage", icon: BookOpen, label: "使用", subLabel: "API、Codex" },
+  { to: "/usage", icon: BookOpen, label: "使用", subLabel: "API、Codex ... 配置" },
   { to: "/channels", icon: Radio, label: "渠道" },
   { to: "/api-keys", icon: Key, label: "密钥" },
   { to: "/services", icon: Database, label: "服务", subLabel: "知识库、MCP、Skills" },
@@ -99,7 +99,7 @@ export function Sidebar({
             </span>
             <span className="font-medium">{label}</span>
             {subLabel && (
-              <span className="ml-1 text-[10px] font-normal text-slate-400" style={{ textShadow: "0 1px 1px rgba(0,0,0,0.06), inset 0 0.5px 0 rgba(255,255,255,0.8)" }}>
+              <span className="ml-1 whitespace-nowrap text-[10px] font-normal text-slate-400" style={{ textShadow: "0 1px 1px rgba(0,0,0,0.06), inset 0 0.5px 0 rgba(255,255,255,0.8)" }}>
                 ({subLabel})
               </span>
             )}
