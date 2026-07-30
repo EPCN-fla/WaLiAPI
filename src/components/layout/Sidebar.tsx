@@ -23,7 +23,7 @@ const navItems = [
   { to: "/usage", icon: BookOpen, label: "使用" },
   { to: "/channels", icon: Radio, label: "渠道" },
   { to: "/api-keys", icon: Key, label: "密钥" },
-  { to: "/services", icon: Database, label: "服务" },
+  { to: "/services", icon: Database, label: "服务", subLabel: "知识库、MCP、Skills" },
   { to: "/logs", icon: ScrollText, label: "日志" },
   { to: "/settings", icon: Settings, label: "设置" },
 ];
@@ -82,7 +82,7 @@ export function Sidebar({
       </div>
 
       <nav className="mt-4 flex-1 min-h-0 space-y-1.5 overflow-y-auto">
-        {navItems.map(({ to, icon: Icon, label }) => (
+        {navItems.map(({ to, icon: Icon, label, subLabel }) => (
           <NavLink
             key={to}
             to={to}
@@ -98,6 +98,11 @@ export function Sidebar({
               <Icon size={17} />
             </span>
             <span className="font-medium">{label}</span>
+            {subLabel && (
+              <span className="ml-1 text-[10px] font-normal text-slate-400" style={{ textShadow: "0 1px 1px rgba(0,0,0,0.06), inset 0 0.5px 0 rgba(255,255,255,0.8)" }}>
+                ({subLabel})
+              </span>
+            )}
             <ChevronRight size={15} className="ml-auto opacity-0 transition-opacity group-hover:opacity-40" />
           </NavLink>
         ))}
