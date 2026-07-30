@@ -20,7 +20,7 @@ import packageJson from "../../../package.json";
 
 const navItems = [
   { to: "/", icon: LayoutDashboard, label: "仪表盘" },
-  { to: "/usage", icon: BookOpen, label: "使用", subLabel: "API、Codex、Claude Code" },
+  { to: "/usage", icon: BookOpen, label: "使用", subLabel: "API、Codex" },
   { to: "/channels", icon: Radio, label: "渠道" },
   { to: "/api-keys", icon: Key, label: "密钥" },
   { to: "/services", icon: Database, label: "服务", subLabel: "知识库、MCP、Skills" },
