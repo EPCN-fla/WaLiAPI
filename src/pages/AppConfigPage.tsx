@@ -23,6 +23,7 @@ import {
   Link2,
   Download,
   Copy,
+  Lightbulb,
 } from "lucide-react";
 
 // ── 图标映射 ──
@@ -53,6 +54,10 @@ export function AppConfigPanel({ appName }: { appName: string }) {
   const [selKey, setSelKey] = useState("");
   const [selModel, setSelModel] = useState("");
   const [loading, setLoading] = useState(true);
+
+  // Storage key for persisting model selection per app
+  const modelStorageKey = `waliapi:codex-model:${appName}`;
+  const keyStorageKey = `waliapi:codex-key:${appName}`;
   const [applying, setApplying] = useState(false);
   const [appliedResult, setAppliedResult] = useState<{ success: boolean; message: string } | null>(null);
   const [copied, setCopied] = useState(false);
@@ -74,9 +79,15 @@ export function AppConfigPanel({ appName }: { appName: string }) {
       const chList = chs as Channel[];
       setKeys(keyList);
       setChannels(chList);
-      if (keyList.length > 0 && !selKey) setSelKey(keyList[0].key);
 
-      // 默认选第一个模型
+      // Restore persisted key selection, fallback to first key
+      const savedKey = localStorage.getItem(keyStorageKey);
+      const savedKeyValid = savedKey && keyList.some(k => k.key === savedKey);
+      if (keyList.length > 0 && !selKey) {
+        setSelKey(savedKeyValid ? savedKey! : keyList[0].key);
+      }
+
+      // Restore persisted model selection, fallback to first model
       const ms: string[] = [];
       chList.forEach(c => {
         c.models.forEach(m => { if (!ms.includes(m)) ms.push(m); });
@@ -84,7 +95,10 @@ export function AppConfigPanel({ appName }: { appName: string }) {
           Object.keys(c.model_mapping).forEach(from => { if (!ms.includes(from)) ms.push(from); });
         }
       });
-      if (ms.length > 0 && !selModel) setSelModel(ms[0]);
+      if (ms.length > 0 && !selModel) {
+        const savedModel = localStorage.getItem(modelStorageKey);
+        setSelModel(savedModel && ms.includes(savedModel) ? savedModel : ms[0]);
+      }
     } catch (e) {
       console.error("Failed to load app config:", e);
     } finally {
@@ -254,7 +268,10 @@ export function AppConfigPanel({ appName }: { appName: string }) {
             <div className="relative">
               <select
                 value={selKey}
-                onChange={e => setSelKey(e.target.value)}
+                onChange={e => {
+                  setSelKey(e.target.value);
+                  localStorage.setItem(keyStorageKey, e.target.value);
+                }}
                 className="w-full appearance-none rounded-xl border border-slate-200 bg-white px-3 py-2.5 pr-8 text-sm font-mono text-slate-900 shadow-sm cursor-pointer"
               >
                 {keys.length === 0 && <option value="">请先创建密钥</option>}
@@ -271,7 +288,10 @@ export function AppConfigPanel({ appName }: { appName: string }) {
             <div className="relative">
               <select
                 value={selModel}
-                onChange={e => setSelModel(e.target.value)}
+                onChange={e => {
+                  setSelModel(e.target.value);
+                  localStorage.setItem(modelStorageKey, e.target.value);
+                }}
                 className="w-full appearance-none rounded-xl border border-slate-200 bg-white px-3 py-2.5 pr-8 text-sm font-mono text-slate-900 shadow-sm cursor-pointer"
               >
                 {allModels.length === 0 && <option value="">请先配置渠道</option>}
@@ -331,6 +351,12 @@ export function AppConfigPanel({ appName }: { appName: string }) {
                 {appliedResult.success ? "配置已写入" : "写入失败"}
               </div>
               <div className="mt-0.5 text-xs opacity-80">{appliedResult.message}</div>
+              {appliedResult.success && (
+                <div className="mt-2 flex items-start gap-1.5 rounded-lg bg-blue-50 px-2.5 py-1.5 text-xs text-blue-600">
+                  <Lightbulb size={13} className="mt-0.5 shrink-0" />
+                  <span>建议重启 {appInfo.label} 以避免缓存导致仍使用旧模型。重启后可在「日志」页面查看实际调用的模型。</span>
+                </div>
+              )}
             </div>
           </div>
         )}

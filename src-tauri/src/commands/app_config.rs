@@ -388,6 +388,20 @@ fn write_codex(config_dir: &PathBuf, waliapi_url: &str, waliapi_key: &str, model
             table["base_url"] = toml_edit::value(format!("{}/v1", waliapi_url.trim_end_matches('/')));
             table["wire_api"] = toml_edit::value("responses");
             table["experimental_bearer_token"] = toml_edit::value(waliapi_key);
+            // Ensure requires_openai_auth is NOT set for waliapi provider
+            // This prevents Codex from trying to validate the token with OpenAI
+            table.remove("requires_openai_auth");
+        }
+
+        // If there's a legacy 'custom' provider with requires_openai_auth = true
+        // and base_url pointing to a third-party (non-OpenAI) endpoint,
+        // remove requires_openai_auth to prevent auth conflicts
+        if let Some(custom_table) = providers.get_mut("custom") {
+            if let Some(t) = custom_table.as_table_mut() {
+                if t.contains_key("requires_openai_auth") {
+                    t.remove("requires_openai_auth");
+                }
+            }
         }
     }
 

@@ -65,13 +65,26 @@ export function UsagePage() {
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [usageTab, setUsageTab] = useState<UsageTab>("api");
 
+  // Persist model & key selection across sessions
+  const modelStorageKey = "waliapi:usage-model";
+  const keyStorageKey = "waliapi:usage-key";
+
   useEffect(() => {
     Promise.all([
       channelApi.getAll().catch(() => []), apiKeyApi.getAll().catch(() => []),
       serverApi.getStatus().catch(() => null),
     ]).then(([ch, ks, s]) => {
       setChannels(ch as Channel[]); setKeys(ks as ApiKey[]); setSs(s as ServerStatus | null);
-      if ((ks as ApiKey[]).length > 0) setSelKey((ks as ApiKey[])[0].key);
+
+      // Restore persisted key, fallback to first
+      const savedKey = localStorage.getItem(keyStorageKey);
+      const keyList = ks as ApiKey[];
+      if (keyList.length > 0) {
+        const keyValid = savedKey && keyList.some(k => k.key === savedKey);
+        setSelKey(keyValid ? savedKey! : keyList[0].key);
+      }
+
+      // Restore persisted model, fallback to first
       const ms: string[] = [];
       (ch as Channel[]).forEach(c => {
         c.models.forEach(m => { if (!ms.includes(m)) ms.push(m); });
@@ -79,7 +92,10 @@ export function UsagePage() {
           Object.keys(c.model_mapping).forEach(from => { if (!ms.includes(from)) ms.push(from); });
         }
       });
-      if (ms.length > 0) setSelModel(ms[0]);
+      if (ms.length > 0) {
+        const savedModel = localStorage.getItem(modelStorageKey);
+        setSelModel(savedModel && ms.includes(savedModel) ? savedModel : ms[0]);
+      }
     });
     const iv = setInterval(() => serverApi.getStatus().then(setSs).catch(() => {}), 5000);
     return () => clearInterval(iv);
@@ -524,7 +540,10 @@ public class AnthropicTest {
                 <div className="relative flex-1">
                   <select
                     value={selKey}
-                    onChange={e => setSelKey(e.target.value)}
+                    onChange={e => {
+                      setSelKey(e.target.value);
+                      localStorage.setItem(keyStorageKey, e.target.value);
+                    }}
                     className="w-full appearance-none rounded-xl border border-slate-200 bg-white px-3 py-2.5 pr-8 text-sm font-mono text-slate-900 shadow-sm cursor-pointer"
                   >
                     {keys.length === 0 && <option value="">请先创建密钥</option>}
@@ -546,7 +565,10 @@ public class AnthropicTest {
                 <div className="relative flex-1">
                   <select
                     value={selModel}
-                    onChange={e => setSelModel(e.target.value)}
+                    onChange={e => {
+                      setSelModel(e.target.value);
+                      localStorage.setItem(modelStorageKey, e.target.value);
+                    }}
                     className="w-full appearance-none rounded-xl border border-slate-200 bg-white px-3 py-2.5 pr-8 text-sm font-mono text-slate-900 shadow-sm cursor-pointer"
                   >
                     {models.length === 0 && <option value="">请先配置渠道</option>}
