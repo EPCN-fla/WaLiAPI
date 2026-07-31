@@ -176,9 +176,23 @@ pub fn responses_to_openai(body: &Value) -> Value {
                             return Some(t.clone());
                         }
                         // Responses API flat format → convert to Chat Completions nested format
+                        // Ensure parameters is always a valid JSON schema object with type="object"
+                        let parameters = t.get("parameters").cloned().unwrap_or(Value::Null);
+                        let parameters = if parameters.is_null() || !parameters.is_object() {
+                            serde_json::json!({"type": "object", "properties": {}})
+                        } else {
+                            // Ensure type field exists and is "object"
+                            let mut params = parameters;
+                            if params.get("type").is_none() {
+                                if let Some(obj) = params.as_object_mut() {
+                                    obj.insert("type".to_string(), Value::String("object".to_string()));
+                                }
+                            }
+                            params
+                        };
                         let func = serde_json::json!({
                             "name": t.get("name").cloned().unwrap_or(Value::Null),
-                            "parameters": t.get("parameters").cloned().unwrap_or(Value::Null),
+                            "parameters": parameters,
                         });
                         let mut func_obj = func;
                         if let Some(desc) = t.get("description") {
@@ -229,18 +243,28 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
         // First pass: collect all function_call call_ids and their matching outputs
         let mut call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut output_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Map from original (possibly empty) call_id → fallback call_id
+        let mut call_id_fallback: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut fallback_counter = 0u32;
         for item in arr {
             let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match item_type {
                 "function_call" => {
-                    if let Some(cid) = item.get("call_id").and_then(|c| c.as_str()) {
-                        call_ids.insert(cid.to_string());
+                    let cid = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    if cid.is_empty() {
+                        let fallback = format!("call_{}", fallback_counter);
+                        fallback_counter += 1;
+                        call_id_fallback.insert(cid.clone(), fallback.clone());
+                        call_ids.insert(fallback);
+                    } else {
+                        call_ids.insert(cid);
                     }
                 }
                 "function_call_output" => {
-                    if let Some(cid) = item.get("call_id").and_then(|c| c.as_str()) {
-                        output_ids.insert(cid.to_string());
-                    }
+                    let cid = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    // Use fallback if one was generated for the corresponding function_call
+                    let effective_cid = call_id_fallback.get(&cid).cloned().unwrap_or(cid);
+                    output_ids.insert(effective_cid);
                 }
                 _ => {}
             }
@@ -255,7 +279,9 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
                 "function_call" => {
                     let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     let arguments = item.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
-                    let call_id = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
+                    let original_call_id = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    // Use fallback call_id if the original was empty
+                    let call_id = call_id_fallback.get(&original_call_id).cloned().unwrap_or(original_call_id);
                     msgs.push(serde_json::json!({
                         "role": "assistant",
                         "content": null,
@@ -270,7 +296,7 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
                     }));
                     // If this function_call has no matching output, synthesize an empty tool response
                     // to prevent upstream "tool_call_ids did not have response messages" errors
-                    if !output_ids.contains(call_id) {
+                    if !output_ids.contains(&call_id) {
                         msgs.push(serde_json::json!({
                             "role": "tool",
                             "tool_call_id": call_id,
@@ -281,7 +307,9 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
 
                 // function_call_output: tool result → OpenAI tool message
                 "function_call_output" => {
-                    let call_id = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
+                    let original_call_id = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    // Use fallback call_id if one was generated for the corresponding function_call
+                    let call_id = call_id_fallback.get(&original_call_id).cloned().unwrap_or(original_call_id);
                     let output = item.get("output").and_then(|o| o.as_str()).unwrap_or("");
                     msgs.push(serde_json::json!({
                         "role": "tool",
