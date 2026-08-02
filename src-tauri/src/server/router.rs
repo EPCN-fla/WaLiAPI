@@ -1,5 +1,6 @@
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     routing::{get, post},
 };
 use std::sync::Arc;
@@ -43,6 +44,7 @@ pub fn create_router(app: AppHandle, state: Arc<AppState>) -> Router {
         .route("/health", get(handle_health))
         // Service routes (Knowledge Base, MCP, etc.)
         .merge(service_router)
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(cors)
         .with_state(shared)
 }
