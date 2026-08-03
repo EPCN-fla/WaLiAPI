@@ -1,5 +1,5 @@
-pub mod responses;
 pub mod anthropic;
+pub mod responses;
 
 use serde_json::Value;
 
@@ -84,10 +84,21 @@ pub fn openai_to_responses(openai_resp: &Value, model: &str) -> Value {
     let mut output = Vec::new();
 
     // Add function_call outputs for tool_calls
-    if let Some(tool_calls) = message.and_then(|m| m.get("tool_calls")).and_then(|t| t.as_array()) {
+    if let Some(tool_calls) = message
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(|t| t.as_array())
+    {
         for tc in tool_calls {
-            let name = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
-            let arguments = tc.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()).unwrap_or("");
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let arguments = tc
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .unwrap_or("");
             let call_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
             output.push(serde_json::json!({
                 "id": format!("fc_{}", uuid::Uuid::new_v4().simple()),
@@ -132,8 +143,12 @@ pub fn openai_to_responses(openai_resp: &Value, model: &str) -> Value {
 
 /// Convert Responses API request to OpenAI Chat Completions format.
 pub fn responses_to_openai(body: &Value) -> Value {
-    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
-    
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+
     // Convert input array to messages array
     let messages = if let Some(input) = body.get("input") {
         convert_responses_input_to_messages(input)
@@ -142,9 +157,15 @@ pub fn responses_to_openai(body: &Value) -> Value {
     };
 
     // max_output_tokens -> max_tokens
-    let max_tokens = body.get("max_output_tokens").and_then(|m| m.as_u64()).unwrap_or(4096);
+    let max_tokens = body
+        .get("max_output_tokens")
+        .and_then(|m| m.as_u64())
+        .unwrap_or(4096);
 
-    let stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    let stream = body
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
 
     let mut openai_body = serde_json::json!({
         "model": model,
@@ -166,36 +187,39 @@ pub fn responses_to_openai(body: &Value) -> Value {
     // Chat Completions uses nested format: { type: "function", function: { name, parameters, description } }
     if let Some(tools) = body.get("tools") {
         if let Some(arr) = tools.as_array() {
-            let openai_tools: Vec<Value> = arr.iter().filter_map(|t| {
-                let tool_type = t.get("type").and_then(|ty| ty.as_str()).unwrap_or("");
-                match tool_type {
-                    // Function tools: convert flat → nested
-                    "function" => {
-                        // Already in Chat Completions format (has "function" field) — pass through
-                        if t.get("function").is_some() {
-                            return Some(t.clone());
+            let openai_tools: Vec<Value> = arr
+                .iter()
+                .filter_map(|t| {
+                    let tool_type = t.get("type").and_then(|ty| ty.as_str()).unwrap_or("");
+                    match tool_type {
+                        // Function tools: convert flat → nested
+                        "function" => {
+                            // Already in Chat Completions format (has "function" field) — pass through
+                            if t.get("function").is_some() {
+                                return Some(t.clone());
+                            }
+                            // Responses API flat format → convert to Chat Completions nested format
+                            let func = serde_json::json!({
+                                "name": t.get("name").cloned().unwrap_or(Value::Null),
+                                "parameters": t.get("parameters").cloned().unwrap_or(Value::Null),
+                            });
+                            let mut func_obj = func;
+                            if let Some(desc) = t.get("description") {
+                                func_obj["description"] = desc.clone();
+                            }
+                            if let Some(strict) = t.get("strict") {
+                                func_obj["strict"] = strict.clone();
+                            }
+                            Some(serde_json::json!({
+                                "type": "function",
+                                "function": func_obj
+                            }))
                         }
-                        // Responses API flat format → convert to Chat Completions nested format
-                        let func = serde_json::json!({
-                            "name": t.get("name").cloned().unwrap_or(Value::Null),
-                            "parameters": t.get("parameters").cloned().unwrap_or(Value::Null),
-                        });
-                        let mut func_obj = func;
-                        if let Some(desc) = t.get("description") {
-                            func_obj["description"] = desc.clone();
-                        }
-                        if let Some(strict) = t.get("strict") {
-                            func_obj["strict"] = strict.clone();
-                        }
-                        Some(serde_json::json!({
-                            "type": "function",
-                            "function": func_obj
-                        }))
+                        // Built-in tools (web_search, file_search, computer_use, etc.) — skip
+                        _ => None,
                     }
-                    // Built-in tools (web_search, file_search, computer_use, etc.) — skip
-                    _ => None
-                }
-            }).collect();
+                })
+                .collect();
             if !openai_tools.is_empty() {
                 openai_body["tools"] = Value::Array(openai_tools);
             }
@@ -210,11 +234,17 @@ pub fn responses_to_openai(body: &Value) -> Value {
     // Pass through instructions as a system message if present
     if let Some(instructions) = body.get("instructions").and_then(|i| i.as_str()) {
         if !instructions.is_empty() {
-            if let Some(msgs) = openai_body.get_mut("messages").and_then(|m| m.as_array_mut()) {
-                msgs.insert(0, serde_json::json!({
-                    "role": "system",
-                    "content": instructions
-                }));
+            if let Some(msgs) = openai_body
+                .get_mut("messages")
+                .and_then(|m| m.as_array_mut())
+            {
+                msgs.insert(
+                    0,
+                    serde_json::json!({
+                        "role": "system",
+                        "content": instructions
+                    }),
+                );
             }
         }
     }
@@ -292,25 +322,36 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
 
                 // message: standard chat message
                 "message" | _ if item.get("role").is_some() => {
-                    let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user").to_string();
+                    let role = item
+                        .get("role")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("user")
+                        .to_string();
                     // Map Roles that some providers don't recognize
                     // 'developer' is an OpenAI alias for 'system' (used by Codex/Responses API)
                     let role = match role.as_str() {
                         "developer" => "system".to_string(),
                         other => other.to_string(),
                     };
-                    let content = if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
-                        // Extract text from content blocks
-                        let texts: Vec<String> = content_arr.iter().filter_map(|block| {
-                            // input_text, output_text, text
-                            block.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
-                        }).collect();
-                        Value::String(texts.join(""))
-                    } else if let Some(text) = item.get("content").and_then(|c| c.as_str()) {
-                        Value::String(text.to_string())
-                    } else {
-                        Value::String(String::new())
-                    };
+                    let content =
+                        if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
+                            // Extract text from content blocks
+                            let texts: Vec<String> = content_arr
+                                .iter()
+                                .filter_map(|block| {
+                                    // input_text, output_text, text
+                                    block
+                                        .get("text")
+                                        .and_then(|t| t.as_str())
+                                        .map(|s| s.to_string())
+                                })
+                                .collect();
+                            Value::String(texts.join(""))
+                        } else if let Some(text) = item.get("content").and_then(|c| c.as_str()) {
+                            Value::String(text.to_string())
+                        } else {
+                            Value::String(String::new())
+                        };
                     msgs.push(serde_json::json!({
                         "role": role,
                         "content": content,
@@ -348,8 +389,12 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
     Value::Array(messages)
 }
 
-/// Convert OpenAI Chat Completions response to Anthropic Messages format.
-pub fn openai_to_anthropic(openai_resp: &Value, model: &str) -> Value {
+/// Convert an OpenAI Chat Completions response to Anthropic Messages format.
+///
+/// This deliberately fails instead of inventing tool input when an upstream
+/// returns malformed function arguments. Claude Code uses those arguments to
+/// execute local tools, so replacing bad JSON with `{}` is unsafe.
+pub fn openai_to_anthropic(openai_resp: &Value, model: &str) -> Result<Value, String> {
     let choice = openai_resp
         .get("choices")
         .and_then(|c| c.as_array())
@@ -357,20 +402,39 @@ pub fn openai_to_anthropic(openai_resp: &Value, model: &str) -> Value {
 
     let message = choice.and_then(|ch| ch.get("message"));
 
-    let content_text = message
-        .and_then(|msg| msg.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
+    let message = message
+        .ok_or_else(|| "OpenAI response does not contain a completion message".to_string())?;
+    if message.get("reasoning_content").is_some() || message.get("thinking").is_some() {
+        return Err("OpenAI upstream returned thinking content, which cannot be represented safely by this Anthropic compatibility endpoint".to_string());
+    }
+    let content_text = match message.get("content") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(value)) => value,
+        Some(_) => {
+            return Err("OpenAI response has unsupported non-text message content".to_string())
+        }
+    };
 
     let finish_reason = choice
         .and_then(|ch| ch.get("finish_reason"))
         .and_then(|f| f.as_str())
-        .unwrap_or("stop");
+        .unwrap_or("");
 
+    // Chat Completions normally sets `tool_calls`, but some compatible
+    // upstreams omit it.  The tool-call payload is less ambiguous than a
+    // missing finish reason, so do not report a completed tool turn as an
+    // ordinary end_turn.
+    let has_tool_calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty());
     let stop_reason = match finish_reason {
         "stop" => "end_turn",
         "length" => "max_tokens",
         "tool_calls" => "tool_use",
+        "content_filter" => "refusal",
+        _ if message.get("refusal").is_some() => "refusal",
+        _ if has_tool_calls => "tool_use",
         _ => "end_turn",
     };
 
@@ -397,13 +461,34 @@ pub fn openai_to_anthropic(openai_resp: &Value, model: &str) -> Value {
     }
 
     // Add tool_use blocks for tool_calls
-    if let Some(tool_calls) = message.and_then(|m| m.get("tool_calls")).and_then(|t| t.as_array()) {
+    if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
         for tc in tool_calls {
-            let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            let id = tc
+                .get("id")
+                .and_then(|i| i.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "OpenAI response tool call is missing its id".to_string())?;
             let func = tc.get("function");
-            let name = func.and_then(|f| f.get("name").and_then(|n| n.as_str())).unwrap_or("");
-            let arguments_str = func.and_then(|f| f.get("arguments").and_then(|a| a.as_str())).unwrap_or("{}");
-            let input: Value = serde_json::from_str(&arguments_str).unwrap_or(serde_json::json!({}));
+            let name = func
+                .and_then(|f| f.get("name").and_then(|n| n.as_str()))
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    "OpenAI response tool call is missing its function name".to_string()
+                })?;
+            let arguments_str = func
+                .and_then(|f| f.get("arguments").and_then(|a| a.as_str()))
+                .ok_or_else(|| {
+                    "OpenAI response tool call is missing function arguments".to_string()
+                })?;
+            let input: Value = serde_json::from_str(arguments_str).map_err(|error| {
+                format!(
+                    "OpenAI response contained invalid tool arguments: {}",
+                    error
+                )
+            })?;
+            if !input.is_object() {
+                return Err("OpenAI response tool arguments must decode to a JSON object".to_string());
+            }
 
             content_blocks.push(serde_json::json!({
                 "type": "tool_use",
@@ -422,44 +507,80 @@ pub fn openai_to_anthropic(openai_resp: &Value, model: &str) -> Value {
         }));
     }
 
-    serde_json::json!({
+    Ok(serde_json::json!({
         "id": openai_resp.get("id").cloned().unwrap_or(Value::String(format!("msg_{}", uuid::Uuid::new_v4().simple()))),
         "type": "message",
         "role": "assistant",
         "model": model,
         "content": content_blocks,
         "stop_reason": stop_reason,
+        "stop_sequence": null,
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens
         }
-    })
+    }))
 }
 
-/// Convert Anthropic Messages request to OpenAI Chat Completions format.
-pub fn anthropic_to_openai(body: &Value) -> Value {
-    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
-    let messages = body.get("messages").cloned().unwrap_or(Value::Array(vec![]));
-    let max_tokens = body.get("max_tokens").and_then(|m| m.as_u64()).unwrap_or(4096);
-    let stream = body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+/// Convert an Anthropic Messages request to OpenAI Chat Completions.
+///
+/// This converter intentionally accepts only the intersection which can be
+/// represented by Chat Completions. Native Anthropic channels must bypass it.
+pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
+    if body.get("thinking").is_some()
+        || body.get("output_config").is_some()
+        || body.get("container").is_some()
+        || body.get("context_management").is_some()
+        || body.get("context_management_config").is_some()
+    {
+        return Err(
+            "thinking, containers, output_config, and context management require a native Anthropic Messages channel"
+                .to_string(),
+        );
+    }
+    let model = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let messages = body
+        .get("messages")
+        .cloned()
+        .unwrap_or(Value::Array(vec![]));
+    let max_tokens = body
+        .get("max_tokens")
+        .and_then(|m| m.as_u64())
+        .unwrap_or(4096);
+    let stream = body
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
 
     // Extract system message and prepend it
-    let system = body.get("system").and_then(|s| {
+    let system = body.get("system").map(|s| {
         if let Some(str_val) = s.as_str() {
-            Some(str_val.to_string())
+            Ok(str_val.to_string())
         } else if let Some(arr) = s.as_array() {
-            // Anthropic system can be an array of content blocks
-            let texts: Vec<String> = arr.iter().filter_map(|block| {
-                block.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
-            }).collect();
-            Some(texts.join(""))
+            let mut texts = Vec::new();
+            for block in arr {
+                // Prompt caching changes Anthropic billing/cache behavior but
+                // not the text content of a Chat Completions request.  It is
+                // safe to drop this annotation on the OpenAI bridge; native
+                // channels still receive the original body unchanged.
+                match block.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => texts.push(block.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
+                    Some("cache_control") | Some("thinking") => return Err("system cache/thinking blocks require a native Anthropic Messages channel".to_string()),
+                    _ => return Err("unsupported non-text system content requires a native Anthropic Messages channel".to_string()),
+                }
+            }
+            Ok(texts.join(""))
         } else {
-            None
+            Err("system must be text or an array of text blocks".to_string())
         }
-    });
+    }).transpose()?;
 
     // Convert Anthropic message content (array format) to OpenAI string format
-    let openai_messages = convert_anthropic_messages_to_openai(&messages, system);
+    let openai_messages = convert_anthropic_messages_to_openai(&messages, system)?;
 
     let mut openai_body = serde_json::json!({
         "model": model,
@@ -482,37 +603,58 @@ pub fn anthropic_to_openai(body: &Value) -> Value {
     if let Some(stop_seq) = body.get("stop_sequences") {
         openai_body["stop"] = stop_seq.clone();
     }
-    // Note: thinking field is not forwarded to OpenAI API since most providers don't support it.
-    // It's safely ignored rather than causing an error.
-
+    if stream {
+        let mut options = body.get("stream_options").cloned().unwrap_or_else(|| serde_json::json!({}));
+        if !options.is_object() { return Err("stream_options must be an object".to_string()); }
+        options["include_usage"] = Value::Bool(true);
+        openai_body["stream_options"] = options;
+    }
     // Convert Anthropic tools to OpenAI tools format
     // Anthropic: {"name": "xxx", "description": "xxx", "input_schema": {...}}
     // OpenAI: {"type": "function", "function": {"name": "xxx", "description": "xxx", "parameters": {...}}}
     // Also handles Anthropic built-in tools (web_search, computer_use, etc.) which are skipped.
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
-        let openai_tools: Vec<Value> = tools.iter().filter_map(|tool| {
+        let mut openai_tools = Vec::new();
+        for tool in tools {
+            // `cache_control` on a custom tool is likewise an Anthropic
+            // caching annotation and has no Chat Completions equivalent.
             // Get the tool type — Anthropic custom tools use "custom" or have no type field
-            let tool_type = tool.get("type").and_then(|t| t.as_str()).unwrap_or("custom");
+            let tool_type = tool
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("custom");
             match tool_type {
                 // Standard function tools (type "custom" or no type)
                 "custom" | "" => {
-                    let name = tool.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    if name.is_empty() { return None; }
-                    let description = tool.get("description").and_then(|d| d.as_str()).unwrap_or("");
-                    let parameters = tool.get("input_schema").cloned().unwrap_or(serde_json::json!({}));
-                    Some(serde_json::json!({
+                    let name = tool
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| "Anthropic tool is missing its name".to_string())?;
+                    let description = tool
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("");
+                    let parameters = tool.get("input_schema").cloned().ok_or_else(|| {
+                        format!("Anthropic tool '{}' is missing input_schema", name)
+                    })?;
+                    openai_tools.push(serde_json::json!({
                         "type": "function",
                         "function": {
                             "name": name,
                             "description": description,
                             "parameters": parameters
                         }
-                    }))
+                    }));
                 }
-                // Built-in tools (web_search_*, computer_*, bash_*, text_editor_*, etc.) — skip
-                _ => None
+                _ => {
+                    return Err(
+                        "Anthropic built-in tools require a native Anthropic Messages channel"
+                            .to_string(),
+                    )
+                }
             }
-        }).collect();
+        }
         if !openai_tools.is_empty() {
             openai_body["tools"] = Value::Array(openai_tools);
         }
@@ -527,13 +669,14 @@ pub fn anthropic_to_openai(body: &Value) -> Value {
                 "auto" => Value::String("auto".to_string()),
                 "any" => Value::String("required".to_string()),
                 "tool" => {
-                    let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let name = tc.get("name").and_then(|n| n.as_str()).filter(|s| !s.is_empty())
+                        .ok_or_else(|| "Anthropic tool_choice type 'tool' is missing a name".to_string())?;
                     serde_json::json!({
                         "type": "function",
                         "function": {"name": name}
                     })
                 }
-                _ => Value::String("auto".to_string()),
+                _ => return Err("unsupported Anthropic tool_choice requires a native Anthropic Messages channel".to_string()),
             };
             openai_body["tool_choice"] = openai_tc;
         } else if let Some(s) = tc.as_str() {
@@ -541,13 +684,63 @@ pub fn anthropic_to_openai(body: &Value) -> Value {
         }
     }
 
-    openai_body
+    if body
+        .get("tool_choice")
+        .and_then(|choice| choice.get("disable_parallel_tool_use"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        openai_body["parallel_tool_calls"] = Value::Bool(false);
+    }
+
+    Ok(openai_body)
+}
+
+/// Estimate structured Anthropic request size for the optional count_tokens endpoint.
+pub fn estimate_anthropic_input_tokens(body: &Value) -> u64 {
+    fn estimate(value: &Value) -> u64 {
+        match value {
+            Value::String(text) => ((text.chars().count() as u64) + 3) / 4,
+            Value::Array(values) => values.iter().map(estimate).sum(),
+            Value::Object(object) => object
+                .iter()
+                // Image source data is base64, not prompt text. Counting it would
+                // overestimate by orders of magnitude on OpenAI-only channels.
+                .filter(|(key, _)| !matches!(key.as_str(), "model" | "stream" | "data"))
+                .map(|(_, value)| estimate(value))
+                .sum(),
+            _ => 0,
+        }
+    }
+    estimate(body).max(1)
+}
+
+fn tool_result_to_openai_content(block: &Value) -> Result<String, String> {
+    match block.get("content") {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(text)) => Ok(text.clone()),
+        Some(Value::Array(items)) => {
+            let mut text = String::new();
+            for item in items {
+                match item.get("type").and_then(|v| v.as_str()) {
+                    Some("text") => text.push_str(item.get("text").and_then(|v| v.as_str()).unwrap_or("")),
+                    Some("image") => return Err("tool_result images require a native Anthropic Messages channel".to_string()),
+                    _ => return Err("unsupported tool_result content requires a native Anthropic Messages channel".to_string()),
+                }
+            }
+            Ok(text)
+        }
+        _ => Err("tool_result content must be text or text blocks".to_string()),
+    }
 }
 
 /// Convert Anthropic messages array to OpenAI messages array.
 /// Anthropic content can be string or array of content blocks.
 /// Handles: text, tool_use (assistant), tool_result (user)
-fn convert_anthropic_messages_to_openai(messages: &Value, system: Option<String>) -> Value {
+fn convert_anthropic_messages_to_openai(
+    messages: &Value,
+    system: Option<String>,
+) -> Result<Value, String> {
     let mut msgs = Vec::new();
 
     // Prepend system message if present
@@ -557,97 +750,88 @@ fn convert_anthropic_messages_to_openai(messages: &Value, system: Option<String>
 
     if let Some(arr) = messages.as_array() {
         for msg in arr {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user").to_string();
+            let role = msg
+                .get("role")
+                .and_then(|r| r.as_str())
+                .ok_or_else(|| "Anthropic message is missing role".to_string())?
+                .to_string();
+            if role != "user" && role != "assistant" {
+                return Err("only user and assistant Anthropic messages can be sent to OpenAI Chat Completions".to_string());
+            }
 
             if let Some(content_arr) = msg.get("content").and_then(|c| c.as_array()) {
-                // Complex content: may contain text, tool_use, or tool_result blocks
-                let mut text_parts: Vec<String> = Vec::new();
+                let mut parts: Vec<Value> = Vec::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
-                let mut tool_results: Vec<Value> = Vec::new();
-
+                let flush_user_parts = |parts: &mut Vec<Value>, msgs: &mut Vec<Value>| {
+                    if !parts.is_empty() {
+                        msgs.push(
+                            serde_json::json!({"role": "user", "content": std::mem::take(parts)}),
+                        );
+                    }
+                };
                 for block in content_arr {
+                    // Cache controls are annotations on otherwise supported
+                    // blocks.  Strip them instead of rejecting an entire
+                    // OpenAI-only Claude Code request.
                     match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-                        "text" => {
-                            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
-                                text_parts.push(t.to_string());
-                            }
+                        "text" => parts.push(serde_json::json!({"type": "text", "text": block.get("text").and_then(|t| t.as_str()).unwrap_or("")})),
+                        "image" => {
+                            if role != "user" { return Err("OpenAI Chat Completions cannot safely encode assistant image blocks".to_string()); }
+                            let source = block.get("source").ok_or_else(|| "Anthropic image block is missing source".to_string())?;
+                            let url = match source.get("type").and_then(|v| v.as_str()) {
+                                Some("url") => source.get("url").and_then(|v| v.as_str()).ok_or_else(|| "Anthropic image URL source is missing url".to_string())?.to_string(),
+                                Some("base64") => format!("data:{};base64,{}", source.get("media_type").and_then(|v| v.as_str()).ok_or_else(|| "Anthropic base64 image is missing media_type".to_string())?, source.get("data").and_then(|v| v.as_str()).ok_or_else(|| "Anthropic base64 image is missing data".to_string())?),
+                                _ => return Err("unsupported Anthropic image source requires a native channel".to_string()),
+                            };
+                            parts.push(serde_json::json!({"type": "image_url", "image_url": {"url": url}}));
                         }
                         "tool_use" => {
-                            // Anthropic tool_use → OpenAI assistant tool_calls
-                            let id = block.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                            let input = block.get("input").cloned().unwrap_or(serde_json::json!({}));
-                            let arguments = serde_json::to_string(&input).unwrap_or_default();
-                            tool_calls.push(serde_json::json!({
-                                "id": id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": arguments
-                                }
-                            }));
-                        }
-                        "thinking" => {
-                            // Anthropic thinking block — extract text, prepend to message content
-                            // OpenAI doesn't have a native thinking block, so we include it as text
-                            if let Some(t) = block.get("thinking").and_then(|t| t.as_str()) {
-                                text_parts.push(t.to_string());
-                            }
-                        }
-                        "image" => {
-                            // Anthropic image block — skip for now (would need URL conversion)
-                            // Future: convert to OpenAI image_url format
+                            if role != "assistant" { return Err("tool_use blocks must be in an assistant message".to_string()); }
+                            let id = block.get("id").and_then(|i| i.as_str()).filter(|s| !s.is_empty()).ok_or_else(|| "tool_use is missing id".to_string())?;
+                            let name = block.get("name").and_then(|n| n.as_str()).filter(|s| !s.is_empty()).ok_or_else(|| "tool_use is missing name".to_string())?;
+                            let input = block.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                            tool_calls.push(serde_json::json!({"id": id, "type": "function", "function": {"name": name, "arguments": serde_json::to_string(&input).map_err(|e| e.to_string())?}}));
                         }
                         "tool_result" => {
-                            // Anthropic tool_result → OpenAI tool message
-                            let tool_use_id = block.get("tool_use_id").and_then(|t| t.as_str()).unwrap_or("");
-                            let result_content = if let Some(rc) = block.get("content").and_then(|c| c.as_array()) {
-                                // Extract text from result content blocks
-                                let texts: Vec<String> = rc.iter().filter_map(|b| {
-                                    b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
-                                }).collect();
-                                texts.join("")
-                            } else if let Some(s) = block.get("content").and_then(|c| c.as_str()) {
-                                s.to_string()
-                            } else {
-                                String::new()
-                            };
-                            tool_results.push(serde_json::json!({
-                                "role": "tool",
-                                "tool_call_id": tool_use_id,
-                                "content": result_content
-                            }));
+                            if role != "user" { return Err("tool_result blocks must be in a user message".to_string()); }
+                            flush_user_parts(&mut parts, &mut msgs);
+                            let tool_use_id = block.get("tool_use_id").and_then(|t| t.as_str()).filter(|s| !s.is_empty()).ok_or_else(|| "tool_result is missing tool_use_id".to_string())?;
+                            let result_content = tool_result_to_openai_content(block)?;
+                            let is_error = block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                            msgs.push(serde_json::json!({"role": "tool", "tool_call_id": tool_use_id, "content": if is_error { format!("Tool execution error:\n{}", result_content) } else { result_content }}));
                         }
-                        _ => {}
+                        "thinking" | "redacted_thinking" => return Err("Anthropic thinking blocks require a native Anthropic Messages channel".to_string()),
+                        "cache_control" => return Err("Anthropic cache controls require a native Anthropic Messages channel".to_string()),
+                        _ => return Err("unsupported Anthropic content block requires a native Anthropic Messages channel".to_string()),
                     }
                 }
-
-                if !tool_calls.is_empty() {
-                    // Assistant message with tool_calls
-                    let content = if text_parts.is_empty() { Value::Null } else { Value::String(text_parts.join("")) };
-                    msgs.push(serde_json::json!({
-                        "role": role,
-                        "content": content,
-                        "tool_calls": tool_calls
-                    }));
-                } else if !tool_results.is_empty() {
-                    // Tool result messages (may be multiple)
-                    // If there's also text, add it as a preceding user message
-                    if !text_parts.is_empty() {
-                        msgs.push(serde_json::json!({
-                            "role": role,
-                            "content": text_parts.join("")
-                        }));
+                if role == "assistant" {
+                    let content = if parts.is_empty() {
+                        Value::Null
+                    } else if parts
+                        .iter()
+                        .all(|part| part.get("type").and_then(|v| v.as_str()) == Some("text"))
+                    {
+                        Value::String(
+                            parts
+                                .iter()
+                                .filter_map(|part| part.get("text").and_then(|v| v.as_str()))
+                                .collect::<String>(),
+                        )
+                    } else {
+                        Value::Array(parts)
+                    };
+                    if tool_calls.is_empty() && content.is_null() {
+                        return Err("assistant message is empty".to_string());
                     }
-                    for tr in tool_results {
-                        msgs.push(tr);
+                    let mut assistant =
+                        serde_json::json!({"role": "assistant", "content": content});
+                    if !tool_calls.is_empty() {
+                        assistant["tool_calls"] = Value::Array(tool_calls);
                     }
+                    msgs.push(assistant);
                 } else {
-                    // Plain text message
-                    msgs.push(serde_json::json!({
-                        "role": role,
-                        "content": text_parts.join("")
-                    }));
+                    flush_user_parts(&mut parts, &mut msgs);
                 }
             } else if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
                 msgs.push(serde_json::json!({
@@ -661,7 +845,89 @@ fn convert_anthropic_messages_to_openai(messages: &Value, system: Option<String>
                 }));
             }
         }
+    } else {
+        return Err("Anthropic messages must be an array".to_string());
     }
 
-    Value::Array(msgs)
+    Ok(Value::Array(msgs))
+}
+
+#[cfg(test)]
+mod anthropic_tests {
+    use super::*;
+
+    #[test]
+    fn counts_structured_anthropic_input() {
+        let body = serde_json::json!({
+            "model": "test-model",
+            "system": [{"type": "text", "text": "system prompt"}],
+            "tools": [{"name": "read", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+        });
+        assert!(estimate_anthropic_input_tokens(&body) > 1);
+    }
+
+    #[test]
+    fn maps_tools_parallel_control_and_mixed_tool_results() {
+        let request = serde_json::json!({
+            "model": "claude-compatible",
+            "max_tokens": 32,
+            "system": [{"type":"text", "text":"be concise"}],
+            "tools": [{"name":"weather", "description":"weather", "input_schema":{"type":"object"}}],
+            "tool_choice": {"type":"any", "disable_parallel_tool_use":true},
+            "messages": [
+                {"role":"assistant", "content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"call_1","name":"weather","input":{"city":"Paris"}}]},
+                {"role":"user", "content":[{"type":"tool_result","tool_use_id":"call_1","content":"sunny"},{"type":"text","text":"thanks"}]}
+            ]
+        });
+        let converted = anthropic_to_openai(&request).unwrap();
+        assert_eq!(converted["parallel_tool_calls"], false);
+        assert_eq!(converted["tool_choice"], "required");
+        assert_eq!(
+            converted["tools"][0]["function"]["parameters"]["type"],
+            "object"
+        );
+        assert_eq!(
+            converted["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Paris\"}"
+        );
+        assert_eq!(converted["messages"][2]["role"], "tool");
+        assert_eq!(converted["messages"][3]["content"][0]["text"], "thanks");
+    }
+
+    #[test]
+    fn rejects_invalid_openai_tool_arguments_without_inventing_input() {
+        let response = serde_json::json!({"choices":[{"finish_reason":"tool_calls", "message":{"role":"assistant", "content":null, "tool_calls":[{"id":"call_1", "function":{"name":"run", "arguments":"{bad"}}]}}]});
+        assert!(openai_to_anthropic(&response, "model").is_err());
+    }
+
+    #[test]
+    fn rejects_non_object_openai_tool_arguments_and_strips_cache_controls() {
+        let response = serde_json::json!({"choices":[{"message":{"role":"assistant", "tool_calls":[{"id":"call_1", "function":{"name":"run", "arguments":"[]"}}]}}]});
+        assert!(openai_to_anthropic(&response, "model").is_err());
+
+        let cache_in_system = serde_json::json!({"model":"model", "system":[{"type":"text", "text":"cached", "cache_control":{"type":"ephemeral"}}], "messages":[]});
+        assert_eq!(anthropic_to_openai(&cache_in_system).unwrap()["messages"][0]["content"], "cached");
+        let cache_in_message = serde_json::json!({"model":"model", "messages":[{"role":"user", "content":[{"type":"text", "text":"cached", "cache_control":{"type":"ephemeral"}}]}]});
+        assert_eq!(anthropic_to_openai(&cache_in_message).unwrap()["messages"][0]["content"][0]["text"], "cached");
+    }
+
+    #[test]
+    fn preserves_anthropic_response_shape_for_refusals_and_implicit_tools() {
+        let refusal = serde_json::json!({"choices":[{"finish_reason":"content_filter", "message":{"role":"assistant", "content":null, "refusal":"no"}}]});
+        let converted = openai_to_anthropic(&refusal, "model").unwrap();
+        assert_eq!(converted["stop_reason"], "refusal");
+        assert!(converted.get("stop_sequence").is_some());
+
+        let implicit_tool = serde_json::json!({"choices":[{"finish_reason":null, "message":{"role":"assistant", "content":null, "tool_calls":[{"id":"call_1", "function":{"name":"run", "arguments":"{}"}}]}}]});
+        assert_eq!(openai_to_anthropic(&implicit_tool, "model").unwrap()["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn streaming_openai_requests_always_request_late_usage() {
+        let request = serde_json::json!({"model":"model", "stream":true, "stream_options":{"include_usage":false, "custom":true}, "messages":[]});
+        let converted = anthropic_to_openai(&request).unwrap();
+        assert_eq!(converted["stream_options"]["include_usage"], true);
+        assert_eq!(converted["stream_options"]["custom"], true);
+    }
 }

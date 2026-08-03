@@ -1,4 +1,5 @@
 use axum::{
+    extract::DefaultBodyLimit,
     Router,
     routing::{get, post},
 };
@@ -38,7 +39,8 @@ pub fn create_router(app: AppHandle, state: Arc<AppState>) -> Router {
         .route("/v1/audio/transcriptions", post(handle_audio_transcriptions))
         .route("/v1/audio/speech", post(handle_audio_speech))
         // Anthropic Messages API
-        .route("/v1/messages", post(handle_messages))
+        .route("/v1/messages", post(handle_messages).layer(DefaultBodyLimit::max(32 * 1024 * 1024)))
+        .route("/v1/messages/count_tokens", post(handle_messages_count_tokens).layer(DefaultBodyLimit::max(32 * 1024 * 1024)))
         // Health check
         .route("/health", get(handle_health))
         // Service routes (Knowledge Base, MCP, etc.)

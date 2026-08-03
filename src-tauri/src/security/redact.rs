@@ -11,6 +11,16 @@ pub fn redact_json(value: &serde_json::Value, settings: &SecuritySettings) -> se
     cloned
 }
 
+/// Logs are a different trust boundary from upstream forwarding.  Never make
+/// persistence of a caller's prompt conditional on the user-selected
+/// forwarding-redaction mode: scan findings can identify a secret even while
+/// audit mode intentionally forwards the original request.
+pub fn redact_json_for_logging(value: &serde_json::Value) -> serde_json::Value {
+    let mut cloned = value.clone();
+    redact_value_in_place(&mut cloned);
+    cloned
+}
+
 fn redact_value_in_place(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(s) => {
@@ -27,7 +37,7 @@ fn redact_value_in_place(value: &mut serde_json::Value) {
                 let lower_key = k.to_ascii_lowercase();
                 if is_secret_field(&lower_key) {
                     if let Some(s) = v.as_str() {
-                        if s.len() > 4 {
+                        if !s.is_empty() {
                             *v = serde_json::Value::String(mask_string(s));
                         }
                     }

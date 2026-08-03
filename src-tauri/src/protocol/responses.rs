@@ -120,8 +120,7 @@ pub fn convert_openai_sse_to_responses(
             for choice in choices {
                 if let Some(delta) = choice.get("delta") {
                     // Reasoning content delta (DeepSeek R1, OpenAI o1/o3, etc.)
-                    if let Some(reasoning) =
-                        delta.get("reasoning_content").and_then(|c| c.as_str())
+                    if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str())
                     {
                         if !reasoning.is_empty() {
                             let seq = next_seq(state);
@@ -216,10 +215,14 @@ pub fn convert_openai_sse_to_responses(
                             let tc_index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
                             let tc_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
                             let func = tc.get("function");
-                            let name =
-                                func.and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
-                            let arguments =
-                                func.and_then(|f| f.get("arguments")).and_then(|a| a.as_str()).unwrap_or("");
+                            let name = func
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("");
+                            let arguments = func
+                                .and_then(|f| f.get("arguments"))
+                                .and_then(|a| a.as_str())
+                                .unwrap_or("");
 
                             // Initialize tool call state if this is the first time we see it
                             if !state.tool_calls.contains_key(&tc_index) {
@@ -317,9 +320,7 @@ pub fn convert_openai_sse_to_responses(
                 }
 
                 // Check for finish_reason
-                if let Some(finish) =
-                    choice.get("finish_reason").and_then(|f| f.as_str())
-                {
+                if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str()) {
                     if !finish.is_empty() && finish != "null" {
                         // Close text item if it was opened and not yet closed
                         if state.text_item_added && !state.text_item_done {
@@ -385,8 +386,19 @@ pub fn convert_openai_sse_to_responses(
 
                         // Close all tool call items
                         // Collect tool call data first to avoid double mutable borrow of state
-                        let tool_calls_data: Vec<(u64, String, String, String, String, bool, bool, bool)> =
-                            state.tool_calls.iter().map(|(_, tc)| {
+                        let tool_calls_data: Vec<(
+                            u64,
+                            String,
+                            String,
+                            String,
+                            String,
+                            bool,
+                            bool,
+                            bool,
+                        )> = state
+                            .tool_calls
+                            .iter()
+                            .map(|(_, tc)| {
                                 (
                                     tc.output_index as u64,
                                     tc.item_id.clone(),
@@ -397,9 +409,20 @@ pub fn convert_openai_sse_to_responses(
                                     tc.arguments_done_sent,
                                     tc.output_item_done_sent,
                                 )
-                            }).collect();
+                            })
+                            .collect();
 
-                        for (output_index, item_id, call_id, name, accumulated_args, _item_added, arguments_done, output_item_done) in &tool_calls_data {
+                        for (
+                            output_index,
+                            item_id,
+                            call_id,
+                            name,
+                            accumulated_args,
+                            _item_added,
+                            arguments_done,
+                            output_item_done,
+                        ) in &tool_calls_data
+                        {
                             if !arguments_done {
                                 let seq = next_seq(state);
                                 let args_done = serde_json::json!({
@@ -546,7 +569,10 @@ pub fn create_synthetic_completed_events(
             "text": accumulated_content,
             "sequence_number": s
         });
-        events.push(format!("event: response.output_text.done\ndata: {}\n\n", text_done));
+        events.push(format!(
+            "event: response.output_text.done\ndata: {}\n\n",
+            text_done
+        ));
 
         let s = next_seq!();
         let part = serde_json::json!({
@@ -562,7 +588,10 @@ pub fn create_synthetic_completed_events(
             "part": part,
             "sequence_number": s
         });
-        events.push(format!("event: response.content_part.done\ndata: {}\n\n", part_done));
+        events.push(format!(
+            "event: response.content_part.done\ndata: {}\n\n",
+            part_done
+        ));
 
         let s = next_seq!();
         let completed_item = serde_json::json!({
@@ -582,7 +611,10 @@ pub fn create_synthetic_completed_events(
             "item": completed_item,
             "sequence_number": s
         });
-        events.push(format!("event: response.output_item.done\ndata: {}\n\n", item_done));
+        events.push(format!(
+            "event: response.output_item.done\ndata: {}\n\n",
+            item_done
+        ));
     }
 
     // Close any still-open tool call items
@@ -596,7 +628,10 @@ pub fn create_synthetic_completed_events(
                 "arguments": tc_state.accumulated_arguments,
                 "sequence_number": s
             });
-            events.push(format!("event: response.function_call_arguments.done\ndata: {}\n\n", args_done));
+            events.push(format!(
+                "event: response.function_call_arguments.done\ndata: {}\n\n",
+                args_done
+            ));
         }
 
         if !tc_state.output_item_done_sent {
@@ -615,7 +650,10 @@ pub fn create_synthetic_completed_events(
                 "item": fc_completed,
                 "sequence_number": s
             });
-            events.push(format!("event: response.output_item.done\ndata: {}\n\n", item_done));
+            events.push(format!(
+                "event: response.output_item.done\ndata: {}\n\n",
+                item_done
+            ));
         }
     }
 
@@ -680,7 +718,10 @@ pub fn create_synthetic_completed_events(
         },
         "sequence_number": s
     });
-    events.push(format!("event: response.completed\ndata: {}\n\n", completed));
+    events.push(format!(
+        "event: response.completed\ndata: {}\n\n",
+        completed
+    ));
 
     events
 }
@@ -698,9 +739,18 @@ pub fn parse_usage_from_sse_chunk(text: &str) -> Option<(i64, i64, i64)> {
         }
         if let Ok(json) = serde_json::from_str::<Value>(data_str) {
             if let Some(usage) = json.get("usage") {
-                let prompt = usage.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                let completion = usage.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                let total = usage.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                let prompt = usage
+                    .get("prompt_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let completion = usage
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let total = usage
+                    .get("total_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
                 if total > 0 || prompt > 0 || completion > 0 {
                     return Some((prompt, completion, total));
                 }
@@ -759,9 +809,8 @@ mod tests {
 
         // Chunk 1: text delta
         let chunk1 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
-        let events1 = convert_openai_sse_to_responses(
-            chunk1, "gpt-4", response_id, "Hello", &mut state,
-        );
+        let events1 =
+            convert_openai_sse_to_responses(chunk1, "gpt-4", response_id, "Hello", &mut state);
         let types1 = extract_event_types(&events1);
         assert_eq!(
             types1,
@@ -780,15 +829,24 @@ mod tests {
         // Chunk 2: more text
         let chunk2 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}"#;
         let events2 = convert_openai_sse_to_responses(
-            chunk2, "gpt-4", response_id, "Hello world", &mut state,
+            chunk2,
+            "gpt-4",
+            response_id,
+            "Hello world",
+            &mut state,
         );
         let types2 = extract_event_types(&events2);
         assert_eq!(types2, vec!["response.output_text.delta"]);
 
         // Chunk 3: finish
-        let chunk3 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+        let chunk3 =
+            r#"data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
         let events3 = convert_openai_sse_to_responses(
-            chunk3, "gpt-4", response_id, "Hello world", &mut state,
+            chunk3,
+            "gpt-4",
+            response_id,
+            "Hello world",
+            &mut state,
         );
         let types3 = extract_event_types(&events3);
         assert_eq!(
@@ -813,14 +871,9 @@ mod tests {
 
         // Chunk 1: tool call start (id + name)
         let chunk1 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#;
-        let events1 = convert_openai_sse_to_responses(
-            chunk1, "gpt-4", response_id, "", &mut state,
-        );
+        let events1 = convert_openai_sse_to_responses(chunk1, "gpt-4", response_id, "", &mut state);
         let types1 = extract_event_types(&events1);
-        assert_eq!(
-            types1,
-            vec!["response.output_item.added"]
-        );
+        assert_eq!(types1, vec!["response.output_item.added"]);
 
         // Verify it's a function_call item
         let added_data = extract_event_data(&events1[0]);
@@ -831,9 +884,7 @@ mod tests {
 
         // Chunk 2: arguments delta
         let chunk2 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"SF\"}"}}]},"finish_reason":null}]}"#;
-        let events2 = convert_openai_sse_to_responses(
-            chunk2, "gpt-4", response_id, "", &mut state,
-        );
+        let events2 = convert_openai_sse_to_responses(chunk2, "gpt-4", response_id, "", &mut state);
         let types2 = extract_event_types(&events2);
         assert_eq!(types2, vec!["response.function_call_arguments.delta"]);
 
@@ -843,10 +894,9 @@ mod tests {
         assert_eq!(args_delta_data["delta"], "{\"city\":\"SF\"}");
 
         // Chunk 3: finish with tool_calls
-        let chunk3 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#;
-        let events3 = convert_openai_sse_to_responses(
-            chunk3, "gpt-4", response_id, "", &mut state,
-        );
+        let chunk3 =
+            r#"data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#;
+        let events3 = convert_openai_sse_to_responses(chunk3, "gpt-4", response_id, "", &mut state);
         let types3 = extract_event_types(&events3);
         assert_eq!(
             types3,
@@ -870,7 +920,11 @@ mod tests {
         // Chunk 1: text
         let chunk1 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Let me check"},"finish_reason":null}]}"#;
         let _ = convert_openai_sse_to_responses(
-            chunk1, "gpt-4", response_id, "Let me check", &mut state,
+            chunk1,
+            "gpt-4",
+            response_id,
+            "Let me check",
+            &mut state,
         );
         assert_eq!(state.text_output_index, 0);
         assert_eq!(state.next_output_index, 1);
@@ -878,7 +932,11 @@ mod tests {
         // Chunk 2: tool call start
         let chunk2 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_xyz","function":{"name":"search","arguments":""}}]},"finish_reason":null}]}"#;
         let events2 = convert_openai_sse_to_responses(
-            chunk2, "gpt-4", response_id, "Let me check", &mut state,
+            chunk2,
+            "gpt-4",
+            response_id,
+            "Let me check",
+            &mut state,
         );
         let types2 = extract_event_types(&events2);
         assert_eq!(types2, vec!["response.output_item.added"]);
@@ -891,15 +949,24 @@ mod tests {
         // Chunk 3: arguments
         let chunk3 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]},"finish_reason":null}]}"#;
         let events3 = convert_openai_sse_to_responses(
-            chunk3, "gpt-4", response_id, "Let me check", &mut state,
+            chunk3,
+            "gpt-4",
+            response_id,
+            "Let me check",
+            &mut state,
         );
         let types3 = extract_event_types(&events3);
         assert_eq!(types3, vec!["response.function_call_arguments.delta"]);
 
         // Chunk 4: finish
-        let chunk4 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#;
+        let chunk4 =
+            r#"data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#;
         let events4 = convert_openai_sse_to_responses(
-            chunk4, "gpt-4", response_id, "Let me check", &mut state,
+            chunk4,
+            "gpt-4",
+            response_id,
+            "Let me check",
+            &mut state,
         );
         let types4 = extract_event_types(&events4);
         assert_eq!(
@@ -930,14 +997,10 @@ mod tests {
 
         // Simulate: tool call only, no finish_reason in stream
         let chunk1 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"test","arguments":"{\"x\":1}"}}]},"finish_reason":null}]}"#;
-        let _ = convert_openai_sse_to_responses(
-            chunk1, "gpt-4", response_id, "", &mut state,
-        );
+        let _ = convert_openai_sse_to_responses(chunk1, "gpt-4", response_id, "", &mut state);
 
         // Stream ends without finish_reason — call synthetic completed
-        let synth = create_synthetic_completed_events(
-            "gpt-4", response_id, "", &state, 10, 20,
-        );
+        let synth = create_synthetic_completed_events("gpt-4", response_id, "", &state, 10, 20);
         let synth_types = extract_event_types(&synth);
         assert_eq!(
             synth_types,
@@ -950,7 +1013,10 @@ mod tests {
 
         // Verify response.completed has function_call in output
         let completed_data = extract_event_data(&synth[2]);
-        assert_eq!(completed_data["response"]["output"][0]["type"], "function_call");
+        assert_eq!(
+            completed_data["response"]["output"][0]["type"],
+            "function_call"
+        );
         assert_eq!(completed_data["response"]["usage"]["input_tokens"], 10);
         assert_eq!(completed_data["response"]["usage"]["output_tokens"], 20);
     }
