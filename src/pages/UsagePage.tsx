@@ -1,4 +1,5 @@
 import { useEffect, useState, useMemo, useRef } from "react";
+import { useNavigate } from "react-router-dom";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { channelApi, apiKeyApi, serverApi } from "../lib/api";
@@ -7,7 +8,7 @@ import { AppConfigPanel, getAppIcon } from "./AppConfigPage";
 import {
   BookOpen, Copy, Check, Play, Loader2, Link2, KeyRound, Bot,
   ChevronDown, Terminal, Code2, Coffee, Zap, ArrowRight,
-  MessageSquare, Layers, Sparkles,
+  MessageSquare, Layers, Sparkles, AlertCircle,
 } from "lucide-react";
 
 type Platform = "curl-mac" | "curl-windows" | "javascript" | "typescript" | "java";
@@ -50,6 +51,7 @@ const accentClasses: Record<string, { bg: string; border: string; text: string; 
 };
 
 export function UsagePage() {
+  const navigate = useNavigate();
   const [channels, setChannels] = useState<Channel[]>([]);
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const [ss, setSs] = useState<ServerStatus | null>(null);
@@ -104,16 +106,17 @@ export function UsagePage() {
   const baseUrl = ss?.running ? `${ss.url}/v1` : "http://127.0.0.1:8777/v1";
 
   const modelList = useMemo(() => {
-    const seen = new Set<string>();
+    const realSeen = new Set<string>();
+    const mappedSeen = new Set<string>();
     const real: string[] = [];
     const mapped: string[] = [];
     channels.forEach(c => {
       c.models.forEach(m => {
-        if (!seen.has(m)) { seen.add(m); real.push(m); }
+        if (!realSeen.has(m)) { realSeen.add(m); real.push(m); }
       });
       if (c.model_mapping) {
         Object.keys(c.model_mapping).forEach(from => {
-          if (!seen.has(from)) { seen.add(from); mapped.push(from); }
+          if (!mappedSeen.has(from)) { mappedSeen.add(from); mapped.push(from); }
         });
       }
     });
@@ -558,6 +561,15 @@ public class AnthropicTest {
                   {copied === "key" ? <Check size={16} className="text-emerald-600" /> : <Copy size={16} />}
                 </button>
               </div>
+              {keys.length === 0 && (
+                <div className="mt-2 flex items-center gap-1.5 text-xs text-rose-500">
+                  <AlertCircle size={12} />
+                  <span>尚未创建密钥，</span>
+                  <button onClick={() => navigate("/api-keys")} className="font-medium text-rose-600 underline hover:text-rose-700">
+                    去配置 →
+                  </button>
+                </div>
+              )}
             </div>
 
             <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
@@ -592,6 +604,15 @@ public class AnthropicTest {
                   {copied === "model" ? <Check size={16} className="text-emerald-600" /> : <Copy size={16} />}
                 </button>
               </div>
+              {models.length === 0 && (
+                <div className="mt-2 flex items-center gap-1.5 text-xs text-rose-500">
+                  <AlertCircle size={12} />
+                  <span>尚未配置渠道，</span>
+                  <button onClick={() => navigate("/channels")} className="font-medium text-rose-600 underline hover:text-rose-700">
+                    去配置 →
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>

@@ -162,7 +162,8 @@ export function ChannelsPage() {
     setDragOverId(null);
     try {
       await channelApi.reorder(next.map(c => c.id));
-    } catch {
+    } catch (err) {
+      console.error("reorder failed:", err);
       load(); // revert on failure
     }
   };

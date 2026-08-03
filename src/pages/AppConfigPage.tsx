@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useMemo } from "react";
+import { useNavigate } from "react-router-dom";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { appConfigApi, serverApi, apiKeyApi, channelApi } from "../lib/api";
@@ -46,6 +47,7 @@ export function getAppIcon(name: string) {
 // ── 单应用配置面板 ──
 
 export function AppConfigPanel({ appName }: { appName: string }) {
+  const navigate = useNavigate();
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [configContent, setConfigContent] = useState<ConfigContent | null>(null);
   const [ss, setSs] = useState<ServerStatus | null>(null);
@@ -110,16 +112,17 @@ export function AppConfigPanel({ appName }: { appName: string }) {
 
   // 模型列表
   const modelList = useMemo(() => {
-    const seen = new Set<string>();
+    const realSeen = new Set<string>();
+    const mappedSeen = new Set<string>();
     const real: string[] = [];
     const mapped: string[] = [];
     channels.forEach(c => {
       c.models.forEach(m => {
-        if (!seen.has(m)) { seen.add(m); real.push(m); }
+        if (!realSeen.has(m)) { realSeen.add(m); real.push(m); }
       });
       if (c.model_mapping) {
         Object.keys(c.model_mapping).forEach(from => {
-          if (!seen.has(from)) { seen.add(from); mapped.push(from); }
+          if (!mappedSeen.has(from)) { mappedSeen.add(from); mapped.push(from); }
         });
       }
     });
@@ -279,6 +282,15 @@ export function AppConfigPanel({ appName }: { appName: string }) {
               </select>
               <ChevronDown size={14} className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
             </div>
+            {keys.length === 0 && (
+              <div className="mt-2 flex items-center gap-1.5 text-xs text-rose-500">
+                <AlertCircle size={12} />
+                <span>尚未创建密钥，</span>
+                <button onClick={() => navigate("/api-keys")} className="font-medium text-rose-600 underline hover:text-rose-700">
+                  去配置 →
+                </button>
+              </div>
+            )}
           </div>
 
           <div className="rounded-xl border border-slate-100 bg-slate-50/80 px-4 py-3">
@@ -308,6 +320,15 @@ export function AppConfigPanel({ appName }: { appName: string }) {
               </select>
               <ChevronDown size={14} className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
             </div>
+            {allModels.length === 0 && (
+              <div className="mt-2 flex items-center gap-1.5 text-xs text-rose-500">
+                <AlertCircle size={12} />
+                <span>尚未配置渠道，</span>
+                <button onClick={() => navigate("/channels")} className="font-medium text-rose-600 underline hover:text-rose-700">
+                  去配置 →
+                </button>
+              </div>
+            )}
           </div>
         </div>
 
