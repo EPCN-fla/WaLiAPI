@@ -158,6 +158,7 @@ function getRoleMeta(role: string) {
 export function LogsPage() {
   const [logs, setLogs] = useState<RequestLog[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState(false);
   const [page, setPage] = useState(0);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [showCleanModal, setShowCleanModal] = useState(false);
@@ -192,7 +193,7 @@ export function LogsPage() {
         trace_id: filterTraceId || undefined,
     })
       .then(setLogs)
-      .catch(() => {})
+      .catch(() => setLoadError(true))
       .finally(() => setLoading(false));
   }, [keyword, filterApiKey, filterChannel, filterModel, filterDateFrom, filterDateTo, filterTraceId]);
 
@@ -366,9 +367,20 @@ export function LogsPage() {
         <div className="surface h-full overflow-hidden rounded-[24px] flex flex-col">
           {logs.length === 0 ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 text-center">
-              <ScrollText className="h-12 w-12 text-muted-foreground/70" />
-              <p className="text-base font-medium">暂无审计日志</p>
-              <p className="text-sm text-muted-foreground">当有模型请求经过网关后，这里会显示调用记录</p>
+              {loadError ? (
+                <>
+                  <AlertCircle className="h-12 w-12 text-red-400/70" />
+                  <p className="text-base font-medium">日志加载失败</p>
+                  <p className="text-sm text-muted-foreground">请检查服务是否已启动</p>
+                  <button onClick={() => load(page)} className="mt-1 rounded-lg bg-blue-600 px-4 py-2 text-xs font-medium text-white hover:bg-blue-700">重新加载</button>
+                </>
+              ) : (
+                <>
+                  <ScrollText className="h-12 w-12 text-muted-foreground/70" />
+                  <p className="text-base font-medium">暂无审计日志</p>
+                  <p className="text-sm text-muted-foreground">当有模型请求经过网关后，这里会显示调用记录</p>
+                </>
+              )}
             </div>
           ) : (
             <>

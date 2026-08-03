@@ -25,14 +25,25 @@ import {
 
 export function DashboardPage() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
+  const [loadError, setLoadError] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const navigate = useNavigate();
 
   useEffect(() => {
-    statsApi.getDashboard().then(setStats).catch(() => {});
-    const interval = setInterval(() => statsApi.getDashboard().then(setStats).catch(() => {}), 10000);
+    const doLoad = () => statsApi.getDashboard().then(setStats).catch(() => setLoadError(true));
+    doLoad();
+    const interval = setInterval(doLoad, 10000);
     return () => clearInterval(interval);
   }, []);
+
+  if (loadError && !stats) {
+    return (
+      <div className="page-shell flex flex-col items-center justify-center gap-3 text-sm text-slate-500">
+        <p>数据加载失败，请检查服务是否已启动。</p>
+        <button onClick={() => window.location.reload()} className="rounded-lg bg-blue-600 px-4 py-2 text-xs font-medium text-white hover:bg-blue-700">重新加载</button>
+      </div>
+    );
+  }
 
   if (!stats) {
     return <div className="page-shell text-sm text-slate-500">加载中...</div>;

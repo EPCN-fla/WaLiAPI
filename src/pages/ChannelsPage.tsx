@@ -3,7 +3,7 @@ import { channelApi, importExportApi } from "../lib/api";
 import type { ChannelStats } from "../lib/api";
 import type { Channel } from "../types";
 import { CHANNEL_TYPES, formatTime, formatNumber, formatDuration } from "../lib/constants";
-import { Plus, Radio, Trash2, Zap, Power, Edit, Download, ChevronDown, Upload, Loader2, X, Activity, Clock, GripVertical, Eye, EyeOff, Copy, Check } from "lucide-react";
+import { Plus, Radio, Trash2, Zap, Power, Edit, Download, ChevronDown, Upload, Loader2, X, Activity, Clock, GripVertical, Eye, EyeOff, Copy, Check, AlertCircle } from "lucide-react";
 import { ChannelForm } from "../components/ChannelForm";
 import { ImportDialog } from "../components/ImportDialog";
 
@@ -19,6 +19,7 @@ export function ChannelsPage() {
   const [exporting, setExporting] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Channel | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [loadError, setLoadError] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
@@ -27,6 +28,7 @@ export function ChannelsPage() {
   const [fullKeyMap, setFullKeyMap] = useState<Record<string, string>>({});
   const [keyLoading, setKeyLoading] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [copiedModel, setCopiedModel] = useState<string | null>(null);
   const importMenuRef = useRef<HTMLDivElement>(null);
   const dragCounter = useRef(0);
 
@@ -37,6 +39,9 @@ export function ChannelsPage() {
       stats.forEach(s => { map[s.channel_id] = s; });
       setChannelStats(map);
     }).catch(() => {});
+    Promise.all([channelApi.getAll(), channelApi.getStats()])
+      .then(() => setLoadError(false))
+      .catch(() => setLoadError(true));
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -118,6 +123,14 @@ export function ChannelsPage() {
   };
 
   // 复制 API Key
+  const handleCopyModel = async (model: string) => {
+    try {
+      await navigator.clipboard.writeText(model);
+      setCopiedModel(model);
+      setTimeout(() => setCopiedModel(null), 2000);
+    } catch {}
+  };
+
   const handleCopyKey = async (ch: Channel) => {
     const keyToCopy = fullKeyMap[ch.id] || ch.api_key;
     try {
@@ -218,9 +231,20 @@ export function ChannelsPage() {
 
       {channels.length === 0 ? (
         <div className="surface empty-state">
-          <Radio className="h-12 w-12 text-muted-foreground/70" />
-          <p className="text-base font-medium">还没有配置任何渠道</p>
-          <p className="text-sm text-muted-foreground">先添加一个上游服务商，即可开始分发请求</p>
+          {loadError ? (
+            <>
+              <AlertCircle className="h-12 w-12 text-red-400/70" />
+              <p className="text-base font-medium">数据加载失败</p>
+              <p className="text-sm text-muted-foreground">请检查服务是否已启动，或点击下方按钮重试</p>
+              <button onClick={() => load()} className="mt-2 rounded-lg bg-blue-600 px-4 py-2 text-xs font-medium text-white hover:bg-blue-700">重新加载</button>
+            </>
+          ) : (
+            <>
+              <Radio className="h-12 w-12 text-muted-foreground/70" />
+              <p className="text-base font-medium">还没有配置任何渠道</p>
+              <p className="text-sm text-muted-foreground">先添加一个上游服务商，即可开始分发请求</p>
+            </>
+          )}
         </div>
       ) : (
         <div className="space-y-3">
@@ -335,7 +359,15 @@ export function ChannelsPage() {
                       <div className="mb-1.5 text-xs font-semibold text-slate-500">可用模型 ({ch.models.length})</div>
                       <div className="flex flex-wrap gap-1.5">
                         {ch.models.map(m => (
-                          <span key={m} className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700">{m}</span>
+                          <button
+                            key={m}
+                            onClick={() => handleCopyModel(m)}
+                            className={`inline-flex items-center gap-0.5 rounded-full px-1.5 py-0 text-[11px] font-medium leading-5 transition-all active:scale-95 ${copiedModel === m ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-700 hover:bg-slate-200"}`}
+                            title="点击复制"
+                          >
+                            {m}
+                            {copiedModel === m && <Check size={9} className="text-emerald-500" />}
+                          </button>
                         ))}
                       </div>
                     </div>
@@ -345,11 +377,21 @@ export function ChannelsPage() {
                       <div>
                         <div className="mb-1.5 text-xs font-semibold text-slate-500">映射模型</div>
                         <div className="flex flex-wrap gap-1.5">
-                          {Object.entries(ch.model_mapping).map(([name, target]) => (
-                            <span key={name} className="rounded-full bg-violet-50 px-2 py-0.5 text-xs font-medium text-violet-700">
-                              {name} → {target}
-                            </span>
-                          ))}
+                          {Object.entries(ch.model_mapping).map(([name, target]) => {
+                            const targets = Array.isArray(target) ? target : [target];
+                            const label = `${name} → ${targets.join(" / ")}`;
+                            return (
+                              <button
+                                key={name}
+                                onClick={() => handleCopyModel(name)}
+                                className={`inline-flex items-center gap-0.5 rounded-full px-1.5 py-0 text-[11px] font-medium leading-5 transition-all active:scale-95 ${copiedModel === name ? "bg-emerald-50 text-emerald-700" : "bg-violet-50 text-violet-700 hover:bg-violet-100"}`}
+                                title="点击复制映射名"
+                              >
+                                {label}
+                                {copiedModel === name && <Check size={9} className="text-emerald-500" />}
+                              </button>
+                            );
+                          })}
                         </div>
                       </div>
                     )}

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { settingsApi, serverApi, securityApi } from "../lib/api";
 import type { Settings, BuiltinRule, CustomRule } from "../types";
-import { Save, RotateCcw, Check, Server, SlidersHorizontal, Palette, RefreshCw, ShieldAlert, Plus, Trash2, ListChecks, Pencil, X } from "lucide-react";
+import { Save, RotateCcw, Check, Server, SlidersHorizontal, Palette, RefreshCw, ShieldAlert, Plus, Trash2, ListChecks, Pencil, X, AlertCircle } from "lucide-react";
 
 const SEVERITY_BADGE: Record<string, string> = {
   critical: "bg-red-50 text-red-700 border-red-200",
@@ -17,6 +17,7 @@ export function SettingsPage() {
   const [message, setMessage] = useState<string | null>(null);
   const [builtinRules, setBuiltinRules] = useState<BuiltinRule[]>([]);
   const [customRules, setCustomRules] = useState<CustomRule[]>([]);
+  const [loadError, setLoadError] = useState(false);
   const [showAddRule, setShowAddRule] = useState(false);
   const [newRule, setNewRule] = useState({ rule_type: "blacklist", category: "domain", pattern: "", severity: "medium", action: "warn", description: "" });
   const [editingBuiltin, setEditingBuiltin] = useState<string | null>(null);
@@ -30,6 +31,9 @@ export function SettingsPage() {
     settingsApi.get().then(setSettings).catch(() => {});
     securityApi.getBuiltinRules().then(setBuiltinRules).catch(() => {});
     securityApi.getCustomRules().then(setCustomRules).catch(() => {});
+    Promise.all([settingsApi.get(), securityApi.getBuiltinRules(), securityApi.getCustomRules()])
+      .then(() => setLoadError(false))
+      .catch(() => setLoadError(true));
   }, []);
 
   const handleAddRule = async () => {
@@ -130,7 +134,18 @@ export function SettingsPage() {
     }
   };
 
-  if (!settings) return <div className="page-shell text-sm text-muted-foreground">加载中...</div>;
+  if (!settings) {
+    if (loadError) {
+      return (
+        <div className="page-shell flex flex-col items-center justify-center gap-3 text-sm text-slate-500">
+          <AlertCircle className="h-10 w-10 text-red-400/70" />
+          <p>设置加载失败，请检查服务是否已启动。</p>
+          <button onClick={() => window.location.reload()} className="rounded-lg bg-blue-600 px-4 py-2 text-xs font-medium text-white hover:bg-blue-700">重新加载</button>
+        </div>
+      );
+    }
+    return <div className="page-shell text-sm text-muted-foreground">加载中...</div>;
+  }
 
   const handleSave = async () => {
     await settingsApi.save(settings);
