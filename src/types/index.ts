@@ -11,6 +11,7 @@ export interface Channel {
   weight: number;
   config: Record<string, unknown>;
   model_mapping: Record<string, string | string[]>;
+  timeout_secs: number;
   created_at: string;
   updated_at: string;
   last_test_at: string | null;
@@ -27,6 +28,7 @@ export interface CreateChannelInput {
   weight?: number;
   config?: Record<string, unknown>;
   model_mapping?: Record<string, string | string[]>;
+  timeout_secs?: number;
 }
 
 export interface UpdateChannelInput {
@@ -41,6 +43,7 @@ export interface UpdateChannelInput {
   weight?: number;
   config?: Record<string, unknown>;
   model_mapping?: Record<string, string | string[]>;
+  timeout_secs?: number;
 }
 
 export interface TestChannelResult {

@@ -70,7 +70,10 @@ impl Adaptor for ClaudeAdaptor {
             claude_body["temperature"] = temp;
         }
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let resp = client.post(&url)
             .header("x-api-key", &config.api_key)
             .header("anthropic-version", "2023-06-01")
@@ -79,7 +82,7 @@ impl Adaptor for ClaudeAdaptor {
             .send().await?;
 
         let status = resp.status().as_u16();
-        let claude_json: serde_json::Value = resp.json().await?;
+        let claude_json: serde_json::Value = resp.json().await?;;
 
         // Convert Claude response to OpenAI format
         let openai_response = convert_claude_to_openai(&claude_json, model);
@@ -110,7 +113,10 @@ impl Adaptor for ClaudeAdaptor {
             claude_body["system"] = serde_json::Value::String(sys);
         }
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let resp = client.post(&url)
             .header("x-api-key", &config.api_key)
             .header("anthropic-version", "2023-06-01")

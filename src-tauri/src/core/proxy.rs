@@ -140,6 +140,45 @@ pub async fn handle_request(
 
         match result {
             Ok((status, resp_body, usage)) => {
+                // P0 fix: check HTTP status code — non-success codes should trigger failover
+                if status >= 400 {
+                    let error_message = format!("{}: HTTP {}", channel.name, status);
+                    let log = RequestLog {
+                        id: utils::id::new_id(),
+                        seq: None,
+                        api_key_id: Some(api_key_id.to_string()),
+                        api_key_name: Some(api_key_name.to_string()),
+                        channel_id: Some(channel.id.clone()),
+                        channel_name: Some(channel.name.clone()),
+                        model: model.clone(),
+                        upstream_model: Some(upstream_model.clone()),
+                        mode: "chat".to_string(),
+                        status_code: status as i64,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        duration_ms: duration_ms as i64,
+                        error_message: Some(error_message.clone()),
+                        is_stream: if is_stream { 1 } else { 0 },
+                        is_retry,
+                        created_at: utils::time::now_iso(),
+                        request_body: request_body.clone(),
+                        response_choices: None,
+                        risk_level: security_result.risk_level.as_str().to_string(),
+                        risk_score: security_result.risk_score as i64,
+                        risk_summary: Some(security_result.summary.clone()),
+                        security_action: security_result.action.as_str().to_string(),
+                        sanitized: if security_result.sanitized { 1 } else { 0 },
+                        blocked_reason: security_result.blocked_reason.clone(),
+                        trace_id: trace_id.clone(),
+                    };
+                    let log_id = log.id.clone();
+                    if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
+                    if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+                    last_error = Some(error_message);
+                    continue;
+                }
+
                 // Extract and log choices
                 let response_choices = resp_body.get("choices").and_then(|c| serde_json::to_string(c).ok());
                 if response_choices.is_some() {

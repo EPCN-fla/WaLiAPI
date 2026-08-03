@@ -18,6 +18,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
     priority: editing?.priority ?? 0,
     weight: editing?.weight ?? 1,
     model_mapping: editing?.model_mapping || {},
+    timeout_secs: editing?.timeout_secs ?? 60,
   });
   const [modelInput, setModelInput] = useState("");
   const [showTypePicker, setShowTypePicker] = useState(false);
@@ -144,6 +145,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
         priority: form.priority,
         weight: form.weight,
         model_mapping: form.model_mapping,
+        timeout_secs: form.timeout_secs,
       });
     } else {
       await channelApi.create(form);
@@ -345,6 +347,20 @@ export function ChannelForm({ editing, onClose, onSaved }: {
               />
               <p className="mt-1.5 text-xs text-muted-foreground">同优先级渠道间的负载均衡比例，数值越大分配的请求越多</p>
             </div>
+          </div>
+
+          {/* Timeout */}
+          <div>
+            <label className="mb-2 block text-sm font-medium">请求超时时间（秒）</label>
+            <input
+              type="number"
+              min={1}
+              max={600}
+              value={form.timeout_secs}
+              onChange={e => setForm(prev => ({ ...prev, timeout_secs: Math.max(1, parseInt(e.target.value) || 60) }))}
+              className="w-full rounded-2xl border border-border bg-background/70 px-4 py-3 text-sm"
+            />
+            <p className="mt-1.5 text-xs text-muted-foreground">该渠道请求的超时时间，默认 60 秒。流式请求也受此限制。超时后会自动重试下一个渠道</p>
           </div>
 
           {/* Actions */}

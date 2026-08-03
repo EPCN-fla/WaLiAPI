@@ -629,7 +629,10 @@ async fn native_anthropic_request(
         "messages"
     };
     let url = native_anthropic_url(config, path, query);
-    let mut request = reqwest::Client::new()
+    let mut request = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(config.timeout_secs))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
         .post(url)
         .header("x-api-key", &config.api_key)
         .header("content-type", "application/json");
@@ -656,7 +659,10 @@ async fn openai_messages_request(
     body: &serde_json::Value,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(config.timeout_secs))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
         .post(url)
         .bearer_auth(&config.api_key)
         .header("content-type", "application/json")
@@ -1221,7 +1227,7 @@ mod anthropic_handler_tests {
     #[test]
     fn preserves_query_beta_for_both_native_message_paths() {
         let config = crate::adaptor::ChannelConfig {
-            base_url: "https://upstream.example/v1/".to_string(), api_key: "key".to_string(), models: vec![], model_mapping: serde_json::json!({}), extra: serde_json::json!({}),
+            base_url: "https://upstream.example/v1/".to_string(), api_key: "key".to_string(), models: vec![], model_mapping: serde_json::json!({}), extra: serde_json::json!({}), timeout_secs: 60,
         };
         assert_eq!(native_anthropic_url(&config, "messages", Some("beta=true")), "https://upstream.example/v1/messages?beta=true");
         assert_eq!(native_anthropic_url(&config, "messages/count_tokens", Some("beta=true")), "https://upstream.example/v1/messages/count_tokens?beta=true");
@@ -2374,7 +2380,14 @@ pub async fn handle_embeddings(
 
     let mut last_error = None;
     let start = std::time::Instant::now();
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            selected_channels.first()
+                .map(|ch| ch.timeout_secs.max(1) as u64)
+                .unwrap_or(60)
+        ))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     for (attempt, channel) in selected_channels.into_iter().take(max_attempts).enumerate() {
         let config = Dispatcher::channel_to_config(&channel);
@@ -2395,7 +2408,7 @@ pub async fn handle_embeddings(
             .header("Authorization", format!("Bearer {}", config.api_key))
             .header("Content-Type", "application/json")
             .json(&embed_body)
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .send()
             .await;
 

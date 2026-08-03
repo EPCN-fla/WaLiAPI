@@ -30,7 +30,10 @@ impl Adaptor for CustomAdaptor {
     async fn forward(&self, request: &ProxyRequest, config: &ChannelConfig) -> Result<(u16, serde_json::Value, Option<TokenUsage>), anyhow::Error> {
         let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
         let body = apply_model_mapping(&request.body, &config.model_mapping);
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let resp = client.post(&url).header("Authorization", format!("Bearer {}", config.api_key)).header("Content-Type", "application/json").json(&body).send().await?;
         let status = resp.status().as_u16();
         let json: serde_json::Value = resp.json().await?;
@@ -45,7 +48,10 @@ impl Adaptor for CustomAdaptor {
     async fn forward_stream(&self, request: &ProxyRequest, config: &ChannelConfig) -> Result<reqwest::Response, anyhow::Error> {
         let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
         let body = apply_model_mapping(&request.body, &config.model_mapping);
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let resp = client.post(&url).header("Authorization", format!("Bearer {}", config.api_key)).header("Content-Type", "application/json").json(&body).send().await?;
         Ok(resp)
     }

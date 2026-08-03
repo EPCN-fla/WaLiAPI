@@ -25,6 +25,7 @@ pub struct ExportedChannel {
     pub weight: i64,
     pub config: serde_json::Value,
     pub model_mapping: serde_json::Value,
+    pub timeout_secs: i64,
 }
 
 impl From<Channel> for ExportedChannel {
@@ -40,6 +41,7 @@ impl From<Channel> for ExportedChannel {
             weight: c.weight,
             config: serde_json::from_str(&c.config).unwrap_or(serde_json::Value::Object(Default::default())),
             model_mapping: serde_json::from_str(&c.model_mapping).unwrap_or(serde_json::Value::Object(Default::default())),
+            timeout_secs: c.timeout_secs,
         }
     }
 }
@@ -189,6 +191,7 @@ pub async fn import_walicode_backup(
                         weight: Some(1),
                         config: None,
                         model_mapping: None,
+                        timeout_secs: None,
                     };
 
                     match repo.create_channel(&input).await {
@@ -236,7 +239,8 @@ pub async fn import_walicode_backup(
                     weight: Some(1),
                     config: None,
                     model_mapping: None,
-                };
+                        timeout_secs: None,
+                    };
 
                 match repo.create_channel(&input).await {
                     Ok(_) => imported += 1,
@@ -283,7 +287,8 @@ pub async fn import_waliapi_export(
             weight: Some(ch.weight),
             config: Some(ch.config),
             model_mapping: Some(ch.model_mapping),
-        };
+                        timeout_secs: None,
+                    };
 
         match repo.create_channel(&input).await {
             Ok(_) => imported += 1,
@@ -531,6 +536,7 @@ pub async fn import_scanned_sources(
             weight: Some(1),
             config: None,
             model_mapping: None,
+            timeout_secs: None,
         };
 
         match repo.create_channel(&input).await {

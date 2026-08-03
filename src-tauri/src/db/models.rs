@@ -16,6 +16,7 @@ pub struct Channel {
     pub weight: i64,
     pub config: String,
     pub model_mapping: String,
+    pub timeout_secs: i64,
     pub created_at: String,
     pub updated_at: String,
     pub last_test_at: Option<String>,
@@ -34,6 +35,7 @@ pub struct CreateChannelInput {
     pub weight: Option<i64>,
     pub config: Option<serde_json::Value>,
     pub model_mapping: Option<serde_json::Value>,
+    pub timeout_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +52,7 @@ pub struct UpdateChannelInput {
     pub weight: Option<i64>,
     pub config: Option<serde_json::Value>,
     pub model_mapping: Option<serde_json::Value>,
+    pub timeout_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

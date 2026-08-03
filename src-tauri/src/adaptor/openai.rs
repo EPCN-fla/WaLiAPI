@@ -47,7 +47,10 @@ impl Adaptor for OpenAIAdaptor {
         let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
         let body = apply_model_mapping(&request.body, &config.model_mapping);
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let resp = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", config.api_key))
@@ -57,7 +60,7 @@ impl Adaptor for OpenAIAdaptor {
             .await?;
 
         let status = resp.status().as_u16();
-        let json: serde_json::Value = resp.json().await?;
+        let json: serde_json::Value = resp.json().await?;;
 
         let usage = json.get("usage").and_then(|u| {
             Some(TokenUsage {
@@ -78,7 +81,10 @@ impl Adaptor for OpenAIAdaptor {
         let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
         let body = apply_model_mapping(&request.body, &config.model_mapping);
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let resp = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", config.api_key))

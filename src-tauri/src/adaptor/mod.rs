@@ -14,6 +14,7 @@ pub struct ChannelConfig {
     pub models: Vec<String>,
     pub model_mapping: serde_json::Value,
     pub extra: serde_json::Value,
+    pub timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

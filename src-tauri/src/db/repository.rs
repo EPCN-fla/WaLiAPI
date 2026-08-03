@@ -43,8 +43,8 @@ impl Repository {
             .unwrap_or_else(|| "{}".to_string());
 
         sqlx::query(
-            "INSERT INTO channels (id, name, type, base_url, api_key, models, status, priority, weight, config, model_mapping, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO channels (id, name, type, base_url, api_key, models, status, priority, weight, config, model_mapping, timeout_secs, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&id)
         .bind(&input.name)
@@ -56,6 +56,7 @@ impl Repository {
         .bind(input.weight.unwrap_or(1))
         .bind(&config)
         .bind(&model_mapping)
+        .bind(input.timeout_secs.unwrap_or(60))
         .bind(&now)
         .bind(&now)
         .execute(&self.pool)
@@ -103,6 +104,9 @@ impl Repository {
         if let Some(mapping) = &input.model_mapping {
             let m = serde_json::to_string(mapping).unwrap_or_else(|_| "{}".to_string());
             q.push(", model_mapping = ").push_bind(m);
+        }
+        if let Some(timeout_secs) = input.timeout_secs {
+            q.push(", timeout_secs = ").push_bind(timeout_secs);
         }
 
         q.push(" WHERE id = ").push_bind(&input.id);

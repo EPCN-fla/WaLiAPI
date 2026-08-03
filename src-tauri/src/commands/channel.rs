@@ -124,6 +124,7 @@ pub async fn test_channel(id: String, state: tauri::State<'_, std::sync::Arc<App
         models: serde_json::from_str(&channel.models).unwrap_or_default(),
         model_mapping: serde_json::from_str(&channel.model_mapping).unwrap_or(serde_json::Value::Object(Default::default())),
         extra: serde_json::from_str(&channel.config).unwrap_or(serde_json::Value::Object(Default::default())),
+        timeout_secs: channel.timeout_secs.max(1) as u64,
     };
 
     let adaptor = get_adaptor(&channel.channel_type);

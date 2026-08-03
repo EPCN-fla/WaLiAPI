@@ -83,6 +83,7 @@ impl Dispatcher {
             models,
             model_mapping,
             extra,
+            timeout_secs: channel.timeout_secs.max(1) as u64,
         }
     }
 }

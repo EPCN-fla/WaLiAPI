@@ -4,7 +4,7 @@
 
 ### 本地 LLM API 网关 · 多协议接入 · 知识库 RAG · MCP 工具服务
 
-[![Version](https://img.shields.io/badge/version-0.1.4-blue.svg)](./src-tauri/tauri.conf.json)
+[![Version](https://img.shields.io/badge/version-0.1.5-blue.svg)](./src-tauri/tauri.conf.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)](#-安装使用)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app)
@@ -392,6 +392,18 @@ WaLiAPI/
 
 ## 📌 版本历史
 
+### v0.1.5 (2026-08-03)
+
+- ✨ 模型映射一对多：`model_mapping` 支持单目标→多目标数组映射，同优先级渠道间随机负载均衡
+- 🐛 输入法 composing 回车误触发修复：`isComposing` + `keyCode 229` 双重防护，覆盖 ChannelForm / ApiKeysPage / KnowledgeBasePage
+- 🐛 渠道拖拽排序修复：Tauri v2 `dragDropEnabled` 吞掉 HTML5 drop 事件，禁用后拖拽排序正常
+- 🐛 proxy.rs P0 修复：Chat Completions 路径 429/5xx 误返客户端，新增 `status >= 400` 检查触发 failover
+- ✨ 渠道超时配置：`timeout_secs` 字段（默认 60s，可配 1~600s），覆盖 5 个适配器 + handlers 3 处请求
+- ✨ ChannelForm UX 增强：映射 from 下拉（跨渠道通用映射名 + 添加新映射名入口）、优先级/权重说明文字
+- 🐛 映射模型分组去重修复：UsagePage / AppConfigPage 拆分 `realSeen` / `mappedSeen` 独立去重
+- ✨ LLM 使用页空配置提示：无密钥/无渠道时显示红色提示 + 快捷跳转链接
+- ✨ 渠道卡片空白区域点击展开/收起
+
 ### v0.1.4 (2026-07-30)
 
 - ✨ 知识库引擎：文档解析 → tree-sitter 代码符号感知 → 智能分块 → 向量化 → HNSW 索引
@@ -425,13 +437,14 @@ WaLiAPI/
 
 ## 👥 贡献者
 
-感谢以下开发者对 WaLiAPI 项目的代码贡献：
+感谢以下开发者对 WaLiAPI 项目的代码贡献（按贡献量排序）：
 
-| 贡献者 | GitHub | 主要贡献 |
-|:---|:---|:---|
-| 小傅哥 | [@fuzhengwei](https://github.com/fuzhengwei) | 项目创建者，核心架构、多渠道管理、协议网关、安全审计、知识库引擎、MCP Server |
-| mw | [@maowei0427](https://github.com/maowei0427) | 日志模块响应内容记录、Trace ID 追踪、详情页体验优化 |
-| lianggq | [@GQingL](https://github.com/GQingL) | 日志日期筛选与渠道删除修复 |
+| 贡献者 | GitHub | 提交 | 代码行数 | 主要贡献 |
+|:---|:---|:---|:---|:---|
+| 小傅哥 | [@fuzhengwei](https://github.com/fuzhengwei) | 181 | +55,951 / -13,859 | 项目创建者，核心架构、多渠道管理、协议网关、安全审计、知识库引擎、MCP Server |
+| xian | [@zsxink](https://github.com/zsxink) | 2 | +2,149 / -661 | Claude Code Anthropic Messages 协议兼容适配 |
+| mw | [@maowei0427](https://github.com/maowei0427) | 6 | +1,105 / -197 | 日志模块响应内容记录、Trace ID 追踪、详情页体验优化、知识库 embedding 批次大小配置 |
+| lianggq | [@GQingL](https://github.com/GQingL) | 1 | +91 / -9 | 日志结束日期筛选修复、macOS 渠道删除按钮无响应修复 |
 
 > 欢迎通过 PR / Issue 参与项目共建。
 
