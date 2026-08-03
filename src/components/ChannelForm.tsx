@@ -22,17 +22,58 @@ export function ChannelForm({ editing, onClose, onSaved }: {
   const [modelInput, setModelInput] = useState("");
   const [showTypePicker, setShowTypePicker] = useState(false);
 
+  // Global mapping names from all channels (for from dropdown suggestions)
+  const [globalFroms, setGlobalFroms] = useState<string[]>([]);
+  useEffect(() => {
+    channelApi.getAll().then(channels => {
+      const names = new Set<string>();
+      for (const ch of channels) {
+        const mm = ch.model_mapping;
+        if (mm && typeof mm === "object") {
+          for (const key of Object.keys(mm)) {
+            if (key) names.add(key);
+          }
+        }
+      }
+      setGlobalFroms(Array.from(names).sort());
+    }).catch(() => {});
+  }, []);
+
   // Model mapping state: array of { from, to } pairs
+  // Supports duplicate from values (e.g. auto -> model-a, auto -> model-b)
   const [mappings, setMappings] = useState<{ from: string; to: string }[]>(() => {
     const raw = editing?.model_mapping || {};
-    return Object.entries(raw).map(([from, to]) => ({ from, to }));
+    const result: { from: string; to: string }[] = [];
+    for (const [from, val] of Object.entries(raw)) {
+      if (Array.isArray(val)) {
+        for (const to of val) {
+          result.push({ from, to });
+        }
+      } else {
+        result.push({ from, to: val });
+      }
+    }
+    return result;
   });
 
   // Sync mappings back to form.model_mapping whenever they change
+  // Supports multiple targets per source key: { from: [to1, to2, ...] }
   useEffect(() => {
-    const obj: Record<string, string> = {};
+    const obj: Record<string, string | string[]> = {};
     mappings.forEach(m => {
-      if (m.from && m.to) obj[m.from] = m.to;
+      if (m.from && m.to) {
+        if (obj[m.from] !== undefined) {
+          // Key already exists — convert to array or append
+          const existing = obj[m.from];
+          if (Array.isArray(existing)) {
+            existing.push(m.to);
+          } else {
+            obj[m.from] = [existing, m.to];
+          }
+        } else {
+          obj[m.from] = m.to;
+        }
+      }
     });
     setForm(prev => ({ ...prev, model_mapping: obj }));
   }, [mappings]);
@@ -122,7 +163,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
           <h2 className="text-lg font-semibold">{editing ? "编辑渠道" : "新建渠道"}</h2>
           <button onClick={onClose} className="action-secondary px-3 py-2"><X size={18} /></button>
         </div>
-        <form onSubmit={handleSubmit} className="space-y-5 p-5">
+        <form onSubmit={handleSubmit} className="space-y-5 p-5" onKeyDown={e => { if (e.key === "Enter" && (e.nativeEvent.isComposing || e.keyCode === 229)) e.preventDefault(); }}>
           {/* Name + Type */}
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             <div>
@@ -218,7 +259,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
               <input
                 value={modelInput}
                 onChange={e => setModelInput(e.target.value)}
-                onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); addModel(); } }}
+                onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); if (!e.nativeEvent.isComposing && e.keyCode !== 229) addModel(); } }}
                 className="flex-1 rounded-2xl border border-border bg-background/70 px-4 py-3 text-sm"
                 placeholder="输入模型名称，回车添加"
               />
@@ -265,6 +306,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
                     from={map.from}
                     to={map.to}
                     availableTargets={getAvailableTargets(idx)}
+                    existingFroms={Array.from(new Set([...globalFroms, ...mappings.map(m => m.from).filter(Boolean)])).sort()}
                     onRemove={() => removeMapping(idx)}
                     onChange={(field, value) => updateMapping(idx, field, value)}
                   />
@@ -291,6 +333,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
                 onChange={e => setForm(prev => ({ ...prev, priority: parseInt(e.target.value) || 0 }))}
                 className="w-full rounded-2xl border border-border bg-background/70 px-4 py-3 text-sm"
               />
+              <p className="mt-1.5 text-xs text-muted-foreground">数字越大优先级越高，相同映射名的请求会优先路由到高优先级渠道</p>
             </div>
             <div>
               <label className="mb-2 block text-sm font-medium">权重</label>
@@ -300,6 +343,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
                 onChange={e => setForm(prev => ({ ...prev, weight: parseInt(e.target.value) || 1 }))}
                 className="w-full rounded-2xl border border-border bg-background/70 px-4 py-3 text-sm"
               />
+              <p className="mt-1.5 text-xs text-muted-foreground">同优先级渠道间的负载均衡比例，数值越大分配的请求越多</p>
             </div>
           </div>
 
@@ -322,16 +366,20 @@ function MappingRow({
   from,
   to,
   availableTargets,
+  existingFroms,
   onRemove,
   onChange,
 }: {
   from: string;
   to: string;
   availableTargets: string[];
+  existingFroms: string[];
   onRemove: () => void;
   onChange: (field: "from" | "to", value: string) => void;
 }) {
+  const [showFromPicker, setShowFromPicker] = useState(false);
   const [showToPicker, setShowToPicker] = useState(false);
+  const [fromInput, setFromInput] = useState("");
 
   // Target options: currently selected + available
   const targetOptions = useMemo(() => {
@@ -342,14 +390,76 @@ function MappingRow({
 
   return (
     <div className="flex items-center gap-2 rounded-2xl border border-border bg-background/40 px-3 py-2.5">
-      {/* Left: mapping model name (what client requests) — manual input */}
+      {/* Left: mapping model name (what client requests) — input + dropdown */}
       <div className="relative flex-1 min-w-0">
         <input
           value={from}
           onChange={e => onChange("from", e.target.value)}
+          onFocus={() => setShowFromPicker(true)}
           placeholder="映射模型名"
           className="w-full rounded-xl border border-border bg-white px-3 py-2.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
         />
+        {showFromPicker && (
+          <>
+            <div className="fixed inset-0 z-40" onClick={() => setShowFromPicker(false)} />
+            <div className="absolute left-0 right-0 top-full z-50 mt-1.5 rounded-2xl border border-border bg-white p-2 shadow-xl max-h-[240px] overflow-auto">
+              <div className="px-2 py-1.5 text-[11px] font-semibold text-muted-foreground/70 uppercase tracking-wide">已配置映射名</div>
+              {existingFroms.length === 0 && (
+                <div className="px-2 py-2 text-sm text-muted-foreground">暂无已配置映射名</div>
+              )}
+              {existingFroms.map(m => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => { onChange("from", m); setShowFromPicker(false); }}
+                  className={`flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-sm font-mono transition-all ${
+                    from === m
+                      ? "bg-primary/8 text-primary font-semibold"
+                      : "text-foreground hover:bg-muted/60"
+                  }`}
+                >
+                  {m}
+                  {from === m && <Check size={14} />}
+                </button>
+              ))}
+              {/* Add new mapping name */}
+              <div className="mt-1 border-t border-border pt-1">
+                <div className="flex items-center gap-1 px-1 py-1">
+                  <input
+                    value={fromInput}
+                    onChange={e => setFromInput(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (fromInput.trim()) {
+                          onChange("from", fromInput.trim());
+                          setFromInput("");
+                          setShowFromPicker(false);
+                        }
+                      }
+                    }}
+                    placeholder="新映射名"
+                    className="min-w-0 flex-1 rounded-lg border border-border bg-background/60 px-2 py-1.5 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (fromInput.trim()) {
+                        onChange("from", fromInput.trim());
+                        setFromInput("");
+                        setShowFromPicker(false);
+                      }
+                    }}
+                    className="shrink-0 rounded-lg bg-primary/10 p-1.5 text-primary hover:bg-primary/20 transition-colors"
+                  >
+                    <Plus size={14} />
+                  </button>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
       </div>
 
       {/* Arrow */}

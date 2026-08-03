@@ -242,14 +242,7 @@ async fn handle_stream(
         let adaptor = get_adaptor(&channel.channel_type);
 
         // Compute the actual upstream model after mapping
-        let upstream_model = {
-            let mapping = &config.model_mapping;
-            if let Some(mapped) = mapping.get(model.as_str()).and_then(|v| v.as_str()) {
-                mapped.to_string()
-            } else {
-                model.clone()
-            }
-        };
+        let upstream_model = resolve_mapped_model(&config.model_mapping, &model);
 
         match adaptor.forward_stream(&request, &config).await {
             Ok(resp) => {
@@ -551,14 +544,35 @@ fn anthropic_error(status: StatusCode, kind: &str, message: impl Into<String>) -
         .into_response()
 }
 
+/// Resolve a model name through the mapping: supports both single string and array of strings.
+/// If mapped to an array, picks a random model (load balancing).
+/// Returns the original model if no mapping exists.
+fn resolve_mapped_model(mapping: &serde_json::Value, model: &str) -> String {
+    if let Some(mapped) = mapping.get(model) {
+        if let Some(s) = mapped.as_str() {
+            return s.to_string();
+        } else if let Some(arr) = mapped.as_array() {
+            let models: Vec<String> = arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            if !models.is_empty() {
+                let idx = rand::Rng::random_range(&mut rand::rng(), 0..models.len());
+                return models[idx].clone();
+            }
+        }
+    }
+    model.to_string()
+}
+
 fn mapped_anthropic_body(
     body: &serde_json::Value,
     mapping: &serde_json::Value,
 ) -> serde_json::Value {
     let mut body = body.clone();
     if let Some(model) = body.get("model").and_then(|value| value.as_str()) {
-        if let Some(mapped) = mapping.get(model).and_then(|value| value.as_str()) {
-            body["model"] = serde_json::Value::String(mapped.to_string());
+        let resolved = resolve_mapped_model(mapping, model);
+        if &resolved != model {
+            body["model"] = serde_json::Value::String(resolved);
         }
     }
     body
@@ -1164,6 +1178,15 @@ mod anthropic_handler_tests {
         assert!(is_native_anthropic_channel("claude"));
     }
 
+    #[test]
+    fn mapped_anthropic_body_supports_array_mapping() {
+        let body = serde_json::json!({"model":"auto", "messages":[]});
+        let mapping = serde_json::json!({"auto":["model-a", "model-b"]});
+        let mapped = mapped_anthropic_body(&body, &mapping);
+        let result = mapped["model"].as_str().unwrap();
+        assert!(result == "model-a" || result == "model-b");
+    }
+
     #[tokio::test]
     async fn maps_openai_rate_limits_without_exposing_channel_auth_as_client_auth() {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -1556,14 +1579,7 @@ async fn handle_messages_stream(
     for (attempt, channel) in selected_channels.into_iter().take(max_attempts).enumerate() {
         let config = Dispatcher::channel_to_config(&channel);
         let adaptor = get_adaptor(&channel.channel_type);
-        let upstream_model = {
-            let mapping = &config.model_mapping;
-            if let Some(mapped) = mapping.get(model.as_str()).and_then(|v| v.as_str()) {
-                mapped.to_string()
-            } else {
-                model.clone()
-            }
-        };
+        let upstream_model = resolve_mapped_model(&config.model_mapping, &model);
 
         match adaptor.forward_stream(&request, &config).await {
             Ok(resp) => {
@@ -1981,14 +1997,7 @@ async fn handle_responses_stream(
     for (attempt, channel) in selected_channels.into_iter().take(max_attempts).enumerate() {
         let config = Dispatcher::channel_to_config(&channel);
         let adaptor = get_adaptor(&channel.channel_type);
-        let upstream_model = {
-            let mapping = &config.model_mapping;
-            if let Some(mapped) = mapping.get(model.as_str()).and_then(|v| v.as_str()) {
-                mapped.to_string()
-            } else {
-                model.clone()
-            }
-        };
+        let upstream_model = resolve_mapped_model(&config.model_mapping, &model);
 
         match adaptor.forward_stream(&request, &config).await {
             Ok(resp) => {
@@ -2369,14 +2378,7 @@ pub async fn handle_embeddings(
 
     for (attempt, channel) in selected_channels.into_iter().take(max_attempts).enumerate() {
         let config = Dispatcher::channel_to_config(&channel);
-        let upstream_model = {
-            let mapping = &config.model_mapping;
-            if let Some(mapped) = mapping.get(model.as_str()).and_then(|v| v.as_str()) {
-                mapped.to_string()
-            } else {
-                model.clone()
-            }
-        };
+        let upstream_model = resolve_mapped_model(&config.model_mapping, &model);
 
         // Build upstream embedding request — send directly to /embeddings
         // (adaptor.forward() hard-codes /chat/completions which doesn't work for embeddings)

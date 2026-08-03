@@ -97,8 +97,24 @@ pub fn apply_model_mapping(body: &serde_json::Value, mapping: &serde_json::Value
     }
     let mut body = body.clone();
     if let Some(model) = body.get("model").and_then(|m| m.as_str()) {
-        if let Some(mapped) = mapping.get(model).and_then(|m| m.as_str()) {
-            body["model"] = serde_json::Value::String(mapped.to_string());
+        if let Some(mapped) = mapping.get(model) {
+            // Support both single string and array of strings
+            let chosen = if let Some(s) = mapped.as_str() {
+                s.to_string()
+            } else if let Some(arr) = mapped.as_array() {
+                // Pick a random model from the array (load balancing)
+                let models: Vec<String> = arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                if models.is_empty() {
+                    return sanitize_messages(body);
+                }
+                let idx = rand::Rng::random_range(&mut rand::rng(), 0..models.len());
+                models[idx].clone()
+            } else {
+                return sanitize_messages(body);
+            };
+            body["model"] = serde_json::Value::String(chosen);
         }
     }
     sanitize_messages(body)

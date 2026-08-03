@@ -10,7 +10,7 @@ export interface Channel {
   priority: number;
   weight: number;
   config: Record<string, unknown>;
-  model_mapping: Record<string, string>;
+  model_mapping: Record<string, string | string[]>;
   created_at: string;
   updated_at: string;
   last_test_at: string | null;
@@ -26,7 +26,7 @@ export interface CreateChannelInput {
   priority?: number;
   weight?: number;
   config?: Record<string, unknown>;
-  model_mapping?: Record<string, string>;
+  model_mapping?: Record<string, string | string[]>;
 }
 
 export interface UpdateChannelInput {
@@ -40,7 +40,7 @@ export interface UpdateChannelInput {
   priority?: number;
   weight?: number;
   config?: Record<string, unknown>;
-  model_mapping?: Record<string, string>;
+  model_mapping?: Record<string, string | string[]>;
 }
 
 export interface TestChannelResult {

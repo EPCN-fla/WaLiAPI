@@ -114,10 +114,25 @@ pub async fn handle_request(
         let is_retry = if attempt > 0 { 1 } else { 0 };
 
         // Compute the actual upstream model after mapping
+        // Supports both single string and array of strings (random selection for load balancing)
         let upstream_model = {
             let mapping = &config.model_mapping;
-            if let Some(mapped) = mapping.get(model.as_str()).and_then(|v| v.as_str()) {
-                mapped.to_string()
+            if let Some(mapped) = mapping.get(model.as_str()) {
+                if let Some(s) = mapped.as_str() {
+                    s.to_string()
+                } else if let Some(arr) = mapped.as_array() {
+                    let models: Vec<String> = arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                    if models.is_empty() {
+                        model.clone()
+                    } else {
+                        let idx = rand::Rng::random_range(&mut rand::rng(), 0..models.len());
+                        models[idx].clone()
+                    }
+                } else {
+                    model.clone()
+                }
             } else {
                 model.clone()
             }

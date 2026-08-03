@@ -245,9 +245,9 @@ export function ChannelsPage() {
                   isDragOver ? "ring-2 ring-blue-400 ring-offset-1" : ""
                 }`}
               >
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 cursor-pointer" onClick={() => setExpandedId(isExpanded ? null : ch.id)}>
                   {/* 拖拽手柄 */}
-                  <div className="flex cursor-grab items-center text-slate-300 transition-colors hover:text-slate-400 active:cursor-grabbing">
+                  <div className="flex cursor-grab items-center text-slate-300 transition-colors hover:text-slate-400 active:cursor-grabbing" onClick={e => e.stopPropagation()}>
                     <GripVertical size={18} />
                   </div>
 
@@ -299,7 +299,7 @@ export function ChannelsPage() {
                   </div>
 
                   {/* 操作按钮 */}
-                  <div className="flex items-center gap-1">
+                  <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
                     <button onClick={() => handleTest(ch.id)} disabled={testing === ch.id} className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-blue-50 hover:text-blue-600 disabled:opacity-50" title="测试连接">
                       {testing === ch.id ? <Loader2 size={15} className="animate-spin" /> : <Zap size={15} />}
                     </button>

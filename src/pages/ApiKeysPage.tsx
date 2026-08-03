@@ -278,7 +278,7 @@ function ApiKeyForm({ onClose, onSaved }: { onClose: () => void; onSaved: () => 
           <h2 className="text-lg font-semibold">新建密钥</h2>
           <button onClick={onClose} className="action-secondary px-3 py-2"><X size={18} /></button>
         </div>
-        <form onSubmit={handleSubmit} className="space-y-4 p-5">
+        <form onSubmit={handleSubmit} className="space-y-4 p-5" onKeyDown={e => { if (e.key === "Enter" && (e.nativeEvent.isComposing || e.keyCode === 229)) e.preventDefault(); }}>
           <div>
             <label className="mb-2 block text-sm font-medium">名称</label>
             <input
