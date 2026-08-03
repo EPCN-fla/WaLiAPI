@@ -248,6 +248,15 @@ pub fn convert_openai_sse_to_responses(
 
                             let tc_state = state.tool_calls.get_mut(&tc_index).unwrap();
 
+                            // Always update call_id and name if they were empty and we now have values
+                            // (upstream may send id in a later chunk than the first one)
+                            if tc_state.call_id.is_empty() && !tc_id.is_empty() {
+                                tc_state.call_id = tc_id.to_string();
+                            }
+                            if tc_state.name.is_empty() && !name.is_empty() {
+                                tc_state.name = name.to_string();
+                            }
+
                             // Emit output_item.added for function_call if not yet sent
                             if !tc_state.item_added_sent {
                                 // If we have a call_id and name, emit the added event
@@ -381,6 +390,14 @@ pub fn convert_openai_sse_to_responses(
                             ));
 
                             state.text_item_done = true;
+                        }
+
+                        // Ensure all tool calls have non-empty call_id before closing them.
+                        // Some upstreams never send a tool_call id in streaming chunks.
+                        for (_, tc_state) in state.tool_calls.iter_mut() {
+                            if tc_state.call_id.is_empty() {
+                                tc_state.call_id = format!("call_{}", tc_state.output_index);
+                            }
                         }
 
                         // Close all tool call items
@@ -587,6 +604,12 @@ pub fn create_synthetic_completed_events(
 
     // Close any still-open tool call items
     for (_, tc_state) in state.tool_calls.iter() {
+        // Fallback: ensure call_id is never empty
+        let effective_call_id = if tc_state.call_id.is_empty() {
+            format!("call_{}", tc_state.output_index)
+        } else {
+            tc_state.call_id.clone()
+        };
         if !tc_state.arguments_done_sent {
             let s = next_seq!();
             let args_done = serde_json::json!({
@@ -605,7 +628,7 @@ pub fn create_synthetic_completed_events(
                 "id": tc_state.item_id,
                 "type": "function_call",
                 "status": "completed",
-                "call_id": tc_state.call_id,
+                "call_id": effective_call_id,
                 "name": tc_state.name,
                 "arguments": tc_state.accumulated_arguments
             });
@@ -639,11 +662,16 @@ pub fn create_synthetic_completed_events(
 
     // Add tool call items to output
     for (_, tc_state) in state.tool_calls.iter() {
+        let effective_call_id = if tc_state.call_id.is_empty() {
+            format!("call_{}", tc_state.output_index)
+        } else {
+            tc_state.call_id.clone()
+        };
         output_items.push(serde_json::json!({
             "id": tc_state.item_id,
             "type": "function_call",
             "status": "completed",
-            "call_id": tc_state.call_id,
+            "call_id": effective_call_id,
             "name": tc_state.name,
             "arguments": tc_state.accumulated_arguments
         }));
