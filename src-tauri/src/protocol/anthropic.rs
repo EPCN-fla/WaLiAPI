@@ -1,322 +1,331 @@
-use serde_json::Value;
-use std::collections::HashMap;
+//! OpenAI Chat Completions SSE -> Anthropic Messages SSE codec.
+//!
+//! This module never handles native Anthropic streams. They are byte-for-byte
+//! proxied by the handler, because parsing and re-emitting them loses forward
+//! compatibility with Claude Code.
 
-/// Convert an OpenAI SSE chunk (Chat Completions stream) to Anthropic Messages SSE events.
-///
-/// Anthropic stream events for text:
-/// - event: message_start
-/// - event: content_block_start (index=0, type="text")
-/// - event: content_block_delta (index=0, type="text_delta")
-/// - event: content_block_stop (index=0)
-///
-/// Anthropic stream events for tool_use:
-/// - event: content_block_start (index=N, type="tool_use", id, name)
-/// - event: content_block_delta (index=N, type="input_json_delta", partial_json)
-/// - event: content_block_stop (index=N)
-///
-/// Final events:
-/// - event: message_delta (stop_reason, usage)
-/// - event: message_stop
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+#[derive(Default)]
+pub struct AnthropicStreamState {
+    pending: Vec<u8>,
+    started: bool,
+    ended: bool,
+    finish_reason: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    next_content_index: usize,
+    open_text: Option<usize>,
+    tools: BTreeMap<usize, ToolState>,
+}
+
+#[derive(Default)]
+struct ToolState {
+    content_index: Option<usize>,
+    id: String,
+    name: String,
+    arguments: String,
+    stopped: bool,
+}
+
+fn event(name: &str, value: Value) -> String {
+    format!("event: {name}\ndata: {value}\n\n")
+}
+
+impl AnthropicStreamState {
+    pub fn usage(&self) -> (i64, i64) { (self.input_tokens as i64, self.output_tokens as i64) }
+    /// Feed arbitrary network bytes.  A TCP chunk may split a UTF-8 codepoint,
+    /// an SSE field, or the CRLF event delimiter, so bytes are retained until a
+    /// complete event is available.
+    pub fn feed(
+        &mut self,
+        bytes: &[u8],
+        model: &str,
+        message_id: &str,
+    ) -> Result<Vec<String>, String> {
+        self.pending.extend_from_slice(bytes);
+        let mut events = Vec::new();
+        while let Some(end) = sse_record_end(&self.pending) {
+            let record: Vec<u8> = self.pending.drain(..end).collect();
+            let payload = parse_sse_data(&record)?;
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+            let json: Value = serde_json::from_str(&payload)
+                .map_err(|error| format!("OpenAI upstream emitted invalid SSE JSON: {error}"))?;
+            self.consume_json(json, model, message_id, &mut events)?;
+        }
+        Ok(events)
+    }
+
+    /// Flush an EOF-terminated event and emit the exactly-once final sequence.
+    pub fn finish(&mut self, model: &str, message_id: &str) -> Result<Vec<String>, String> {
+        let mut events = Vec::new();
+        if !self.pending.is_empty() {
+            let record = std::mem::take(&mut self.pending);
+            let payload = parse_sse_data(&record)?;
+            if !payload.is_empty() && payload != "[DONE]" {
+                let json: Value = serde_json::from_str(&payload).map_err(|error| {
+                    format!("OpenAI upstream emitted invalid SSE JSON: {error}")
+                })?;
+                self.consume_json(json, model, message_id, &mut events)?;
+            }
+        }
+        self.emit_final(&mut events)?;
+        Ok(events)
+    }
+
+    fn consume_json(
+        &mut self,
+        json: Value,
+        model: &str,
+        message_id: &str,
+        events: &mut Vec<String>,
+    ) -> Result<(), String> {
+        self.update_usage(&json);
+        if !self.started {
+            self.started = true;
+            events.push(event("message_start", serde_json::json!({
+                "type": "message_start",
+                "message": {"id": message_id, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": self.input_tokens, "output_tokens": 0}}
+            })));
+        }
+        for choice in json
+            .get("choices")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let delta = choice.get("delta").unwrap_or(&Value::Null);
+            if delta
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .is_some()
+                || delta.get("thinking").is_some()
+            {
+                return Err("OpenAI upstream returned thinking content, which cannot be converted to Anthropic Messages safely".to_string());
+            }
+            if let Some(text) = delta
+                .get("content")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                let index = self.ensure_text(events);
+                events.push(event("content_block_delta", serde_json::json!({"type":"content_block_delta", "index":index, "delta":{"type":"text_delta", "text":text}})));
+            }
+            if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for call in calls { self.consume_tool_call(call)?; }
+            }
+            if let Some(reason) = choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.is_empty() && *reason != "null")
+            {
+                self.finish_reason = Some(reason.to_string());
+            }
+            if delta.get("refusal").and_then(Value::as_str).is_some() {
+                self.finish_reason = Some("content_filter".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn update_usage(&mut self, json: &Value) {
+        if let Some(usage) = json.get("usage") {
+            self.input_tokens = usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(self.input_tokens);
+            self.output_tokens = usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(self.output_tokens);
+        }
+    }
+
+    fn ensure_text(&mut self, events: &mut Vec<String>) -> usize {
+        if let Some(index) = self.open_text {
+            return index;
+        }
+        let index = self.next_content_index;
+        self.next_content_index += 1;
+        self.open_text = Some(index);
+        events.push(event("content_block_start", serde_json::json!({"type":"content_block_start", "index":index, "content_block":{"type":"text", "text":""}})));
+        index
+    }
+
+    fn consume_tool_call(&mut self, call: &Value) -> Result<(), String> {
+        let source_index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let id = call.get("id").and_then(Value::as_str);
+        let name = call
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str);
+        let arguments = call
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(Value::as_str);
+        let tool = self.tools.entry(source_index).or_default();
+        if let Some(id) = id { tool.id = id.to_string(); }
+        if let Some(name) = name { tool.name = name.to_string(); }
+        if let Some(arguments) = arguments { tool.arguments.push_str(arguments); }
+        Ok(())
+    }
+
+    fn emit_final(&mut self, events: &mut Vec<String>) -> Result<(), String> {
+        if self.ended || !self.started {
+            return Ok(());
+        }
+        if let Some(index) = self.open_text.take() {
+            events.push(event(
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop", "index":index}),
+            ));
+        }
+        // OpenAI deltas for parallel calls may interleave. Anthropic content
+        // blocks may not: serialize each complete tool block only after every
+        // text block has stopped.
+        for tool in self.tools.values_mut() {
+            if tool.id.is_empty() || tool.name.is_empty() { return Err("OpenAI stream ended with an incomplete tool call".to_string()); }
+            let input: Value = serde_json::from_str(&tool.arguments).map_err(|error| format!("OpenAI stream ended with invalid tool arguments: {error}"))?;
+            if !input.is_object() { return Err("OpenAI stream tool arguments must decode to a JSON object".to_string()); }
+            let index = self.next_content_index;
+            self.next_content_index += 1;
+            tool.content_index = Some(index);
+            events.push(event("content_block_start", serde_json::json!({"type":"content_block_start", "index":index, "content_block":{"type":"tool_use", "id":tool.id, "name":tool.name, "input":{}}})));
+            events.push(event("content_block_delta", serde_json::json!({"type":"content_block_delta", "index":index, "delta":{"type":"input_json_delta", "partial_json":tool.arguments}})));
+            tool.stopped = true;
+            events.push(event("content_block_stop", serde_json::json!({"type":"content_block_stop", "index":index})));
+        }
+        let stop_reason = match self.finish_reason.as_deref() {
+            Some("length") => "max_tokens",
+            Some("tool_calls") | Some("function_call") => "tool_use",
+            Some("content_filter") => "refusal",
+            None if !self.tools.is_empty() => "tool_use",
+            _ => "end_turn",
+        };
+        events.push(event("message_delta", serde_json::json!({"type":"message_delta", "delta":{"stop_reason":stop_reason, "stop_sequence":null}, "usage":{"input_tokens":self.input_tokens, "output_tokens":self.output_tokens}})));
+        events.push(event(
+            "message_stop",
+            serde_json::json!({"type":"message_stop"}),
+        ));
+        self.ended = true;
+        Ok(())
+    }
+}
+
+fn sse_record_end(input: &[u8]) -> Option<usize> {
+    let crlf = input
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4);
+    let lf = input
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| index + 2);
+    match (crlf, lf) {
+        (Some(crlf), Some(lf)) => Some(crlf.min(lf)),
+        (Some(end), None) | (None, Some(end)) => Some(end),
+        (None, None) => None,
+    }
+}
+
+fn parse_sse_data(record: &[u8]) -> Result<String, String> {
+    let text = std::str::from_utf8(record)
+        .map_err(|_| "OpenAI upstream SSE was not valid UTF-8".to_string())?;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(data) = line.strip_prefix("data:") {
+            lines.push(data.strip_prefix(' ').unwrap_or(data));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+// Kept for the older OpenAI-only handlers while they remain available. The
+// Anthropic Messages endpoint uses `feed`/`finish` directly above.
+#[allow(dead_code)]
 pub fn convert_openai_sse_to_anthropic(
-    chunk_text: &str,
+    chunk: &str,
     model: &str,
     message_id: &str,
     state: &mut AnthropicStreamState,
 ) -> Vec<String> {
-    let mut events = Vec::new();
-
-    // Emit message_start on first chunk
-    if !state.started {
-        let msg_start = serde_json::json!({
-            "type": "message_start",
-            "message": {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "content": [],
-                "stop_reason": null,
-                "usage": {
-                    "input_tokens": state.input_tokens,
-                    "output_tokens": 0
-                }
-            }
-        });
-        events.push(format!("event: message_start\ndata: {}\n\n", msg_start));
-        state.started = true;
-    }
-
-    for line in chunk_text.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("data:") {
-            continue;
-        }
-        let data_str = trimmed.trim_start_matches("data:").trim();
-        if data_str == "[DONE]" || data_str.is_empty() {
-            continue;
-        }
-
-        let json: Value = match serde_json::from_str(data_str) {
-            Ok(j) => j,
-            Err(_) => continue,
-        };
-
-        if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
-            for choice in choices {
-                if let Some(delta) = choice.get("delta") {
-                    // --- Text content delta ---
-                    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                        if !content.is_empty() {
-                            // Ensure text block is open at index 0
-                            if !state.text_block_open {
-                                // Close any open tool_use blocks before opening text? No — text comes first.
-                                let block_start = serde_json::json!({
-                                    "type": "content_block_start",
-                                    "index": 0,
-                                    "content_block": {"type": "text", "text": ""}
-                                });
-                                events.push(format!("event: content_block_start\ndata: {}\n\n", block_start));
-                                state.text_block_open = true;
-                                state.current_index = 0;
-                            }
-
-                            let block_delta = serde_json::json!({
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {
-                                    "type": "text_delta",
-                                    "text": content
-                                }
-                            });
-                            events.push(format!("event: content_block_delta\ndata: {}\n\n", block_delta));
-                            state.output_tokens += 1; // approximate
-                        }
-                    }
-
-                    // --- Tool calls delta ---
-                    if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                        for tc in tool_calls {
-                            let tc_index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-
-                            // Get or create tool call state
-                            let tool_state = state.tool_calls.entry(tc_index).or_insert_with(|| ToolCallState {
-                                block_index: 0,
-                                id: String::new(),
-                                name: String::new(),
-                                arguments: String::new(),
-                                block_started: false,
-                                block_stopped: false,
-                            });
-
-                            // If this is the first delta for this tool call, capture id and name
-                            if !tool_state.block_started {
-                                // Close text block if open
-                                if state.text_block_open && !state.text_block_stopped {
-                                    let block_stop = serde_json::json!({
-                                        "type": "content_block_stop",
-                                        "index": 0
-                                    });
-                                    events.push(format!("event: content_block_stop\ndata: {}\n\n", block_stop));
-                                    state.text_block_stopped = true;
-                                }
-
-                                // Assign next content block index
-                                state.next_block_index += 1;
-                                tool_state.block_index = state.next_block_index;
-
-                                // Extract id and function name
-                                tool_state.id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-                                let func = tc.get("function");
-                                tool_state.name = func
-                                    .and_then(|f| f.get("name"))
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-
-                                // Emit content_block_start for tool_use
-                                let block_start = serde_json::json!({
-                                    "type": "content_block_start",
-                                    "index": tool_state.block_index,
-                                    "content_block": {
-                                        "type": "tool_use",
-                                        "id": tool_state.id,
-                                        "name": tool_state.name,
-                                        "input": {}
-                                    }
-                                });
-                                events.push(format!("event: content_block_start\ndata: {}\n\n", block_start));
-                                tool_state.block_started = true;
-                            }
-
-                            // Accumulate arguments delta
-                            if let Some(args_delta) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()) {
-                                tool_state.arguments.push_str(args_delta);
-
-                                // Emit input_json_delta
-                                let block_delta = serde_json::json!({
-                                    "type": "content_block_delta",
-                                    "index": tool_state.block_index,
-                                    "delta": {
-                                        "type": "input_json_delta",
-                                        "partial_json": args_delta
-                                    }
-                                });
-                                events.push(format!("event: content_block_delta\ndata: {}\n\n", block_delta));
-                            }
-                        }
-                    }
-
-                    // --- Reasoning content (thinking) ---
-                    // Some OpenAI-compatible providers return delta.reasoning_content
-                    if let Some(reasoning) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
-                        if !reasoning.is_empty() {
-                            // Map to thinking block in Anthropic format
-                            if !state.thinking_block_open {
-                                let block_start = serde_json::json!({
-                                    "type": "content_block_start",
-                                    "index": state.next_block_index + 1,
-                                    "content_block": {
-                                        "type": "thinking",
-                                        "thinking": ""
-                                    }
-                                });
-                                events.push(format!("event: content_block_start\ndata: {}\n\n", block_start));
-                                state.thinking_block_open = true;
-                                state.thinking_block_index = state.next_block_index + 1;
-                            }
-
-                            let block_delta = serde_json::json!({
-                                "type": "content_block_delta",
-                                "index": state.thinking_block_index,
-                                "delta": {
-                                    "type": "thinking_delta",
-                                    "thinking": reasoning
-                                }
-                            });
-                            events.push(format!("event: content_block_delta\ndata: {}\n\n", block_delta));
-                        }
-                    }
-                }
-
-                // Check for finish_reason
-                if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-                    if !finish.is_empty() && finish != "null" {
-                        // Close text block if still open
-                        if state.text_block_open && !state.text_block_stopped {
-                            let block_stop = serde_json::json!({
-                                "type": "content_block_stop",
-                                "index": 0
-                            });
-                            events.push(format!("event: content_block_stop\ndata: {}\n\n", block_stop));
-                            state.text_block_stopped = true;
-                        }
-
-                        // Close all tool_use blocks
-                        for (_, ts) in &state.tool_calls {
-                            if ts.block_started && !ts.block_stopped {
-                                let block_stop = serde_json::json!({
-                                    "type": "content_block_stop",
-                                    "index": ts.block_index
-                                });
-                                events.push(format!("event: content_block_stop\ndata: {}\n\n", block_stop));
-                            }
-                        }
-
-                        // Close thinking block if open
-                        if state.thinking_block_open {
-                            let block_stop = serde_json::json!({
-                                "type": "content_block_stop",
-                                "index": state.thinking_block_index
-                            });
-                            events.push(format!("event: content_block_stop\ndata: {}\n\n", block_stop));
-                        }
-
-                        let stop_reason = match finish {
-                            "stop" => "end_turn",
-                            "length" => "max_tokens",
-                            "tool_calls" => "tool_use",
-                            _ => "end_turn",
-                        };
-
-                        // Extract usage if present
-                        let prompt_tokens = json.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|t| t.as_u64()).unwrap_or(0);
-                        let completion_tokens = json.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|t| t.as_u64()).unwrap_or(0);
-
-                        let msg_delta = serde_json::json!({
-                            "type": "message_delta",
-                            "delta": {
-                                "stop_reason": stop_reason,
-                                "stop_sequence": null
-                            },
-                            "usage": {
-                                "input_tokens": prompt_tokens,
-                                "output_tokens": completion_tokens
-                            }
-                        });
-                        events.push(format!("event: message_delta\ndata: {}\n\n", msg_delta));
-
-                        let msg_stop = serde_json::json!({"type": "message_stop"});
-                        events.push(format!("event: message_stop\ndata: {}\n\n", msg_stop));
-                    }
-                }
-            }
-        }
-    }
-
-    events
+    state
+        .feed(chunk.as_bytes(), model, message_id)
+        .unwrap_or_default()
 }
 
-/// State for a single tool call being streamed.
-#[derive(Clone)]
-struct ToolCallState {
-    block_index: usize,
-    id: String,
-    name: String,
-    arguments: String,
-    block_started: bool,
-    block_stopped: bool,
-}
-
-/// State for Anthropic stream conversion.
-#[derive(Default)]
-pub struct AnthropicStreamState {
-    pub started: bool,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    // Text block tracking
-    text_block_open: bool,
-    text_block_stopped: bool,
-    // Tool call tracking: OpenAI tool_call index → state
-    tool_calls: HashMap<usize, ToolCallState>,
-    // Next content block index (0 = text, 1+ = tool_use)
-    next_block_index: usize,
-    current_index: usize,
-    // Thinking block tracking
-    thinking_block_open: bool,
-    thinking_block_index: usize,
-}
-
-/// Parse usage from OpenAI SSE chunk for Anthropic logging.
+#[allow(dead_code)]
 pub fn parse_usage_from_sse_chunk(text: &str) -> Option<(i64, i64, i64)> {
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("data:") {
-            continue;
-        }
-        let data_str = trimmed.trim_start_matches("data:").trim();
-        if data_str == "[DONE]" || data_str.is_empty() {
-            continue;
-        }
-        if let Ok(json) = serde_json::from_str::<Value>(data_str) {
+    for record in text.split("\n\n") {
+        let data = parse_sse_data(record.as_bytes()).ok()?;
+        if let Ok(json) = serde_json::from_str::<Value>(&data) {
             if let Some(usage) = json.get("usage") {
-                let prompt = usage.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                let completion = usage.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                let total = usage.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                if total > 0 || prompt > 0 || completion > 0 {
-                    return Some((prompt, completion, total));
+                let input = usage
+                    .get("prompt_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let output = usage
+                    .get("completion_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let total = usage
+                    .get("total_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(input + output);
+                if input > 0 || output > 0 || total > 0 {
+                    return Some((input, output, total));
                 }
             }
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handles_crlf_utf8_splits_parallel_tools_and_late_usage() {
+        let mut state = AnthropicStreamState::default();
+        let parts = [
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"h".as_slice(),
+            "\u{00e9}".as_bytes(),
+            b"\"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"two\",\"arguments\":\"{\\\"b\\\":2}\"}},{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"one\",\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}\r\n\r\n".as_slice(),
+            b"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n".as_slice(),
+        ];
+        let mut output = Vec::new();
+        for part in parts {
+            output.extend(state.feed(part, "model", "msg_1").unwrap());
+        }
+        output.extend(state.finish("model", "msg_1").unwrap());
+        let output = output.join("");
+        assert!(output.contains("hé"));
+        assert!(output.contains("\"id\":\"a\""));
+        assert!(output.contains("\"id\":\"b\""));
+        assert!(output.contains("\"input_tokens\":7"));
+        assert!(output.contains("\"stop_sequence\":null"));
+        let text_stop = output.find("content_block_stop").unwrap();
+        let first_tool = output.find("\"type\":\"tool_use\"").unwrap();
+        assert!(text_stop < first_tool, "text must stop before a tool block starts");
+        assert!(output.find("\"id\":\"a\"").unwrap() < output.find("\"id\":\"b\"").unwrap());
+        assert_eq!(output.matches("event: message_stop").count(), 1);
+    }
+
+    #[test]
+    fn infers_tool_use_and_maps_refusal_when_chat_omits_finish_reason() {
+        let mut state = AnthropicStreamState::default();
+        let tool = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}}]}\n\n";
+        state.feed(tool, "model", "msg_1").unwrap();
+        assert!(state.finish("model", "msg_1").unwrap().join("").contains("\"stop_reason\":\"tool_use\""));
+
+        let mut refusal = AnthropicStreamState::default();
+        refusal.feed(b"data: {\"choices\":[{\"delta\":{\"refusal\":\"no\"}}]}\n\n", "model", "msg_2").unwrap();
+        assert!(refusal.finish("model", "msg_2").unwrap().join("").contains("\"stop_reason\":\"refusal\""));
+    }
 }

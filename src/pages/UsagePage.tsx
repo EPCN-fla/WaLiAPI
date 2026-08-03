@@ -141,6 +141,9 @@ export function UsagePage() {
     responses: `${baseUrl}/responses`,
     anthropic: `${baseUrl}/messages`,
   };
+  // API/SDK examples use the `/v1` base. Claude Code is different: it adds
+  // `/v1/messages` itself to ANTHROPIC_BASE_URL.
+  const anthropicClientBaseUrl = baseUrl.replace(/\/v1\/?$/, "");
 
   const scripts: Record<Protocol, Record<Platform, string>> = {
     chat: {
@@ -349,7 +352,7 @@ public class AnthropicTest {
       }
       let body: string;
       if (isAnthropic) {
-        body = JSON.stringify({ model: selModel, max_tokens: 1024, messages: [{ role: "user", content: "Say hello in one sentence" }] });
+        body = JSON.stringify({ model: selModel, max_tokens: 1024, stream: false, messages: [{ role: "user", content: "Say hello in one sentence" }] });
       } else if (isResponses) {
         body = JSON.stringify({ model: selModel, input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "Say hello in one sentence" }] }] });
       } else {
@@ -510,9 +513,9 @@ public class AnthropicTest {
             </div>
             <div className="flex items-center gap-2">
               <code className="flex-1 break-all rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-mono text-slate-900">
-                {baseUrl}
+                {activeProtocol === "anthropic" ? anthropicClientBaseUrl : baseUrl}
               </code>
-              <button onClick={() => copy(baseUrl, "baseurl")} className="action-secondary px-3 py-2.5" title="复制 Base URL">
+              <button onClick={() => copy(activeProtocol === "anthropic" ? anthropicClientBaseUrl : baseUrl, "baseurl")} className="action-secondary px-3 py-2.5" title="复制 Base URL">
                 {copied === "baseurl" ? <Check size={16} className="text-emerald-600" /> : <Copy size={16} />}
               </button>
             </div>
