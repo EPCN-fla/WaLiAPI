@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod codec;
 pub mod responses;
 
 use serde_json::Value;

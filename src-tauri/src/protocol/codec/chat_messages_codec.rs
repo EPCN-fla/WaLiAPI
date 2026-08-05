@@ -1,0 +1,606 @@
+//! Tests for the strict Chat ↔ Messages codec (T04).
+//!
+//! These tests encode the WaLiAPI fail-closed contract: unsupported features
+//! are rejected with a concrete JSON pointer and stable error code before any
+//! upstream access; invalid tool arguments are never rewritten to `{}`; an
+//! unknown finish reason is never downgraded to a normal stop/end_turn; SSE
+//! arbitrary fragmentation is deterministic; termination happens exactly once.
+
+use super::chat;
+use super::error::{FeatureKind, UnsupportedFeatures};
+use super::messages;
+use super::registry::CodecRegistry;
+use serde_json::json;
+use serde_json::Value;
+
+fn reject_features(e: &UnsupportedFeatures) -> Vec<String> {
+    e.features.clone()
+}
+
+// ===========================================================================
+// chat_to_messages_v1 — request encoding
+// ===========================================================================
+
+#[test]
+fn chat_request_text_system_and_sampling() {
+    let body = json!({
+        "model": "public-model",
+        "max_tokens": 128,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "stop": ["END"],
+        "stream": false,
+        "messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "developer", "content": "follow up"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"}
+        ]
+    });
+    let prepared = CodecRegistry::chat_to_messages("upstream-model", &body).unwrap();
+    let out = &prepared.encoded_request;
+    assert_eq!(out["model"], "upstream-model");
+    assert_eq!(out["max_tokens"], 128);
+    assert_eq!(out["temperature"], 0.7);
+    assert_eq!(out["top_p"], 0.9);
+    assert_eq!(out["stop_sequences"], json!(["END"]));
+    assert_eq!(out["stream"], false);
+    // system and developer are ordered and hoisted to top-level system.
+    let system = out["system"].as_array().unwrap();
+    assert_eq!(system[0]["text"], "be brief");
+    assert_eq!(system[1]["text"], "follow up");
+    // messages contain only user/assistant.
+    let msgs = out["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(prepared.context.upstream_model, "upstream-model");
+}
+
+#[test]
+fn chat_request_function_tools_and_choice() {
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "u"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "get weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        }],
+        "tool_choice": {"type": "function", "function": {"name": "weather"}}
+    });
+    let prepared = CodecRegistry::chat_to_messages("m", &body).unwrap();
+    let out = &prepared.encoded_request;
+    assert_eq!(out["tools"][0]["name"], "weather");
+    assert_eq!(out["tools"][0]["input_schema"]["type"], "object");
+    assert_eq!(out["tool_choice"], json!({"type": "tool", "name": "weather"}));
+}
+
+#[test]
+fn chat_request_tool_calls_and_results_are_strict() {
+    let body = json!({
+        "model": "m",
+        "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{\"a\":1}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "done"}
+        ]
+    });
+    let prepared = CodecRegistry::chat_to_messages("m", &body).unwrap();
+    let out = &prepared.encoded_request;
+    let msgs = out["messages"].as_array().unwrap();
+    // assistant -> tool_use block
+    assert_eq!(msgs[0]["content"][0]["type"], "tool_use");
+    assert_eq!(msgs[0]["content"][0]["id"], "call_1");
+    assert_eq!(msgs[0]["content"][0]["input"], json!({"a": 1}));
+    // tool -> user tool_result
+    assert_eq!(msgs[1]["role"], "user");
+    assert_eq!(msgs[1]["tool_result"]["tool_use_id"], "call_1");
+    assert_eq!(msgs[1]["tool_result"]["content"], "done");
+}
+
+#[test]
+fn chat_request_user_images() {
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+        ]}]
+    });
+    let prepared = CodecRegistry::chat_to_messages("m", &body).unwrap();
+    let out = &prepared.encoded_request;
+    assert_eq!(out["messages"][0]["content"][0]["type"], "image");
+    assert_eq!(out["messages"][0]["content"][0]["source"]["type"], "base64");
+    assert_eq!(out["messages"][0]["content"][0]["source"]["media_type"], "image/png");
+}
+
+#[test]
+fn chat_request_rejects_thinking_and_structured_output() {
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "u"}],
+        "response_format": {"type": "json_schema", "json_schema": {}}
+    });
+    let e = CodecRegistry::chat_to_messages("m", &body).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("structured_output")));
+    assert!(e.json_pointers.iter().any(|p| p == "/response_format"));
+}
+
+#[test]
+fn chat_request_rejects_unknown_role_and_builtin_tool() {
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "system", "content": "x"}, {"role": "tool", "tool_call_id": "t", "content": "x"}]
+    });
+    // No prior assistant tool_call -> tool message without id should fail (but
+    // here id is present; role tool without matching assistant tool is a
+    // strictness case).  This must not invent an assistant message.
+    let body = json!({
+        "model": "m",
+        "messages": [
+            {"role": "function", "content": "x"}
+        ]
+    });
+    let e = CodecRegistry::chat_to_messages("m", &body).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_role")));
+
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "u"}],
+        "tools": [{"type": "web_search", "function": {"name": "x"}}]
+    });
+    let e = CodecRegistry::chat_to_messages("m", &body).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("builtin_tool")));
+}
+
+#[test]
+fn chat_request_rejects_invalid_tool_arguments_never_rewrites() {
+    let body = json!({
+        "model": "m",
+        "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{bad"}}
+            ]}
+        ]
+    });
+    let e = CodecRegistry::chat_to_messages("m", &body).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("invalid_tool_arguments")));
+    // The non-object argument case (array) must also fail, not become {}.
+    let body = json!({
+        "model": "m",
+        "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "[]"}}
+            ]}
+        ]
+    });
+    assert!(CodecRegistry::chat_to_messages("m", &body).is_err());
+}
+
+// ===========================================================================
+// chat_to_messages_v1 — non-stream response
+// ===========================================================================
+
+#[test]
+fn chat_response_text_and_finish_mapping() {
+    let body = json!({
+        "id": "chatcmpl-1",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+    });
+    let out = chat::decode_chat_response_to_messages(&body, &Default::default()).unwrap();
+    assert_eq!(out["content"][0]["type"], "text");
+    assert_eq!(out["content"][0]["text"], "hi");
+    assert_eq!(out["stop_reason"], "end_turn");
+    assert_eq!(out["usage"]["input_tokens"], 10);
+    assert_eq!(out["usage"]["output_tokens"], 5);
+}
+
+#[test]
+fn chat_response_maps_length_and_tool_calls() {
+    let body = json!({
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_1", "function": {"name": "run", "arguments": "{\"a\":1}"}}
+        ]}, "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+    });
+    let out = chat::decode_chat_response_to_messages(&body, &Default::default()).unwrap();
+    assert_eq!(out["stop_reason"], "tool_use");
+    assert_eq!(out["content"][0]["type"], "tool_use");
+    assert_eq!(out["content"][0]["input"], json!({"a": 1}));
+}
+
+#[test]
+fn chat_response_rejects_invalid_tool_arguments() {
+    let body = json!({
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_1", "function": {"name": "run", "arguments": "{bad"}}
+        ]}, "finish_reason": "tool_calls"}],
+        "usage": {}
+    });
+    let e = chat::decode_chat_response_to_messages(&body, &Default::default()).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("invalid_tool_arguments")));
+    // Array arguments must not become {}.
+    let body = json!({
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_1", "function": {"name": "run", "arguments": "[]"}}
+        ]}, "finish_reason": "tool_calls"}],
+        "usage": {}
+    });
+    assert!(chat::decode_chat_response_to_messages(&body, &Default::default()).is_err());
+}
+
+#[test]
+fn chat_response_unknown_finish_reason_never_becomes_stop() {
+    let body = json!({
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "x"}, "finish_reason": "content_steering"}],
+        "usage": {}
+    });
+    let e = chat::decode_chat_response_to_messages(&body, &Default::default()).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("finish_reason")));
+}
+
+#[test]
+fn chat_response_refusal_maps_to_refusal_not_stop() {
+    let body = json!({
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "refusal": "no"}, "finish_reason": "content_filter"}],
+        "usage": {}
+    });
+    let out = chat::decode_chat_response_to_messages(&body, &Default::default()).unwrap();
+    assert_eq!(out["stop_reason"], "refusal");
+}
+
+#[test]
+fn chat_response_no_finish_reason_with_tool_calls_is_tool_use() {
+    let body = json!({
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_1", "function": {"name": "run", "arguments": "{}"}}
+        ]}, "finish_reason": null}],
+        "usage": {}
+    });
+    let out = chat::decode_chat_response_to_messages(&body, &Default::default()).unwrap();
+    assert_eq!(out["stop_reason"], "tool_use");
+}
+
+// ===========================================================================
+// chat_to_messages_v1 — streaming
+// ===========================================================================
+
+#[test]
+fn chat_stream_arbitrary_fragmentation_and_tool_accumulation() {
+    let mut state = chat::ChatSseState::default();
+    let parts = [
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"h".as_slice(),
+        "\u{00e9}".as_bytes(),
+        b"\"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"two\",\"arguments\":\"{\\\"b\\\":2}\"}},{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"one\",\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}\r\n\r\n".as_slice(),
+        b"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n".as_slice(),
+    ];
+    let mut output = Vec::new();
+    for part in parts {
+        output.extend(state.feed(part).unwrap());
+    }
+    output.extend(state.finish().unwrap());
+    let output = output.join("");
+    assert!(output.contains("hé"));
+    assert!(output.contains("\"id\":\"a\""));
+    assert!(output.contains("\"id\":\"b\""));
+    assert!(output.contains("\"input_tokens\":7"));
+    assert!(output.contains("\"stop_sequence\":null"));
+    let text_stop = output.find("content_block_stop").unwrap();
+    let first_tool = output.find("\"type\":\"tool_use\"").unwrap();
+    assert!(text_stop < first_tool, "text must stop before a tool block starts");
+    assert!(output.find("\"id\":\"a\"").unwrap() < output.find("\"id\":\"b\"").unwrap());
+    assert_eq!(output.matches("event: message_stop").count(), 1);
+}
+
+#[test]
+fn chat_stream_incomplete_tool_arguments_are_rejected() {
+    let mut state = chat::ChatSseState::default();
+    state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"run\",\"arguments\":\"{bad\"}}]}}]}\n\n").unwrap();
+    let e = state.finish().unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("invalid_tool_arguments")));
+}
+
+#[test]
+fn chat_stream_unknown_finish_reason_rejected_at_finalize() {
+    let mut state = chat::ChatSseState::default();
+    state.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n").unwrap();
+    state.feed(b"data: {\"choices\":[{\"finish_reason\":\"bizarre\"}]}\n\n").unwrap();
+    let e = state.finish().unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("finish_reason")));
+}
+
+#[test]
+fn chat_stream_first_frame_invalid_is_a_codec_error() {
+    let mut state = chat::ChatSseState::default();
+    let e = state.feed(b"data: {not-json}\n\n").unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_event")));
+}
+
+#[test]
+fn chat_stream_termination_exactly_once() {
+    let mut state = chat::ChatSseState::default();
+    state.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n").unwrap();
+    let first = state.finish().unwrap();
+    assert_eq!(first.iter().filter(|e| e.contains("message_stop")).count(), 1);
+    // finish() again is a no-op.
+    let second = state.finish().unwrap();
+    assert!(second.is_empty());
+}
+
+// ===========================================================================
+// messages_to_chat_v1 — request encoding
+// ===========================================================================
+
+#[test]
+fn messages_request_system_text_and_sampling() {
+    let body = json!({
+        "model": "m",
+        "max_tokens": 64,
+        "temperature": 0.5,
+        "system": [{"type": "text", "text": "sys"}],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    });
+    let prepared = CodecRegistry::messages_to_chat("up", &body).unwrap();
+    let out = &prepared.encoded_request;
+    assert_eq!(out["model"], "up");
+    assert_eq!(out["max_tokens"], 64);
+    assert_eq!(out["temperature"], 0.5);
+    assert_eq!(out["messages"][0], json!({"role": "system", "content": "sys"}));
+    assert_eq!(out["messages"][1]["content"], "hi");
+}
+
+#[test]
+fn messages_request_tools_choice_and_tool_results() {
+    let body = json!({
+        "model": "m",
+        "messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": "checking"}, {"type": "tool_use", "id": "call_1", "name": "weather", "input": {"city": "Paris"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "sunny"}, {"type": "text", "text": "thanks"}]}
+        ],
+        "tools": [{"name": "weather", "description": "weather", "input_schema": {"type": "object"}}],
+        "tool_choice": {"type": "any", "disable_parallel_tool_use": true}
+    });
+    let prepared = CodecRegistry::messages_to_chat("m", &body).unwrap();
+    let out = &prepared.encoded_request;
+    assert_eq!(out["parallel_tool_calls"], false);
+    assert_eq!(out["tool_choice"], "required");
+    assert_eq!(out["tools"][0]["function"]["name"], "weather");
+    // No system message here, so messages[0] is the assistant with tool_calls.
+    assert_eq!(out["messages"][0]["content"], "checking");
+    assert_eq!(out["messages"][0]["tool_calls"][0]["function"]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(out["messages"][1]["role"], "tool");
+    assert_eq!(out["messages"][2]["content"], "thanks");
+}
+
+#[test]
+fn messages_request_rejects_thinking_and_builtin_tools() {
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "u"}],
+        "thinking": {"type": "enabled", "budget_tokens": 1024}
+    });
+    let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("beta_feature")));
+
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "u"}],
+        "tools": [{"type": "web_search", "name": "web"}]
+    });
+    let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("builtin_tool")));
+}
+
+#[test]
+fn messages_request_unknown_role_and_block_rejected() {
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "system", "content": "x"}]
+    });
+    let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_role")));
+
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": [{"type": "document", "source": {}}]}]
+    });
+    let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_block")));
+}
+
+#[test]
+fn messages_request_strips_lossless_cache_controls() {
+    let body = json!({
+        "model": "m",
+        "system": [{"type": "text", "text": "cached", "cache_control": {"type": "ephemeral"}}],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}]}]
+    });
+    let prepared = CodecRegistry::messages_to_chat("m", &body).unwrap();
+    let out = &prepared.encoded_request;
+    assert_eq!(out["messages"][0]["content"], "cached");
+    assert!(out["messages"][0].get("cache_control").is_none());
+}
+
+#[test]
+fn messages_request_rejects_invalid_tool_input() {
+    let body = json!({
+        "model": "m",
+        "messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "c", "name": "run", "input": [1, 2]}]}
+        ]
+    });
+    let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("invalid_tool_arguments")));
+}
+
+// ===========================================================================
+// messages_to_chat_v1 — non-stream response
+// ===========================================================================
+
+#[test]
+fn messages_response_text_and_tool_use() {
+    let body = json!({
+        "id": "msg_1",
+        "type": "message",
+        "content": [
+            {"type": "text", "text": "hello"},
+            {"type": "tool_use", "id": "call_1", "name": "run", "input": {"a": 1}}
+        ],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    });
+    let out = messages::decode_messages_response_to_chat(&body, &Default::default()).unwrap();
+    assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(out["choices"][0]["message"]["content"], "hello");
+    assert_eq!(out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], "{\"a\":1}");
+    assert_eq!(out["usage"]["prompt_tokens"], 10);
+    assert_eq!(out["usage"]["completion_tokens"], 5);
+}
+
+#[test]
+fn messages_response_maps_stop_reasons() {
+    let base = |stop: &str| json!({
+        "id": "msg_1", "type": "message", "content": [{"type": "text", "text": "x"}],
+        "stop_reason": stop, "usage": {"input_tokens": 1, "output_tokens": 1}
+    });
+    assert_eq!(
+        messages::decode_messages_response_to_chat(&base("end_turn"), &Default::default()).unwrap()["choices"][0]["finish_reason"],
+        "stop"
+    );
+    assert_eq!(
+        messages::decode_messages_response_to_chat(&base("max_tokens"), &Default::default()).unwrap()["choices"][0]["finish_reason"],
+        "length"
+    );
+    // Unknown stop reason is rejected, never mapped to stop.
+    let e = messages::decode_messages_response_to_chat(&base("budget_forced"), &Default::default()).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("finish_reason")));
+}
+
+#[test]
+fn messages_response_rejects_unknown_block_and_bad_input() {
+    let body = json!({
+        "id": "msg_1", "type": "message",
+        "content": [{"type": "thinking", "thinking": "..."}],
+        "stop_reason": "end_turn", "usage": {}
+    });
+    let e = messages::decode_messages_response_to_chat(&body, &Default::default()).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_block")));
+
+    let body = json!({
+        "id": "msg_1", "type": "message",
+        "content": [{"type": "tool_use", "id": "c", "name": "run", "input": [1]}],
+        "stop_reason": "tool_use", "usage": {}
+    });
+    let e = messages::decode_messages_response_to_chat(&body, &Default::default()).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("invalid_tool_arguments")));
+}
+
+// ===========================================================================
+// messages_to_chat_v1 — streaming
+// ===========================================================================
+
+#[test]
+fn messages_stream_text_and_tool_deltas() {
+    let mut state = messages::MessagesSseState::default();
+    let mut events = Vec::new();
+    events.extend(state.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":5}}}\n\n").unwrap());
+    events.extend(state.feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n").unwrap());
+    events.extend(state.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n").unwrap());
+    events.extend(state.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n").unwrap());
+    events.extend(state.feed(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap());
+    events.extend(state.feed(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n").unwrap());
+    events.extend(state.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n").unwrap());
+    events.extend(state.finish().unwrap());
+    let joined = events.join("");
+    assert!(joined.contains("\"role\":\"assistant\""));
+    assert!(joined.contains("\"content\":\"hel\""));
+    assert!(joined.contains("\"content\":\"lo\""));
+    assert!(joined.contains("\"finish_reason\":\"stop\""));
+    assert!(joined.contains("\"prompt_tokens\":5"));
+    assert!(joined.contains("\"completion_tokens\":2"));
+    assert_eq!(events.iter().filter(|e| e.contains("[DONE]")).count(), 1);
+}
+
+#[test]
+fn messages_stream_tool_calls_accumulate_by_index() {
+    let mut state = messages::MessagesSseState::default();
+    let mut events = Vec::new();
+    events.extend(state.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{}}}\n\n").unwrap());
+    // Two parallel tool blocks (index 0 and 1); deltas interleave.
+    events.extend(state.feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_a\",\"name\":\"one\",\"input\":{}}}\n\n").unwrap());
+    events.extend(state.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\"\"}}\n\n").unwrap());
+    events.extend(state.feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_b\",\"name\":\"two\",\"input\":{}}}\n\n").unwrap());
+    events.extend(state.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"b\\\":2}\"}}\n\n").unwrap());
+    events.extend(state.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\":1}\"}}\n\n").unwrap());
+    events.extend(state.feed(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap());
+    events.extend(state.feed(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n").unwrap());
+    events.extend(state.feed(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{}}\n\n").unwrap());
+    events.extend(state.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n").unwrap());
+    events.extend(state.finish().unwrap());
+    let joined = events.join("");
+    assert!(joined.contains("\"id\":\"call_a\""));
+    assert!(joined.contains("\"name\":\"one\""));
+    assert!(joined.contains("\"id\":\"call_b\""));
+    assert!(joined.contains("\"name\":\"two\""));
+    assert!(joined.contains("\"arguments\":\"{\\\"a\\\":1}\""));
+    assert!(joined.contains("\"arguments\":\"{\\\"b\\\":2}\""));
+    assert!(joined.contains("\"finish_reason\":\"tool_calls\""));
+    assert_eq!(events.iter().filter(|e| e.contains("[DONE]")).count(), 1);
+}
+
+#[test]
+fn messages_stream_invalid_tool_json_is_rejected() {
+    let mut state = messages::MessagesSseState::default();
+    state.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{}}}\n\n").unwrap();
+    state.feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c\",\"name\":\"run\",\"input\":{}}}\n\n").unwrap();
+    state.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{bad\"}}\n\n").unwrap();
+    // content_block_stop validates the accumulated arguments and must reject the
+    // malformed JSON rather than invent `{}`.
+    let e = state.feed(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("invalid_tool_arguments")));
+}
+
+#[test]
+fn messages_stream_unknown_event_is_a_codec_error() {
+    let mut state = messages::MessagesSseState::default();
+    let e = state.feed(b"event: wat\ndata: {\"type\":\"wat\"}\n\n").unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_event")));
+}
+
+#[test]
+fn messages_stream_fragmented_utf8_and_crlf() {
+    let mut state = messages::MessagesSseState::default();
+    let mut events = Vec::new();
+    let payload = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{}}}\r\n\r\n";
+    for chunk in payload.as_bytes().chunks(5) {
+        events.extend(state.feed(chunk).unwrap());
+    }
+    events.extend(state.feed("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\r\n\r\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"h\u{00e9}\"}}\r\n\r\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\r\n\r\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\r\n\r\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\r\n\r\n".as_bytes()).unwrap());
+    events.extend(state.finish().unwrap());
+    assert!(events.join("").contains("h\u{00e9}"));
+}
+
+// ===========================================================================
+// FeatureKind stable codes
+// ===========================================================================
+
+#[test]
+fn feature_kind_stable_codes() {
+    assert_eq!(FeatureKind::Thinking.code(), "unsupported_feature.thinking");
+    assert_eq!(FeatureKind::StructuredOutput.code(), "unsupported_feature.structured_output");
+    assert_eq!(FeatureKind::BuiltinTool.code(), "unsupported_feature.builtin_tool");
+    assert_eq!(FeatureKind::Document.code(), "unsupported_feature.document");
+    assert_eq!(FeatureKind::PromptCache.code(), "unsupported_feature.prompt_cache");
+    assert_eq!(FeatureKind::UnknownRole.code(), "unsupported_feature.unknown_role");
+    assert_eq!(FeatureKind::UnknownBlock.code(), "unsupported_feature.unknown_block");
+    assert_eq!(FeatureKind::UnknownEvent.code(), "unsupported_feature.unknown_event");
+    assert_eq!(FeatureKind::UnknownFinishReason.code(), "unsupported_feature.finish_reason");
+    assert_eq!(FeatureKind::InvalidToolArguments.code(), "unsupported_feature.invalid_tool_arguments");
+    assert_eq!(FeatureKind::MissingToolField.code(), "unsupported_feature.missing_tool_field");
+    assert_eq!(FeatureKind::Media.code(), "unsupported_media");
+}
