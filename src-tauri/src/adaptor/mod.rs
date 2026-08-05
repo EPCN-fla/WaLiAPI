@@ -74,6 +74,9 @@ pub fn get_adaptor(channel_type: &str) -> Box<dyn Adaptor> {
 }
 
 #[allow(dead_code)]
+/// 已弃用（T01）：模板职责已迁至 `crate::channel_presets`。
+/// 仅显式标记、不删除；T06 负责移除调用点。
+#[deprecated(note = "模板职责已迁移至 crate::channel_presets；待 T06 移除调用点")]
 pub fn channel_types() -> Vec<ChannelTypeInfo> {
     vec![
         ChannelTypeInfo { value: "openai", label: "OpenAI", category: "international", default_base_url: "https://api.openai.com/v1", models: vec!["gpt-5.4", "gpt-5.5", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"] },
@@ -91,6 +94,7 @@ pub fn channel_types() -> Vec<ChannelTypeInfo> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
+#[deprecated(note = "模板职责已迁移至 crate::channel_presets；待 T06 移除调用点")]
 pub struct ChannelTypeInfo {
     pub value: &'static str,
     pub label: &'static str,

@@ -7,6 +7,7 @@ import type {
   Settings,
   ServerStatus,
   BuiltinRule, CustomRule, CreateCustomRuleInput, UpdateBuiltinRuleInput,
+  ChannelProtocolPresetGroup,
 } from "../types";
 
 // Channel stats
@@ -34,6 +35,8 @@ export const channelApi = {
   test: (id: string) => invoke<TestChannelResult>("test_channel", { id }),
   getStats: () => invoke<ChannelStats[]>("get_channel_stats"),
   reorder: (orderedIds: string[]) => invoke<void>("reorder_channels", { orderedIds }),
+  /** 获取全部协议及其提供商模板（只读；`presets[0]` 恒为 custom option）。 */
+  getPresets: () => invoke<ChannelProtocolPresetGroup[]>("get_channel_presets"),
 };
 
 // API Key commands

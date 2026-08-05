@@ -229,3 +229,78 @@ export interface ChannelTypeInfo {
   default_base_url: string;
   models: string[];
 }
+
+// ── Provider preset DTO（T01，与 src-tauri/src/channel_presets.rs 保持一致）──
+// 序列化字符串必须与 Rust 枚举的 serde 输出完全一致。
+
+export type ChannelProtocol = "openai" | "anthropic" | "ollama";
+
+export type ChannelProvider =
+  | "openai"
+  | "google"
+  | "deepseek"
+  | "qwen"
+  | "zhipu"
+  | "doubao"
+  | "doubao_coding_plan"
+  | "moonshot"
+  | "anthropic"
+  | "ollama"
+  | "custom";
+
+export type ChannelEndpoint =
+  | "chat_completions"
+  | "responses"
+  | "messages"
+  | "count_tokens"
+  | "embeddings"
+  | "api_chat";
+
+export type ChannelAuthScheme =
+  | "bearer"
+  | "x_api_key"
+  | "query_key"
+  | "optional_bearer";
+
+export type ChannelRegionGroup =
+  | "custom"
+  | "international"
+  | "domestic"
+  | "local";
+
+export type ChannelModelEnumStrategy = "static_only" | "static_plus_sync" | "sync_only";
+
+export type ChannelEndpointTestStrategy = "probe_first_model" | "list_models";
+
+export interface ChannelModelSuggestion {
+  id: string;
+  verified_at: string;
+  source_url: string;
+}
+
+/** 渠道提供商模板（T01）。URL/模型/能力唯一真相在后端 registry。 */
+export interface ChannelPreset {
+  id: string;
+  protocol: ChannelProtocol;
+  provider: ChannelProvider;
+  display_name: string;
+  region: ChannelRegionGroup;
+  description: string;
+  icon_key: string;
+  native_base_url: string;
+  legacy_base_url: string;
+  legacy_type: string;
+  native_endpoints: ChannelEndpoint[];
+  default_checked_endpoints: ChannelEndpoint[];
+  auth_scheme: ChannelAuthScheme;
+  model_suggestions: ChannelModelSuggestion[];
+  model_enum_strategy: ChannelModelEnumStrategy;
+  endpoint_test_strategy: ChannelEndpointTestStrategy;
+  preset_revision: string;
+}
+
+/** 每个协议一组；`presets[0]` 恒为固定 custom option。 */
+export interface ChannelProtocolPresetGroup {
+  protocol: ChannelProtocol;
+  presets: ChannelPreset[];
+}

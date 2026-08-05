@@ -1,6 +1,7 @@
 mod commands;
 mod core;
 mod adaptor;
+mod channel_presets;
 mod server;
 mod db;
 mod utils;
@@ -121,6 +122,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::channel::get_channels,
+            commands::channel::get_channel_presets,
             commands::channel::get_channel,
             commands::channel::get_channel_api_key,
             commands::channel::create_channel,

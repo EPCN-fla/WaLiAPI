@@ -2,6 +2,7 @@ use crate::db::models::{Channel, CreateChannelInput, UpdateChannelInput, Channel
 use crate::db::repository::Repository;
 use crate::AppState;
 use crate::adaptor::{get_adaptor, ChannelConfig};
+use crate::channel_presets::ProtocolPresetGroup;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,6 +68,13 @@ pub async fn get_channels(state: tauri::State<'_, std::sync::Arc<AppState>>) -> 
 pub async fn get_channel(id: String, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<ChannelDto, String> {
     let repo = Repository::new(state.db.pool.clone());
     repo.get_channel(&id).await.map_err(|e| e.to_string()).map(to_dto)
+}
+
+/// 只读：返回全部协议及其 provider 模板，`groups[n].presets[0]` 恒为 custom option。
+/// 不落库、不访问网络。
+#[tauri::command]
+pub fn get_channel_presets() -> Result<Vec<ProtocolPresetGroup>, String> {
+    Ok(crate::channel_presets::groups_for_protocols())
 }
 
 #[tauri::command]
