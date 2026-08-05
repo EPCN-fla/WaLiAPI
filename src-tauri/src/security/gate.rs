@@ -23,6 +23,7 @@
 //! Whole-request cumulative budgets (bytes, string nodes, JSON depth, elapsed
 //! time) are enforced by the scanner; over-budget results fail closed with
 //! `security_scan_budget_exceeded` and are NEVER reported as clean.
+#![allow(dead_code)] // API surface consumed by T05 route-plan / T06 executors
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

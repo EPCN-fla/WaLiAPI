@@ -133,6 +133,7 @@ async fn log_security_block(
 /// Serialize a JSON body for logging.  This is the ONLY sanctioned path from a
 /// request body into the log layer: it always redacts secrets first, so raw
 /// request bytes are never persisted (T03 spec).
+#[allow(dead_code)]
 fn sanitized_log_string(value: &serde_json::Value) -> String {
     serde_json::to_string(&security::redact::redact_json_for_logging(value)).unwrap_or_default()
 }
