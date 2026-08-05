@@ -97,10 +97,39 @@ fn chat_request_tool_calls_and_results_are_strict() {
     assert_eq!(msgs[0]["content"][0]["type"], "tool_use");
     assert_eq!(msgs[0]["content"][0]["id"], "call_1");
     assert_eq!(msgs[0]["content"][0]["input"], json!({"a": 1}));
-    // tool -> user tool_result
+    // tool -> user tool_result as a content block (canonical Anthropic shape).
     assert_eq!(msgs[1]["role"], "user");
-    assert_eq!(msgs[1]["tool_result"]["tool_use_id"], "call_1");
-    assert_eq!(msgs[1]["tool_result"]["content"], "done");
+    assert_eq!(msgs[1]["content"][0]["type"], "tool_result");
+    assert_eq!(msgs[1]["content"][0]["tool_use_id"], "call_1");
+    assert_eq!(msgs[1]["content"][0]["content"][0]["type"], "text");
+    assert_eq!(msgs[1]["content"][0]["content"][0]["text"], "done");
+    assert!(msgs[1].get("tool_result").is_none(), "no message-level tool_result key");
+}
+
+#[test]
+fn chat_request_consecutive_tool_results_aggregate_into_one_user_message() {
+    let body = json!({
+        "model": "m",
+        "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+                {"id": "call_2", "type": "function", "function": {"name": "b", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "first"},
+            {"role": "tool", "tool_call_id": "call_2", "content": "second"}
+        ]
+    });
+    let prepared = CodecRegistry::chat_to_messages("m", &body).unwrap();
+    let msgs = prepared.encoded_request["messages"].as_array().unwrap();
+    // assistant + a SINGLE user message carrying both tool_result blocks.
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["role"], "assistant");
+    assert_eq!(msgs[1]["role"], "user");
+    assert_eq!(msgs[1]["content"].as_array().unwrap().len(), 2);
+    assert_eq!(msgs[1]["content"][0]["tool_use_id"], "call_1");
+    assert_eq!(msgs[1]["content"][1]["tool_use_id"], "call_2");
+    assert_eq!(msgs[1]["content"][0]["content"][0]["text"], "first");
+    assert_eq!(msgs[1]["content"][1]["content"][0]["text"], "second");
 }
 
 #[test]
@@ -116,6 +145,22 @@ fn chat_request_user_images() {
     assert_eq!(out["messages"][0]["content"][0]["type"], "image");
     assert_eq!(out["messages"][0]["content"][0]["source"]["type"], "base64");
     assert_eq!(out["messages"][0]["content"][0]["source"]["media_type"], "image/png");
+    // F2: no non-canonical `_media_type` key on the image block.
+    assert!(out["messages"][0]["content"][0].get("_media_type").is_none());
+}
+
+#[test]
+fn chat_request_rejects_n_gt_1_instead_of_silently_dropping() {
+    // `n` is not in the support matrix: Messages always returns one completion,
+    // so n>1 must be rejected (never silently yield a single completion).
+    let body = json!({
+        "model": "m",
+        "n": 2,
+        "messages": [{"role": "user", "content": "u"}]
+    });
+    let e = CodecRegistry::chat_to_messages("m", &body).unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("unsupported_feature.field")));
+    assert!(e.json_pointers.iter().any(|p| p == "/n"));
 }
 
 #[test]
@@ -330,6 +375,34 @@ fn chat_stream_termination_exactly_once() {
     // finish() again is a no-op.
     let second = state.finish().unwrap();
     assert!(second.is_empty());
+}
+
+#[test]
+fn chat_stream_empty_stream_is_a_codec_error_not_an_empty_success() {
+    // F4: a stream that closes before any first frame must surface a codec
+    // error (for pre-commit failover), never a silent empty Ok.
+    let mut state = chat::ChatSseState::default();
+    state.feed(b"").unwrap();
+    let e = state.finish().unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_event")));
+
+    let mut state = chat::ChatSseState::default();
+    state.feed(b"data: [DONE]\n\n").unwrap();
+    let e = state.finish().unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_event")));
+}
+
+#[test]
+fn chat_stream_emits_prepared_model_and_request_id() {
+    // F5: the streaming decoder must thread the mapped upstream model and the
+    // per-request id from the PreparedAttempt context into the synthesized
+    // message_start frame.
+    let mut state = chat::ChatSseState::new("upstream-model-9", "req-42");
+    let events = state.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n").unwrap();
+    let joined = events.join("");
+    assert!(joined.contains("\"model\":\"upstream-model-9\""));
+    assert!(joined.contains("\"id\":\"req-42\""));
+    state.finish().unwrap();
 }
 
 // ===========================================================================
@@ -583,6 +656,39 @@ fn messages_stream_fragmented_utf8_and_crlf() {
     events.extend(state.feed("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\r\n\r\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"h\u{00e9}\"}}\r\n\r\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\r\n\r\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\r\n\r\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\r\n\r\n".as_bytes()).unwrap());
     events.extend(state.finish().unwrap());
     assert!(events.join("").contains("h\u{00e9}"));
+}
+
+#[test]
+fn messages_stream_empty_stream_is_a_codec_error_not_an_empty_success() {
+    // F4: a Messages stream that closes before any message_start frame must
+    // surface a codec error for pre-commit failover, never an empty Ok.
+    let mut state = messages::MessagesSseState::default();
+    state.feed(b"").unwrap();
+    let e = state.finish().unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_event")));
+
+    let mut state = messages::MessagesSseState::default();
+    state.feed(b"event: ping\ndata: {\"type\":\"ping\"}\n\n").unwrap();
+    let e = state.finish().unwrap_err();
+    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_event")));
+}
+
+#[test]
+fn messages_stream_emits_prepared_model() {
+    // F5: the Messages→Chat streaming decoder must thread the mapped upstream
+    // model from the PreparedAttempt context into the synthesized Chat role
+    // frame (never a hardcoded empty model).
+    let mut state = messages::MessagesSseState::new("upstream-model-9");
+    let mut events = Vec::new();
+    events.extend(state.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{}}}\n\n").unwrap());
+    events.extend(state.feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n").unwrap());
+    events.extend(state.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n").unwrap());
+    events.extend(state.feed(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap());
+    events.extend(state.feed(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n").unwrap());
+    events.extend(state.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n").unwrap());
+    events.extend(state.finish().unwrap());
+    let joined = events.join("");
+    assert!(joined.contains("\"model\":\"upstream-model-9\""));
 }
 
 // ===========================================================================

@@ -15,6 +15,10 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 /// Sampling parameters we can map 1:1 between Chat and Messages.
+///
+/// `n` is intentionally absent: Anthropic Messages only ever returns a single
+/// completion, so `n > 1` cannot be preserved and must be rejected rather than
+/// silently yielding one completion.
 const SUPPORTED_TOP_LEVEL: &[&str] = &[
     "model",
     "messages",
@@ -26,7 +30,6 @@ const SUPPORTED_TOP_LEVEL: &[&str] = &[
     "stop",
     "tools",
     "tool_choice",
-    "n",
 ];
 
 /// Encode a Chat Completions request into an Anthropic Messages request.
@@ -94,15 +97,18 @@ pub fn encode_chat_to_messages(
     }
 
     // ---- model ----
-    let request_id = body
-        .get("id")
-        .and_then(Value::as_str)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("chatcmpl_{}", uuid::Uuid::new_v4().simple()));
+    // Chat Completions *requests* do not carry an `id` (that is a response
+    // field), so derive a per-request conversation id from the caller instead.
+    let request_id = format!("chatcmpl_{}", uuid::Uuid::new_v4().simple());
 
     // ---- sampling params ----
     let mut claude = Map::new();
     claude.insert("model".to_string(), Value::String(model.to_string()));
+    // Anthropic Messages requires `max_tokens`.  When the Chat request omits it
+    // we use a documented safe default (4096) so the upstream call is not
+    // malformed; a per-model profile would live in the caller (PreparedAttempt)
+    // and could override this via the request body.  Recorded as a deferred
+    // choice in the T04 report (F8).
     claude.insert(
         "max_tokens".to_string(),
         body.get("max_tokens")
@@ -268,7 +274,7 @@ fn convert_chat_message_to_anthropic(
                                             "image_url content block missing image_url.url",
                                         )
                                     })?;
-                                let (media_type, base64) = parse_data_url(url);
+                                let (_media_type, base64) = parse_data_url(url);
                                 let source = if let Some((mt, data)) = base64 {
                                     serde_json::json!({
                                         "type": "base64",
@@ -281,7 +287,6 @@ fn convert_chat_message_to_anthropic(
                                 blocks.push(serde_json::json!({
                                     "type": "image",
                                     "source": source,
-                                    "_media_type": media_type,
                                 }));
                             }
                             Some("input_text") | Some("output_text") => {
@@ -483,20 +488,51 @@ fn convert_chat_message_to_anthropic(
                 }
             };
             let is_error = msg.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-            let mut result_content: Vec<Value> = Vec::new();
+            // Canonical Anthropic tool_result is a *content block* inside the
+            // user message's content array.  The message-level `tool_result`
+            // key is not part of the Messages schema and the real API rejects
+            // it with 400 invalid_request_error.
+            let mut result_blocks: Vec<Value> = Vec::new();
             if !text.is_empty() {
-                result_content.push(serde_json::json!({"type": "text", "text": text}));
+                result_blocks.push(serde_json::json!({"type": "text", "text": text}));
             }
-            let mut user_msg = serde_json::json!({
-                "role": "user",
-                "content": Value::Array(result_content),
-            });
-            user_msg["tool_result"] = serde_json::json!({
+            let tool_result_block = serde_json::json!({
+                "type": "tool_result",
                 "tool_use_id": tool_call_id,
-                "content": text,
+                "content": Value::Array(result_blocks),
                 "is_error": is_error,
             });
-            messages_out.push(user_msg);
+            // Anthropic requires all tool results for one assistant turn in a
+            // SINGLE user message: aggregate consecutive tool results into the
+            // same user message instead of one message per tool result.
+            let appended = if let Some(last) = messages_out.last_mut() {
+                if last.get("role").and_then(Value::as_str) == Some("user") {
+                    if let Some(content_arr) = last.get_mut("content").and_then(Value::as_array_mut) {
+                        let is_tool_result = content_arr
+                            .last()
+                            .map(|b| b.get("type").and_then(Value::as_str))
+                            == Some(Some("tool_result"));
+                        if is_tool_result {
+                            content_arr.push(tool_result_block.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !appended {
+                messages_out.push(serde_json::json!({
+                    "role": "user",
+                    "content": Value::Array(vec![tool_result_block]),
+                }));
+            }
             Ok(())
         }
         other => Err(UnsupportedFeatures::single(
@@ -745,12 +781,6 @@ pub fn decode_chat_response_to_messages(
         content_blocks.push(serde_json::json!({"type": "text", "text": ""}));
     }
 
-    let _message_id = if context.request_id.is_empty() {
-        format!("msg_{}", uuid::Uuid::new_v4().simple())
-    } else {
-        context.request_id.clone()
-    };
-
     Ok(serde_json::json!({
         "id": body.get("id").and_then(Value::as_str).map(String::from).unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4().simple())),
         "type": "message",
@@ -814,9 +844,27 @@ pub struct ChatSseState {
     next_content_index: usize,
     open_text: Option<usize>,
     tools: BTreeMap<usize, ToolAccum>,
+    /// The mapped upstream model (from the PreparedAttempt) to emit in the
+    /// synthesized `message_start` frame; the codec never re-maps models.
+    pub model: String,
+    /// Per-request downstream message id.
+    pub message_id: String,
 }
 
 impl ChatSseState {
+    /// Create the per-request state with the caller-provided model and id.
+    pub fn new(model: &str, message_id: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            message_id: if message_id.is_empty() {
+                format!("msg_{}", uuid::Uuid::new_v4().simple())
+            } else {
+                message_id.to_string()
+            },
+            ..Default::default()
+        }
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
         self.pending.extend_from_slice(bytes);
         let mut events = Vec::new();
@@ -872,10 +920,10 @@ impl ChatSseState {
             events.push(sse::event("message_start", serde_json::json!({
                 "type": "message_start",
                 "message": {
-                    "id": format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                    "id": self.message_id,
                     "type": "message",
                     "role": "assistant",
-                    "model": "",
+                    "model": self.model,
                     "content": [],
                     "stop_reason": null,
                     "stop_sequence": null,
@@ -985,8 +1033,18 @@ impl ChatSseState {
     }
 
     fn emit_final(&mut self, events: &mut Vec<String>) -> Result<(), UnsupportedFeatures> {
-        if self.ended || !self.started {
+        if self.ended {
             return Ok(());
+        }
+        if !self.started {
+            // The upstream stream never delivered a first frame.  This is a
+            // codec error (not an empty success) so the gateway can fail over
+            // before committing the downstream response.
+            return Err(UnsupportedFeatures::single(
+                FeatureKind::UnknownEvent,
+                "/",
+                "OpenAI upstream stream ended before any first frame (no message_start emitted)",
+            ));
         }
         if let Some(index) = self.open_text.take() {
             events.push(sse::event("content_block_stop", serde_json::json!({
@@ -1079,9 +1137,9 @@ pub struct ChatStreamDecoder {
 }
 
 impl ChatStreamDecoder {
-    pub fn boxed(_context: &ConversionContext) -> Box<dyn StreamDecoder + Send + Sync> {
+    pub fn boxed(context: &ConversionContext) -> Box<dyn StreamDecoder + Send + Sync> {
         Box::new(ChatStreamDecoder {
-            state: ChatSseState::default(),
+            state: ChatSseState::new(&context.upstream_model, &context.request_id),
         })
     }
 }

@@ -709,9 +709,19 @@ pub struct MessagesSseState {
     usage: Usage,
     message_id: String,
     current_block: Option<String>,
+    /// The mapped upstream model to emit in the synthesized Chat `role` frame.
+    pub model: String,
 }
 
 impl MessagesSseState {
+    /// Create the per-request state with the caller-provided model.
+    pub fn new(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            ..Default::default()
+        }
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
         self.pending.extend_from_slice(bytes);
         let mut events = Vec::new();
@@ -782,7 +792,7 @@ impl MessagesSseState {
                         "id": self.message_id,
                         "object": "chat.completion.chunk",
                         "created": chrono::Utc::now().timestamp(),
-                        "model": "",
+                        "model": self.model,
                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]
                     })));
                 }
@@ -940,13 +950,19 @@ impl MessagesSseState {
     }
 
     fn emit_final(&mut self, events: &mut Vec<String>) -> Result<(), UnsupportedFeatures> {
-        if self.ended || !self.started {
-            // Never started (empty/errored stream before any message_start) or
-            // already finalized: emit nothing more.
-            if !self.ended {
-                self.ended = true;
-            }
+        if self.ended {
             return Ok(());
+        }
+        if !self.started {
+            // The upstream stream never delivered a message_start frame.  This
+            // is a codec error (not an empty success) so the gateway can fail
+            // over before committing the downstream response.
+            self.ended = true;
+            return Err(UnsupportedFeatures::single(
+                FeatureKind::UnknownEvent,
+                "/",
+                "Anthropic upstream stream ended before any first frame (no message_start)",
+            ));
         }
         // Validate any in-progress tool calls: Anthropic may send
         // content_block_stop for a tool_use with no deltas yet (empty object).
@@ -1004,9 +1020,9 @@ pub struct MessagesStreamDecoder {
 }
 
 impl MessagesStreamDecoder {
-    pub fn boxed(_context: &ConversionContext) -> Box<dyn StreamDecoder + Send + Sync> {
+    pub fn boxed(context: &ConversionContext) -> Box<dyn StreamDecoder + Send + Sync> {
         Box::new(MessagesStreamDecoder {
-            state: MessagesSseState::default(),
+            state: MessagesSseState::new(&context.upstream_model),
         })
     }
 }
