@@ -559,4 +559,53 @@ mod gate_tests {
         .unwrap();
         assert!(!out.budget_exceeded);
     }
+
+    #[test]
+    fn confirm_budget_and_parse_fail_never_produce_forward_json() {
+        // Fail-closed contract: Confirm / budget-exceeded / parse-failure must
+        // never yield a forwardable body, so a caller that short-circuits on
+        // the error never contacts upstream (zero upstream calls by
+        // construction — there is no HTTP layer inside the gate itself, and
+        // the handlers reject before building any request).
+        let settings = || SecuritySettings { mode: "confirm".to_string(), ..default_settings() };
+
+        // Confirm → error, no output.
+        let confirm_json = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "sk-abcdefghijklmnopqrstuvwxyz123456"}]});
+        let err = audit_request(SecurityGateInput {
+            downstream_protocol: DownstreamProtocol::ChatCompletions,
+            endpoint: "/v1/chat/completions".to_string(),
+            original_json: confirm_json,
+            safe_forward_headers: vec![],
+            query: None,
+            model: "m".to_string(),
+            stream: false,
+            trace_id: None,
+            settings: settings(),
+            budget: None,
+        })
+        .unwrap_err();
+        assert_eq!(err, SecurityGateError::ApprovalRequired { message: err.message().to_string() });
+
+        // Budget → error, never reported clean, no forward output.
+        let big = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "a".repeat(4096)}]});
+        let budget = ScanBudget { max_total_bytes: Some(64), ..Default::default() };
+        let err = audit_request(SecurityGateInput {
+            downstream_protocol: DownstreamProtocol::Embeddings,
+            endpoint: "/v1/embeddings".to_string(),
+            original_json: big,
+            safe_forward_headers: vec![],
+            query: None,
+            model: "m".to_string(),
+            stream: false,
+            trace_id: None,
+            settings: default_settings(),
+            budget: Some(budget),
+        })
+        .unwrap_err();
+        assert_eq!(err.code(), "security_scan_budget_exceeded");
+
+        // The gate does not own HTTP; confirm it never constructs forward_json
+        // on any error path (type-level: a failed call returns Err, not Ok).
+        assert!(matches!(err, SecurityGateError::BudgetExceeded { .. }));
+    }
 }

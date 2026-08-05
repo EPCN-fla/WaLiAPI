@@ -1596,7 +1596,7 @@ pub async fn handle_messages_legacy(
         .get("Wali-Trace-Id")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
-    let request_body_str = serde_json::to_string(&json).unwrap_or_default();
+    let request_body_str = sanitized_log_string(&json);
     let model = json
         .get("model")
         .and_then(|m| m.as_str())
