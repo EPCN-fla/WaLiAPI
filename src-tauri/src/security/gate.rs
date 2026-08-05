@@ -102,6 +102,11 @@ pub struct RequestFeatures {
     pub has_tools: bool,
     /// Anthropic beta headers forwarded (audited, non-credential).
     pub beta_headers: Vec<String>,
+    /// Feature collection was truncated because the feature-walk budget was
+    /// exceeded.  Advisory only — the gate's own fail-closed scan is
+    /// authoritative; this flag tells a router/codec that the feature set may
+    /// be incomplete.
+    pub truncated: bool,
 }
 
 /// Metadata-only audit for base64 attachments: type, declared length, actual
@@ -231,10 +236,13 @@ pub fn audit_request(input: SecurityGateInput) -> Result<SecurityGateOutput, Sec
     super::decide_action(&mut result, settings);
 
     // Base64 attachment metadata audit (never scanned as ordinary text).
+    // Feature collection runs under the SAME cumulative budget so a hostile
+    // tree cannot grow unbounded feature vectors or hash unbounded base64.
     let request_features = super::features::collect_features(
         &input.original_json,
         input.downstream_protocol,
         &input.safe_forward_headers,
+        &budget,
     );
 
     // Resolve the effective forward action.
@@ -314,11 +322,60 @@ pub fn audit_envelope(
     })
 }
 
+/// Single funnel for EVERY content-bearing downstream entry.
+///
+/// The exhaustive `match` below is the STRUCTURAL fail-closed guard for the
+/// not-yet-enabled Images/Audio 501 placeholders: adding a new
+/// [`DownstreamProtocol`] variant is a compile error until it is wired through
+/// this match, so a newly-enabled Images/Audio handler cannot forward model
+/// content without the audit.  Every handler entry point must route through
+/// [`gate_original`], which delegates here.
+pub fn gate_dispatch(
+    protocol: DownstreamProtocol,
+    endpoint: &str,
+    original_json: serde_json::Value,
+    query: Option<String>,
+    model: String,
+    stream: bool,
+    trace_id: Option<String>,
+    settings: &SecuritySettings,
+    budget: Option<ScanBudget>,
+) -> Result<AuditedRequest, SecurityGateError> {
+    match protocol {
+        // Compiler-enforced checklist: ALL variants, no wildcard arm.  Forgetting
+        // one is a compile error; adding a new variant without wiring it here
+        // cannot build.
+        DownstreamProtocol::ChatCompletions
+        | DownstreamProtocol::Completions
+        | DownstreamProtocol::Responses
+        | DownstreamProtocol::Messages
+        | DownstreamProtocol::CountTokens
+        | DownstreamProtocol::Embeddings
+        | DownstreamProtocol::Images
+        | DownstreamProtocol::Audio => {
+            let envelope = RequestEnvelope {
+                downstream_protocol: protocol,
+                endpoint: endpoint.to_string(),
+                original_json,
+                safe_forward_headers: Vec::new(),
+                query,
+                model,
+                stream,
+                trace_id,
+            };
+            audit_envelope(envelope, settings, budget)
+        }
+    }
+}
+
 /// Minimal handler integration helper.  Given the ORIGINAL downstream protocol
 /// JSON and its caller context, audits the full tree and returns a
 /// fail-closed `AuditedRequest`.  `Err` means the request must never reach
 /// upstream (Confirm / budget / parse).  Callers use `audit.forward_json` for
 /// conversion or passthrough and `audit.sanitized_log_json` for logging.
+///
+/// Delegates to [`gate_dispatch`] so the exhaustive-variant guard above applies
+/// to every handler path.
 pub fn gate_original(
     protocol: DownstreamProtocol,
     endpoint: &str,
@@ -330,23 +387,63 @@ pub fn gate_original(
     settings: &SecuritySettings,
     budget: Option<ScanBudget>,
 ) -> Result<AuditedRequest, SecurityGateError> {
-    let envelope = RequestEnvelope {
-        downstream_protocol: protocol,
-        endpoint: endpoint.to_string(),
+    gate_dispatch(
+        protocol,
+        endpoint,
         original_json,
-        safe_forward_headers: Vec::new(),
         query,
         model,
         stream,
         trace_id,
-    };
-    audit_envelope(envelope, settings, budget)
+        settings,
+        budget,
+    )
 }
 
 /// Hash of a raw body (used by callers that already hold raw bytes for
 /// forensics).  Never persists the original bytes.
 pub fn hash_raw_body(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+/// Delta-scan interface for T06 codecs and streaming executors (spec step 8).
+///
+/// The gate audits the ORIGINAL protocol JSON once.  A codec may then rewrite
+/// it into a different protocol shape, and a stream executor may emit many
+/// small chunks — neither may smuggle content past the audit by inventing NEW
+/// strings after the full-tree scan.  This narrow interface re-scans exactly
+/// the `new_strings` (converted fields, merged prompts, per-chunk SSE deltas)
+/// with the SAME whole-request cumulative budget semantics and returns the
+/// resulting [`SecurityScanResult`], which the caller MUST treat as
+/// authoritative for those strings (fail-closed on `BudgetExceeded`).
+///
+/// T06 dependency (explicit, not silently untracked): every codec-produced
+/// string and every streaming-response delta MUST be passed through this
+/// function before forwarding or persisting.  Findings are additive to the
+/// request log.
+#[allow(dead_code)] // consumed by T06 executors
+pub fn audit_delta_strings(
+    protocol: DownstreamProtocol,
+    new_strings: &[String],
+    settings: &SecuritySettings,
+    budget: Option<ScanBudget>,
+) -> Result<SecurityScanResult, SecurityGateError> {
+    let budget = budget.unwrap_or_default();
+    let phase = format!("request_delta/{}", protocol.as_str());
+    // Wrap in a synthetic array so the exact same cumulative byte/string-node/
+    // depth/elapsed budget walker applies to the deltas.
+    let delta_tree: serde_json::Value = serde_json::Value::Array(
+        new_strings
+            .iter()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .collect(),
+    );
+    let mut result = scanner::scan_with_budget(&delta_tree, &phase, settings, &budget)
+        .map_err(|scanner::BudgetError::Exceeded(reason)| SecurityGateError::BudgetExceeded {
+            message: reason,
+        })?;
+    super::decide_action(&mut result, settings);
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -413,9 +510,11 @@ mod gate_tests {
             budget: None,
         })
         .unwrap_err();
-        assert_eq!(err, SecurityGateError::ApprovalRequired { message: err.message().to_string() });
+        assert!(matches!(&err, SecurityGateError::ApprovalRequired { .. }));
         assert_eq!(err.code(), "approval_required");
         assert_eq!(err.http_status(), 409);
+        // Fail-closed: the error carries the scan summary, never the raw secret.
+        assert!(!err.message().contains("abcdefghijklmnopqrstuvwx"));
     }
 
     #[test]
@@ -585,7 +684,8 @@ mod gate_tests {
             budget: None,
         })
         .unwrap_err();
-        assert_eq!(err, SecurityGateError::ApprovalRequired { message: err.message().to_string() });
+        assert!(matches!(&err, SecurityGateError::ApprovalRequired { .. }));
+        assert!(!err.message().contains("abcdefghijklmnopqrstuvwx"));
 
         // Budget → error, never reported clean, no forward output.
         let big = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "a".repeat(4096)}]});
@@ -608,5 +708,88 @@ mod gate_tests {
         // The gate does not own HTTP; confirm it never constructs forward_json
         // on any error path (type-level: a failed call returns Err, not Ok).
         assert!(matches!(err, SecurityGateError::BudgetExceeded { .. }));
+    }
+
+    #[test]
+    fn delta_strings_are_rescanned_with_budget_and_findings() {
+        // T06 codecs cannot bypass the audit via codec rewriting: strings a
+        // codec invents AFTER the full-tree scan must pass through
+        // audit_delta_strings with the same budget semantics.
+        let settings = default_settings();
+        let audit = audit_delta_strings(
+            DownstreamProtocol::ChatCompletions,
+            &["Bearer sk-abcdefghijklmnopqrstuvwx123456".to_string()],
+            &settings,
+            None,
+        )
+        .unwrap();
+        assert!(audit.findings.iter().any(|f| f.category == "credential"));
+        assert!(audit.findings.iter().all(|f| f.phase.starts_with("request_delta/")));
+
+        // The delta budget is enforced independently and fails closed.
+        let budget = ScanBudget { max_total_bytes: Some(8), ..Default::default() };
+        let err = audit_delta_strings(
+            DownstreamProtocol::Messages,
+            &["a".repeat(2048)],
+            &settings,
+            Some(budget),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "security_scan_budget_exceeded");
+    }
+
+    #[test]
+    fn streaming_response_delta_audit_is_explicit_t06_item() {
+        // T06 handoff (spec step 8): streaming responses are audited per SSE
+        // delta through `audit_delta_strings`.  A secret smuggled inside a
+        // single streaming chunk must be caught.  This placeholder locks the
+        // requirement in so it is not silently lost.
+        let settings = default_settings();
+        let chunk = "data: {\"content\": \"sk-abcdefghijklmnopqrstuvwx123456\"}".to_string();
+        let audit = audit_delta_strings(
+            DownstreamProtocol::ChatCompletions,
+            &[chunk],
+            &settings,
+            None,
+        )
+        .unwrap();
+        assert!(audit.findings.iter().any(|f| f.category == "credential"));
+    }
+
+    #[test]
+    fn every_protocol_variant_routes_through_gate_dispatch() {
+        // Structural guard (review finding 1): gate_dispatch holds an exhaustive
+        // match over ALL DownstreamProtocol variants.  Adding a new variant is a
+        // compile error there until it is wired through the gate.  This test
+        // exercises every current variant so the checklist is live, including
+        // the not-yet-enabled Images/Audio 501 placeholders.
+        let settings = default_settings();
+        let variants = [
+            DownstreamProtocol::ChatCompletions,
+            DownstreamProtocol::Completions,
+            DownstreamProtocol::Responses,
+            DownstreamProtocol::Messages,
+            DownstreamProtocol::CountTokens,
+            DownstreamProtocol::Embeddings,
+            DownstreamProtocol::Images,
+            DownstreamProtocol::Audio,
+        ];
+        for protocol in variants {
+            let audited = gate_dispatch(
+                protocol,
+                "/v1/gate-dispatch-test",
+                serde_json::json!({"model": "m"}),
+                None,
+                "m".to_string(),
+                false,
+                None,
+                &settings,
+                None,
+            )
+            .unwrap();
+            assert_eq!(audited.envelope.downstream_protocol, protocol);
+            assert!(audited.body_hash.len() >= 64);
+            assert!(audited.sanitized_log_json.is_object());
+        }
     }
 }

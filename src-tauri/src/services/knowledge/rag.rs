@@ -202,6 +202,7 @@ pub async fn ask_with_config(
         false,
         Some(chat_request_str),
         Some(format!("kb-internal_{}", kb_id)),
+        None, // legacy RAG path: no security gate yet — proxy scans internally
     )
     .await;
 
@@ -437,6 +438,7 @@ pub async fn deep_research(
                 false,
                 Some(follow_up_request_str),
                 Some(format!("kb-research_{}", kb_id)),
+                None, // legacy RAG path: no security gate yet — proxy scans internally
             ).await {
                 Ok(result) => {
                     result.body
@@ -538,6 +540,7 @@ pub async fn deep_research(
             false,
             Some(chat_request_str),
             Some(format!("kb-research_{}", kb_id)),
+            None, // legacy RAG path: no security gate yet — proxy scans internally
         ).await;
 
         let round_answer = match proxy_result {
@@ -604,6 +607,7 @@ pub async fn deep_research(
         false,
         Some(final_request_str),
         Some(format!("kb-research_{}", kb_id)),
+        None, // legacy RAG path: no security gate yet — proxy scans internally
     ).await;
 
     match proxy_result {

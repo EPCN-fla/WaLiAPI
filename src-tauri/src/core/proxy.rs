@@ -27,11 +27,24 @@ pub async fn handle_request(
     is_stream: bool,
     sanitized_request_body: Option<String>,
     trace_id: Option<String>,
+    // Authoritative security audit from the gate (audited the ORIGINAL
+    // protocol JSON full tree).  When `Some`, the body is NOT re-scanned here:
+    // the gate's verdict is used for log fields and the safety-net block.
+    // `None` falls back to an internal scan and is used only by legacy paths
+    // (e.g. RAG) that do not pass the gate yet.
+    audit: Option<&security::SecurityScanResult>,
 ) -> Result<ProxyResult, (u16, String)> {
     let start: Instant = Instant::now();
     let model: String = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
     let security_settings = security::get_security_settings(app);
-    let security_result = security::scan_request(&body, &security_settings);
+    // The gate already audited the ORIGINAL protocol JSON at the handler.
+    // Re-scanning the (possibly converted) Chat JSON here would be a redundant,
+    // competing non-authoritative audit — only do that when the caller had no
+    // gate (legacy RAG path).
+    let mut security_result = match audit {
+        Some(result) => result.clone(),
+        None => security::scan_request(&body, &security_settings),
+    };
 
     // Real redaction: if redact mode is active, sanitize the request body before forwarding
     let (forward_body, was_redacted) = if matches!(security_result.action, security::SecurityAction::Redact) || security_settings.redact_secrets {
@@ -39,7 +52,6 @@ pub async fn handle_request(
     } else {
         (body.clone(), false)
     };
-    let mut security_result = security_result;
     if was_redacted {
         security_result.sanitized = true;
     }

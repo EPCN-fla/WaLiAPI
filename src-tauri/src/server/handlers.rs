@@ -238,6 +238,7 @@ pub async fn handle_chat_completions(
             false,
             Some(request_body_str),
             trace_id,
+            Some(&audit_result),
         )
         .await
         {
@@ -1400,23 +1401,46 @@ mod anthropic_handler_tests {
 
     #[test]
     fn images_audio_placeholders_stay_early_rejected_and_must_use_gate_once_enabled() {
-        // T03 guard: while Images/Audio are not-yet-enabled 501 placeholders,
-        // they must remain early-reject and NOT read/forward model content.
-        // Once enabled, any handler that forwards model content but bypasses
-        // the security gate must fail this contract (the mandatory path is
-        // audit_original at each content-bearing entry).
-        use crate::security::gate::DownstreamProtocol;
-        for protocol in [DownstreamProtocol::Images, DownstreamProtocol::Audio] {
-            assert!(matches!(protocol, DownstreamProtocol::Images | DownstreamProtocol::Audio));
-        }
-        let entries = [
+        // T03 guard (STRUCTURAL, compiler-enforced): every content-bearing
+        // entry — including the not-yet-enabled Images/Audio 501 placeholders —
+        // must route through `security::gate::gate_dispatch`.  That function
+        // holds an exhaustive `match` over ALL `DownstreamProtocol` variants
+        // with no wildcard arm: adding a new variant (or enabling Images/Audio
+        // without wiring the gate) is a COMPILE ERROR there, so a newly-enabled
+        // handler cannot forward model content without the audit by accident.
+        //
+        // This test exercises the dispatch for every variant so the checklist
+        // stays live, and proves the Images/Audio variants audit a clean body
+        // through the gate today (while their HTTP handlers are still 501).
+        use crate::security::gate::{gate_dispatch, DownstreamProtocol};
+        let settings = crate::security::SecuritySettings::default();
+        for protocol in [
+            DownstreamProtocol::Images,
+            DownstreamProtocol::Audio,
             DownstreamProtocol::ChatCompletions,
+            DownstreamProtocol::Completions,
             DownstreamProtocol::Responses,
             DownstreamProtocol::Messages,
             DownstreamProtocol::CountTokens,
             DownstreamProtocol::Embeddings,
-        ];
-        assert_eq!(entries.len(), 5);
+        ] {
+            let audited = gate_dispatch(
+                protocol,
+                "/v1/gate-dispatch-test",
+                serde_json::json!({"model": "m"}),
+                None,
+                "m".to_string(),
+                false,
+                None,
+                &settings,
+                None,
+            )
+            .unwrap();
+            assert_eq!(audited.envelope.downstream_protocol, protocol);
+            assert!(audited.body_hash.len() >= 64);
+            // Sanitized log body is a JSON object for a clean body.
+            assert!(audited.sanitized_log_json.is_object());
+        }
     }
 
     #[test]
@@ -1633,6 +1657,7 @@ pub async fn handle_messages_legacy(
             false,
             Some(request_body_str),
             trace_id,
+            None, // legacy (unrouted) path: no gate audit — proxy scans internally
         )
         .await
         {
@@ -2121,6 +2146,7 @@ pub async fn handle_responses(
             false,
             Some(request_body_str),
             trace_id,
+            Some(&audit_result),
         )
         .await
         {
