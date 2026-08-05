@@ -12,6 +12,14 @@ export interface Channel {
   config: Record<string, unknown>;
   model_mapping: Record<string, string | string[]>;
   timeout_secs: number;
+  // --- T02 normalized protocol identity (output DTO always returns these) ---
+  protocol: "openai" | "anthropic" | "ollama" | string;
+  provider: string;
+  native_base_url: string;
+  native_endpoints: string[];
+  identity_revision: number;
+  legacy_executor_override?: string | null;
+  executor_kind: string;
   created_at: string;
   updated_at: string;
   last_test_at: string | null;
@@ -29,6 +37,14 @@ export interface CreateChannelInput {
   config?: Record<string, unknown>;
   model_mapping?: Record<string, string | string[]>;
   timeout_secs?: number;
+  // --- T02 optional new identity fields (missing => legacy inference) ---
+  protocol?: "openai" | "anthropic" | "ollama" | string;
+  provider?: string;
+  native_base_url?: string;
+  native_endpoints?: string[];
+  preset_revision?: string;
+  identity_revision?: number;
+  legacy_executor_override?: string;
 }
 
 export interface UpdateChannelInput {
@@ -44,6 +60,17 @@ export interface UpdateChannelInput {
   config?: Record<string, unknown>;
   model_mapping?: Record<string, string | string[]>;
   timeout_secs?: number;
+  // --- T02 optional new identity fields. None = keep; explicit empty
+  // native_endpoints is rejected by the backend. ---
+  protocol?: "openai" | "anthropic" | "ollama" | string;
+  provider?: string;
+  native_base_url?: string;
+  native_endpoints?: string[];
+  preset_revision?: string;
+  identity_revision?: number;
+  legacy_executor_override?: string;
+  /** Distinguish "edit leave-blank = keep key" from explicit clear (Ollama). */
+  clear_api_key?: boolean;
 }
 
 export interface TestChannelResult {

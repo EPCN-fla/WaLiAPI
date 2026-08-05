@@ -17,13 +17,21 @@ pub struct Channel {
     pub config: String,
     pub model_mapping: String,
     pub timeout_secs: i64,
+    // --- T02 protocol identity columns (migration 015) ---
+    pub protocol: Option<String>,
+    pub provider: Option<String>,
+    pub native_base_url: Option<String>,
+    pub native_endpoints: Option<String>,
+    pub preset_revision: Option<String>,
+    pub identity_revision: i64,
+    pub legacy_executor_override: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub last_test_at: Option<String>,
     pub last_test_ok: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CreateChannelInput {
     pub name: String,
     #[serde(rename = "type")]
@@ -36,9 +44,26 @@ pub struct CreateChannelInput {
     pub config: Option<serde_json::Value>,
     pub model_mapping: Option<serde_json::Value>,
     pub timeout_secs: Option<i64>,
+    // --- T02 protocol identity fields (all Option + serde(default)) ---
+    // Missing => legacy inference from type/base_url/config.
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub native_base_url: Option<String>,
+    /// Serialized JSON array of endpoint strings; missing => legacy inference.
+    #[serde(default)]
+    pub native_endpoints: Option<Vec<String>>,
+    #[serde(default)]
+    pub preset_revision: Option<String>,
+    #[serde(default)]
+    pub identity_revision: Option<i64>,
+    #[serde(default)]
+    pub legacy_executor_override: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UpdateChannelInput {
     pub id: String,
     pub name: Option<String>,
@@ -53,6 +78,26 @@ pub struct UpdateChannelInput {
     pub config: Option<serde_json::Value>,
     pub model_mapping: Option<serde_json::Value>,
     pub timeout_secs: Option<i64>,
+    // --- T02 protocol identity fields. None = keep current value. ---
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub native_base_url: Option<String>,
+    /// None = keep; explicit empty Vec is REJECTED (must be non-empty or absent).
+    #[serde(default)]
+    pub native_endpoints: Option<Vec<String>>,
+    #[serde(default)]
+    pub preset_revision: Option<String>,
+    #[serde(default)]
+    pub identity_revision: Option<i64>,
+    #[serde(default)]
+    pub legacy_executor_override: Option<String>,
+    /// Distinguish "edit leave-blank = keep key" from "Ollama explicitly clear
+    /// key": true => persist an empty api_key (clears the stored key).
+    #[serde(default)]
+    pub clear_api_key: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

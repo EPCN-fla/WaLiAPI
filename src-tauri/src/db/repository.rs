@@ -1,6 +1,17 @@
 use super::models::*;
 use sqlx::SqlitePool;
 
+/// Parse the stored JSON endpoint list back into a Vec, or None when empty/absent.
+fn parse_eps(raw: &Option<String>) -> Option<Vec<String>> {
+    let s = raw.as_deref()?;
+    let parsed: Vec<String> = serde_json::from_str(s).unwrap_or_default();
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
 pub struct Repository {
     pool: SqlitePool,
 }
@@ -31,6 +42,78 @@ impl Repository {
             .await
     }
 
+    /// Resolve the full identity to persist for a create/update, and the
+    /// legacy dual-write pair (type, base_url).
+    ///
+    /// * New fields all present (protocol/provider/native_base_url/native
+    ///   endpoints) => identity written from them, dual-write via
+    ///   `new_to_legacy`, revision = max(current, 1).
+    /// * Otherwise => live-infer from legacy fields; identity revision stays 0.
+    fn plan_channel_identity(
+        protocol: &Option<String>,
+        provider: &Option<String>,
+        native_base_url: &Option<String>,
+        native_endpoints: &Option<Vec<String>>,
+        current_revision: i64,
+        legacy_type: &str,
+        legacy_base_url: &str,
+        config_json: &str,
+    ) -> (crate::core::channel_identity::ChannelIdentity, String, String, String) {
+        use crate::core::channel_identity::{
+            resolve_channel_identity, ChannelIdentity, ChannelIdentityRow,
+        };
+
+        let protocol_ok = protocol.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let provider_ok = provider.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let base_ok = native_base_url.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let eps_ok = native_endpoints.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+
+        // Determine which legacy fields to infer from. If the caller supplied a
+        // legacy type/base_url (e.g. old frontend payload), use those; else the
+        // current row values.
+        let (identity, legacy_type_out, legacy_base_out) = if protocol_ok && provider_ok && base_ok && eps_ok {
+            let identity = ChannelIdentity {
+                protocol: protocol.clone().unwrap_or_default(),
+                provider: provider.clone().unwrap_or_default(),
+                native_base_url: native_base_url.clone().unwrap_or_default(),
+                native_endpoints: native_endpoints.clone().unwrap_or_default(),
+                identity_revision: current_revision.max(1),
+                legacy_executor_override: None,
+                executor_kind: crate::core::channel_identity::derive_executor_kind(
+                    protocol.as_deref().unwrap_or(""),
+                )
+                .to_string(),
+                inferred: false,
+            };
+            let (lt, lb) = crate::core::channel_identity::new_to_legacy(&identity);
+            (identity, lt, lb)
+        } else {
+            // Legacy infer from the legacy fields (old payload or current row).
+            let row = ChannelIdentityRow {
+                channel_type: legacy_type.to_string(),
+                base_url: legacy_base_url.to_string(),
+                config: serde_json::from_str(config_json).unwrap_or(serde_json::Value::Object(Default::default())),
+                protocol: protocol.clone(),
+                provider: provider.clone(),
+                native_base_url: native_base_url.clone(),
+                native_endpoints: native_endpoints.as_ref().map(|v| {
+                    serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string())
+                }),
+                preset_revision: None,
+                identity_revision: 0,
+                legacy_executor_override: None,
+            };
+            let identity = resolve_channel_identity(&row);
+            let lt = legacy_type.to_string();
+            let lb = legacy_base_url.to_string();
+            (identity, lt, lb)
+        };
+
+        let endpoints_json = serde_json::to_string(&identity.native_endpoints)
+            .unwrap_or_else(|_| "[]".to_string());
+        (identity, legacy_type_out, legacy_base_out, endpoints_json)
+    }
+
     pub async fn create_channel(&self, input: &CreateChannelInput) -> Result<Channel, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
@@ -42,14 +125,30 @@ impl Repository {
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
             .unwrap_or_else(|| "{}".to_string());
 
+        let (identity, legacy_type, legacy_base, endpoints_json) = Self::plan_channel_identity(
+            &input.protocol,
+            &input.provider,
+            &input.native_base_url,
+            &input.native_endpoints,
+            0,
+            &input.channel_type,
+            &input.base_url,
+            &config,
+        );
+
         sqlx::query(
-            "INSERT INTO channels (id, name, type, base_url, api_key, models, status, priority, weight, config, model_mapping, timeout_secs, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO channels (
+                id, name, type, base_url, api_key, models, status, priority, weight,
+                config, model_mapping, timeout_secs,
+                protocol, provider, native_base_url, native_endpoints,
+                preset_revision, identity_revision, legacy_executor_override,
+                created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&id)
         .bind(&input.name)
-        .bind(&input.channel_type)
-        .bind(&input.base_url)
+        .bind(&legacy_type)
+        .bind(&legacy_base)
         .bind(&input.api_key)
         .bind(&models)
         .bind(input.priority.unwrap_or(0))
@@ -57,6 +156,13 @@ impl Repository {
         .bind(&config)
         .bind(&model_mapping)
         .bind(input.timeout_secs.unwrap_or(60))
+        .bind(&identity.protocol)
+        .bind(&identity.provider)
+        .bind(&identity.native_base_url)
+        .bind(&endpoints_json)
+        .bind(&input.preset_revision)
+        .bind(identity.identity_revision)
+        .bind(&identity.legacy_executor_override)
         .bind(&now)
         .bind(&now)
         .execute(&self.pool)
@@ -66,11 +172,26 @@ impl Repository {
     }
 
     pub async fn update_channel(&self, input: &UpdateChannelInput) -> Result<Channel, sqlx::Error> {
-        let now = now_iso();
+        // Explicit empty native endpoints are rejected (T02 DTO contract):
+        // None = keep, empty Vec = invalid configuration.
+        if let Some(eps) = &input.native_endpoints {
+            if eps.is_empty() {
+                return Err(sqlx::Error::Protocol(
+                    "native_endpoints must not be explicitly empty; omit it to keep current value"
+                        .to_string(),
+                ));
+            }
+        }
 
+        let now = now_iso();
+        let mut tx = self.pool.begin().await?;
+
+        // STEP 1: write the legacy/business fields. If any of the legacy
+        // identity fields (type/base_url/config) actually changes value, the
+        // AFTER UPDATE trigger invalidates the stored new identity (revision 0).
         let mut q = sqlx::QueryBuilder::new("UPDATE channels SET updated_at = ");
 
-        q.push_bind(now);
+        q.push_bind(&now);
 
         if let Some(name) = &input.name {
             q.push(", name = ").push_bind(name);
@@ -83,6 +204,9 @@ impl Repository {
         }
         if let Some(api_key) = &input.api_key {
             q.push(", api_key = ").push_bind(api_key);
+        }
+        if input.clear_api_key == Some(true) {
+            q.push(", api_key = ").push_bind("");
         }
         if let Some(models) = &input.models {
             let m = serde_json::to_string(models).unwrap_or_else(|_| "[]".to_string());
@@ -110,7 +234,62 @@ impl Repository {
         }
 
         q.push(" WHERE id = ").push_bind(&input.id);
-        q.build().execute(&self.pool).await?;
+        q.build().execute(&mut *tx).await?;
+
+        // Read the row as it now stands (post legacy-write, post trigger) so
+        // the identity plan starts from current persisted state.
+        let row: Channel = sqlx::query_as("SELECT * FROM channels WHERE id = ?")
+            .bind(&input.id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        // The effective legacy fields: what was written this UPDATE, else the
+        // row's current value. Used both for the final identity UPDATE and for
+        // legacy inference when the new fields are not fully provided.
+        let eff_type = input.channel_type.clone().unwrap_or_else(|| row.channel_type.clone());
+        let eff_base = input.base_url.clone().unwrap_or_else(|| row.base_url.clone());
+        let eff_config = input.config.as_ref().map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
+            .unwrap_or_else(|| row.config.clone());
+        let eff_protocol = input.protocol.clone().or_else(|| row.protocol.clone());
+        let eff_provider = input.provider.clone().or_else(|| row.provider.clone());
+        let eff_native_base = input.native_base_url.clone().or_else(|| row.native_base_url.clone());
+        let eff_eps = input.native_endpoints.clone().or_else(|| {
+            parse_eps(&row.native_endpoints)
+        });
+        let eff_preset_revision = input.preset_revision.clone().or_else(|| row.preset_revision.clone());
+
+        // STEP 2: final UPDATE writes the complete new identity + current
+        // revision. If the identity plan falls back to legacy inference, the
+        // revision stays 0 and the resolver live-infers on read.
+        let (identity, _, _, endpoints_json) = Self::plan_channel_identity(
+            &eff_protocol,
+            &eff_provider,
+            &eff_native_base,
+            &eff_eps,
+            row.identity_revision,
+            &eff_type,
+            &eff_base,
+            &eff_config,
+        );
+
+        sqlx::query(
+            "UPDATE channels SET
+                protocol = ?, provider = ?, native_base_url = ?, native_endpoints = ?,
+                preset_revision = ?, identity_revision = ?, legacy_executor_override = ?
+             WHERE id = ?"
+        )
+        .bind(&identity.protocol)
+        .bind(&identity.provider)
+        .bind(&identity.native_base_url)
+        .bind(&endpoints_json)
+        .bind(&eff_preset_revision)
+        .bind(identity.identity_revision)
+        .bind(&identity.legacy_executor_override)
+        .bind(&input.id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
 
         self.get_channel(&input.id).await
     }

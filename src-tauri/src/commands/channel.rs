@@ -3,8 +3,12 @@ use crate::db::repository::Repository;
 use crate::AppState;
 use crate::adaptor::{get_adaptor, ChannelConfig};
 use crate::channel_presets::ProtocolPresetGroup;
+use crate::core::channel_identity::{resolve_channel_identity, ChannelIdentity, ChannelIdentityRow};
 use serde::{Deserialize, Serialize};
 
+/// Output DTO for a channel. Always returns the NORMALIZED protocol identity
+/// (via `resolve_channel_identity`), including the previously omitted
+/// `timeout_secs` (design 11.4). API key stays masked.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChannelDto {
     pub id: String,
@@ -19,6 +23,15 @@ pub struct ChannelDto {
     pub weight: i64,
     pub config: serde_json::Value,
     pub model_mapping: serde_json::Value,
+    pub timeout_secs: i64,
+    // --- normalized protocol identity (T02) ---
+    pub protocol: String,
+    pub provider: String,
+    pub native_base_url: String,
+    pub native_endpoints: Vec<String>,
+    pub identity_revision: i64,
+    pub legacy_executor_override: Option<String>,
+    pub executor_kind: String,
     pub created_at: String,
     pub updated_at: String,
     pub last_test_at: Option<String>,
@@ -27,6 +40,7 @@ pub struct ChannelDto {
 
 impl From<Channel> for ChannelDto {
     fn from(c: Channel) -> Self {
+        let identity: ChannelIdentity = resolve_channel_identity(&ChannelIdentityRow::from(&c));
         ChannelDto {
             id: c.id,
             name: c.name,
@@ -39,6 +53,14 @@ impl From<Channel> for ChannelDto {
             weight: c.weight,
             config: serde_json::from_str(&c.config).unwrap_or(serde_json::Value::Object(Default::default())),
             model_mapping: serde_json::from_str(&c.model_mapping).unwrap_or(serde_json::Value::Object(Default::default())),
+            timeout_secs: c.timeout_secs,
+            protocol: identity.protocol,
+            provider: identity.provider,
+            native_base_url: identity.native_base_url,
+            native_endpoints: identity.native_endpoints,
+            identity_revision: identity.identity_revision,
+            legacy_executor_override: identity.legacy_executor_override,
+            executor_kind: identity.executor_kind,
             created_at: c.created_at,
             updated_at: c.updated_at,
             last_test_at: c.last_test_at,
