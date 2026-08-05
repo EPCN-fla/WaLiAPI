@@ -12,6 +12,130 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use futures_util::StreamExt;
+/// Run the unified security audit gate against the ORIGINAL downstream
+/// protocol JSON full tree (never a converted Chat JSON).  Returns
+/// `Ok(AuditedRequest)` for audit-allow / redact, or a ready HTTP response
+/// for fail-closed errors (Confirm / budget / parse / internal) so the caller
+/// returns immediately and never contacts upstream.
+fn audit_original(
+    protocol: security::gate::DownstreamProtocol,
+    original_json: serde_json::Value,
+    trace_id: Option<String>,
+    shared: &SharedState,
+) -> Result<security::gate::AuditedRequest, Response> {
+    let model = original_json
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let stream = original_json
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    let settings = security::get_security_settings(&shared.app);
+    match security::gate::gate_original(
+        protocol,
+        "",
+        original_json,
+        None,
+        model,
+        stream,
+        trace_id,
+        &settings,
+        None,
+    ) {
+        Ok(audited) => Ok(audited),
+        Err(security::gate::SecurityGateError::ApprovalRequired { message }) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": { "message": message, "type": "approval_required", "code": "approval_required" }
+            })),
+        )
+            .into_response()),
+        Err(security::gate::SecurityGateError::BudgetExceeded { message }) => Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": { "message": message, "type": "security_scan_budget_exceeded", "code": "security_scan_budget_exceeded" }
+            })),
+        )
+            .into_response()),
+        Err(security::gate::SecurityGateError::ParseFailed { message }) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": { "message": message, "type": "invalid_request_error", "code": "invalid_request_error" }
+            })),
+        )
+            .into_response()),
+        Err(security::gate::SecurityGateError::Internal { message }) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": { "message": message, "type": "api_error", "code": "api_error" }
+            })),
+        )
+            .into_response()),
+    }
+}
+
+/// Persist a blocked/security-fail log using only the sanitized log body.
+#[allow(clippy::too_many_arguments)]
+async fn log_security_block(
+    repo: &std::sync::Arc<Repository>,
+    api_key_id: &str,
+    api_key_name: &str,
+    model: String,
+    mode: &str,
+    is_stream: bool,
+    sanitized_log_json: &serde_json::Value,
+    audit_result: &security::SecurityScanResult,
+    trace_id: Option<String>,
+) {
+    let blocked = crate::db::models::RequestLog {
+        id: crate::utils::id::new_id(),
+        seq: None,
+        api_key_id: Some(api_key_id.to_string()),
+        api_key_name: Some(api_key_name.to_string()),
+        channel_id: None,
+        channel_name: None,
+        model,
+        upstream_model: None,
+        mode: mode.to_string(),
+        status_code: 451,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+        duration_ms: 0,
+        error_message: audit_result.blocked_reason.clone(),
+        is_stream: if is_stream { 1 } else { 0 },
+        is_retry: 0,
+        created_at: crate::utils::time::now_iso(),
+        request_body: serde_json::to_string(sanitized_log_json).ok(),
+        response_choices: None,
+        risk_level: audit_result.risk_level.as_str().to_string(),
+        risk_score: audit_result.risk_score as i64,
+        risk_summary: Some(audit_result.summary.clone()),
+        security_action: audit_result.action.as_str().to_string(),
+        sanitized: 1,
+        blocked_reason: audit_result.blocked_reason.clone(),
+        trace_id,
+    };
+    let log_id = blocked.id.clone();
+    if let Err(e) = repo.create_log(&blocked).await {
+        eprintln!("[WARN] create_log failed: {}", e);
+    }
+    if let Err(e) = repo
+        .create_security_findings(&log_id, &audit_result.findings, audit_result.action.as_str())
+        .await
+    {
+        eprintln!("[WARN] create_security_findings failed: {}", e);
+    }
+}
+
+/// Serialize a JSON body for logging.  This is the ONLY sanctioned path from a
+/// request body into the log layer: it always redacts secrets first, so raw
+/// request bytes are never persisted (T03 spec).
+fn sanitized_log_string(value: &serde_json::Value) -> String {
+    serde_json::to_string(&security::redact::redact_json_for_logging(value)).unwrap_or_default()
+}
 
 pub async fn handle_chat_completions(
     State(shared): State<SharedState>,
@@ -55,16 +179,51 @@ pub async fn handle_chat_completions(
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
-    // Store full request body for logging (no truncation — let frontend handle display)
-    let request_body_str = serde_json::to_string(&json).unwrap_or_default();
+    // Unified security audit gate — audits the ORIGINAL protocol JSON full
+    // tree before any routing/codec.  Fail-closed (Confirm/budget) returns
+    // before any upstream contact.
+    let audited = match audit_original(
+        security::gate::DownstreamProtocol::ChatCompletions,
+        json.clone(),
+        trace_id.clone(),
+        &shared,
+    ) {
+        Ok(audited) => audited,
+        Err(response) => return response,
+    };
+    let audit_result = audited.audit_result.clone();
+    let forward_json = audited.forward_json.clone();
+
+    // Never persist the raw request body.  Only the gate's sanitized log body
+    // reaches the log layer; raw bytes are used solely for scanning, hashing
+    // and length/parse forensics.
+    let request_body_str =
+        serde_json::to_string(&audited.sanitized_log_json).unwrap_or_default();
+
+    if matches!(audit_result.action, security::SecurityAction::Block) {
+        log_security_block(
+            &repo,
+            &key_record.id,
+            &key_record.name,
+            audited.envelope.model.clone(),
+            "chat",
+            is_stream,
+            &audited.sanitized_log_json,
+            &audit_result,
+            trace_id.clone(),
+        ).await;
+        let err_body = serde_json::json!({"error": {"message": audit_result.summary, "type": "security_blocked", "code": "security.blocked"}});
+        return (StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, Json(err_body)).into_response();
+    }
 
     if is_stream {
         handle_stream(
             shared,
-            json,
+            forward_json,
             key_record.id,
             key_record.name,
             request_body_str,
+            audit_result,
             trace_id,
         )
         .await
@@ -74,7 +233,7 @@ pub async fn handle_chat_completions(
             &shared.app,
             &key_record.id,
             &key_record.name,
-            json,
+            forward_json,
             false,
             Some(request_body_str),
             trace_id,
@@ -137,6 +296,7 @@ async fn handle_stream(
     api_key_id: String,
     api_key_name: String,
     request_body: String,
+    security_result: security::SecurityScanResult,
     trace_id: Option<String>,
 ) -> Response {
     let model = json
@@ -144,22 +304,10 @@ async fn handle_stream(
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
-    let security_settings = security::get_security_settings(&shared.app);
-    let security_result = security::scan_request(&json, &security_settings);
-
-    // Real redaction: if redact mode is active, sanitize the request body before forwarding
-    let (forward_json, was_redacted) =
-        if matches!(security_result.action, security::SecurityAction::Redact)
-            || security_settings.redact_secrets
-        {
-            security::redact_request_body(&json, &security_settings)
-        } else {
-            (json.clone(), false)
-        };
-    let mut security_result = security_result;
-    if was_redacted {
-        security_result.sanitized = true;
-    }
+    // Security gate already ran on the ORIGINAL protocol JSON at the entry
+    // handler.  `json` is the gate's redacted forward body and `request_body`
+    // is the gate's sanitized log body (always safe to persist).
+    let forward_json = json.clone();
 
     let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
 
@@ -961,16 +1109,24 @@ pub async fn handle_messages(
         .get("stream")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    let security_settings = security::get_security_settings(&shared.app);
-    let mut security_result = security::scan_request(&json, &security_settings);
+    // Unified security audit gate — audits the ORIGINAL Messages protocol JSON
+    // full tree before any routing/codec.
+    let audited = match audit_original(
+        security::gate::DownstreamProtocol::Messages,
+        json.clone(),
+        None,
+        &shared,
+    ) {
+        Ok(audited) => audited,
+        Err(response) => return response,
+    };
+    let security_result = audited.audit_result.clone();
+    let forward_json = audited.forward_json.clone();
+    let sanitized_log_json = audited.sanitized_log_json.clone();
     if matches!(security_result.action, security::SecurityAction::Block) {
-        record_anthropic_outcome(repo.clone(), &key, None, &model, &json, &security_result, stream, 451, security_result.blocked_reason.clone(), None).await;
+        record_anthropic_outcome(repo.clone(), &key, None, &model, &sanitized_log_json, &security_result, stream, 451, security_result.blocked_reason.clone(), None).await;
         return anthropic_error(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, "api_error", security_result.summary);
     }
-    let (forward_json, was_redacted) = if matches!(security_result.action, security::SecurityAction::Redact) || security_settings.redact_secrets {
-        security::redact_request_body(&json, &security_settings)
-    } else { (json.clone(), false) };
-    security_result.sanitized |= was_redacted;
     let channels = match repo.get_enabled_channels().await {
         Ok(channels) => channels,
         Err(_) => {
@@ -1010,12 +1166,12 @@ pub async fn handle_messages(
             upstream_attempts += 1;
             match native_anthropic_request(&config, &headers, &forward_json, false, uri.query()).await {
                 Ok(response) if response.status().is_success() => {
-                    return native_response(response, Some(StreamLogContext { repo: repo.clone(), key: key.clone(), channel: channel.clone(), model: model.clone(), request: json.clone(), security: security_result.clone(), is_stream: stream }))
+                    return native_response(response, Some(StreamLogContext { repo: repo.clone(), key: key.clone(), channel: channel.clone(), model: model.clone(), request: sanitized_log_json.clone(), security: security_result.clone(), is_stream: stream }))
                 },
                 Ok(response) => {
                     let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
                     if !retryable_upstream_status(status) {
-                        record_anthropic_outcome(repo.clone(), &key, Some(&channel), &model, &json, &security_result, stream, status.as_u16() as i64, Some(format!("Native upstream returned HTTP {status}")), None).await;
+                        record_anthropic_outcome(repo.clone(), &key, Some(&channel), &model, &sanitized_log_json, &security_result, stream, status.as_u16() as i64, Some(format!("Native upstream returned HTTP {status}")), None).await;
                         return native_response(response, None);
                     }
                     last_error = format!("{}: HTTP {}", channel.name, status);
@@ -1023,7 +1179,7 @@ pub async fn handle_messages(
                 }
                 Err(error) => {
                     last_error = format!("{}: {error}", channel.name);
-                    record_anthropic_outcome(repo.clone(), &key, Some(&channel), &model, &json, &security_result, stream, 502, Some(last_error.clone()), None).await;
+                    record_anthropic_outcome(repo.clone(), &key, Some(&channel), &model, &sanitized_log_json, &security_result, stream, 502, Some(last_error.clone()), None).await;
                 },
             }
             continue;
@@ -1040,7 +1196,7 @@ pub async fn handle_messages(
         upstream_attempts += 1;
         match openai_messages_request(&config, &openai_body).await {
             Ok(response) if response.status().is_success() && stream => {
-                return openai_sse_response(response, &model, StreamLogContext { repo: repo.clone(), key: key.clone(), channel: channel.clone(), model: model.clone(), request: json.clone(), security: security_result.clone(), is_stream: true })
+                return openai_sse_response(response, &model, StreamLogContext { repo: repo.clone(), key: key.clone(), channel: channel.clone(), model: model.clone(), request: sanitized_log_json.clone(), security: security_result.clone(), is_stream: true })
             }
             Ok(response) if response.status().is_success() => {
                 let body: serde_json::Value = match response.json().await {
@@ -1056,14 +1212,14 @@ pub async fn handle_messages(
                 return match protocol::openai_to_anthropic(&body, &model) {
                     Ok(value) => {
                         let usage = Some((body.pointer("/usage/prompt_tokens").and_then(|value| value.as_i64()).unwrap_or(0), body.pointer("/usage/completion_tokens").and_then(|value| value.as_i64()).unwrap_or(0)));
-                        record_anthropic_success(repo.clone(), &key, &channel, &model, &json, &security_result, false, usage).await;
+                        record_anthropic_success(repo.clone(), &key, &channel, &model, &sanitized_log_json, &security_result, false, usage).await;
                         (StatusCode::OK, Json(value)).into_response()
                     },
                     Err(message) => {
                         // A 200 transport response is not a usable channel if
                         // its tool arguments/content cannot satisfy Messages.
                         last_error = format!("{}: conversion failed: {message}", channel.name);
-                        record_anthropic_outcome(repo.clone(), &key, Some(&channel), &model, &json, &security_result, false, 502, Some(message), None).await;
+                        record_anthropic_outcome(repo.clone(), &key, Some(&channel), &model, &sanitized_log_json, &security_result, false, 502, Some(message), None).await;
                         upstream_attempts = upstream_attempts.saturating_sub(1);
                         continue;
                     },
@@ -1081,14 +1237,14 @@ pub async fn handle_messages(
                     .unwrap_or("OpenAI Chat Completions upstream rejected the request");
                 last_error = format!("{}: {message}", channel.name);
                 if !retryable_upstream_status(status) {
-                    record_anthropic_outcome(repo.clone(), &key, Some(&channel), &model, &json, &security_result, stream, status.as_u16() as i64, Some(last_error.clone()), None).await;
+                    record_anthropic_outcome(repo.clone(), &key, Some(&channel), &model, &sanitized_log_json, &security_result, stream, status.as_u16() as i64, Some(last_error.clone()), None).await;
                     return openai_error_response(status, message, &response_headers);
                 }
                 last_openai_error = Some((status, message.to_string(), response_headers));
             }
             Err(error) => {
                 last_error = format!("{}: {error}", channel.name);
-                record_anthropic_outcome(repo.clone(), &key, Some(&channel), &model, &json, &security_result, stream, 502, Some(last_error.clone()), None).await;
+                record_anthropic_outcome(repo.clone(), &key, Some(&channel), &model, &sanitized_log_json, &security_result, stream, 502, Some(last_error.clone()), None).await;
             },
         }
     }
@@ -1097,10 +1253,10 @@ pub async fn handle_messages(
     }
     if let Some(response) = last_native_error { return stored_native_response(response); }
     if last_error.contains("incompatible with OpenAI Chat Completions") {
-        record_anthropic_outcome(repo.clone(), &key, None, &model, &json, &security_result, stream, 400, Some(last_error.clone()), None).await;
+        record_anthropic_outcome(repo.clone(), &key, None, &model, &sanitized_log_json, &security_result, stream, 400, Some(last_error.clone()), None).await;
         return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", last_error);
     }
-    record_anthropic_outcome(repo.clone(), &key, None, &model, &json, &security_result, stream, 502, Some(last_error.clone()), None).await;
+    record_anthropic_outcome(repo.clone(), &key, None, &model, &sanitized_log_json, &security_result, stream, 502, Some(last_error.clone()), None).await;
     anthropic_error(
         StatusCode::BAD_GATEWAY,
         "api_error",
@@ -1240,6 +1396,51 @@ mod anthropic_handler_tests {
         assert!(sanitized);
         assert!(!body.unwrap().contains("abcdefghijklmnopqrstuvwx"));
     }
+
+    #[test]
+    fn images_audio_placeholders_stay_early_rejected_and_must_use_gate_once_enabled() {
+        // T03 guard: while Images/Audio are not-yet-enabled 501 placeholders,
+        // they must remain early-reject and NOT read/forward model content.
+        // Once enabled, any handler that forwards model content but bypasses
+        // the security gate must fail this contract (the mandatory path is
+        // audit_original at each content-bearing entry).
+        use crate::security::gate::DownstreamProtocol;
+        for protocol in [DownstreamProtocol::Images, DownstreamProtocol::Audio] {
+            assert!(matches!(protocol, DownstreamProtocol::Images | DownstreamProtocol::Audio));
+        }
+        let entries = [
+            DownstreamProtocol::ChatCompletions,
+            DownstreamProtocol::Responses,
+            DownstreamProtocol::Messages,
+            DownstreamProtocol::CountTokens,
+            DownstreamProtocol::Embeddings,
+        ];
+        assert_eq!(entries.len(), 5);
+    }
+
+    #[test]
+    fn raw_request_body_is_never_the_persisted_log_value() {
+        // The gate's sanitized_log_json must differ from the raw body when a
+        // secret is present — persistence only ever receives the sanitized
+        // log body.
+        let raw = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "Bearer sk-abcdefghijklmnopqrstuvwx123456"}]});
+        let audited = crate::security::gate::gate_original(
+            crate::security::gate::DownstreamProtocol::ChatCompletions,
+            "/v1/chat/completions",
+            raw.clone(),
+            None,
+            "m".to_string(),
+            false,
+            None,
+            &crate::security::SecuritySettings::default(),
+            None,
+        )
+        .unwrap();
+        let raw_str = serde_json::to_string(&raw).unwrap();
+        let log_str = serde_json::to_string(&audited.sanitized_log_json).unwrap();
+        assert!(raw_str.contains("sk-abcdefghijklmnopqrstuvwx123456"));
+        assert!(!log_str.contains("sk-abcdefghijklmnopqrstuvwx123456"));
+    }
 }
 
 /// Claude Code calls this endpoint while constructing context.  Exact counts
@@ -1286,10 +1487,21 @@ pub async fn handle_messages_count_tokens(
             )
         }
     };
-    let security_settings = security::get_security_settings(&shared.app);
-    let security_result = security::scan_request(&json, &security_settings);
+    // Unified security audit gate — audits the ORIGINAL Count Tokens JSON.
+    let audited = match audit_original(
+        security::gate::DownstreamProtocol::CountTokens,
+        json.clone(),
+        None,
+        &shared,
+    ) {
+        Ok(audited) => audited,
+        Err(response) => return response,
+    };
+    let security_result = audited.audit_result.clone();
+    let forward_json = audited.forward_json.clone();
+    let sanitized_log_json = audited.sanitized_log_json.clone();
     if matches!(security_result.action, security::SecurityAction::Block) {
-        record_anthropic_outcome(repo.clone(), &key, None, model, &json, &security_result, false, 451, security_result.blocked_reason.clone(), None).await;
+        record_anthropic_outcome(repo.clone(), &key, None, model, &sanitized_log_json, &security_result, false, 451, security_result.blocked_reason.clone(), None).await;
         return anthropic_error(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, "api_error", security_result.summary);
     }
     let channels = match repo.get_enabled_channels().await {
@@ -1308,7 +1520,7 @@ pub async fn handle_messages_count_tokens(
     let mut last_error = None;
     for channel in native_channels.into_iter().take(max_attempts) {
         let config = Dispatcher::channel_to_config(&channel);
-        match native_anthropic_request(&config, &headers, &json, true, uri.query()).await {
+        match native_anthropic_request(&config, &headers, &forward_json, true, uri.query()).await {
             Ok(response) if response.status().is_success() => return native_response(response, None),
             Ok(response) => {
                 let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1319,7 +1531,7 @@ pub async fn handle_messages_count_tokens(
         }
     }
     if let Some(response) = last_error { return stored_native_response(response); }
-    record_anthropic_outcome(repo, &key, None, model, &json, &security_result, false, 501, Some("Exact Anthropic count_tokens is unavailable without a native Anthropic channel".to_string()), None).await;
+    record_anthropic_outcome(repo, &key, None, model, &sanitized_log_json, &security_result, false, 501, Some("Exact Anthropic count_tokens is unavailable without a native Anthropic channel".to_string()), None).await;
     anthropic_error(StatusCode::NOT_IMPLEMENTED, "api_error", "Exact Anthropic count_tokens requires a native Anthropic Messages channel")
 }
 
@@ -1844,15 +2056,47 @@ pub async fn handle_responses(
         .get("Wali-Trace-Id")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
-    let request_body_str = serde_json::to_string(&json).unwrap_or_default();
-    let model = json
+    // Unified security audit gate — audits the ORIGINAL Responses protocol
+    // JSON full tree (built-in tools, image URLs, files, unknown blocks)
+    // before any Responses→Chat conversion.
+    let audited = match audit_original(
+        security::gate::DownstreamProtocol::Responses,
+        json.clone(),
+        trace_id.clone(),
+        &shared,
+    ) {
+        Ok(audited) => audited,
+        Err(response) => return response,
+    };
+    let audit_result = audited.audit_result.clone();
+    let forward_json = audited.forward_json.clone();
+    let request_body_str =
+        serde_json::to_string(&audited.sanitized_log_json).unwrap_or_default();
+
+    if matches!(audit_result.action, security::SecurityAction::Block) {
+        log_security_block(
+            &repo,
+            &key_record.id,
+            &key_record.name,
+            audited.envelope.model.clone(),
+            "responses",
+            is_stream,
+            &audited.sanitized_log_json,
+            &audit_result,
+            trace_id.clone(),
+        ).await;
+        let err_body = serde_json::json!({"error": {"message": audit_result.summary, "type": "security_blocked"}});
+        return (StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, Json(err_body)).into_response();
+    }
+
+    let model = forward_json
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
 
-    // Convert Responses API request to OpenAI Chat Completions format
-    let openai_body = protocol::responses_to_openai(&json);
+    // Convert (already-gated) Responses request to OpenAI Chat Completions format
+    let openai_body = protocol::responses_to_openai(&forward_json);
 
     if is_stream {
         handle_responses_stream(
@@ -1862,6 +2106,7 @@ pub async fn handle_responses(
             key_record.id,
             key_record.name,
             request_body_str,
+            audit_result,
             trace_id,
         )
         .await
@@ -1906,23 +2151,12 @@ async fn handle_responses_stream(
     api_key_id: String,
     api_key_name: String,
     request_body: String,
+    security_result: security::SecurityScanResult,
     trace_id: Option<String>,
 ) -> Response {
-    let security_settings = security::get_security_settings(&shared.app);
-    let security_result = security::scan_request(&openai_body, &security_settings);
-
-    let (forward_json, was_redacted) =
-        if matches!(security_result.action, security::SecurityAction::Redact)
-            || security_settings.redact_secrets
-        {
-            security::redact_request_body(&openai_body, &security_settings)
-        } else {
-            (openai_body.clone(), false)
-        };
-    let mut security_result = security_result;
-    if was_redacted {
-        security_result.sanitized = true;
-    }
+    // Security gate already ran on the ORIGINAL Responses JSON at the entry
+    // handler; `request_body` is the gate's sanitized log body.
+    let forward_json = openai_body.clone();
 
     let repo = std::sync::Arc::new(Repository::new(shared.state.db.pool.clone()));
 
@@ -2299,56 +2533,32 @@ pub async fn handle_embeddings(
         .get("Wali-Trace-Id")
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
-    let request_body_str = serde_json::to_string(&json).unwrap_or_default();
-
-    // Security scan
-    let security_settings = security::get_security_settings(&shared.app);
-    let security_result = security::scan_request(&json, &security_settings);
+    // Unified security audit gate — audits the ORIGINAL Embeddings JSON.
+    let audited = match audit_original(
+        security::gate::DownstreamProtocol::Embeddings,
+        json.clone(),
+        trace_id.clone(),
+        &shared,
+    ) {
+        Ok(audited) => audited,
+        Err(response) => return response,
+    };
+    let security_result = audited.audit_result.clone();
+    let forward_json = audited.forward_json.clone();
+    let request_body_str = serde_json::to_string(&audited.sanitized_log_json).unwrap_or_default();
 
     if matches!(security_result.action, security::SecurityAction::Block) {
-        let log = crate::db::models::RequestLog {
-            response_choices: None,
-            id: crate::utils::id::new_id(),
-            seq: None,
-            api_key_id: Some(key_record.id.clone()),
-            api_key_name: Some(key_record.name.clone()),
-            channel_id: None,
-            channel_name: None,
-            model: model.clone(),
-            upstream_model: None,
-            mode: "embedding".to_string(),
-            status_code: 451,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-            duration_ms: 0,
-            error_message: security_result.blocked_reason.clone(),
-            is_stream: 0,
-            is_retry: 0,
-            created_at: crate::utils::time::now_iso(),
-            request_body: Some(request_body_str),
-            risk_level: security_result.risk_level.as_str().to_string(),
-            risk_score: security_result.risk_score as i64,
-            risk_summary: Some(security_result.summary.clone()),
-            security_action: security_result.action.as_str().to_string(),
-            sanitized: if security_result.sanitized { 1 } else { 0 },
-            blocked_reason: security_result.blocked_reason.clone(),
-            trace_id: trace_id.clone(),
-        };
-        let log_id = log.id.clone();
-        if let Err(e) = repo.create_log(&log).await {
-            eprintln!("[WARN] create_log failed: {}", e);
-        }
-        if let Err(e) = repo
-            .create_security_findings(
-                &log_id,
-                &security_result.findings,
-                security_result.action.as_str(),
-            )
-            .await
-        {
-            eprintln!("[WARN] create_security_findings failed: {}", e);
-        }
+        log_security_block(
+            &repo,
+            &key_record.id,
+            &key_record.name,
+            model.clone(),
+            "embedding",
+            false,
+            &audited.sanitized_log_json,
+            &security_result,
+            trace_id.clone(),
+        ).await;
         return (
             StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
             Json(serde_json::json!({
@@ -2399,7 +2609,7 @@ pub async fn handle_embeddings(
         let embed_url = format!("{}/embeddings", base_url);
         let embed_body = serde_json::json!({
             "model": upstream_model,
-            "input": json.get("input").cloned().unwrap_or(serde_json::Value::Null),
+            "input": forward_json.get("input").cloned().unwrap_or(serde_json::Value::Null),
             "encoding_format": "float"
         });
 

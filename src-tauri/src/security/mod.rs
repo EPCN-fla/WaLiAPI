@@ -5,6 +5,8 @@ use tauri_plugin_store::StoreExt;
 pub mod scanner;
 pub mod redact;
 pub mod rules;
+pub mod gate;
+pub mod features;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -41,7 +43,7 @@ impl RiskLevel {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SecurityAction {
     Allow,
@@ -188,17 +190,59 @@ pub fn scan_request(body: &serde_json::Value, settings: &SecuritySettings) -> Se
     if !settings.enabled || !settings.scan_request {
         return SecurityScanResult::default();
     }
-    let mut result = scanner::scan_json(body, "request", settings);
+    let mut result = scanner::scan_with_budget(body, "request", settings, &scanner::ScanBudget::default())
+        .unwrap_or_else(|err| {
+            // Over-budget must fail closed as a high-risk block, never clean.
+            let mut blocked = SecurityScanResult::default();
+            blocked.risk_level = RiskLevel::Critical;
+            blocked.risk_score = 100;
+            blocked.action = SecurityAction::Block;
+            blocked.blocked_reason = Some(blocked.summary.clone());
+            blocked.summary = match err {
+                scanner::BudgetError::Exceeded(msg) => msg,
+            };
+            blocked.blocked_reason = Some(blocked.summary.clone());
+            blocked.findings.push(SecurityFinding {
+                phase: "request".to_string(),
+                category: "budget".to_string(),
+                rule_id: "budget.scan_exceeded".to_string(),
+                severity: RiskLevel::Critical,
+                title: "安全扫描预算超限".to_string(),
+                description: "整个请求的扫描预算被超过，请求被 fail-closed 拒绝。".to_string(),
+                location: "$".to_string(),
+                evidence_masked: "budget exceeded".to_string(),
+            });
+            blocked
+        });
     decide_action(&mut result, settings);
     result
 }
 
 /// Scan an upstream response for risks (sensitive info, tracking, etc.)
+/// Uses a response-side budget with a looser default (responses may be large).
 pub fn scan_response(body: &serde_json::Value, settings: &SecuritySettings) -> SecurityScanResult {
     if !settings.enabled || !settings.scan_response {
         return SecurityScanResult::default();
     }
-    let mut result = scanner::scan_json(body, "response", settings);
+    let budget = scanner::ScanBudget {
+        max_total_bytes: Some(64 * 1024 * 1024),
+        max_string_nodes: Some(100_000),
+        max_depth: Some(256),
+        max_elapsed: Some(std::time::Duration::from_millis(800)),
+        max_text_bytes_per_string: Some(64 * 1024),
+    };
+    let mut result = scanner::scan_with_budget(body, "response", settings, &budget)
+        .unwrap_or_else(|err| match err {
+            scanner::BudgetError::Exceeded(msg) => {
+                let mut blocked = SecurityScanResult::default();
+                blocked.risk_level = RiskLevel::Critical;
+                blocked.risk_score = 100;
+                blocked.action = SecurityAction::Block;
+                blocked.summary = msg;
+                blocked.blocked_reason = Some(blocked.summary.clone());
+                blocked
+            }
+        });
     decide_action(&mut result, settings);
     result
 }
