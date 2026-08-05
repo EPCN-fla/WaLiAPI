@@ -100,13 +100,6 @@ impl From<&crate::db::models::Channel> for ChannelIdentityRow {
     }
 }
 
-impl ChannelIdentity {
-    /// Serialized form of `native_endpoints` for storage (`TEXT NOT NULL DEFAULT '[]'`).
-    pub fn endpoints_json(&self) -> String {
-        serde_json::to_string(&self.native_endpoints).unwrap_or_else(|_| "[]".to_string())
-    }
-}
-
 /// The one and only entry point: resolve the normalized identity of a channel row.
 ///
 /// Legacy-uninitialized means: `identity_revision == 0`, or `protocol`/`provider`
@@ -184,10 +177,26 @@ fn infer_legacy(
                 } else {
                     ChannelProvider::Custom
                 };
-                let eps = vec![
-                    NativeEndpoint::ChatCompletions,
-                    NativeEndpoint::Responses,
-                ];
+                // T00 decision 2 / design 11.2: an old openai record must NOT be
+                // reported natively capable of /responses just because it is
+                // typed openai. The Responses-via-Chat legacy debt is only
+                // recorded per-row in config.legacy_capabilities.
+                let has_responses_debt = config
+                    .get("legacy_capabilities")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .any(|s| s.as_str() == Some("responses_via_chat_v1"))
+                    })
+                    .unwrap_or(false);
+                let eps = if has_responses_debt {
+                    vec![
+                        NativeEndpoint::ChatCompletions,
+                        NativeEndpoint::Responses,
+                    ]
+                } else {
+                    vec![NativeEndpoint::ChatCompletions]
+                };
                 (
                     ChannelProtocol::OpenAI,
                     provider,
@@ -210,11 +219,13 @@ fn infer_legacy(
                 // Legacy claude base_url is the old-adaptor root (already
                 // includes "/v1"); the new-code executor appends "v1/messages"
                 // to native_base_url, so the native root must drop a trailing
-                // "/v1" to avoid ".../v1/v1/messages".
-                let native = base_url
+                // "/v1" to avoid ".../v1/v1/messages". Trim trailing '/' FIRST
+                // so "…/v1/" (trailing slash after /v1) also collapses to the
+                // vendor root and never yields a double "/v1/v1/messages".
+                let trimmed = base_url.trim_end_matches('/');
+                let native = trimmed
                     .strip_suffix("/v1")
-                    .unwrap_or(base_url)
-                    .trim_end_matches('/')
+                    .unwrap_or(trimmed)
                     .to_string();
                 (
                     ChannelProtocol::Anthropic,
@@ -274,11 +285,14 @@ fn infer_legacy(
                 ExecutorKind::ChatCompletions,
             ),
             // Old Ollama: strip ONLY an exact trailing "/v1" for the native
-            // base. Never produces "/v1/api/chat" (design 11.1).
+            // base. Never produces "/v1/api/chat" (design 11.1). Trim trailing
+            // '/' first so "…:11434/v1/" also collapses to "…:11434" instead of
+            // yielding "/v1/api/chat".
             "ollama" => {
-                let native = base_url
+                let trimmed = base_url.trim_end_matches('/');
+                let native = trimmed
                     .strip_suffix("/v1")
-                    .unwrap_or(base_url)
+                    .unwrap_or(trimmed)
                     .to_string();
                 (
                     ChannelProtocol::Ollama,
@@ -423,11 +437,6 @@ pub fn preset_for(protocol: &str, provider: &str) -> Option<ChannelPreset> {
         .find(|p| p.protocol.as_str() == protocol && p.provider.as_str() == provider)
 }
 
-/// Resolve a preset by its stable id `{protocol}:{provider}`.
-pub fn preset_by_id(id: &str) -> Option<ChannelPreset> {
-    all_channel_presets().into_iter().find(|p| p.id == id)
-}
-
 /// New-config -> legacy dual-write mapping (design 5.1 table).
 ///
 /// Given the normalized identity + the preset that produced it, return the
@@ -505,7 +514,9 @@ mod tests {
         assert_eq!(id.protocol, "openai");
         assert_eq!(id.provider, "openai");
         assert_eq!(id.native_base_url, "https://api.openai.com/v1");
-        assert_eq!(id.native_endpoints, vec!["chat_completions", "responses"]);
+        // T00 decision 2 / design 11.2: old openai rows are NOT natively
+        // capable of /responses unless config records the legacy debt.
+        assert_eq!(id.native_endpoints, vec!["chat_completions"]);
         assert!(id.inferred);
         assert_eq!(id.executor_kind, "chat_completions");
     }
@@ -516,6 +527,33 @@ mod tests {
         assert_eq!(id.protocol, "openai");
         assert_eq!(id.provider, "custom");
         assert_eq!(id.native_base_url, "https://gw.example.com/v1");
+        assert_eq!(id.native_endpoints, vec!["chat_completions"]);
+    }
+
+    #[test]
+    fn openai_with_responses_debt_keeps_both() {
+        let mut r = row("openai", "https://api.openai.com/v1", 0);
+        r.config = serde_json::json!({ "legacy_capabilities": ["responses_via_chat_v1"] });
+        let id = resolve_channel_identity(&r);
+        assert_eq!(id.native_endpoints, vec!["chat_completions", "responses"]);
+    }
+
+    #[test]
+    fn ollama_trailing_slash_v1_does_not_produce_v1_api_chat() {
+        // "…:11434/v1/" (trailing slash after /v1) must collapse to the root,
+        // not "…/v1", so /api/chat never becomes /v1/api/chat.
+        let id = resolve_channel_identity(&row("ollama", "http://localhost:11434/v1/", 0));
+        assert_eq!(id.native_base_url, "http://localhost:11434");
+        assert_eq!(id.native_endpoints, vec!["api_chat"]);
+    }
+
+    #[test]
+    fn claude_trailing_slash_v1_does_not_double_v1() {
+        // "…/v1/" must collapse to the vendor root so the new executor builds
+        // exactly one "/v1/messages", not "/v1/v1/messages".
+        let id = resolve_channel_identity(&row("claude", "https://api.anthropic.com/v1/", 0));
+        assert_eq!(id.native_base_url, "https://api.anthropic.com");
+        assert_eq!(id.native_endpoints, vec!["messages"]);
     }
 
     #[test]

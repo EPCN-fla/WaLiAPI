@@ -186,9 +186,10 @@ impl Repository {
         let now = now_iso();
         let mut tx = self.pool.begin().await?;
 
-        // STEP 1: write the legacy/business fields. If any of the legacy
-        // identity fields (type/base_url/config) actually changes value, the
-        // AFTER UPDATE trigger invalidates the stored new identity (revision 0).
+        // STEP 1: write the legacy/business fields exactly as the payload
+        // provides them (old frontend payloads). Naming type/base_url/config in
+        // this UPDATE fires the invalidation trigger (revision 0), which is what
+        // makes an old binary's legacy edit re-infer identity on next read.
         let mut q = sqlx::QueryBuilder::new("UPDATE channels SET updated_at = ");
 
         q.push_bind(&now);
@@ -236,16 +237,15 @@ impl Repository {
         q.push(" WHERE id = ").push_bind(&input.id);
         q.build().execute(&mut *tx).await?;
 
-        // Read the row as it now stands (post legacy-write, post trigger) so
-        // the identity plan starts from current persisted state.
+        // Read the row as it now stands (post-legacy-write, post-trigger) so the
+        // identity plan starts from the persisted state: if the trigger fired,
+        // identity fields are NULL/revision 0 and we re-infer.
         let row: Channel = sqlx::query_as("SELECT * FROM channels WHERE id = ?")
             .bind(&input.id)
             .fetch_one(&mut *tx)
             .await?;
 
-        // The effective legacy fields: what was written this UPDATE, else the
-        // row's current value. Used both for the final identity UPDATE and for
-        // legacy inference when the new fields are not fully provided.
+        // Effective fields: what was written this UPDATE, else the row's value.
         let eff_type = input.channel_type.clone().unwrap_or_else(|| row.channel_type.clone());
         let eff_base = input.base_url.clone().unwrap_or_else(|| row.base_url.clone());
         let eff_config = input.config.as_ref().map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
@@ -258,10 +258,9 @@ impl Repository {
         });
         let eff_preset_revision = input.preset_revision.clone().or_else(|| row.preset_revision.clone());
 
-        // STEP 2: final UPDATE writes the complete new identity + current
-        // revision. If the identity plan falls back to legacy inference, the
-        // revision stays 0 and the resolver live-infers on read.
-        let (identity, _, _, endpoints_json) = Self::plan_channel_identity(
+        // Compute the full identity plan. On a full identity write this yields
+        // the DERIVED legacy dual-write pair (type/base_url from new_to_legacy).
+        let (identity, legacy_type, legacy_base, endpoints_json) = Self::plan_channel_identity(
             &eff_protocol,
             &eff_provider,
             &eff_native_base,
@@ -272,6 +271,21 @@ impl Repository {
             &eff_config,
         );
 
+        // STEP 1b: write the DERIVED legacy dual-write pair in a separate
+        // statement (never merged with the identity write — 不得单条 UPDATE
+        // 同时写新旧). On a full-identity write this repairs a raw/empty
+        // base_url to the old-code compat root (F1); on a legacy write it is a
+        // no-op equal to the effective fields.
+        sqlx::query("UPDATE channels SET type = ?, base_url = ? WHERE id = ?")
+            .bind(&legacy_type)
+            .bind(&legacy_base)
+            .bind(&input.id)
+            .execute(&mut *tx)
+            .await?;
+
+        // STEP 2: final UPDATE writes the complete new identity + current
+        // revision. If the identity plan fell back to legacy inference, the
+        // revision stays 0 and the resolver live-infers on read.
         sqlx::query(
             "UPDATE channels SET
                 protocol = ?, provider = ?, native_base_url = ?, native_endpoints = ?,

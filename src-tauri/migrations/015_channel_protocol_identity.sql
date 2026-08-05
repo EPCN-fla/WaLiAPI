@@ -30,9 +30,11 @@ ALTER TABLE channels ADD COLUMN identity_revision INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE channels ADD COLUMN legacy_executor_override TEXT;
 
 -- Invalidation trigger (T00 decision 10, design 11.3):
--- Whenever an old code path changes the legacy identity fields
--- (type/base_url/config), clear the new identity and reset revision to 0 so
--- the resolver re-infers from the current legacy fields on next read.
+-- Whenever an old code path WRITES the legacy identity columns
+-- (type/base_url/config) — SQLite fires AFTER UPDATE OF when the columns are
+-- named in the UPDATE's SET list, regardless of whether the value changed —
+-- clear the new identity and reset revision to 0 so the resolver re-infers
+-- from the current legacy fields on next read.
 -- This is what makes "upgrade -> rollback writes legacy -> re-upgrade" safe:
 -- the rolled-back write invalidates any stale new-identity values.
 CREATE TRIGGER IF NOT EXISTS trg_channels_legacy_invalidate_identity

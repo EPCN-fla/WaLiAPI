@@ -30,6 +30,8 @@ pub struct ChannelDto {
     pub native_base_url: String,
     pub native_endpoints: Vec<String>,
     pub identity_revision: i64,
+    /// preset registry revision recorded at save time (traceability only).
+    pub preset_revision: Option<String>,
     pub legacy_executor_override: Option<String>,
     pub executor_kind: String,
     pub created_at: String,
@@ -59,6 +61,7 @@ impl From<Channel> for ChannelDto {
             native_base_url: identity.native_base_url,
             native_endpoints: identity.native_endpoints,
             identity_revision: identity.identity_revision,
+            preset_revision: c.preset_revision.clone(),
             legacy_executor_override: identity.legacy_executor_override,
             executor_kind: identity.executor_kind,
             created_at: c.created_at,

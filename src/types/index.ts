@@ -18,6 +18,7 @@ export interface Channel {
   native_base_url: string;
   native_endpoints: string[];
   identity_revision: number;
+  preset_revision?: string | null;
   legacy_executor_override?: string | null;
   executor_kind: string;
   created_at: string;
@@ -43,7 +44,6 @@ export interface CreateChannelInput {
   native_base_url?: string;
   native_endpoints?: string[];
   preset_revision?: string;
-  identity_revision?: number;
   legacy_executor_override?: string;
 }
 
@@ -67,7 +67,6 @@ export interface UpdateChannelInput {
   native_base_url?: string;
   native_endpoints?: string[];
   preset_revision?: string;
-  identity_revision?: number;
   legacy_executor_override?: string;
   /** Distinguish "edit leave-blank = keep key" from explicit clear (Ollama). */
   clear_api_key?: boolean;

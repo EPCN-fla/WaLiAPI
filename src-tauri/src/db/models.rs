@@ -58,8 +58,6 @@ pub struct CreateChannelInput {
     #[serde(default)]
     pub preset_revision: Option<String>,
     #[serde(default)]
-    pub identity_revision: Option<i64>,
-    #[serde(default)]
     pub legacy_executor_override: Option<String>,
 }
 
@@ -90,8 +88,6 @@ pub struct UpdateChannelInput {
     pub native_endpoints: Option<Vec<String>>,
     #[serde(default)]
     pub preset_revision: Option<String>,
-    #[serde(default)]
-    pub identity_revision: Option<i64>,
     #[serde(default)]
     pub legacy_executor_override: Option<String>,
     /// Distinguish "edit leave-blank = keep key" from "Ollama explicitly clear

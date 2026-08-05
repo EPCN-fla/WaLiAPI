@@ -324,7 +324,6 @@ async fn create_new_anthropic_dual_writes_type_and_compat_base() {
         native_base_url: Some("https://open.bigmodel.cn/api/anthropic".into()),
         native_endpoints: Some(vec!["messages".into()]),
         preset_revision: Some("2026-08-04".into()),
-        identity_revision: None,
         legacy_executor_override: None,
     };
 
@@ -369,7 +368,6 @@ async fn create_new_ollama_native_dual_writes_openai_compat() {
         native_base_url: Some("http://localhost:11434".into()),
         native_endpoints: Some(vec!["api_chat".into()]),
         preset_revision: Some("2026-08-04".into()),
-        identity_revision: None,
         legacy_executor_override: None,
     };
 
@@ -410,7 +408,6 @@ async fn create_new_openai_google_is_openai_type() {
         native_base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai".into()),
         native_endpoints: Some(vec!["chat_completions".into()]),
         preset_revision: Some("2026-08-04".into()),
-        identity_revision: None,
         legacy_executor_override: None,
     };
 
@@ -460,6 +457,38 @@ async fn create_old_payload_infers_and_preserves_fields() {
 }
 
 #[tokio::test]
+async fn create_legacy_gemini_keeps_override_and_original_url() {
+    let pool = fresh_db().await;
+    let repo = make_repo(pool.clone());
+
+    let input = models::CreateChannelInput {
+        name: "old-gemini".into(),
+        channel_type: "gemini".into(),
+        base_url: "https://generativelanguage.googleapis.com".into(),
+        api_key: "gkey".into(),
+        models: vec!["gemini-2.5-flash".into()],
+        priority: None,
+        weight: None,
+        config: None,
+        model_mapping: None,
+        timeout_secs: None,
+        ..Default::default()
+    };
+
+    let row = repo.create_channel(&input).await.expect("create legacy gemini");
+    // Legacy type/base preserved exactly (design 11.1).
+    assert_eq!(row.channel_type, "gemini");
+    assert_eq!(row.base_url, "https://generativelanguage.googleapis.com");
+    // Resolver identity: openai/google + legacy native override.
+    assert_eq!(row.legacy_executor_override.as_deref(), Some("gemini_native"));
+    let identity = row_to_identity(&row);
+    assert_eq!(identity.protocol, "openai");
+    assert_eq!(identity.provider, "google");
+    assert_eq!(identity.executor_kind, "gemini_native");
+    assert_eq!(identity.native_base_url, "https://generativelanguage.googleapis.com");
+}
+
+#[tokio::test]
 async fn update_two_step_writes_full_identity_and_revision() {
     let pool = fresh_db().await;
     let repo = make_repo(pool.clone());
@@ -483,13 +512,16 @@ async fn update_two_step_writes_full_identity_and_revision() {
         native_base_url: Some("https://open.bigmodel.cn/api/anthropic".into()),
         native_endpoints: Some(vec!["messages".into()]),
         preset_revision: Some("2026-08-04".into()),
-        identity_revision: None,
         legacy_executor_override: None,
         clear_api_key: None,
     };
 
     let row = repo.update_channel(&input).await.expect("two-step update");
     assert_eq!(row.channel_type, "claude");
+    // F1: the stored legacy base must be the DERIVED compat root (new_to_legacy),
+    // NOT the raw input (which lacked "/v1") — old binaries must request
+    // …/api/anthropic/v1/messages, never …/api/anthropic/messages.
+    assert_eq!(row.base_url, "https://open.bigmodel.cn/api/anthropic/v1");
     assert_eq!(row.identity_revision, 1);
     assert_eq!(row.protocol.as_deref(), Some("anthropic"));
     assert_eq!(row.provider.as_deref(), Some("zhipu"));
@@ -497,6 +529,35 @@ async fn update_two_step_writes_full_identity_and_revision() {
     assert_eq!(row.native_endpoints.as_deref(), Some("[\"messages\"]"));
     // api_key untouched (None = keep).
     assert_eq!(row.api_key, "sk");
+}
+
+#[tokio::test]
+async fn update_new_payload_empty_legacy_fields_is_repaired() {
+    // F1(b): a new-protocol payload that sends empty type/base_url (the new UI
+    // only sends identity fields) must have its legacy dual-write pair derived
+    // and stored, so old binaries can still route the channel.
+    let pool = fresh_db().await;
+    let repo = make_repo(pool.clone());
+    insert_legacy_row(&pool, "u7", "openai", "https://api.openai.com/v1", "sk").await;
+
+    let input = models::UpdateChannelInput {
+        id: "u7".into(),
+        name: Some("empty-legacy".into()),
+        channel_type: Some(String::new()), // empty, not provided by new UI
+        base_url: Some(String::new()),
+        protocol: Some("anthropic".into()),
+        provider: Some("zhipu".into()),
+        native_base_url: Some("https://open.bigmodel.cn/api/anthropic".into()),
+        native_endpoints: Some(vec!["messages".into()]),
+        ..Default::default()
+    };
+
+    let row = repo.update_channel(&input).await.expect("repair legacy pair");
+    assert_eq!(row.channel_type, "claude");
+    assert_eq!(row.base_url, "https://open.bigmodel.cn/api/anthropic/v1");
+    assert_eq!(row.identity_revision, 1);
+    assert_eq!(row.protocol.as_deref(), Some("anthropic"));
+    assert_eq!(row.provider.as_deref(), Some("zhipu"));
 }
 
 #[tokio::test]
@@ -612,7 +673,9 @@ async fn mid_transaction_failure_rolls_back_fully() {
     // Resolver still sees the coherent legacy identity.
     let identity = row_to_identity(&row);
     assert_eq!(identity.provider, "openai");
-    assert_eq!(identity.native_endpoints, vec!["chat_completions", "responses"]);
+    // Legacy openai rows are NOT natively /responses-capable without the
+    // config legacy_capabilities debt marker (design 11.2).
+    assert_eq!(identity.native_endpoints, vec!["chat_completions"]);
 }
 
 #[tokio::test]
