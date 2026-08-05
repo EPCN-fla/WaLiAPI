@@ -90,7 +90,9 @@ pub fn encode_chat_to_messages(
 
     for (i, msg) in messages.iter().enumerate() {
         let mp = format!("/messages/{i}");
-        if let Err(e) = convert_chat_message_to_anthropic(msg, &mp, &mut messages_out, &mut system_parts) {
+        if let Err(e) =
+            convert_chat_message_to_anthropic(msg, &mp, &mut messages_out, &mut system_parts)
+        {
             // merge rejections
             out.extend(e.fields);
         }
@@ -348,7 +350,8 @@ fn convert_chat_message_to_anthropic(
                             Some("text") => {
                                 let t = item.get("text").and_then(Value::as_str).unwrap_or("");
                                 if !t.is_empty() {
-                                    content_blocks.push(serde_json::json!({"type": "text", "text": t}));
+                                    content_blocks
+                                        .push(serde_json::json!({"type": "text", "text": t}));
                                 }
                             }
                             Some(other) => {
@@ -380,13 +383,17 @@ fn convert_chat_message_to_anthropic(
             if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
                 for (ci, call) in calls.iter().enumerate() {
                     let cp = format!("{pointer}/tool_calls/{ci}");
-                    let id = call.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| {
-                        UnsupportedFeatures::single(
-                            FeatureKind::MissingToolField,
-                            format!("{cp}/id"),
-                            "tool call missing id",
-                        )
-                    })?;
+                    let id = call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            UnsupportedFeatures::single(
+                                FeatureKind::MissingToolField,
+                                format!("{cp}/id"),
+                                "tool call missing id",
+                            )
+                        })?;
                     let name = call
                         .pointer("/function/name")
                         .and_then(Value::as_str)
@@ -444,13 +451,17 @@ fn convert_chat_message_to_anthropic(
             Ok(())
         }
         "tool" => {
-            let tool_call_id = msg.get("tool_call_id").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| {
-                UnsupportedFeatures::single(
-                    FeatureKind::MissingToolField,
-                    format!("{pointer}/tool_call_id"),
-                    "tool message missing tool_call_id",
-                )
-            })?;
+            let tool_call_id = msg
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    UnsupportedFeatures::single(
+                        FeatureKind::MissingToolField,
+                        format!("{pointer}/tool_call_id"),
+                        "tool message missing tool_call_id",
+                    )
+                })?;
             let content = msg.get("content");
             let text = match content {
                 Some(Value::String(s)) => s.clone(),
@@ -487,7 +498,10 @@ fn convert_chat_message_to_anthropic(
                     ))
                 }
             };
-            let is_error = msg.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+            let is_error = msg
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             // Canonical Anthropic tool_result is a *content block* inside the
             // user message's content array.  The message-level `tool_result`
             // key is not part of the Messages schema and the real API rejects
@@ -507,7 +521,8 @@ fn convert_chat_message_to_anthropic(
             // same user message instead of one message per tool result.
             let appended = if let Some(last) = messages_out.last_mut() {
                 if last.get("role").and_then(Value::as_str) == Some("user") {
-                    if let Some(content_arr) = last.get_mut("content").and_then(Value::as_array_mut) {
+                    if let Some(content_arr) = last.get_mut("content").and_then(Value::as_array_mut)
+                    {
                         let is_tool_result = content_arr
                             .last()
                             .map(|b| b.get("type").and_then(Value::as_str))
@@ -544,7 +559,10 @@ fn convert_chat_message_to_anthropic(
 }
 
 /// Convert a Chat `tools` array entry to an Anthropic tool.
-fn convert_chat_tool_to_anthropic(tool: &Value, pointer: &str) -> Result<Value, UnsupportedFeatures> {
+fn convert_chat_tool_to_anthropic(
+    tool: &Value,
+    pointer: &str,
+) -> Result<Value, UnsupportedFeatures> {
     let ty = tool.get("type").and_then(Value::as_str);
     if ty != Some("function") {
         return Err(UnsupportedFeatures::single(
@@ -560,13 +578,17 @@ fn convert_chat_tool_to_anthropic(tool: &Value, pointer: &str) -> Result<Value, 
             "function tool missing function",
         )
     })?;
-    let name = f.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| {
-        UnsupportedFeatures::single(
-            FeatureKind::MissingToolField,
-            format!("{pointer}/function/name"),
-            "function tool missing name",
-        )
-    })?;
+    let name = f
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            UnsupportedFeatures::single(
+                FeatureKind::MissingToolField,
+                format!("{pointer}/function/name"),
+                "function tool missing name",
+            )
+        })?;
     let parameters = f.get("parameters").cloned().ok_or_else(|| {
         UnsupportedFeatures::single(
             FeatureKind::InvalidToolArguments,
@@ -600,7 +622,10 @@ fn parse_data_url(url: &str) -> (Option<String>, Option<(String, String)>) {
             let media_type = rest[..semi].to_string();
             let after = &rest[semi + 1..];
             if let Some(b64) = after.strip_prefix("base64,") {
-                return (Some(media_type.clone()), Some((media_type, b64.to_string())));
+                return (
+                    Some(media_type.clone()),
+                    Some((media_type, b64.to_string())),
+                );
             }
             // e.g. data:image/png;charset=utf-8,...
             return (Some(media_type), None);
@@ -727,13 +752,17 @@ pub fn decode_chat_response_to_messages(
     if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
         for (i, tc) in tool_calls.iter().enumerate() {
             let cp = format!("/choices/0/message/tool_calls/{i}");
-            let id = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| {
-                UnsupportedFeatures::single(
-                    FeatureKind::MissingToolField,
-                    format!("{cp}/id"),
-                    "Chat response tool call missing id",
-                )
-            })?;
+            let id = tc
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    UnsupportedFeatures::single(
+                        FeatureKind::MissingToolField,
+                        format!("{cp}/id"),
+                        "Chat response tool call missing id",
+                    )
+                })?;
             let name = tc
                 .pointer("/function/name")
                 .and_then(Value::as_str)
@@ -802,11 +831,16 @@ pub fn decode_chat_response_to_messages(
 /// gateway via the report; a 0 is only ever a protocol-mandated placeholder.
 pub fn usage_from_chat(body: &Value) -> Usage {
     let prompt = body.pointer("/usage/prompt_tokens").and_then(Value::as_u64);
-    let completion = body.pointer("/usage/completion_tokens").and_then(Value::as_u64);
+    let completion = body
+        .pointer("/usage/completion_tokens")
+        .and_then(Value::as_u64);
     let cache_read = body
         .pointer("/usage/prompt_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
-        .or_else(|| body.pointer("/usage/cache_read_input_tokens").and_then(Value::as_u64))
+        .or_else(|| {
+            body.pointer("/usage/cache_read_input_tokens")
+                .and_then(Value::as_u64)
+        })
         .unwrap_or(0);
     let cache_creation = body
         .pointer("/usage/cache_creation_input_tokens")
@@ -910,30 +944,46 @@ impl ChatSseState {
         self.usage
     }
 
-    fn consume_json(&mut self, json: Value, events: &mut Vec<String>) -> Result<(), UnsupportedFeatures> {
+    fn consume_json(
+        &mut self,
+        json: Value,
+        events: &mut Vec<String>,
+    ) -> Result<(), UnsupportedFeatures> {
         // usage may arrive as a standalone frame or on a choice frame.
         if let Some(u) = json.get("usage") {
             self.update_usage(u);
         }
         if !self.started {
             self.started = true;
-            events.push(sse::event("message_start", serde_json::json!({
-                "type": "message_start",
-                "message": {
-                    "id": self.message_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": self.model,
-                    "content": [],
-                    "stop_reason": null,
-                    "stop_sequence": null,
-                    "usage": {"input_tokens": self.usage.input_tokens, "output_tokens": 0}
-                }
-            })));
+            events.push(sse::event(
+                "message_start",
+                serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": self.message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": self.model,
+                        "content": [],
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": self.usage.input_tokens, "output_tokens": 0}
+                    }
+                }),
+            ));
         }
-        for choice in json.get("choices").and_then(Value::as_array).into_iter().flatten() {
+        for choice in json
+            .get("choices")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             let delta = choice.get("delta").unwrap_or(&Value::Null);
-            if delta.get("reasoning_content").and_then(Value::as_str).filter(|t| !t.is_empty()).is_some()
+            if delta
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .is_some()
                 || delta.get("thinking").is_some()
             {
                 return Err(UnsupportedFeatures::single(
@@ -942,13 +992,20 @@ impl ChatSseState {
                     "OpenAI upstream returned thinking content, which cannot be converted to Messages safely",
                 ));
             }
-            if let Some(text) = delta.get("content").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+            if let Some(text) = delta
+                .get("content")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+            {
                 let index = self.ensure_text(events);
-                events.push(sse::event("content_block_delta", serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "text_delta", "text": text}
-                })));
+                events.push(sse::event(
+                    "content_block_delta",
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "text_delta", "text": text}
+                    }),
+                ));
             }
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in calls {
@@ -1002,11 +1059,14 @@ impl ChatSseState {
         let index = self.next_content_index;
         self.next_content_index += 1;
         self.open_text = Some(index);
-        events.push(sse::event("content_block_start", serde_json::json!({
-            "type": "content_block_start",
-            "index": index,
-            "content_block": {"type": "text", "text": ""}
-        })));
+        events.push(sse::event(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        ));
         index
     }
 
@@ -1027,7 +1087,11 @@ impl ChatSseState {
             .and_then(|f| f.get("arguments"))
             .and_then(Value::as_str)
         {
-            self.tools.entry(source_index).or_default().arguments.push_str(arguments);
+            self.tools
+                .entry(source_index)
+                .or_default()
+                .arguments
+                .push_str(arguments);
         }
         Ok(())
     }
@@ -1047,10 +1111,13 @@ impl ChatSseState {
             ));
         }
         if let Some(index) = self.open_text.take() {
-            events.push(sse::event("content_block_stop", serde_json::json!({
-                "type": "content_block_stop",
-                "index": index
-            })));
+            events.push(sse::event(
+                "content_block_stop",
+                serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": index
+                }),
+            ));
         }
         for tool in self.tools.values_mut() {
             if tool.id.is_empty() || tool.name.is_empty() {
@@ -1081,16 +1148,22 @@ impl ChatSseState {
                 "index": index,
                 "content_block": {"type": "tool_use", "id": tool.id, "name": tool.name, "input": {}}
             })));
-            events.push(sse::event("content_block_delta", serde_json::json!({
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {"type": "input_json_delta", "partial_json": tool.arguments}
-            })));
+            events.push(sse::event(
+                "content_block_delta",
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": tool.arguments}
+                }),
+            ));
             tool.stopped = true;
-            events.push(sse::event("content_block_stop", serde_json::json!({
-                "type": "content_block_stop",
-                "index": index
-            })));
+            events.push(sse::event(
+                "content_block_stop",
+                serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": index
+                }),
+            ));
         }
         let stop_reason = match self.finish_reason.as_deref() {
             Some("stop") => "end_turn",
@@ -1116,17 +1189,23 @@ impl ChatSseState {
                 }
             }
         };
-        events.push(sse::event("message_delta", serde_json::json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-            "usage": {
-                "input_tokens": self.usage.input_tokens,
-                "output_tokens": self.usage.output_tokens,
-                "cache_creation_input_tokens": self.usage.cache_creation_input_tokens,
-                "cache_read_input_tokens": self.usage.cache_read_input_tokens,
-            }
-        })));
-        events.push(sse::event("message_stop", serde_json::json!({"type": "message_stop"})));
+        events.push(sse::event(
+            "message_delta",
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                "usage": {
+                    "input_tokens": self.usage.input_tokens,
+                    "output_tokens": self.usage.output_tokens,
+                    "cache_creation_input_tokens": self.usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": self.usage.cache_read_input_tokens,
+                }
+            }),
+        ));
+        events.push(sse::event(
+            "message_stop",
+            serde_json::json!({"type": "message_stop"}),
+        ));
         self.ended = true;
         Ok(())
     }

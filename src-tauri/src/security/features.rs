@@ -73,23 +73,108 @@ pub fn collect_features(
 /// dropped (T00 decision 8 / T03 spec).
 fn known_top_level_field(protocol: DownstreamProtocol, key: &str) -> bool {
     let common = [
-        "model", "stream", "stream_options", "temperature", "top_p", "n", "stop",
-        "max_tokens", "max_completion_tokens", "presence_penalty", "frequency_penalty",
-        "logit_bias", "user", "seed", "extra_body", "metadata", "store", "reasoning",
-        "parallel_tool_calls", "tool_choice", "tools", "response_format", "timeout",
-        "trace_id", "route_group",
+        "model",
+        "stream",
+        "stream_options",
+        "temperature",
+        "top_p",
+        "n",
+        "stop",
+        "max_tokens",
+        "max_completion_tokens",
+        "presence_penalty",
+        "frequency_penalty",
+        "logit_bias",
+        "user",
+        "seed",
+        "extra_body",
+        "metadata",
+        "store",
+        "reasoning",
+        "parallel_tool_calls",
+        "tool_choice",
+        "tools",
+        "response_format",
+        "timeout",
+        "trace_id",
+        "route_group",
     ];
     if common.contains(&key) {
         return true;
     }
     match protocol {
-        DownstreamProtocol::ChatCompletions => matches!(key, "messages" | "function_call" | "functions" | "logprobs" | "top_logprobs" | "modalities" | "audio" | "service_tier"),
-        DownstreamProtocol::Completions => matches!(key, "prompt" | "best_of" | "echo" | "logprobs" | "suffix" | "max_tokens"),
-        DownstreamProtocol::Responses => matches!(key, "input" | "instructions" | "previous_response_id" | "include" | "text" | "output" | "tools" | "builtin_tool" | "file_search" | "web_search" | "code_interpreter" | "computer_use" | "truncation" | "dimensions" | "store" | "parallel_tool_calls" | "reasoning"),
-        DownstreamProtocol::Messages | DownstreamProtocol::CountTokens => matches!(key, "messages" | "system" | "max_tokens" | "stop_sequences" | "temperature" | "top_p" | "top_k" | "metadata" | "tools" | "tool_choice" | "thinking" | "betas" | "service_tier"),
-        DownstreamProtocol::Embeddings => matches!(key, "input" | "encoding_format" | "dimensions" | "input_type"),
-        DownstreamProtocol::Images => matches!(key, "prompt" | "n" | "size" | "quality" | "style" | "response_format" | "user"),
-        DownstreamProtocol::Audio => matches!(key, "file" | "model" | "language" | "prompt" | "response_format" | "temperature" | "input" | "voice" | "speed" | "instructions"),
+        DownstreamProtocol::ChatCompletions => matches!(
+            key,
+            "messages"
+                | "function_call"
+                | "functions"
+                | "logprobs"
+                | "top_logprobs"
+                | "modalities"
+                | "audio"
+                | "service_tier"
+        ),
+        DownstreamProtocol::Completions => matches!(
+            key,
+            "prompt" | "best_of" | "echo" | "logprobs" | "suffix" | "max_tokens"
+        ),
+        DownstreamProtocol::Responses => matches!(
+            key,
+            "input"
+                | "instructions"
+                | "previous_response_id"
+                | "include"
+                | "text"
+                | "output"
+                | "tools"
+                | "builtin_tool"
+                | "file_search"
+                | "web_search"
+                | "code_interpreter"
+                | "computer_use"
+                | "truncation"
+                | "dimensions"
+                | "store"
+                | "parallel_tool_calls"
+                | "reasoning"
+        ),
+        DownstreamProtocol::Messages | DownstreamProtocol::CountTokens => matches!(
+            key,
+            "messages"
+                | "system"
+                | "max_tokens"
+                | "stop_sequences"
+                | "temperature"
+                | "top_p"
+                | "top_k"
+                | "metadata"
+                | "tools"
+                | "tool_choice"
+                | "thinking"
+                | "betas"
+                | "service_tier"
+        ),
+        DownstreamProtocol::Embeddings => matches!(
+            key,
+            "input" | "encoding_format" | "dimensions" | "input_type"
+        ),
+        DownstreamProtocol::Images => matches!(
+            key,
+            "prompt" | "n" | "size" | "quality" | "style" | "response_format" | "user"
+        ),
+        DownstreamProtocol::Audio => matches!(
+            key,
+            "file"
+                | "model"
+                | "language"
+                | "prompt"
+                | "response_format"
+                | "temperature"
+                | "input"
+                | "voice"
+                | "speed"
+                | "instructions"
+        ),
     }
 }
 
@@ -308,7 +393,11 @@ fn parse_data_url(path: &str, s: &str) -> Option<Base64AttachmentMeta> {
     };
     Some(Base64AttachmentMeta {
         pointer: path.to_string(),
-        media_type: if media_type.is_empty() { "application/octet-stream".to_string() } else { media_type.to_string() },
+        media_type: if media_type.is_empty() {
+            "application/octet-stream".to_string()
+        } else {
+            media_type.to_string()
+        },
         declared_len: payload.len(),
         actual_len: payload.len(),
         sha256,

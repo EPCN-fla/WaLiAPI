@@ -58,29 +58,74 @@ async fn upgraded_db() -> sqlx::SqlitePool {
             .unwrap_or_else(|e| panic!("apply legacy schema migration: {e}"));
     }
     // Now apply 015 on top.
-    sqlx::raw_sql(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/015_channel_protocol_identity.sql")))
-        .execute(&pool)
-        .await
-        .expect("apply 015 migration on upgraded schema");
+    sqlx::raw_sql(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/migrations/015_channel_protocol_identity.sql"
+    )))
+    .execute(&pool)
+    .await
+    .expect("apply 015 migration on upgraded schema");
     pool
 }
 
 fn legacy_schema_migrations() -> Vec<&'static str> {
     vec![
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/001_init.sql")),
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/002_add_request_body.sql")),
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/003_security_audit.sql")),
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/004_security_rules.sql")),
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/005_add_response_choices_and_seq.sql")),
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/006_add_trace_id.sql")),
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/007_fix_log_seq.sql")),
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/008_knowledge_base.sql")),
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/009_add_mcp_enabled.sql")),
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/010_kb_upgrade.sql")),
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/011_chunk_symbol_metadata.sql")),
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/012_fts5_hybrid_search.sql")),
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/013_add_embedding_batch_size.sql")),
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/014_add_channel_timeout.sql")),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/001_init.sql"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/002_add_request_body.sql"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/003_security_audit.sql"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/004_security_rules.sql"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/005_add_response_choices_and_seq.sql"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/006_add_trace_id.sql"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/007_fix_log_seq.sql"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/008_knowledge_base.sql"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/009_add_mcp_enabled.sql"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/010_kb_upgrade.sql"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/011_chunk_symbol_metadata.sql"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/012_fts5_hybrid_search.sql"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/013_add_embedding_batch_size.sql"
+        )),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/014_add_channel_timeout.sql"
+        )),
     ]
 }
 
@@ -173,10 +218,13 @@ async fn upgrade_db_applies_015_and_preserves_legacy_values() {
     .execute(&pool)
     .await
     .expect("pre-insert legacy row");
-    sqlx::raw_sql(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations/015_channel_protocol_identity.sql")))
-        .execute(&pool)
-        .await
-        .expect("apply 015 to upgraded schema");
+    sqlx::raw_sql(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/migrations/015_channel_protocol_identity.sql"
+    )))
+    .execute(&pool)
+    .await
+    .expect("apply 015 to upgraded schema");
 
     let row = get_row(&pool, "pre1").await;
     // Business fields untouched.
@@ -325,6 +373,7 @@ async fn create_new_anthropic_dual_writes_type_and_compat_base() {
         native_endpoints: Some(vec!["messages".into()]),
         preset_revision: Some("2026-08-04".into()),
         legacy_executor_override: None,
+        ..Default::default()
     };
 
     let row = repo.create_channel(&input).await.expect("create anthropic");
@@ -335,7 +384,10 @@ async fn create_new_anthropic_dual_writes_type_and_compat_base() {
     assert_eq!(row.identity_revision, 1);
     assert_eq!(row.protocol.as_deref(), Some("anthropic"));
     assert_eq!(row.provider.as_deref(), Some("zhipu"));
-    assert_eq!(row.native_base_url.as_deref(), Some("https://open.bigmodel.cn/api/anthropic"));
+    assert_eq!(
+        row.native_base_url.as_deref(),
+        Some("https://open.bigmodel.cn/api/anthropic")
+    );
     assert_eq!(row.native_endpoints.as_deref(), Some("[\"messages\"]"));
     // Business fields preserved.
     assert_eq!(row.timeout_secs, 120);
@@ -344,7 +396,10 @@ async fn create_new_anthropic_dual_writes_type_and_compat_base() {
     // Old-code final URL from legacy fields must be correct.
     // Old claude adaptor appends /messages to base_url.
     let legacy_final = format!("{}/messages", row.base_url.trim_end_matches('/'));
-    assert_eq!(legacy_final, "https://open.bigmodel.cn/api/anthropic/v1/messages");
+    assert_eq!(
+        legacy_final,
+        "https://open.bigmodel.cn/api/anthropic/v1/messages"
+    );
 }
 
 #[tokio::test]
@@ -369,12 +424,19 @@ async fn create_new_ollama_native_dual_writes_openai_compat() {
         native_endpoints: Some(vec!["api_chat".into()]),
         preset_revision: Some("2026-08-04".into()),
         legacy_executor_override: None,
+        ..Default::default()
     };
 
-    let row = repo.create_channel(&input).await.expect("create ollama native");
+    let row = repo
+        .create_channel(&input)
+        .await
+        .expect("create ollama native");
     assert_eq!(row.channel_type, "openai");
     assert_eq!(row.base_url, "http://localhost:11434/v1");
-    assert_eq!(row.native_base_url.as_deref(), Some("http://localhost:11434"));
+    assert_eq!(
+        row.native_base_url.as_deref(),
+        Some("http://localhost:11434")
+    );
     assert_eq!(row.identity_revision, 1);
     // Old openai adaptor final URL.
     assert_eq!(
@@ -382,7 +444,13 @@ async fn create_new_ollama_native_dual_writes_openai_compat() {
         "http://localhost:11434/v1/chat/completions"
     );
     // Must never produce /v1/api/chat.
-    let native_final = format!("{}/api/chat", row.native_base_url.as_deref().unwrap_or("").trim_end_matches('/'));
+    let native_final = format!(
+        "{}/api/chat",
+        row.native_base_url
+            .as_deref()
+            .unwrap_or("")
+            .trim_end_matches('/')
+    );
     assert_eq!(native_final, "http://localhost:11434/api/chat");
     assert!(!native_final.contains("/v1/"));
 }
@@ -409,9 +477,13 @@ async fn create_new_openai_google_is_openai_type() {
         native_endpoints: Some(vec!["chat_completions".into()]),
         preset_revision: Some("2026-08-04".into()),
         legacy_executor_override: None,
+        ..Default::default()
     };
 
-    let row = repo.create_channel(&input).await.expect("create google compat");
+    let row = repo
+        .create_channel(&input)
+        .await
+        .expect("create google compat");
     // Must be type=openai, NOT gemini (avoids the legacy native adaptor).
     assert_eq!(row.channel_type, "openai");
     assert_eq!(row.identity_revision, 1);
@@ -437,7 +509,10 @@ async fn create_old_payload_infers_and_preserves_fields() {
         ..Default::default()
     };
 
-    let row = repo.create_channel(&input).await.expect("create old payload");
+    let row = repo
+        .create_channel(&input)
+        .await
+        .expect("create old payload");
     // Legacy type/base preserved exactly.
     assert_eq!(row.channel_type, "deepseek");
     assert_eq!(row.base_url, "https://api.deepseek.com");
@@ -475,17 +550,26 @@ async fn create_legacy_gemini_keeps_override_and_original_url() {
         ..Default::default()
     };
 
-    let row = repo.create_channel(&input).await.expect("create legacy gemini");
+    let row = repo
+        .create_channel(&input)
+        .await
+        .expect("create legacy gemini");
     // Legacy type/base preserved exactly (design 11.1).
     assert_eq!(row.channel_type, "gemini");
     assert_eq!(row.base_url, "https://generativelanguage.googleapis.com");
     // Resolver identity: openai/google + legacy native override.
-    assert_eq!(row.legacy_executor_override.as_deref(), Some("gemini_native"));
+    assert_eq!(
+        row.legacy_executor_override.as_deref(),
+        Some("gemini_native")
+    );
     let identity = row_to_identity(&row);
     assert_eq!(identity.protocol, "openai");
     assert_eq!(identity.provider, "google");
     assert_eq!(identity.executor_kind, "gemini_native");
-    assert_eq!(identity.native_base_url, "https://generativelanguage.googleapis.com");
+    assert_eq!(
+        identity.native_base_url,
+        "https://generativelanguage.googleapis.com"
+    );
 }
 
 #[tokio::test]
@@ -514,6 +598,7 @@ async fn update_two_step_writes_full_identity_and_revision() {
         preset_revision: Some("2026-08-04".into()),
         legacy_executor_override: None,
         clear_api_key: None,
+        ..Default::default()
     };
 
     let row = repo.update_channel(&input).await.expect("two-step update");
@@ -525,7 +610,10 @@ async fn update_two_step_writes_full_identity_and_revision() {
     assert_eq!(row.identity_revision, 1);
     assert_eq!(row.protocol.as_deref(), Some("anthropic"));
     assert_eq!(row.provider.as_deref(), Some("zhipu"));
-    assert_eq!(row.native_base_url.as_deref(), Some("https://open.bigmodel.cn/api/anthropic"));
+    assert_eq!(
+        row.native_base_url.as_deref(),
+        Some("https://open.bigmodel.cn/api/anthropic")
+    );
     assert_eq!(row.native_endpoints.as_deref(), Some("[\"messages\"]"));
     // api_key untouched (None = keep).
     assert_eq!(row.api_key, "sk");
@@ -552,7 +640,10 @@ async fn update_new_payload_empty_legacy_fields_is_repaired() {
         ..Default::default()
     };
 
-    let row = repo.update_channel(&input).await.expect("repair legacy pair");
+    let row = repo
+        .update_channel(&input)
+        .await
+        .expect("repair legacy pair");
     assert_eq!(row.channel_type, "claude");
     assert_eq!(row.base_url, "https://open.bigmodel.cn/api/anthropic/v1");
     assert_eq!(row.identity_revision, 1);
@@ -737,13 +828,19 @@ async fn two_step_update_commits_both_legacy_and_identity() {
         preset_revision: Some("2026-08-04".into()),
         ..Default::default()
     };
-    let row = repo.update_channel(&input).await.expect("convert to anthropic/ollama");
+    let row = repo
+        .update_channel(&input)
+        .await
+        .expect("convert to anthropic/ollama");
     assert_eq!(row.channel_type, "claude");
     assert_eq!(row.base_url, "http://localhost:11434/v1");
     assert_eq!(row.identity_revision, 1);
     assert_eq!(row.protocol.as_deref(), Some("anthropic"));
     assert_eq!(row.provider.as_deref(), Some("ollama"));
-    assert_eq!(row.native_base_url.as_deref(), Some("http://localhost:11434"));
+    assert_eq!(
+        row.native_base_url.as_deref(),
+        Some("http://localhost:11434")
+    );
     // Legacy claude adaptor final URL.
     assert_eq!(
         format!("{}/messages", row.base_url.trim_end_matches('/')),
@@ -778,10 +875,13 @@ async fn rollback_write_then_reupgrade_live_infers() {
     assert!(row.provider.is_none());
 
     // Re-upgrade: resolver must live-infer from the current legacy fields.
+    // T06 I-4 (leader adjudication): legacy claude live-infers
+    // [messages, count_tokens] (the old type=="claude" predicate served
+    // /v1/messages/count_tokens).
     let identity = row_to_identity(&row);
     assert_eq!(identity.protocol, "anthropic");
     assert_eq!(identity.provider, "deepseek");
-    assert_eq!(identity.native_endpoints, vec!["messages"]);
+    assert_eq!(identity.native_endpoints, vec!["messages", "count_tokens"]);
     assert!(identity.inferred);
 }
 
@@ -808,7 +908,7 @@ async fn preset_url_fixtures_new_and_legacy() {
             channel_type: "".into(),
             base_url: "".into(),
             api_key: "sk".into(),
-            models: vec![].into(),
+            models: vec![],
             protocol: Some("anthropic".into()),
             provider: Some("anthropic".into()),
             native_base_url: Some("https://api.anthropic.com".into()),
@@ -834,7 +934,7 @@ async fn preset_url_fixtures_new_and_legacy() {
             channel_type: "".into(),
             base_url: "".into(),
             api_key: "sk".into(),
-            models: vec![].into(),
+            models: vec![],
             protocol: Some("anthropic".into()),
             provider: Some("deepseek".into()),
             native_base_url: Some("https://api.deepseek.com/anthropic".into()),
@@ -860,7 +960,7 @@ async fn preset_url_fixtures_new_and_legacy() {
             channel_type: "".into(),
             base_url: "".into(),
             api_key: "sk".into(),
-            models: vec![].into(),
+            models: vec![],
             protocol: Some("anthropic".into()),
             provider: Some("zhipu".into()),
             native_base_url: Some("https://open.bigmodel.cn/api/anthropic".into()),
@@ -885,7 +985,7 @@ async fn preset_url_fixtures_new_and_legacy() {
             channel_type: "".into(),
             base_url: "".into(),
             api_key: "sk".into(),
-            models: vec![].into(),
+            models: vec![],
             protocol: Some("anthropic".into()),
             provider: Some("doubao_coding_plan".into()),
             native_base_url: Some("https://ark.cn-beijing.volces.com/api/coding".into()),
@@ -910,7 +1010,7 @@ async fn preset_url_fixtures_new_and_legacy() {
             channel_type: "".into(),
             base_url: "".into(),
             api_key: "".into(),
-            models: vec![].into(),
+            models: vec![],
             protocol: Some("anthropic".into()),
             provider: Some("ollama".into()),
             native_base_url: Some("http://localhost:11434".into()),
@@ -936,7 +1036,7 @@ async fn preset_url_fixtures_new_and_legacy() {
             channel_type: "".into(),
             base_url: "".into(),
             api_key: "".into(),
-            models: vec![].into(),
+            models: vec![],
             protocol: Some("ollama".into()),
             provider: Some("ollama".into()),
             native_base_url: Some("http://localhost:11434".into()),
@@ -964,7 +1064,7 @@ async fn preset_url_fixtures_new_and_legacy() {
             channel_type: "".into(),
             base_url: "".into(),
             api_key: "sk".into(),
-            models: vec![].into(),
+            models: vec![],
             protocol: Some("openai".into()),
             provider: Some("openai".into()),
             native_base_url: Some("https://api.openai.com/v1".into()),

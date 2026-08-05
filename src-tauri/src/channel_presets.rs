@@ -193,10 +193,12 @@ pub const PRESET_REVISION: &str = "2026-08-04";
 
 const SRC_OPENAI: &str = "https://platform.openai.com/docs/api-reference/chat";
 const SRC_GEMINI_MODELS: &str = "https://ai.google.dev/gemini-api/docs/models";
-const SRC_DEEPSEEK_FUNCTION_CALLING: &str = "https://api-docs.deepseek.com/guides/function_calling/";
+const SRC_DEEPSEEK_FUNCTION_CALLING: &str =
+    "https://api-docs.deepseek.com/guides/function_calling/";
 const SRC_DEEPSEEK_ANTHROPIC: &str = "https://api-docs.deepseek.com/guides/anthropic_api";
 const SRC_QWEN_ANTHROPIC: &str = "https://help.aliyun.com/en/model-studio/more-tools";
-const SRC_QWEN_RESPONSES: &str = "https://help.aliyun.com/en/model-studio/qwen-api-via-openai-responses";
+const SRC_QWEN_RESPONSES: &str =
+    "https://help.aliyun.com/en/model-studio/qwen-api-via-openai-responses";
 const SRC_ZHIPU: &str = "https://open.bigmodel.cn/dev/api";
 const SRC_DOUBAO: &str = "https://www.volcengine.com/docs/82379/";
 const SRC_MOONSHOT: &str = "https://platform.moonshot.ai/docs/api/chat";
@@ -355,8 +357,16 @@ fn openai_presets() -> Vec<ChannelPreset> {
             vec![NativeEndpoint::ChatCompletions],
             AuthScheme::Bearer,
             vec![
-                model("deepseek-v4-pro", PRESET_REVISION, SRC_DEEPSEEK_FUNCTION_CALLING),
-                model("deepseek-v4-flash", PRESET_REVISION, SRC_DEEPSEEK_FUNCTION_CALLING),
+                model(
+                    "deepseek-v4-pro",
+                    PRESET_REVISION,
+                    SRC_DEEPSEEK_FUNCTION_CALLING,
+                ),
+                model(
+                    "deepseek-v4-flash",
+                    PRESET_REVISION,
+                    SRC_DEEPSEEK_FUNCTION_CALLING,
+                ),
             ],
             ModelEnumStrategy::StaticPlusSync,
             EndpointTestStrategy::ProbeFirstModel,
@@ -589,25 +599,23 @@ fn anthropic_presets() -> Vec<ChannelPreset> {
 }
 
 fn ollama_presets() -> Vec<ChannelPreset> {
-    vec![
-        preset(
-            ChannelProtocol::Ollama,
-            ChannelProvider::Ollama,
-            "Ollama（本地）",
-            RegionGroup::Local,
-            "Ollama 原生 /api/chat 协议。",
-            "ollama",
-            "http://localhost:11434",
-            "http://localhost:11434/v1",
-            "openai",
-            vec![NativeEndpoint::ApiChat],
-            vec![NativeEndpoint::ApiChat],
-            AuthScheme::OptionalBearer,
-            vec![],
-            ModelEnumStrategy::SyncOnly,
-            EndpointTestStrategy::ProbeFirstModel,
-        ),
-    ]
+    vec![preset(
+        ChannelProtocol::Ollama,
+        ChannelProvider::Ollama,
+        "Ollama（本地）",
+        RegionGroup::Local,
+        "Ollama 原生 /api/chat 协议。",
+        "ollama",
+        "http://localhost:11434",
+        "http://localhost:11434/v1",
+        "openai",
+        vec![NativeEndpoint::ApiChat],
+        vec![NativeEndpoint::ApiChat],
+        AuthScheme::OptionalBearer,
+        vec![],
+        ModelEnumStrategy::SyncOnly,
+        EndpointTestStrategy::ProbeFirstModel,
+    )]
 }
 
 /// 全部 preset，顺序为每个协议的 custom 置顶，其后 international → domestic → local。
@@ -691,7 +699,9 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), all.len(), "duplicate preset ids");
-        assert!(all.iter().all(|p| p.id == format!("{}:{}", p.protocol.as_str(), p.provider.as_str())));
+        assert!(all
+            .iter()
+            .all(|p| p.id == format!("{}:{}", p.protocol.as_str(), p.provider.as_str())));
         assert!(all.iter().all(|p| p.preset_revision == PRESET_REVISION));
     }
 
@@ -699,17 +709,16 @@ mod tests {
     fn anthropic_excludes_moonshot() {
         let presets = presets_for_protocol(ChannelProtocol::Anthropic);
         assert!(
-            presets.iter().all(|p| p.provider != ChannelProvider::Moonshot),
+            presets
+                .iter()
+                .all(|p| p.provider != ChannelProvider::Moonshot),
             "Anthropic 不得包含 Moonshot"
         );
     }
 
     #[test]
     fn deepseek_region_is_domestic() {
-        for protocol in [
-            ChannelProtocol::OpenAI,
-            ChannelProtocol::Anthropic,
-        ] {
+        for protocol in [ChannelProtocol::OpenAI, ChannelProtocol::Anthropic] {
             let p = presets_for_protocol(protocol)
                 .into_iter()
                 .find(|p| p.provider == ChannelProvider::DeepSeek)
@@ -729,7 +738,10 @@ mod tests {
             let order: Vec<u8> = presets.iter().map(|p| region_order(p.region)).collect();
             let mut sorted = order.clone();
             sorted.sort_unstable();
-            assert_eq!(order, sorted, "preset 顺序必须为 custom→international→domestic→local");
+            assert_eq!(
+                order, sorted,
+                "preset 顺序必须为 custom→international→domestic→local"
+            );
             assert_eq!(order[0], 0);
         }
     }
@@ -776,7 +788,10 @@ mod tests {
 
     #[test]
     fn non_custom_presets_have_full_fields() {
-        for p in all_channel_presets().into_iter().filter(|p| p.provider != ChannelProvider::Custom) {
+        for p in all_channel_presets()
+            .into_iter()
+            .filter(|p| p.provider != ChannelProvider::Custom)
+        {
             assert!(!p.native_base_url.is_empty(), "{}", p.id);
             assert!(!p.legacy_base_url.is_empty(), "{}", p.id);
             assert!(!p.legacy_type.is_empty(), "{}", p.id);
@@ -812,7 +827,10 @@ mod tests {
             .find(|p| p.provider == ChannelProvider::Zhipu)
             .unwrap();
         assert_eq!(p.native_base_url, "https://open.bigmodel.cn/api/anthropic");
-        assert_eq!(p.legacy_base_url, "https://open.bigmodel.cn/api/anthropic/v1");
+        assert_eq!(
+            p.legacy_base_url,
+            "https://open.bigmodel.cn/api/anthropic/v1"
+        );
     }
 
     #[test]
@@ -822,7 +840,10 @@ mod tests {
             .find(|p| p.provider == ChannelProvider::DoubaoCodingPlan)
             .unwrap();
         assert_eq!(p.display_name, "字节豆包（Coding Plan）");
-        assert_eq!(p.native_base_url, "https://ark.cn-beijing.volces.com/api/coding");
+        assert_eq!(
+            p.native_base_url,
+            "https://ark.cn-beijing.volces.com/api/coding"
+        );
     }
 
     #[test]
@@ -856,52 +877,109 @@ mod tests {
         // OpenAI / OpenAI
         let p = f(ChannelProtocol::OpenAI, ChannelProvider::OpenAI);
         assert_eq!(p.native_base_url, "https://api.openai.com/v1");
-        assert_eq!(join(&p.native_base_url, "chat/completions"), "https://api.openai.com/v1/chat/completions");
-        assert_eq!(join(&p.native_base_url, "responses"), "https://api.openai.com/v1/responses");
+        assert_eq!(
+            join(&p.native_base_url, "chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            join(&p.native_base_url, "responses"),
+            "https://api.openai.com/v1/responses"
+        );
         assert_eq!(p.legacy_type, "openai");
-        assert_eq!(join(&p.legacy_base_url, "chat/completions"), "https://api.openai.com/v1/chat/completions");
+        assert_eq!(
+            join(&p.legacy_base_url, "chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
         // Anthropic / Anthropic
         let p = f(ChannelProtocol::Anthropic, ChannelProvider::Anthropic);
         assert_eq!(p.native_base_url, "https://api.anthropic.com");
-        assert_eq!(join(&p.native_base_url, "v1/messages"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            join(&p.native_base_url, "v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
         assert_eq!(p.legacy_type, "claude");
         assert_eq!(p.legacy_base_url, "https://api.anthropic.com/v1");
-        assert_eq!(join(&p.legacy_base_url, "messages"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            join(&p.legacy_base_url, "messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
         // Anthropic / DeepSeek
         let p = f(ChannelProtocol::Anthropic, ChannelProvider::DeepSeek);
         assert_eq!(p.native_base_url, "https://api.deepseek.com/anthropic");
-        assert_eq!(join(&p.native_base_url, "v1/messages"), "https://api.deepseek.com/anthropic/v1/messages");
+        assert_eq!(
+            join(&p.native_base_url, "v1/messages"),
+            "https://api.deepseek.com/anthropic/v1/messages"
+        );
         assert_eq!(p.legacy_type, "claude");
         assert_eq!(p.legacy_base_url, "https://api.deepseek.com/anthropic/v1");
-        assert_eq!(join(&p.legacy_base_url, "messages"), "https://api.deepseek.com/anthropic/v1/messages");
+        assert_eq!(
+            join(&p.legacy_base_url, "messages"),
+            "https://api.deepseek.com/anthropic/v1/messages"
+        );
         // Anthropic / 智谱
         let p = f(ChannelProtocol::Anthropic, ChannelProvider::Zhipu);
         assert_eq!(p.native_base_url, "https://open.bigmodel.cn/api/anthropic");
-        assert_eq!(join(&p.native_base_url, "v1/messages"), "https://open.bigmodel.cn/api/anthropic/v1/messages");
+        assert_eq!(
+            join(&p.native_base_url, "v1/messages"),
+            "https://open.bigmodel.cn/api/anthropic/v1/messages"
+        );
         assert_eq!(p.legacy_type, "claude");
-        assert_eq!(p.legacy_base_url, "https://open.bigmodel.cn/api/anthropic/v1");
-        assert_eq!(join(&p.legacy_base_url, "messages"), "https://open.bigmodel.cn/api/anthropic/v1/messages");
+        assert_eq!(
+            p.legacy_base_url,
+            "https://open.bigmodel.cn/api/anthropic/v1"
+        );
+        assert_eq!(
+            join(&p.legacy_base_url, "messages"),
+            "https://open.bigmodel.cn/api/anthropic/v1/messages"
+        );
         // Anthropic / 豆包 Coding Plan
-        let p = f(ChannelProtocol::Anthropic, ChannelProvider::DoubaoCodingPlan);
-        assert_eq!(p.native_base_url, "https://ark.cn-beijing.volces.com/api/coding");
-        assert_eq!(join(&p.native_base_url, "v1/messages"), "https://ark.cn-beijing.volces.com/api/coding/v1/messages");
+        let p = f(
+            ChannelProtocol::Anthropic,
+            ChannelProvider::DoubaoCodingPlan,
+        );
+        assert_eq!(
+            p.native_base_url,
+            "https://ark.cn-beijing.volces.com/api/coding"
+        );
+        assert_eq!(
+            join(&p.native_base_url, "v1/messages"),
+            "https://ark.cn-beijing.volces.com/api/coding/v1/messages"
+        );
         assert_eq!(p.legacy_type, "claude");
-        assert_eq!(p.legacy_base_url, "https://ark.cn-beijing.volces.com/api/coding/v1");
-        assert_eq!(join(&p.legacy_base_url, "messages"), "https://ark.cn-beijing.volces.com/api/coding/v1/messages");
+        assert_eq!(
+            p.legacy_base_url,
+            "https://ark.cn-beijing.volces.com/api/coding/v1"
+        );
+        assert_eq!(
+            join(&p.legacy_base_url, "messages"),
+            "https://ark.cn-beijing.volces.com/api/coding/v1/messages"
+        );
         // Anthropic / Ollama
         let p = f(ChannelProtocol::Anthropic, ChannelProvider::Ollama);
         assert_eq!(p.native_base_url, "http://localhost:11434");
-        assert_eq!(join(&p.native_base_url, "v1/messages"), "http://localhost:11434/v1/messages");
+        assert_eq!(
+            join(&p.native_base_url, "v1/messages"),
+            "http://localhost:11434/v1/messages"
+        );
         assert_eq!(p.legacy_type, "claude");
         assert_eq!(p.legacy_base_url, "http://localhost:11434/v1");
-        assert_eq!(join(&p.legacy_base_url, "messages"), "http://localhost:11434/v1/messages");
+        assert_eq!(
+            join(&p.legacy_base_url, "messages"),
+            "http://localhost:11434/v1/messages"
+        );
         // Ollama / Ollama
         let p = f(ChannelProtocol::Ollama, ChannelProvider::Ollama);
         assert_eq!(p.native_base_url, "http://localhost:11434");
-        assert_eq!(join(&p.native_base_url, "api/chat"), "http://localhost:11434/api/chat");
+        assert_eq!(
+            join(&p.native_base_url, "api/chat"),
+            "http://localhost:11434/api/chat"
+        );
         assert_eq!(p.legacy_type, "openai");
         assert_eq!(p.legacy_base_url, "http://localhost:11434/v1");
-        assert_eq!(join(&p.legacy_base_url, "chat/completions"), "http://localhost:11434/v1/chat/completions");
+        assert_eq!(
+            join(&p.legacy_base_url, "chat/completions"),
+            "http://localhost:11434/v1/chat/completions"
+        );
     }
 
     fn join(base: &str, path: &str) -> String {
@@ -915,7 +993,10 @@ mod tests {
             .into_iter()
             .find(|p| p.provider == ChannelProvider::Qwen)
             .unwrap();
-        assert_eq!(p.native_base_url, "https://dashscope.aliyuncs.com/apps/anthropic");
+        assert_eq!(
+            p.native_base_url,
+            "https://dashscope.aliyuncs.com/apps/anthropic"
+        );
         assert_eq!(
             join(&p.native_base_url, "v1/messages"),
             "https://dashscope.aliyuncs.com/apps/anthropic/v1/messages"

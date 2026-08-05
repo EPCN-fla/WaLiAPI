@@ -24,9 +24,11 @@ impl Repository {
     // ==================== Channel ====================
 
     pub async fn get_all_channels(&self) -> Result<Vec<Channel>, sqlx::Error> {
-        sqlx::query_as::<_, Channel>("SELECT * FROM channels ORDER BY priority DESC, created_at DESC")
-            .fetch_all(&self.pool)
-            .await
+        sqlx::query_as::<_, Channel>(
+            "SELECT * FROM channels ORDER BY priority DESC, created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn get_channel(&self, id: &str) -> Result<Channel, sqlx::Error> {
@@ -37,9 +39,11 @@ impl Repository {
     }
 
     pub async fn get_enabled_channels(&self) -> Result<Vec<Channel>, sqlx::Error> {
-        sqlx::query_as::<_, Channel>("SELECT * FROM channels WHERE status = 1 ORDER BY priority DESC, weight DESC")
-            .fetch_all(&self.pool)
-            .await
+        sqlx::query_as::<_, Channel>(
+            "SELECT * FROM channels WHERE status = 1 ORDER BY priority DESC, weight DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
     }
 
     /// Resolve the full identity to persist for a create/update, and the
@@ -58,59 +62,78 @@ impl Repository {
         legacy_type: &str,
         legacy_base_url: &str,
         config_json: &str,
-    ) -> (crate::core::channel_identity::ChannelIdentity, String, String, String) {
+    ) -> (
+        crate::core::channel_identity::ChannelIdentity,
+        String,
+        String,
+        String,
+    ) {
         use crate::core::channel_identity::{
             resolve_channel_identity, ChannelIdentity, ChannelIdentityRow,
         };
 
-        let protocol_ok = protocol.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-        let provider_ok = provider.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-        let base_ok = native_base_url.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-        let eps_ok = native_endpoints.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+        let protocol_ok = protocol
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let provider_ok = provider
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let base_ok = native_base_url
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let eps_ok = native_endpoints
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
 
         // Determine which legacy fields to infer from. If the caller supplied a
         // legacy type/base_url (e.g. old frontend payload), use those; else the
         // current row values.
-        let (identity, legacy_type_out, legacy_base_out) = if protocol_ok && provider_ok && base_ok && eps_ok {
-            let identity = ChannelIdentity {
-                protocol: protocol.clone().unwrap_or_default(),
-                provider: provider.clone().unwrap_or_default(),
-                native_base_url: native_base_url.clone().unwrap_or_default(),
-                native_endpoints: native_endpoints.clone().unwrap_or_default(),
-                identity_revision: current_revision.max(1),
-                legacy_executor_override: None,
-                executor_kind: crate::core::channel_identity::derive_executor_kind(
-                    protocol.as_deref().unwrap_or(""),
-                )
-                .to_string(),
-                inferred: false,
+        let (identity, legacy_type_out, legacy_base_out) =
+            if protocol_ok && provider_ok && base_ok && eps_ok {
+                let identity = ChannelIdentity {
+                    protocol: protocol.clone().unwrap_or_default(),
+                    provider: provider.clone().unwrap_or_default(),
+                    native_base_url: native_base_url.clone().unwrap_or_default(),
+                    native_endpoints: native_endpoints.clone().unwrap_or_default(),
+                    identity_revision: current_revision.max(1),
+                    legacy_executor_override: None,
+                    executor_kind: crate::core::channel_identity::derive_executor_kind(
+                        protocol.as_deref().unwrap_or(""),
+                    )
+                    .to_string(),
+                    inferred: false,
+                };
+                let (lt, lb) = crate::core::channel_identity::new_to_legacy(&identity);
+                (identity, lt, lb)
+            } else {
+                // Legacy infer from the legacy fields (old payload or current row).
+                let row = ChannelIdentityRow {
+                    channel_type: legacy_type.to_string(),
+                    base_url: legacy_base_url.to_string(),
+                    config: serde_json::from_str(config_json)
+                        .unwrap_or(serde_json::Value::Object(Default::default())),
+                    protocol: protocol.clone(),
+                    provider: provider.clone(),
+                    native_base_url: native_base_url.clone(),
+                    native_endpoints: native_endpoints
+                        .as_ref()
+                        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string())),
+                    preset_revision: None,
+                    identity_revision: 0,
+                    legacy_executor_override: None,
+                };
+                let identity = resolve_channel_identity(&row);
+                let lt = legacy_type.to_string();
+                let lb = legacy_base_url.to_string();
+                (identity, lt, lb)
             };
-            let (lt, lb) = crate::core::channel_identity::new_to_legacy(&identity);
-            (identity, lt, lb)
-        } else {
-            // Legacy infer from the legacy fields (old payload or current row).
-            let row = ChannelIdentityRow {
-                channel_type: legacy_type.to_string(),
-                base_url: legacy_base_url.to_string(),
-                config: serde_json::from_str(config_json).unwrap_or(serde_json::Value::Object(Default::default())),
-                protocol: protocol.clone(),
-                provider: provider.clone(),
-                native_base_url: native_base_url.clone(),
-                native_endpoints: native_endpoints.as_ref().map(|v| {
-                    serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string())
-                }),
-                preset_revision: None,
-                identity_revision: 0,
-                legacy_executor_override: None,
-            };
-            let identity = resolve_channel_identity(&row);
-            let lt = legacy_type.to_string();
-            let lb = legacy_base_url.to_string();
-            (identity, lt, lb)
-        };
 
-        let endpoints_json = serde_json::to_string(&identity.native_endpoints)
-            .unwrap_or_else(|_| "[]".to_string());
+        let endpoints_json =
+            serde_json::to_string(&identity.native_endpoints).unwrap_or_else(|_| "[]".to_string());
         (identity, legacy_type_out, legacy_base_out, endpoints_json)
     }
 
@@ -118,10 +141,14 @@ impl Repository {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
         let models = serde_json::to_string(&input.models).unwrap_or_else(|_| "[]".to_string());
-        let config = input.config.as_ref()
+        let config = input
+            .config
+            .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
             .unwrap_or_else(|| "{}".to_string());
-        let model_mapping = input.model_mapping.as_ref()
+        let model_mapping = input
+            .model_mapping
+            .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
             .unwrap_or_else(|| "{}".to_string());
 
@@ -143,7 +170,7 @@ impl Repository {
                 protocol, provider, native_base_url, native_endpoints,
                 preset_revision, identity_revision, legacy_executor_override,
                 created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&input.name)
@@ -165,6 +192,65 @@ impl Repository {
         .bind(&identity.legacy_executor_override)
         .bind(&now)
         .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_channel(&id).await
+    }
+
+    /// Import a channel with FULL business-field fidelity (T09).
+    ///
+    /// Deliberately NOT `create_channel`: that writer hard-codes `status = 1`
+    /// and a default `timeout_secs`, which would silently corrupt round-trips
+    /// of disabled/slow channels.  This narrow import-write API persists every
+    /// business field verbatim (status/priority/weight/timeout_secs/config
+    /// unknown keys/URL/key/models/array model_mapping) and copies the identity
+    /// columns exactly as resolved by `commands::import_export`.
+    pub async fn import_channel(&self, input: &ImportChannelInput) -> Result<Channel, sqlx::Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = now_iso();
+        let models = serde_json::to_string(&input.models).unwrap_or_else(|_| "[]".to_string());
+        let config = serde_json::to_string(&input.config).unwrap_or_else(|_| "{}".to_string());
+        let model_mapping =
+            serde_json::to_string(&input.model_mapping).unwrap_or_else(|_| "{}".to_string());
+        let endpoints_json = input
+            .native_endpoints
+            .as_ref()
+            .map(|eps| serde_json::to_string(eps).unwrap_or_else(|_| "[]".to_string()))
+            .unwrap_or_else(|| "[]".to_string());
+
+        sqlx::query(
+            "INSERT INTO channels (
+                id, name, type, base_url, api_key, models, status, priority, weight,
+                config, model_mapping, timeout_secs,
+                protocol, provider, native_base_url, native_endpoints,
+                preset_revision, identity_revision, legacy_executor_override,
+                created_at, updated_at, last_test_at, last_test_ok)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&input.name)
+        .bind(&input.channel_type)
+        .bind(&input.base_url)
+        .bind(&input.api_key)
+        .bind(&models)
+        .bind(input.status)
+        .bind(input.priority)
+        .bind(input.weight)
+        .bind(&config)
+        .bind(&model_mapping)
+        .bind(input.timeout_secs)
+        .bind(&input.protocol)
+        .bind(&input.provider)
+        .bind(&input.native_base_url)
+        .bind(&endpoints_json)
+        .bind(&input.preset_revision)
+        .bind(input.identity_revision)
+        .bind(&input.legacy_executor_override)
+        .bind(&now)
+        .bind(&now)
+        .bind(&input.last_test_at)
+        .bind(input.last_test_ok)
         .execute(&self.pool)
         .await?;
 
@@ -246,17 +332,33 @@ impl Repository {
             .await?;
 
         // Effective fields: what was written this UPDATE, else the row's value.
-        let eff_type = input.channel_type.clone().unwrap_or_else(|| row.channel_type.clone());
-        let eff_base = input.base_url.clone().unwrap_or_else(|| row.base_url.clone());
-        let eff_config = input.config.as_ref().map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
+        let eff_type = input
+            .channel_type
+            .clone()
+            .unwrap_or_else(|| row.channel_type.clone());
+        let eff_base = input
+            .base_url
+            .clone()
+            .unwrap_or_else(|| row.base_url.clone());
+        let eff_config = input
+            .config
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
             .unwrap_or_else(|| row.config.clone());
         let eff_protocol = input.protocol.clone().or_else(|| row.protocol.clone());
         let eff_provider = input.provider.clone().or_else(|| row.provider.clone());
-        let eff_native_base = input.native_base_url.clone().or_else(|| row.native_base_url.clone());
-        let eff_eps = input.native_endpoints.clone().or_else(|| {
-            parse_eps(&row.native_endpoints)
-        });
-        let eff_preset_revision = input.preset_revision.clone().or_else(|| row.preset_revision.clone());
+        let eff_native_base = input
+            .native_base_url
+            .clone()
+            .or_else(|| row.native_base_url.clone());
+        let eff_eps = input
+            .native_endpoints
+            .clone()
+            .or_else(|| parse_eps(&row.native_endpoints));
+        let eff_preset_revision = input
+            .preset_revision
+            .clone()
+            .or_else(|| row.preset_revision.clone());
 
         // Compute the full identity plan. On a full identity write this yields
         // the DERIVED legacy dual-write pair (type/base_url from new_to_legacy).
@@ -290,7 +392,7 @@ impl Repository {
             "UPDATE channels SET
                 protocol = ?, provider = ?, native_base_url = ?, native_endpoints = ?,
                 preset_revision = ?, identity_revision = ?, legacy_executor_override = ?
-             WHERE id = ?"
+             WHERE id = ?",
         )
         .bind(&identity.protocol)
         .bind(&identity.provider)
@@ -373,8 +475,12 @@ impl Repository {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
         let key = format!("sk-waliapi-{}", uuid::Uuid::new_v4().simple());
-        let allowed_models = serde_json::to_string(&input.allowed_models.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
-        let allowed_channels = serde_json::to_string(&input.allowed_channels.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
+        let allowed_models =
+            serde_json::to_string(&input.allowed_models.clone().unwrap_or_default())
+                .unwrap_or_else(|_| "[]".to_string());
+        let allowed_channels =
+            serde_json::to_string(&input.allowed_channels.clone().unwrap_or_default())
+                .unwrap_or_else(|_| "[]".to_string());
 
         sqlx::query(
             "INSERT INTO api_keys (id, name, key, status, allowed_models, allowed_channels, quota_limit, quota_used, created_at, updated_at)
@@ -428,10 +534,12 @@ impl Repository {
     // ==================== Request Log ====================
 
     pub async fn create_log(&self, log: &RequestLog) -> Result<(), sqlx::Error> {
-        // Insert with seq auto-incremented via subquery (atomic, avoids race condition)
+        // Insert with seq auto-incremented via subquery (atomic, avoids race condition).
+        // The 11 T09 observability columns (migration 016) are bound as Option<> so
+        // legacy callers using `..Default::default()` persist NULLs for them.
         sqlx::query(
-            "INSERT INTO request_logs (id, seq, api_key_id, api_key_name, channel_id, channel_name, model, upstream_model, mode, status_code, prompt_tokens, completion_tokens, total_tokens, duration_ms, error_message, is_stream, is_retry, created_at, request_body, response_choices, risk_level, risk_score, risk_summary, security_action, sanitized, blocked_reason, trace_id)
-             VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM request_logs), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO request_logs (id, seq, api_key_id, api_key_name, channel_id, channel_name, model, upstream_model, mode, status_code, prompt_tokens, completion_tokens, total_tokens, duration_ms, error_message, is_stream, is_retry, created_at, request_body, response_choices, risk_level, risk_score, risk_summary, security_action, sanitized, blocked_reason, trace_id, downstream_protocol, downstream_endpoint, route_group, upstream_protocol, upstream_endpoint, provider, codec_version, failure_class, identity_revision, client_cancelled, stream_committed)
+             VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM request_logs), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&log.id)
         .bind(&log.api_key_id)
@@ -459,12 +567,28 @@ impl Repository {
         .bind(log.sanitized)
         .bind(&log.blocked_reason)
         .bind(&log.trace_id)
+        .bind(&log.downstream_protocol)
+        .bind(&log.downstream_endpoint)
+        .bind(&log.route_group)
+        .bind(&log.upstream_protocol)
+        .bind(&log.upstream_endpoint)
+        .bind(&log.provider)
+        .bind(&log.codec_version)
+        .bind(&log.failure_class)
+        .bind(log.identity_revision)
+        .bind(log.client_cancelled)
+        .bind(log.stream_committed)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    pub async fn create_security_findings(&self, log_id: &str, findings: &[crate::security::SecurityFinding], action: &str) -> Result<(), sqlx::Error> {
+    pub async fn create_security_findings(
+        &self,
+        log_id: &str,
+        findings: &[crate::security::SecurityFinding],
+        action: &str,
+    ) -> Result<(), sqlx::Error> {
         for finding in findings {
             sqlx::query(
                 "INSERT INTO request_security_findings (id, log_id, phase, category, rule_id, severity, title, description, location, evidence_masked, evidence_hash, action, created_at)
@@ -489,11 +613,16 @@ impl Repository {
         Ok(())
     }
 
-    pub async fn get_security_findings(&self, log_id: &str) -> Result<Vec<RequestSecurityFinding>, sqlx::Error> {
-        sqlx::query_as::<_, RequestSecurityFinding>("SELECT * FROM request_security_findings WHERE log_id = ? ORDER BY created_at ASC")
-            .bind(log_id)
-            .fetch_all(&self.pool)
-            .await
+    pub async fn get_security_findings(
+        &self,
+        log_id: &str,
+    ) -> Result<Vec<RequestSecurityFinding>, sqlx::Error> {
+        sqlx::query_as::<_, RequestSecurityFinding>(
+            "SELECT * FROM request_security_findings WHERE log_id = ? ORDER BY created_at ASC",
+        )
+        .bind(log_id)
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn get_log(&self, id: &str) -> Result<RequestLog, sqlx::Error> {
@@ -528,7 +657,7 @@ impl Repository {
 
     pub async fn get_logs(&self, limit: i64, offset: i64) -> Result<Vec<RequestLog>, sqlx::Error> {
         sqlx::query_as::<_, RequestLog>(
-            "SELECT * FROM request_logs ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            "SELECT * FROM request_logs ORDER BY created_at DESC LIMIT ? OFFSET ?",
         )
         .bind(limit)
         .bind(offset)
@@ -552,10 +681,12 @@ impl Repository {
 
         if let Some(kw) = keyword {
             let pattern = format!("%{}%", kw);
-            q.push(" AND (api_key_name LIKE ").push_bind(pattern.clone());
+            q.push(" AND (api_key_name LIKE ")
+                .push_bind(pattern.clone());
             q.push(" OR channel_name LIKE ").push_bind(pattern.clone());
             q.push(" OR model LIKE ").push_bind(pattern.clone());
-            q.push(" OR upstream_model LIKE ").push_bind(pattern.clone());
+            q.push(" OR upstream_model LIKE ")
+                .push_bind(pattern.clone());
             q.push(" OR api_key_id LIKE ").push_bind(pattern.clone());
             q.push(" OR id LIKE ").push_bind(pattern);
             q.push(")");
@@ -601,71 +732,71 @@ impl Repository {
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let today_prefix = format!("{}%", today);
 
-        let today_requests: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM request_logs WHERE created_at LIKE ?"
-        )
-        .bind(&today_prefix)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+        let today_requests: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_logs WHERE created_at LIKE ?")
+                .bind(&today_prefix)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
 
         let today_total_tokens: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(total_tokens), 0) FROM request_logs WHERE created_at LIKE ?"
+            "SELECT COALESCE(SUM(total_tokens), 0) FROM request_logs WHERE created_at LIKE ?",
         )
         .bind(&today_prefix)
         .fetch_one(&self.pool)
         .await
         .unwrap_or(0);
 
-        let active_channels: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM channels WHERE status = 1"
-        )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+        let active_channels: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM channels WHERE status = 1")
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
 
         let total_channels: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channels")
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         let total_api_keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys")
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         let total_requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
-        let total_tokens: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(total_tokens), 0) FROM request_logs")
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+        let total_tokens: i64 =
+            sqlx::query_scalar("SELECT COALESCE(SUM(total_tokens), 0) FROM request_logs")
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
 
         let avg_latency: f64 = sqlx::query_scalar(
-            "SELECT COALESCE(AVG(duration_ms), 0) FROM request_logs WHERE created_at LIKE ?"
+            "SELECT COALESCE(AVG(duration_ms), 0) FROM request_logs WHERE created_at LIKE ?",
         )
         .bind(&today_prefix)
         .fetch_one(&self.pool)
         .await
         .unwrap_or(0.0);
 
-        let total_knowledge_bases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_knowledge_bases")
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+        let total_knowledge_bases: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM kb_knowledge_bases")
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
 
         let total_kb_documents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_documents")
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         let total_kb_chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_chunks")
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         Ok(DashboardStats {
             today_requests,

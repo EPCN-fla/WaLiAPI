@@ -45,6 +45,12 @@ export interface CreateChannelInput {
   native_endpoints?: string[];
   preset_revision?: string;
   legacy_executor_override?: string;
+  // --- T07 draft-test receipt. Backend validates these against the current
+  // draft when present; force_save saves despite failed/skipped tests as long
+  // as the same draft was tested at least once. ---
+  test_run_id?: string;
+  draft_fingerprint?: string;
+  force_save?: boolean;
 }
 
 export interface UpdateChannelInput {
@@ -70,6 +76,10 @@ export interface UpdateChannelInput {
   legacy_executor_override?: string;
   /** Distinguish "edit leave-blank = keep key" from explicit clear (Ollama). */
   clear_api_key?: boolean;
+  // --- T07 draft-test receipt (see CreateChannelInput). ---
+  test_run_id?: string;
+  draft_fingerprint?: string;
+  force_save?: boolean;
 }
 
 export interface TestChannelResult {
@@ -140,6 +150,18 @@ export interface RequestLog {
   sanitized: boolean;
   blocked_reason: string | null;
   trace_id: string | null;
+  // --- T09 observability fields (nullable; legacy rows are null) ---
+  downstream_protocol: string | null;
+  downstream_endpoint: string | null;
+  route_group: string | null;
+  upstream_protocol: string | null;
+  upstream_endpoint: string | null;
+  provider: string | null;
+  codec_version: string | null;
+  failure_class: string | null;
+  identity_revision: number | null;
+  client_cancelled: boolean | null;
+  stream_committed: boolean | null;
 }
 
 export interface SecurityFinding {
@@ -329,4 +351,64 @@ export interface ChannelPreset {
 export interface ChannelProtocolPresetGroup {
   protocol: ChannelProtocol;
   presets: ChannelPreset[];
+}
+
+// ── 草稿连通性测试（T07）─────────────────────────────────────────────────────
+// 字段名与设计 5.2 及 T07 API 契约逐字一致，不得改名。
+
+export type DraftEndpointTestStatus = "passed" | "failed" | "skipped";
+
+export type DraftEndpointTestFailureCategory =
+  | "network"
+  | "timeout"
+  | "authentication"
+  | "endpoint_unsupported"
+  | "model"
+  | "request"
+  | "protocol"
+  | "unknown";
+
+export interface DraftEndpointTestResult {
+  endpoint: ChannelEndpoint;
+  status: DraftEndpointTestStatus;
+  category?: DraftEndpointTestFailureCategory;
+  /** 已脱敏 message（绝不包含 API Key 或完整请求体）。 */
+  message: string;
+  latency_ms: number;
+  /** 本次测试实际探测的模型。 */
+  tested_model: string | null;
+  /** 该端点的验证是否可能产生极少上游费用。 */
+  cost_possible: boolean;
+}
+
+export interface DraftChannelTestResult {
+  /** 覆盖 protocol/provider/规范 URL/模型/端点/timeout/Key 的后端不可逆指纹。 */
+  draft_fingerprint: string;
+  tested_at: string;
+  test_run_id: string;
+  results: DraftEndpointTestResult[];
+}
+
+/** `test_channel_draft` 的输入：完整未保存草稿（T07 API 契约）。 */
+export interface DraftChannelTestInput {
+  /** 编辑场景提供已保存渠道 id，供后端在 API Key 留空时读取现有 Key（T07）。 */
+  id?: string;
+  name: string;
+  type: string;
+  base_url: string;
+  api_key: string;
+  /** 显式清除已保存 Key（T02）：为 true 时后端把留空的 Key 解析为空串，而非沿用已存 Key。 */
+  clear_api_key?: boolean;
+  models: string[];
+  priority?: number;
+  weight?: number;
+  config?: Record<string, unknown>;
+  model_mapping?: Record<string, string | string[]>;
+  timeout_secs?: number;
+  protocol?: ChannelProtocol | string;
+  provider?: ChannelProvider | string;
+  native_base_url?: string;
+  native_endpoints?: ChannelEndpoint[];
+  preset_revision?: string;
+  legacy_executor_override?: string;
 }

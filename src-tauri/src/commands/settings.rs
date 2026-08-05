@@ -41,16 +41,36 @@ pub struct Settings {
     pub security_block_on_critical: bool,
 }
 
-fn default_port() -> u16 { 8777 }
-fn default_host() -> String { "127.0.0.1".to_string() }
-fn default_theme() -> String { "dark".to_string() }
-fn default_language() -> String { "zh-CN".to_string() }
-fn default_true() -> bool { true }
-fn default_false() -> bool { false }
-fn default_retry_enabled() -> bool { true }
-fn default_retry_times() -> i32 { 2 }
-fn default_security_enabled() -> bool { true }
-fn default_security_mode() -> String { "audit".to_string() }
+fn default_port() -> u16 {
+    8777
+}
+fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_theme() -> String {
+    "dark".to_string()
+}
+fn default_language() -> String {
+    "zh-CN".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_false() -> bool {
+    false
+}
+fn default_retry_enabled() -> bool {
+    true
+}
+fn default_retry_times() -> i32 {
+    2
+}
+fn default_security_enabled() -> bool {
+    true
+}
+fn default_security_mode() -> String {
+    "audit".to_string()
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -77,7 +97,8 @@ impl Default for Settings {
 }
 
 fn get_str(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str, default: &str) -> String {
-    store.get(key)
+    store
+        .get(key)
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| default.to_string())
 }
@@ -134,7 +155,10 @@ pub async fn save_settings(settings: Settings, app: AppHandle) -> Result<(), Str
     store.set("security.scan_network", settings.security_scan_network);
     store.set("security.scan_response", settings.security_scan_response);
     store.set("security.redact_secrets", settings.security_redact_secrets);
-    store.set("security.block_on_critical", settings.security_block_on_critical);
+    store.set(
+        "security.block_on_critical",
+        settings.security_block_on_critical,
+    );
     store.save().map_err(|e| e.to_string())?;
     Ok(())
 }

@@ -1,4 +1,14 @@
-// Channel type definitions
+// ────────────────────────────────────────────────────────────────────────────
+// 纯展示辅助函数与显示映射。
+//
+// 注意：这里【不】保存任何渠道/提供商/模型/URL 模板副本。URL、模型建议、
+// 端点能力、地区分组的唯一可信源是后端 registry（`get_channel_presets`，
+// T01），前端只消费它返回的数据。此处仅保留 UI 展示所需的字符串/图标映射。
+// ────────────────────────────────────────────────────────────────────────────
+
+import type { DraftEndpointTestFailureCategory } from "../types";
+
+// 地区分组标签（产品分组，非部署地域判断）。
 export const CHANNEL_CATEGORIES: Record<string, { label: string; icon: string }> = {
   international: { label: "国际", icon: "🌍" },
   domestic: { label: "国内", icon: "🇨🇳" },
@@ -6,28 +16,71 @@ export const CHANNEL_CATEGORIES: Record<string, { label: string; icon: string }>
   custom: { label: "自定义", icon: "⚙️" },
 };
 
-export const CHANNEL_TYPES: Array<{
-  value: string;
-  label: string;
-  category: string;
-  icon: string;
-  default_base_url: string;
-  models: string[];
-}> = [
-  { value: "openai", label: "OpenAI", category: "international", icon: "🟢", default_base_url: "https://api.openai.com/v1", models: ["gpt-5.4", "gpt-5.5", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"] },
-  { value: "deepseek", label: "DeepSeek", category: "international", icon: "🐋", default_base_url: "https://api.deepseek.com/v1", models: ["deepseek-chat", "deepseek-coder", "deepseek-reasoner"] },
-  { value: "claude", label: "Anthropic Claude", category: "international", icon: "🤖", default_base_url: "https://api.anthropic.com/v1", models: ["claude-sonnet-4-20250514", "claude-3-7-sonnet-20250219", "claude-3-5-haiku-20241022"] },
-  { value: "gemini", label: "Google Gemini", category: "international", icon: "💎", default_base_url: "https://generativelanguage.googleapis.com", models: ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"] },
-  { value: "qwen", label: "通义千问", category: "domestic", icon: "🔮", default_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1", models: ["qwen-max", "qwen-plus", "qwen-turbo"] },
-  { value: "zhipu", label: "智谱 GLM", category: "domestic", icon: "✨", default_base_url: "https://open.bigmodel.cn/api/paas/v4", models: ["glm-4-plus", "glm-4-flash", "glm-4-air"] },
-  { value: "moonshot", label: "Moonshot AI", category: "domestic", icon: "🌙", default_base_url: "https://api.moonshot.cn/v1", models: ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"] },
-  { value: "doubao", label: "字节豆包", category: "domestic", icon: "🫘", default_base_url: "https://ark.cn-beijing.volces.com/api/v3", models: ["doubao-pro-32k", "doubao-pro-128k", "doubao-lite-32k"] },
-  { value: "ollama", label: "Ollama (本地)", category: "local", icon: "🦙", default_base_url: "http://localhost:11434/v1", models: ["llama3.1", "qwen2.5", "mistral"] },
-  { value: "custom", label: "自定义", category: "custom", icon: "⚙️", default_base_url: "", models: [] },
-];
+// 协议显示名。
+export const PROTOCOL_LABELS: Record<string, string> = {
+  openai: "OpenAI",
+  anthropic: "Anthropic",
+  ollama: "Ollama",
+};
 
-export function getChannelType(value: string) {
-  return CHANNEL_TYPES.find(t => t.value === value);
+// provider → 显示名。未知 provider 统一显示“自定义”（设计 3.5）。
+export const CHANNEL_PROVIDER_LABELS: Record<string, string> = {
+  openai: "OpenAI",
+  google: "Google",
+  deepseek: "DeepSeek",
+  qwen: "通义千问",
+  zhipu: "智谱 GLM",
+  doubao: "字节豆包",
+  doubao_coding_plan: "字节豆包（Coding Plan）",
+  moonshot: "Moonshot AI",
+  anthropic: "Anthropic",
+  ollama: "Ollama（本地）",
+  custom: "自定义",
+};
+
+// provider → 图标 key（来自 registry `icon_key`）。
+export const CHANNEL_PROVIDER_ICONS: Record<string, string> = {
+  openai: "🟢",
+  google: "💎",
+  deepseek: "🐋",
+  qwen: "🔮",
+  zhipu: "✨",
+  doubao: "🫘",
+  doubao_coding_plan: "🫘",
+  moonshot: "🌙",
+  anthropic: "🤖",
+  ollama: "🦙",
+  custom: "⚙️",
+};
+
+// 端点失败分类显示名（T07 failure category）。
+export const ENDPOINT_TEST_CATEGORY_LABELS: Record<DraftEndpointTestFailureCategory, string> = {
+  network: "网络不可达",
+  timeout: "超时",
+  authentication: "鉴权失败",
+  endpoint_unsupported: "端点不支持",
+  model: "模型错误",
+  request: "请求被拒绝",
+  protocol: "协议错误",
+  unknown: "未知错误",
+};
+
+// 端点显示名（协议配置区使用）。
+export const ENDPOINT_LABELS: Record<string, string> = {
+  chat_completions: "Chat Completions",
+  responses: "Responses",
+  messages: "Messages",
+  count_tokens: "Count Tokens",
+  embeddings: "Embeddings",
+  api_chat: "/api/chat",
+};
+
+export function getChannelProviderLabel(provider: string): string {
+  return CHANNEL_PROVIDER_LABELS[provider] || "自定义";
+}
+
+export function getProtocolLabel(protocol: string): string {
+  return PROTOCOL_LABELS[protocol] || protocol || "旧配置";
 }
 
 export function formatBytes(bytes: number): string {

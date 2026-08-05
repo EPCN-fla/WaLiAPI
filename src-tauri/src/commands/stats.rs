@@ -18,9 +18,14 @@ pub struct DashboardStatsDto {
 }
 
 #[tauri::command]
-pub async fn get_dashboard_stats(state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<DashboardStatsDto, String> {
+pub async fn get_dashboard_stats(
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<DashboardStatsDto, String> {
     let repo = Repository::new(state.db.pool.clone());
-    let s = repo.get_dashboard_stats().await.map_err(|e| e.to_string())?;
+    let s = repo
+        .get_dashboard_stats()
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(DashboardStatsDto {
         today_requests: s.today_requests,
         today_total_tokens: s.today_total_tokens,

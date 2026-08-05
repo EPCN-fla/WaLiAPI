@@ -2,8 +2,8 @@ use crate::adaptor::{get_adaptor, ProxyRequest, TokenUsage};
 use crate::core::dispatcher::Dispatcher;
 use crate::db::models::{Channel, RequestLog};
 use crate::db::repository::Repository;
-use crate::utils;
 use crate::security;
+use crate::utils;
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::AppHandle;
@@ -35,7 +35,11 @@ pub async fn handle_request(
     audit: Option<&security::SecurityScanResult>,
 ) -> Result<ProxyResult, (u16, String)> {
     let start: Instant = Instant::now();
-    let model: String = body.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+    let model: String = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
     let security_settings = security::get_security_settings(app);
     // The gate already audited the ORIGINAL protocol JSON at the handler.
     // Re-scanning the (possibly converted) Chat JSON here would be a redundant,
@@ -47,11 +51,14 @@ pub async fn handle_request(
     };
 
     // Real redaction: if redact mode is active, sanitize the request body before forwarding
-    let (forward_body, was_redacted) = if matches!(security_result.action, security::SecurityAction::Redact) || security_settings.redact_secrets {
-        security::redact_request_body(&body, &security_settings)
-    } else {
-        (body.clone(), false)
-    };
+    let (forward_body, was_redacted) =
+        if matches!(security_result.action, security::SecurityAction::Redact)
+            || security_settings.redact_secrets
+        {
+            security::redact_request_body(&body, &security_settings)
+        } else {
+            (body.clone(), false)
+        };
     if was_redacted {
         security_result.sanitized = true;
     }
@@ -85,14 +92,30 @@ pub async fn handle_request(
             sanitized: if security_result.sanitized { 1 } else { 0 },
             blocked_reason: security_result.blocked_reason.clone(),
             trace_id: trace_id.clone(),
+            // T09: blocked log — no route/upstream context (channel unknown).
+            ..Default::default()
         };
         let log_id = log.id.clone();
-        if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
-        if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+        if let Err(e) = repo.create_log(&log).await {
+            eprintln!("[WARN] create_log failed: {}", e);
+        }
+        if let Err(e) = repo
+            .create_security_findings(
+                &log_id,
+                &security_result.findings,
+                security_result.action.as_str(),
+            )
+            .await
+        {
+            eprintln!("[WARN] create_security_findings failed: {}", e);
+        }
         return Err((451, security_result.summary));
     }
 
-    let channels = repo.get_enabled_channels().await.map_err(|e| (500, format!("DB error: {}", e)))?;
+    let channels = repo
+        .get_enabled_channels()
+        .await
+        .map_err(|e| (500, format!("DB error: {}", e)))?;
     if channels.is_empty() {
         return Err((503, "No available channels".to_string()));
     }
@@ -101,12 +124,6 @@ pub async fn handle_request(
     if selected_channels.is_empty() {
         return Err((503, format!("No channel available for model: {}", model)));
     }
-
-    let request = ProxyRequest {
-        model: model.clone(),
-        body: forward_body.clone(),
-        stream: is_stream,
-    };
 
     let (retry_enabled, retry_times) = get_retry_settings(app);
     let max_attempts = if retry_enabled {
@@ -121,34 +138,34 @@ pub async fn handle_request(
         let config = Dispatcher::channel_to_config(&channel);
         let adaptor = get_adaptor(&channel.channel_type);
         let attempt_start = Instant::now();
+
+        // T05: array model-mapping sampling moved OUT of this loop into the
+        // shared planner helper.  It is resolved EXACTLY ONCE per attempt and
+        // pre-baked into the forwarded body, so the actual request model, the
+        // adaptor's own apply_model_mapping (now a no-op) and the log all share
+        // the same upstream_model (design 11.4).
+        // ThreadRng is not Send, so scope it tightly: it must be dropped before
+        // the awaited upstream call below.
+        let upstream_model = {
+            let mut rng = rand::rng();
+            crate::core::route_plan::resolve_upstream_model(&config.model_mapping, &model, &mut rng)
+        };
+        let mut attempt_body = forward_body.clone();
+        if let Some(obj) = attempt_body.as_object_mut() {
+            obj.insert(
+                "model".into(),
+                serde_json::Value::String(upstream_model.clone()),
+            );
+        }
+        let request = ProxyRequest {
+            model: model.clone(),
+            body: attempt_body,
+            stream: is_stream,
+        };
+
         let result = adaptor.forward(&request, &config).await;
         let duration_ms = attempt_start.elapsed().as_millis() as u64;
         let is_retry = if attempt > 0 { 1 } else { 0 };
-
-        // Compute the actual upstream model after mapping
-        // Supports both single string and array of strings (random selection for load balancing)
-        let upstream_model = {
-            let mapping = &config.model_mapping;
-            if let Some(mapped) = mapping.get(model.as_str()) {
-                if let Some(s) = mapped.as_str() {
-                    s.to_string()
-                } else if let Some(arr) = mapped.as_array() {
-                    let models: Vec<String> = arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect();
-                    if models.is_empty() {
-                        model.clone()
-                    } else {
-                        let idx = rand::Rng::random_range(&mut rand::rng(), 0..models.len());
-                        models[idx].clone()
-                    }
-                } else {
-                    model.clone()
-                }
-            } else {
-                model.clone()
-            }
-        };
 
         match result {
             Ok((status, resp_body, usage)) => {
@@ -183,16 +200,31 @@ pub async fn handle_request(
                         sanitized: if security_result.sanitized { 1 } else { 0 },
                         blocked_reason: security_result.blocked_reason.clone(),
                         trace_id: trace_id.clone(),
+                        // T09: observability fields on the facade path (T06).
+                        ..Default::default()
                     };
                     let log_id = log.id.clone();
-                    if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
-                    if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+                    if let Err(e) = repo.create_log(&log).await {
+                        eprintln!("[WARN] create_log failed: {}", e);
+                    }
+                    if let Err(e) = repo
+                        .create_security_findings(
+                            &log_id,
+                            &security_result.findings,
+                            security_result.action.as_str(),
+                        )
+                        .await
+                    {
+                        eprintln!("[WARN] create_security_findings failed: {}", e);
+                    }
                     last_error = Some(error_message);
                     continue;
                 }
 
                 // Extract and log choices
-                let response_choices = resp_body.get("choices").and_then(|c| serde_json::to_string(c).ok());
+                let response_choices = resp_body
+                    .get("choices")
+                    .and_then(|c| serde_json::to_string(c).ok());
                 if response_choices.is_some() {
                     // choices logging disabled
                 }
@@ -205,8 +237,12 @@ pub async fn handle_request(
                     security_result.findings.extend(resp_security.findings);
                     if resp_security.risk_level.rank() > security_result.risk_level.rank() {
                         security_result.risk_level = resp_security.risk_level;
-                        security_result.risk_score = security_result.risk_score.max(resp_security.risk_score);
-                        security_result.summary = format!("{} | 响应侧: {}", security_result.summary, resp_security.summary);
+                        security_result.risk_score =
+                            security_result.risk_score.max(resp_security.risk_score);
+                        security_result.summary = format!(
+                            "{} | 响应侧: {}",
+                            security_result.summary, resp_security.summary
+                        );
                     }
                 }
 
@@ -222,7 +258,10 @@ pub async fn handle_request(
                     mode: "chat".to_string(),
                     status_code: status as i64,
                     prompt_tokens: usage.as_ref().map(|u| u.prompt_tokens as i64).unwrap_or(0),
-                    completion_tokens: usage.as_ref().map(|u| u.completion_tokens as i64).unwrap_or(0),
+                    completion_tokens: usage
+                        .as_ref()
+                        .map(|u| u.completion_tokens as i64)
+                        .unwrap_or(0),
                     total_tokens: usage.as_ref().map(|u| u.total_tokens as i64).unwrap_or(0),
                     duration_ms: duration_ms as i64,
                     error_message: None,
@@ -238,13 +277,34 @@ pub async fn handle_request(
                     sanitized: if security_result.sanitized { 1 } else { 0 },
                     blocked_reason: security_result.blocked_reason.clone(),
                     trace_id: trace_id.clone(),
+                    // T09: observability fields (route_group / upstream
+                    // protocol/endpoint / provider / codec / failure class /
+                    // identity revision) are populated on the facade path (T06);
+                    // this legacy loop keeps them NULL for now.
+                    ..Default::default()
                 };
                 let log_id = log.id.clone();
-                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
-                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+                if let Err(e) = repo.create_log(&log).await {
+                    eprintln!("[WARN] create_log failed: {}", e);
+                }
+                if let Err(e) = repo
+                    .create_security_findings(
+                        &log_id,
+                        &security_result.findings,
+                        security_result.action.as_str(),
+                    )
+                    .await
+                {
+                    eprintln!("[WARN] create_security_findings failed: {}", e);
+                }
 
                 if let Some(ref u) = usage {
-                    if let Err(e) = repo.increment_quota(api_key_id, u.total_tokens as i64).await { eprintln!("[WARN] increment_quota failed: {}", e); }
+                    if let Err(e) = repo
+                        .increment_quota(api_key_id, u.total_tokens as i64)
+                        .await
+                    {
+                        eprintln!("[WARN] increment_quota failed: {}", e);
+                    }
                 }
 
                 return Ok(ProxyResult {
@@ -285,10 +345,26 @@ pub async fn handle_request(
                     sanitized: if security_result.sanitized { 1 } else { 0 },
                     blocked_reason: security_result.blocked_reason.clone(),
                     trace_id: trace_id.clone(),
+                    // T09: observability fields (route_group / upstream
+                    // protocol/endpoint / provider / codec / failure class /
+                    // identity revision) are populated on the facade path (T06);
+                    // this legacy loop keeps them NULL for now.
+                    ..Default::default()
                 };
                 let log_id = log.id.clone();
-                if let Err(e) = repo.create_log(&log).await { eprintln!("[WARN] create_log failed: {}", e); }
-                if let Err(e) = repo.create_security_findings(&log_id, &security_result.findings, security_result.action.as_str()).await { eprintln!("[WARN] create_security_findings failed: {}", e); }
+                if let Err(e) = repo.create_log(&log).await {
+                    eprintln!("[WARN] create_log failed: {}", e);
+                }
+                if let Err(e) = repo
+                    .create_security_findings(
+                        &log_id,
+                        &security_result.findings,
+                        security_result.action.as_str(),
+                    )
+                    .await
+                {
+                    eprintln!("[WARN] create_security_findings failed: {}", e);
+                }
                 last_error = Some(error_message);
             }
         }

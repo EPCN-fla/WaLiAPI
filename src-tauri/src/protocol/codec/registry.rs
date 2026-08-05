@@ -95,7 +95,10 @@ impl CodecRegistry {
         Version::v1_0()
     }
 
-    fn direction(downstream: Downstream, upstream: Upstream) -> Result<&'static Direction, CodecError> {
+    fn direction(
+        downstream: Downstream,
+        upstream: Upstream,
+    ) -> Result<&'static Direction, CodecError> {
         static V1: Direction = Direction {
             encode: chat::encode_chat_to_messages,
             non_stream: chat::NonStreamResponseDecoder::boxed,
@@ -130,12 +133,13 @@ impl CodecRegistry {
         model: &str,
         request: &serde_json::Value,
     ) -> Result<PreparedConversion, UnsupportedFeatures> {
-        let dir = Self::direction(downstream, upstream)
-            .map_err(|e| UnsupportedFeatures::single(
+        let dir = Self::direction(downstream, upstream).map_err(|e| {
+            UnsupportedFeatures::single(
                 super::error::FeatureKind::UnsupportedField,
                 "/",
                 e.to_string(),
-            ))?;
+            )
+        })?;
         let (encoded_request, context) = (dir.encode)(request, model)?;
         let report = ConversionReport::ok();
         let non_stream = (dir.non_stream)(&context);
@@ -150,13 +154,31 @@ impl CodecRegistry {
     }
 
     /// Convenience: prepare a Chat → Messages conversion (`chat_to_messages_v1`).
-    pub fn chat_to_messages(model: &str, request: &serde_json::Value) -> Result<PreparedConversion, UnsupportedFeatures> {
-        Self::prepare(Downstream::ChatCompletions, Upstream::Messages, &Self::version(), model, request)
+    pub fn chat_to_messages(
+        model: &str,
+        request: &serde_json::Value,
+    ) -> Result<PreparedConversion, UnsupportedFeatures> {
+        Self::prepare(
+            Downstream::ChatCompletions,
+            Upstream::Messages,
+            &Self::version(),
+            model,
+            request,
+        )
     }
 
     /// Convenience: prepare a Messages → Chat conversion (`messages_to_chat_v1`).
-    pub fn messages_to_chat(model: &str, request: &serde_json::Value) -> Result<PreparedConversion, UnsupportedFeatures> {
-        Self::prepare(Downstream::Messages, Upstream::ChatCompletions, &Self::version(), model, request)
+    pub fn messages_to_chat(
+        model: &str,
+        request: &serde_json::Value,
+    ) -> Result<PreparedConversion, UnsupportedFeatures> {
+        Self::prepare(
+            Downstream::Messages,
+            Upstream::ChatCompletions,
+            &Self::version(),
+            model,
+            request,
+        )
     }
 }
 

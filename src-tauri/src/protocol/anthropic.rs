@@ -34,7 +34,9 @@ fn event(name: &str, value: Value) -> String {
 }
 
 impl AnthropicStreamState {
-    pub fn usage(&self) -> (i64, i64) { (self.input_tokens as i64, self.output_tokens as i64) }
+    pub fn usage(&self) -> (i64, i64) {
+        (self.input_tokens as i64, self.output_tokens as i64)
+    }
     /// Feed arbitrary network bytes.  A TCP chunk may split a UTF-8 codepoint,
     /// an SSE field, or the CRLF event delimiter, so bytes are retained until a
     /// complete event is available.
@@ -116,7 +118,9 @@ impl AnthropicStreamState {
                 events.push(event("content_block_delta", serde_json::json!({"type":"content_block_delta", "index":index, "delta":{"type":"text_delta", "text":text}})));
             }
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                for call in calls { self.consume_tool_call(call)?; }
+                for call in calls {
+                    self.consume_tool_call(call)?;
+                }
             }
             if let Some(reason) = choice
                 .get("finish_reason")
@@ -168,9 +172,15 @@ impl AnthropicStreamState {
             .and_then(|f| f.get("arguments"))
             .and_then(Value::as_str);
         let tool = self.tools.entry(source_index).or_default();
-        if let Some(id) = id { tool.id = id.to_string(); }
-        if let Some(name) = name { tool.name = name.to_string(); }
-        if let Some(arguments) = arguments { tool.arguments.push_str(arguments); }
+        if let Some(id) = id {
+            tool.id = id.to_string();
+        }
+        if let Some(name) = name {
+            tool.name = name.to_string();
+        }
+        if let Some(arguments) = arguments {
+            tool.arguments.push_str(arguments);
+        }
         Ok(())
     }
 
@@ -188,16 +198,25 @@ impl AnthropicStreamState {
         // blocks may not: serialize each complete tool block only after every
         // text block has stopped.
         for tool in self.tools.values_mut() {
-            if tool.id.is_empty() || tool.name.is_empty() { return Err("OpenAI stream ended with an incomplete tool call".to_string()); }
-            let input: Value = serde_json::from_str(&tool.arguments).map_err(|error| format!("OpenAI stream ended with invalid tool arguments: {error}"))?;
-            if !input.is_object() { return Err("OpenAI stream tool arguments must decode to a JSON object".to_string()); }
+            if tool.id.is_empty() || tool.name.is_empty() {
+                return Err("OpenAI stream ended with an incomplete tool call".to_string());
+            }
+            let input: Value = serde_json::from_str(&tool.arguments).map_err(|error| {
+                format!("OpenAI stream ended with invalid tool arguments: {error}")
+            })?;
+            if !input.is_object() {
+                return Err("OpenAI stream tool arguments must decode to a JSON object".to_string());
+            }
             let index = self.next_content_index;
             self.next_content_index += 1;
             tool.content_index = Some(index);
             events.push(event("content_block_start", serde_json::json!({"type":"content_block_start", "index":index, "content_block":{"type":"tool_use", "id":tool.id, "name":tool.name, "input":{}}})));
             events.push(event("content_block_delta", serde_json::json!({"type":"content_block_delta", "index":index, "delta":{"type":"input_json_delta", "partial_json":tool.arguments}})));
             tool.stopped = true;
-            events.push(event("content_block_stop", serde_json::json!({"type":"content_block_stop", "index":index})));
+            events.push(event(
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop", "index":index}),
+            ));
         }
         let stop_reason = match self.finish_reason.as_deref() {
             Some("length") => "max_tokens",
@@ -312,7 +331,10 @@ mod tests {
         assert!(output.contains("\"stop_sequence\":null"));
         let text_stop = output.find("content_block_stop").unwrap();
         let first_tool = output.find("\"type\":\"tool_use\"").unwrap();
-        assert!(text_stop < first_tool, "text must stop before a tool block starts");
+        assert!(
+            text_stop < first_tool,
+            "text must stop before a tool block starts"
+        );
         assert!(output.find("\"id\":\"a\"").unwrap() < output.find("\"id\":\"b\"").unwrap());
         assert_eq!(output.matches("event: message_stop").count(), 1);
     }
@@ -322,10 +344,24 @@ mod tests {
         let mut state = AnthropicStreamState::default();
         let tool = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}}]}\n\n";
         state.feed(tool, "model", "msg_1").unwrap();
-        assert!(state.finish("model", "msg_1").unwrap().join("").contains("\"stop_reason\":\"tool_use\""));
+        assert!(state
+            .finish("model", "msg_1")
+            .unwrap()
+            .join("")
+            .contains("\"stop_reason\":\"tool_use\""));
 
         let mut refusal = AnthropicStreamState::default();
-        refusal.feed(b"data: {\"choices\":[{\"delta\":{\"refusal\":\"no\"}}]}\n\n", "model", "msg_2").unwrap();
-        assert!(refusal.finish("model", "msg_2").unwrap().join("").contains("\"stop_reason\":\"refusal\""));
+        refusal
+            .feed(
+                b"data: {\"choices\":[{\"delta\":{\"refusal\":\"no\"}}]}\n\n",
+                "model",
+                "msg_2",
+            )
+            .unwrap();
+        assert!(refusal
+            .finish("model", "msg_2")
+            .unwrap()
+            .join("")
+            .contains("\"stop_reason\":\"refusal\""));
     }
 }

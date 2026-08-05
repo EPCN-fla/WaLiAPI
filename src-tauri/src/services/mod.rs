@@ -1,12 +1,13 @@
+pub mod channel_test;
 pub mod knowledge;
 pub mod mcp;
 
+use crate::server::router::SharedState;
+use crate::AppState;
 use async_trait::async_trait;
 use axum::Router;
 use serde::Serialize;
 use std::sync::Arc;
-use crate::AppState;
-use crate::server::router::SharedState;
 
 /// Service trait — all services implement this interface
 #[async_trait]

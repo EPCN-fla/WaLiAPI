@@ -27,12 +27,14 @@ pub fn parse_file(filename: &str, content: &[u8]) -> Result<ParsedContent, Strin
             Ok(ParsedContent::Markdown { text })
         }
         // Code files
-        "rs" | "go" | "py" | "ts" | "tsx" | "js" | "jsx" |
-        "java" | "c" | "cpp" | "h" | "hpp" | "cs" | "php" |
-        "swift" | "kt" | "rb" | "scala" | "clj" | "sh" | "bash" |
-        "vue" | "svelte" | "sql" | "proto" | "gradle" => {
+        "rs" | "go" | "py" | "ts" | "tsx" | "js" | "jsx" | "java" | "c" | "cpp" | "h" | "hpp"
+        | "cs" | "php" | "swift" | "kt" | "rb" | "scala" | "clj" | "sh" | "bash" | "vue"
+        | "svelte" | "sql" | "proto" | "gradle" => {
             let text = String::from_utf8_lossy(content).to_string();
-            Ok(ParsedContent::Code { text, language: ext.clone() })
+            Ok(ParsedContent::Code {
+                text,
+                language: ext.clone(),
+            })
         }
         // Structured
         "json" | "yaml" | "yml" | "toml" | "xml" | "html" | "csv" => {
@@ -47,12 +49,14 @@ pub fn parse_file(filename: &str, content: &[u8]) -> Result<ParsedContent, Strin
         // PDF
         "pdf" => {
             let content_vec = content.to_vec(); // owned copy for catch_unwind
-            // 捕获 PDF 解析过程中的代码崩溃（panic）
+                                                // 捕获 PDF 解析过程中的代码崩溃（panic）
             let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pdf_extract::extract_text_from_mem(&content_vec)
             }))
             .map_err(|e| {
-                let msg = e.downcast_ref::<&str>().copied()
+                let msg = e
+                    .downcast_ref::<&str>()
+                    .copied()
                     .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()))
                     .unwrap_or("Unknown PDF parse panic");
                 format!("PDF parse panic: {}", msg)

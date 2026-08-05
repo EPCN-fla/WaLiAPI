@@ -31,7 +31,7 @@ pub use registry::{
     CodecRegistry, Downstream, NonStreamDecoder, PreparedConversion, StreamDecoder, Upstream,
     Version,
 };
-pub use report::{CodecVersion, ConversionReport, ConversionContext, Usage, FieldStatus};
+pub use report::{CodecVersion, ConversionContext, ConversionReport, FieldStatus, Usage};
 
 #[cfg(test)]
 mod chat_messages_codec;

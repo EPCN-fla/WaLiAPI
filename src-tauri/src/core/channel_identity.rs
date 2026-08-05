@@ -126,7 +126,11 @@ pub fn resolve_channel_identity(row: &ChannelIdentityRow) -> ChannelIdentity {
 
     // A row written by the new dual-write path (revision > 0) with a coherent
     // identity is trusted verbatim.
-    if identity_revision > 0 && protocol_ok && provider_ok && native_base_ok && !endpoints.is_empty()
+    if identity_revision > 0
+        && protocol_ok
+        && provider_ok
+        && native_base_ok
+        && !endpoints.is_empty()
     {
         let protocol = row.protocol.as_deref().unwrap_or("").to_string();
         let provider = row.provider.as_deref().unwrap_or("").to_string();
@@ -169,170 +173,167 @@ fn infer_legacy(
     identity_revision: i64,
 ) -> ChannelIdentity {
     let t = channel_type.trim();
-    let (protocol, provider, native_base_url, endpoints, override_used, inferred_executor) =
-        match t {
-            "openai" => {
-                let provider = if host_in(base_url, OPENAI_CANONICAL_HOSTS) {
-                    ChannelProvider::OpenAI
-                } else {
-                    ChannelProvider::Custom
-                };
-                // T00 decision 2 / design 11.2: an old openai record must NOT be
-                // reported natively capable of /responses just because it is
-                // typed openai. The Responses-via-Chat legacy debt is only
-                // recorded per-row in config.legacy_capabilities.
-                let has_responses_debt = config
-                    .get("legacy_capabilities")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .any(|s| s.as_str() == Some("responses_via_chat_v1"))
-                    })
-                    .unwrap_or(false);
-                let eps = if has_responses_debt {
-                    vec![
-                        NativeEndpoint::ChatCompletions,
-                        NativeEndpoint::Responses,
-                    ]
-                } else {
-                    vec![NativeEndpoint::ChatCompletions]
-                };
-                (
-                    ChannelProtocol::OpenAI,
-                    provider,
-                    base_url.to_string(),
-                    eps,
-                    None,
-                    ExecutorKind::ChatCompletions,
-                )
-            }
-            "deepseek" => (
+    let (protocol, provider, native_base_url, endpoints, override_used, inferred_executor) = match t
+    {
+        "openai" => {
+            let provider = if host_in(base_url, OPENAI_CANONICAL_HOSTS) {
+                ChannelProvider::OpenAI
+            } else {
+                ChannelProvider::Custom
+            };
+            // T00 decision 2 / design 11.2: an old openai record must NOT be
+            // reported natively capable of /responses just because it is
+            // typed openai. The Responses-via-Chat legacy debt is only
+            // recorded per-row in config.legacy_capabilities.
+            let has_responses_debt = config
+                .get("legacy_capabilities")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .any(|s| s.as_str() == Some("responses_via_chat_v1"))
+                })
+                .unwrap_or(false);
+            let eps = if has_responses_debt {
+                vec![NativeEndpoint::ChatCompletions, NativeEndpoint::Responses]
+            } else {
+                vec![NativeEndpoint::ChatCompletions]
+            };
+            (
                 ChannelProtocol::OpenAI,
-                ChannelProvider::DeepSeek,
+                provider,
                 base_url.to_string(),
-                vec![NativeEndpoint::ChatCompletions],
+                eps,
                 None,
                 ExecutorKind::ChatCompletions,
-            ),
-            "claude" => {
-                let provider = infer_claude_provider(base_url);
-                // Legacy claude base_url is the old-adaptor root (already
-                // includes "/v1"); the new-code executor appends "v1/messages"
-                // to native_base_url, so the native root must drop a trailing
-                // "/v1" to avoid ".../v1/v1/messages". Trim trailing '/' FIRST
-                // so "…/v1/" (trailing slash after /v1) also collapses to the
-                // vendor root and never yields a double "/v1/v1/messages".
-                let trimmed = base_url.trim_end_matches('/');
-                let native = trimmed
-                    .strip_suffix("/v1")
-                    .unwrap_or(trimmed)
-                    .to_string();
-                (
-                    ChannelProtocol::Anthropic,
-                    provider,
-                    native,
-                    vec![NativeEndpoint::Messages],
-                    None,
-                    ExecutorKind::Messages,
-                )
-            }
-            // Legacy Gemini keeps its original URL, query-key auth and the
-            // native executor until the user explicitly applies the Google
-            // OpenAI-compat preset (design 11.1).
-            "gemini" => {
-                let override_value = legacy_override
-                    .filter(|o| *o == "gemini_native")
-                    .unwrap_or("gemini_native");
-                (
-                    ChannelProtocol::OpenAI,
-                    ChannelProvider::Google,
-                    base_url.to_string(),
-                    Vec::new(),
-                    Some(override_value.to_string()),
-                    ExecutorKind::GeminiNative,
-                )
-            }
-            "qwen" => (
-                ChannelProtocol::OpenAI,
-                ChannelProvider::Qwen,
-                base_url.to_string(),
-                vec![NativeEndpoint::ChatCompletions],
+            )
+        }
+        "deepseek" => (
+            ChannelProtocol::OpenAI,
+            ChannelProvider::DeepSeek,
+            base_url.to_string(),
+            vec![NativeEndpoint::ChatCompletions],
+            None,
+            ExecutorKind::ChatCompletions,
+        ),
+        "claude" => {
+            let provider = infer_claude_provider(base_url);
+            // Legacy claude base_url is the old-adaptor root (already
+            // includes "/v1"); the new-code executor appends "v1/messages"
+            // to native_base_url, so the native root must drop a trailing
+            // "/v1" to avoid ".../v1/v1/messages". Trim trailing '/' FIRST
+            // so "…/v1/" (trailing slash after /v1) also collapses to the
+            // vendor root and never yields a double "/v1/v1/messages".
+            let trimmed = base_url.trim_end_matches('/');
+            let native = trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string();
+            // T06 I-4 (leader adjudication 2026-08-05): legacy `type ==
+            // "claude"` served /v1/messages/count_tokens under the old
+            // predicate, so a revision-0 claude row must infer
+            // [Messages, CountTokens] — NOT [Messages] only.  The canonical
+            // Anthropic preset declares count_tokens, and legacy claude is
+            // Anthropic by definition; granting count_tokens preserves the
+            // pre-refactor behavior exactly.  (Contrast with the T02 F2
+            // openai-responses ruling: legacy openai never served native
+            // responses, so NOT granting preserved old behavior there.)
+            (
+                ChannelProtocol::Anthropic,
+                provider,
+                native,
+                vec![NativeEndpoint::Messages, NativeEndpoint::CountTokens],
                 None,
-                ExecutorKind::ChatCompletions,
-            ),
-            "zhipu" => (
+                ExecutorKind::Messages,
+            )
+        }
+        // Legacy Gemini keeps its original URL, query-key auth and the
+        // native executor until the user explicitly applies the Google
+        // OpenAI-compat preset (design 11.1).
+        "gemini" => {
+            let override_value = legacy_override
+                .filter(|o| *o == "gemini_native")
+                .unwrap_or("gemini_native");
+            (
                 ChannelProtocol::OpenAI,
-                ChannelProvider::Zhipu,
+                ChannelProvider::Google,
                 base_url.to_string(),
-                vec![NativeEndpoint::ChatCompletions],
+                Vec::new(),
+                Some(override_value.to_string()),
+                ExecutorKind::GeminiNative,
+            )
+        }
+        "qwen" => (
+            ChannelProtocol::OpenAI,
+            ChannelProvider::Qwen,
+            base_url.to_string(),
+            vec![NativeEndpoint::ChatCompletions],
+            None,
+            ExecutorKind::ChatCompletions,
+        ),
+        "zhipu" => (
+            ChannelProtocol::OpenAI,
+            ChannelProvider::Zhipu,
+            base_url.to_string(),
+            vec![NativeEndpoint::ChatCompletions],
+            None,
+            ExecutorKind::ChatCompletions,
+        ),
+        "moonshot" => (
+            ChannelProtocol::OpenAI,
+            ChannelProvider::Moonshot,
+            base_url.to_string(),
+            vec![NativeEndpoint::ChatCompletions],
+            None,
+            ExecutorKind::ChatCompletions,
+        ),
+        "doubao" => (
+            ChannelProtocol::OpenAI,
+            ChannelProvider::Doubao,
+            base_url.to_string(),
+            vec![NativeEndpoint::ChatCompletions],
+            None,
+            ExecutorKind::ChatCompletions,
+        ),
+        // Old Ollama: strip ONLY an exact trailing "/v1" for the native
+        // base. Never produces "/v1/api/chat" (design 11.1). Trim trailing
+        // '/' first so "…:11434/v1/" also collapses to "…:11434" instead of
+        // yielding "/v1/api/chat".
+        "ollama" => {
+            let trimmed = base_url.trim_end_matches('/');
+            let native = trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string();
+            (
+                ChannelProtocol::Ollama,
+                ChannelProvider::Ollama,
+                native,
+                vec![NativeEndpoint::ApiChat],
                 None,
-                ExecutorKind::ChatCompletions,
-            ),
-            "moonshot" => (
+                ExecutorKind::ApiChat,
+            )
+        }
+        // "custom" and anything unknown: OpenAI/custom with the legacy
+        // fallback adaptor which hits /chat/completions. Preserve the
+        // original URL, do not fake a vendor (T02 spec custom rule).
+        _ => {
+            let has_responses_debt = config
+                .get("legacy_capabilities")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .any(|s| s.as_str() == Some("responses_via_chat_v1"))
+                })
+                .unwrap_or(false);
+            let eps = if has_responses_debt {
+                vec![NativeEndpoint::ChatCompletions, NativeEndpoint::Responses]
+            } else {
+                vec![NativeEndpoint::ChatCompletions]
+            };
+            (
                 ChannelProtocol::OpenAI,
-                ChannelProvider::Moonshot,
+                ChannelProvider::Custom,
                 base_url.to_string(),
-                vec![NativeEndpoint::ChatCompletions],
+                eps,
                 None,
-                ExecutorKind::ChatCompletions,
-            ),
-            "doubao" => (
-                ChannelProtocol::OpenAI,
-                ChannelProvider::Doubao,
-                base_url.to_string(),
-                vec![NativeEndpoint::ChatCompletions],
-                None,
-                ExecutorKind::ChatCompletions,
-            ),
-            // Old Ollama: strip ONLY an exact trailing "/v1" for the native
-            // base. Never produces "/v1/api/chat" (design 11.1). Trim trailing
-            // '/' first so "…:11434/v1/" also collapses to "…:11434" instead of
-            // yielding "/v1/api/chat".
-            "ollama" => {
-                let trimmed = base_url.trim_end_matches('/');
-                let native = trimmed
-                    .strip_suffix("/v1")
-                    .unwrap_or(trimmed)
-                    .to_string();
-                (
-                    ChannelProtocol::Ollama,
-                    ChannelProvider::Ollama,
-                    native,
-                    vec![NativeEndpoint::ApiChat],
-                    None,
-                    ExecutorKind::ApiChat,
-                )
-            }
-            // "custom" and anything unknown: OpenAI/custom with the legacy
-            // fallback adaptor which hits /chat/completions. Preserve the
-            // original URL, do not fake a vendor (T02 spec custom rule).
-            _ => {
-                let has_responses_debt = config
-                    .get("legacy_capabilities")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .any(|s| s.as_str() == Some("responses_via_chat_v1"))
-                    })
-                    .unwrap_or(false);
-                let eps = if has_responses_debt {
-                    vec![
-                        NativeEndpoint::ChatCompletions,
-                        NativeEndpoint::Responses,
-                    ]
-                } else {
-                    vec![NativeEndpoint::ChatCompletions]
-                };
-                (
-                    ChannelProtocol::OpenAI,
-                    ChannelProvider::Custom,
-                    base_url.to_string(),
-                    eps,
-                    None,
-                    ExecutorKind::FallbackChat,
-                )
-            }
-        };
+                ExecutorKind::FallbackChat,
+            )
+        }
+    };
 
     let endpoints: Vec<String> = endpoints
         .into_iter()
@@ -391,25 +392,27 @@ fn infer_claude_provider(base_url: &str) -> ChannelProvider {
         let lower = base_url.to_lowercase();
         let p = all_channel_presets()
             .into_iter()
-            .filter(|p| p.protocol == ChannelProtocol::Anthropic && p.provider != ChannelProvider::Custom)
+            .filter(|p| {
+                p.protocol == ChannelProtocol::Anthropic && p.provider != ChannelProvider::Custom
+            })
             .find(|p| {
-                !p.native_base_url.is_empty() && lower.starts_with(&p.native_base_url.to_lowercase())
+                !p.native_base_url.is_empty()
+                    && lower.starts_with(&p.native_base_url.to_lowercase())
             })
             .map(|p| p.provider);
         p.unwrap_or(ChannelProvider::Custom)
     }
 }
 
-impl ExecutorKind {
-    pub fn to_string(&self) -> String {
-        match self {
+impl std::fmt::Display for ExecutorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
             ExecutorKind::ChatCompletions => "chat_completions",
             ExecutorKind::Messages => "messages",
             ExecutorKind::ApiChat => "api_chat",
             ExecutorKind::GeminiNative => "gemini_native",
             ExecutorKind::FallbackChat => "fallback_chat",
-        }
-        .to_string()
+        })
     }
 }
 
@@ -493,11 +496,7 @@ fn legacy_alias_for(protocol: &str) -> String {
 mod tests {
     use super::*;
 
-    fn row(
-        channel_type: &str,
-        base_url: &str,
-        rev: i64,
-    ) -> ChannelIdentityRow {
+    fn row(channel_type: &str, base_url: &str, rev: i64) -> ChannelIdentityRow {
         let mut r = ChannelIdentityRow {
             channel_type: channel_type.to_string(),
             base_url: base_url.to_string(),
@@ -553,7 +552,8 @@ mod tests {
         // exactly one "/v1/messages", not "/v1/v1/messages".
         let id = resolve_channel_identity(&row("claude", "https://api.anthropic.com/v1/", 0));
         assert_eq!(id.native_base_url, "https://api.anthropic.com");
-        assert_eq!(id.native_endpoints, vec!["messages"]);
+        // T06 I-4: legacy claude infers [messages, count_tokens].
+        assert_eq!(id.native_endpoints, vec!["messages", "count_tokens"]);
     }
 
     #[test]
@@ -572,7 +572,8 @@ mod tests {
         // legacy claude base is already the /v1 root; the native root drops
         // the "/v1" so the new executor appends "v1/messages" exactly once.
         assert_eq!(id.native_base_url, "https://api.anthropic.com");
-        assert_eq!(id.native_endpoints, vec!["messages"]);
+        // T06 I-4: legacy claude infers [messages, count_tokens].
+        assert_eq!(id.native_endpoints, vec!["messages", "count_tokens"]);
         assert_eq!(id.executor_kind, "messages");
     }
 
@@ -585,13 +586,24 @@ mod tests {
         assert_eq!(id.provider, "deepseek");
     }
 
+    /// T06 I-4 (leader adjudication): legacy revision-0 `type == "claude"`
+    /// MUST infer the count_tokens capability (the old predicate served
+    /// /v1/messages/count_tokens), so the flag-OFF fallback keeps serving it.
+    #[test]
+    fn legacy_claude_infers_count_tokens() {
+        let id = resolve_channel_identity(&row("claude", "https://api.anthropic.com/v1", 0));
+        assert_eq!(id.protocol, "anthropic");
+        assert_eq!(
+            id.native_endpoints,
+            vec!["messages", "count_tokens"],
+            "legacy claude must retain count_tokens (no-regression contract)"
+        );
+        assert!(id.inferred);
+    }
+
     #[test]
     fn claude_deepseek_compat_maps_to_deepseek() {
-        let id = resolve_channel_identity(&row(
-            "claude",
-            "https://api.deepseek.com/anthropic",
-            0,
-        ));
+        let id = resolve_channel_identity(&row("claude", "https://api.deepseek.com/anthropic", 0));
         assert_eq!(id.protocol, "anthropic");
         assert_eq!(id.provider, "deepseek");
     }
@@ -616,7 +628,10 @@ mod tests {
             Some("gemini_native")
         );
         assert_eq!(id.executor_kind, "gemini_native");
-        assert_eq!(id.native_base_url, "https://generativelanguage.googleapis.com");
+        assert_eq!(
+            id.native_base_url,
+            "https://generativelanguage.googleapis.com"
+        );
     }
 
     #[test]
@@ -656,7 +671,11 @@ mod tests {
         // The native base must never keep a "/v1" suffix that an api_chat
         // executor would append to, producing "/v1/api/chat".
         let id = resolve_channel_identity(&row("ollama", "http://localhost:11434/v1", 0));
-        assert!(!id.native_base_url.ends_with("/v1"), "{}", id.native_base_url);
+        assert!(
+            !id.native_base_url.ends_with("/v1"),
+            "{}",
+            id.native_base_url
+        );
     }
 
     #[test]
@@ -743,7 +762,11 @@ mod tests {
 
     #[test]
     fn new_to_legacy_openai_google_is_openai_type() {
-        let mut r = row("openai", "https://generativelanguage.googleapis.com/v1beta/openai", 0);
+        let r = row(
+            "openai",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            0,
+        );
         let id = resolve_channel_identity(&r);
         // provider stays custom because the host is not api.openai.com
         let (lt, _) = new_to_legacy(&id);

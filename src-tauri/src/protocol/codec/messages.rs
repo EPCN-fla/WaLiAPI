@@ -27,35 +27,38 @@ pub fn encode_messages_to_chat(
     // before any upstream access.
     if let Some(obj) = body.as_object() {
         for (key, _) in obj.iter() {
-        if matches!(
-            key.as_str(),
-            "thinking"
-                | "output_config"
-                | "container"
-                | "context_management"
-                | "context_management_config"
-        ) {
-            request::reject(
-                &mut out,
-                FeatureKind::BetaFeature,
-                format!("/{key}"),
-                format!("Messages field {key:?} has no Chat Completions equivalent"),
-            );
-        }
+            if matches!(
+                key.as_str(),
+                "thinking"
+                    | "output_config"
+                    | "container"
+                    | "context_management"
+                    | "context_management_config"
+            ) {
+                request::reject(
+                    &mut out,
+                    FeatureKind::BetaFeature,
+                    format!("/{key}"),
+                    format!("Messages field {key:?} has no Chat Completions equivalent"),
+                );
+            }
         }
     }
 
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let messages = body.get("messages").and_then(Value::as_array).ok_or_else(|| {
-        let mut rejections = out.clone();
-        request::reject(
-            &mut rejections,
-            FeatureKind::UnknownRole,
-            "/messages",
-            "Messages request requires a messages array",
-        );
-        UnsupportedFeatures::new(rejections)
-    })?;
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            let mut rejections = out.clone();
+            request::reject(
+                &mut rejections,
+                FeatureKind::UnknownRole,
+                "/messages",
+                "Messages request requires a messages array",
+            );
+            UnsupportedFeatures::new(rejections)
+        })?;
 
     // system -> single system message (order preserved, annotations stripped).
     let mut system_text: Option<String> = None;
@@ -88,16 +91,21 @@ pub fn encode_messages_to_chat(
     if let Some(sys) = system_text {
         chat.insert(
             "messages".to_string(),
-            Value::Array(std::iter::once(serde_json::json!({"role": "system", "content": sys}))
-                .chain(chat_messages.into_iter())
-                .collect()),
+            Value::Array(
+                std::iter::once(serde_json::json!({"role": "system", "content": sys}))
+                    .chain(chat_messages.into_iter())
+                    .collect(),
+            ),
         );
     } else {
         chat.insert("messages".to_string(), Value::Array(chat_messages));
     }
     chat.insert(
         "max_tokens".to_string(),
-        body.get("max_tokens").and_then(Value::as_u64).map(Value::from).unwrap_or(Value::from(4096u64)),
+        body.get("max_tokens")
+            .and_then(Value::as_u64)
+            .map(Value::from)
+            .unwrap_or(Value::from(4096u64)),
     );
     chat.insert("stream".to_string(), Value::Bool(stream));
     if let Some(t) = body.get("temperature") {
@@ -173,7 +181,10 @@ pub fn encode_messages_to_chat(
 /// Chat messages.  A `tool_result` user message is split into the preceding
 /// text (as a user message) and a `role: tool` message; an assistant message
 /// with tool_use blocks becomes one assistant message with `tool_calls`.
-fn convert_anthropic_message_to_chat(msg: &Value, pointer: &str) -> Result<Vec<Value>, UnsupportedFeatures> {
+fn convert_anthropic_message_to_chat(
+    msg: &Value,
+    pointer: &str,
+) -> Result<Vec<Value>, UnsupportedFeatures> {
     let role = msg.get("role").and_then(Value::as_str).ok_or_else(|| {
         UnsupportedFeatures::single(
             FeatureKind::UnknownRole,
@@ -204,7 +215,13 @@ fn convert_anthropic_message_to_chat(msg: &Value, pointer: &str) -> Result<Vec<V
                 let content = if parts.len() == 1
                     && parts[0].get("type").and_then(Value::as_str) == Some("text")
                 {
-                    Value::String(parts[0].get("text").and_then(Value::as_str).unwrap_or("").to_string())
+                    Value::String(
+                        parts[0]
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    )
                 } else {
                     Value::Array(std::mem::take(parts))
                 };
@@ -254,21 +271,32 @@ fn convert_anthropic_message_to_chat(msg: &Value, pointer: &str) -> Result<Vec<V
                             "tool_use blocks must be in an assistant message",
                         ));
                     }
-                    let id = block.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| {
-                        UnsupportedFeatures::single(
-                            FeatureKind::MissingToolField,
-                            format!("{bp}/id"),
-                            "tool_use block missing id",
-                        )
-                    })?;
-                    let name = block.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| {
-                        UnsupportedFeatures::single(
-                            FeatureKind::MissingToolField,
-                            format!("{bp}/name"),
-                            "tool_use block missing name",
-                        )
-                    })?;
-                    let input = block.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                    let id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            UnsupportedFeatures::single(
+                                FeatureKind::MissingToolField,
+                                format!("{bp}/id"),
+                                "tool_use block missing id",
+                            )
+                        })?;
+                    let name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            UnsupportedFeatures::single(
+                                FeatureKind::MissingToolField,
+                                format!("{bp}/name"),
+                                "tool_use block missing name",
+                            )
+                        })?;
+                    let input = block
+                        .get("input")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
                     if !input.is_object() {
                         return Err(UnsupportedFeatures::single(
                             FeatureKind::InvalidToolArguments,
@@ -298,13 +326,17 @@ fn convert_anthropic_message_to_chat(msg: &Value, pointer: &str) -> Result<Vec<V
                         ));
                     }
                     flush_user(&mut user_parts, &mut out);
-                    let tool_use_id = block.get("tool_use_id").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| {
-                        UnsupportedFeatures::single(
-                            FeatureKind::MissingToolField,
-                            format!("{bp}/tool_use_id"),
-                            "tool_result missing tool_use_id",
-                        )
-                    })?;
+                    let tool_use_id = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            UnsupportedFeatures::single(
+                                FeatureKind::MissingToolField,
+                                format!("{bp}/tool_use_id"),
+                                "tool_result missing tool_use_id",
+                            )
+                        })?;
                     let (text, is_error) = tool_result_to_chat_content(block, &bp)?;
                     let content = if is_error {
                         format!("Tool execution error:\n{text}")
@@ -379,8 +411,14 @@ fn convert_anthropic_message_to_chat(msg: &Value, pointer: &str) -> Result<Vec<V
 }
 
 /// Reduce a `tool_result` block to Chat text + error flag.
-fn tool_result_to_chat_content(block: &Value, pointer: &str) -> Result<(String, bool), UnsupportedFeatures> {
-    let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+fn tool_result_to_chat_content(
+    block: &Value,
+    pointer: &str,
+) -> Result<(String, bool), UnsupportedFeatures> {
+    let is_error = block
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let content = block.get("content");
     match content {
         None | Some(Value::Null) => Ok((String::new(), is_error)),
@@ -390,7 +428,9 @@ fn tool_result_to_chat_content(block: &Value, pointer: &str) -> Result<(String, 
             for (i, item) in items.iter().enumerate() {
                 let ip = format!("{pointer}/content/{i}");
                 match item.get("type").and_then(Value::as_str) {
-                    Some("text") => text.push_str(item.get("text").and_then(Value::as_str).unwrap_or("")),
+                    Some("text") => {
+                        text.push_str(item.get("text").and_then(Value::as_str).unwrap_or(""))
+                    }
                     Some("image") => {
                         return Err(UnsupportedFeatures::single(
                             FeatureKind::Media,
@@ -418,18 +458,28 @@ fn tool_result_to_chat_content(block: &Value, pointer: &str) -> Result<(String, 
 }
 
 /// Convert an Anthropic tool to the Chat `tools` entry.
-fn convert_anthropic_tool_to_chat(tool: &Value, pointer: &str) -> Result<Value, UnsupportedFeatures> {
+fn convert_anthropic_tool_to_chat(
+    tool: &Value,
+    pointer: &str,
+) -> Result<Value, UnsupportedFeatures> {
     let ty = tool.get("type").and_then(Value::as_str).unwrap_or("custom");
     match ty {
         "custom" | "" => {
-            let name = tool.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| {
-                UnsupportedFeatures::single(
-                    FeatureKind::MissingToolField,
-                    format!("{pointer}/name"),
-                    "tool is missing name",
-                )
-            })?;
-            let description = tool.get("description").and_then(Value::as_str).unwrap_or("");
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    UnsupportedFeatures::single(
+                        FeatureKind::MissingToolField,
+                        format!("{pointer}/name"),
+                        "tool is missing name",
+                    )
+                })?;
+            let description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let input_schema = tool.get("input_schema").ok_or_else(|| {
                 UnsupportedFeatures::single(
                     FeatureKind::InvalidToolArguments,
@@ -437,7 +487,10 @@ fn convert_anthropic_tool_to_chat(tool: &Value, pointer: &str) -> Result<Value, 
                     format!("tool {name:?} is missing input_schema"),
                 )
             })?;
-            let parameters = request::anthropic_schema_to_chat_parameters(input_schema, &format!("{pointer}/input_schema"))?;
+            let parameters = request::anthropic_schema_to_chat_parameters(
+                input_schema,
+                &format!("{pointer}/input_schema"),
+            )?;
             Ok(serde_json::json!({
                 "type": "function",
                 "function": {
@@ -471,13 +524,17 @@ fn anthropic_tool_choice_to_chat(tc: &Value, pointer: &str) -> Result<Value, Uns
         "auto" => Ok(Value::String("auto".to_string())),
         "any" => Ok(Value::String("required".to_string())),
         "tool" => {
-            let name = tc.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| {
-                UnsupportedFeatures::single(
-                    FeatureKind::MissingToolField,
-                    format!("{pointer}/name"),
-                    "tool_choice type=tool missing name",
-                )
-            })?;
+            let name = tc
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    UnsupportedFeatures::single(
+                        FeatureKind::MissingToolField,
+                        format!("{pointer}/name"),
+                        "tool_choice type=tool missing name",
+                    )
+                })?;
             Ok(serde_json::json!({
                 "type": "function",
                 "function": {"name": name}
@@ -525,13 +582,16 @@ pub fn decode_messages_response_to_chat(
             "Messages response must have type=message",
         ));
     }
-    let content = body.get("content").and_then(Value::as_array).ok_or_else(|| {
-        UnsupportedFeatures::single(
-            FeatureKind::UnknownEvent,
-            "/content",
-            "Messages response missing content array",
-        )
-    })?;
+    let content = body
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            UnsupportedFeatures::single(
+                FeatureKind::UnknownEvent,
+                "/content",
+                "Messages response missing content array",
+            )
+        })?;
 
     let mut text = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
@@ -542,21 +602,32 @@ pub fn decode_messages_response_to_chat(
                 text.push_str(block.get("text").and_then(Value::as_str).unwrap_or(""));
             }
             Some("tool_use") => {
-                let id = block.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| {
-                    UnsupportedFeatures::single(
-                        FeatureKind::MissingToolField,
-                        format!("{bp}/id"),
-                        "tool_use block missing id",
-                    )
-                })?;
-                let name = block.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| {
-                    UnsupportedFeatures::single(
-                        FeatureKind::MissingToolField,
-                        format!("{bp}/name"),
-                        "tool_use block missing name",
-                    )
-                })?;
-                let input = block.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        UnsupportedFeatures::single(
+                            FeatureKind::MissingToolField,
+                            format!("{bp}/id"),
+                            "tool_use block missing id",
+                        )
+                    })?;
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        UnsupportedFeatures::single(
+                            FeatureKind::MissingToolField,
+                            format!("{bp}/name"),
+                            "tool_use block missing name",
+                        )
+                    })?;
+                let input = block
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
                 if !input.is_object() {
                     return Err(UnsupportedFeatures::single(
                         FeatureKind::InvalidToolArguments,
@@ -767,7 +838,11 @@ impl MessagesSseState {
         self.usage
     }
 
-    fn consume_json(&mut self, json: Value, events: &mut Vec<String>) -> Result<(), UnsupportedFeatures> {
+    fn consume_json(
+        &mut self,
+        json: Value,
+        events: &mut Vec<String>,
+    ) -> Result<(), UnsupportedFeatures> {
         let ty = json.get("type").and_then(Value::as_str).ok_or_else(|| {
             UnsupportedFeatures::single(
                 FeatureKind::UnknownEvent,
@@ -808,18 +883,29 @@ impl MessagesSseState {
                         self.text_content_index = Some(index);
                     }
                     Some("tool_use") => {
-                        let id = block.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                        let name = block.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                        let id = block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let name = block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         let tool_index = self.next_tool_index;
                         self.next_tool_index += 1;
-                        self.tools.insert(index, MsgToolAccum {
-                            index: tool_index,
-                            id: id.clone(),
-                            name: name.clone(),
-                            arguments: String::new(),
-                            started: true,
-                            completed: false,
-                        });
+                        self.tools.insert(
+                            index,
+                            MsgToolAccum {
+                                index: tool_index,
+                                id: id.clone(),
+                                name: name.clone(),
+                                arguments: String::new(),
+                                started: true,
+                                completed: false,
+                            },
+                        );
                         // Emit the Chat tool_calls delta immediately (id + name +
                         // empty arguments) so consumers see the call id early.
                         events.push(sse::data_frame(serde_json::json!({
@@ -848,7 +934,10 @@ impl MessagesSseState {
                         }
                     }
                     Some("input_json_delta") => {
-                        let partial = delta.get("partial_json").and_then(Value::as_str).unwrap_or("");
+                        let partial = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
                         if let Some(tool) = self.tools.get_mut(&index) {
                             if !tool.completed {
                                 tool.arguments.push_str(partial);
@@ -944,7 +1033,11 @@ impl MessagesSseState {
         if let Some(c) = u.get("cache_read_input_tokens").and_then(Value::as_u64) {
             self.usage.cache_read_input_tokens = c;
         }
-        if input.is_none() && output.is_none() && self.usage.input_tokens == 0 && self.usage.output_tokens == 0 {
+        if input.is_none()
+            && output.is_none()
+            && self.usage.input_tokens == 0
+            && self.usage.output_tokens == 0
+        {
             self.usage.usage_unknown = true;
         }
     }

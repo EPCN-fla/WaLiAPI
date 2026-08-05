@@ -202,7 +202,12 @@ fn check_ts_js_node(
             // const X = ... → 大写开头视为常量/组件
             let declarator = node.child_by_field_name("declarator")?;
             let name = field_text(&declarator, "name", source).unwrap_or_default();
-            if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            if name
+                .chars()
+                .next()
+                .map(|c| c.is_uppercase())
+                .unwrap_or(false)
+            {
                 return Some((SymbolKind::Constant, name, None));
             }
             None
@@ -400,9 +405,15 @@ class UserController {
 "#;
         let symbols = extract_symbols("test.ts", code);
         assert!(symbols.len() >= 3);
-        assert!(symbols.iter().any(|s| s.name == "handleRequest" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "UserController" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "getUsers" && s.kind == SymbolKind::Method));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "handleRequest" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "UserController" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "getUsers" && s.kind == SymbolKind::Method));
     }
 
     #[test]
@@ -418,9 +429,15 @@ def main():
     return processor.process("hello")
 "#;
         let symbols = extract_symbols("test.py", code);
-        assert!(symbols.iter().any(|s| s.name == "DataProcessor" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "process" && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name == "main" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "DataProcessor" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "process" && s.kind == SymbolKind::Method));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "main" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -441,9 +458,15 @@ fn main() {
 }
 "#;
         let symbols = extract_symbols("test.rs", code);
-        assert!(symbols.iter().any(|s| s.name == "User" && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name == "new" && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name == "main" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "User" && s.kind == SymbolKind::Struct));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "new" && s.kind == SymbolKind::Method));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "main" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -469,9 +492,17 @@ func (s *Server) run() {
 }
 "#;
         let symbols = extract_symbols("test.go", code);
-        assert!(symbols.iter().any(|s| s.name == "Server" && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name == "Handler" && s.kind == SymbolKind::Interface));
-        assert!(symbols.iter().any(|s| s.name == "main" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "run" && s.kind == SymbolKind::Method));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Server" && s.kind == SymbolKind::Struct));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Handler" && s.kind == SymbolKind::Interface));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "main" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "run" && s.kind == SymbolKind::Method));
     }
 }

@@ -44,7 +44,10 @@ pub fn finish(out: Vec<super::error::RejectedField>) -> Result<(), UnsupportedFe
 ///   - `{"type":"function","function":{"name":...}}` → `{"type":"tool","name":...}`
 /// Anything else (including a named-function `"auto"` string, `"disable_parallel_tool_calls"`,
 /// `parallel_tool_calls` interplay, or an unknown object) is rejected.
-pub fn chat_tool_choice_to_anthropic(value: &Value, pointer: &str) -> Result<Option<Value>, UnsupportedFeatures> {
+pub fn chat_tool_choice_to_anthropic(
+    value: &Value,
+    pointer: &str,
+) -> Result<Option<Value>, UnsupportedFeatures> {
     match value {
         Value::String(s) => match s.as_str() {
             "auto" => Ok(Some(Value::String("auto".to_string()))),
@@ -121,7 +124,10 @@ pub fn chat_tool_choice_to_anthropic(value: &Value, pointer: &str) -> Result<Opt
 
 /// Validate an Anthropic `system` value and reduce it to the Chat-compatible
 /// form (system role message content).  Returns the joined text.
-pub fn anthropic_system_to_chat(value: &Value, pointer: &str) -> Result<String, UnsupportedFeatures> {
+pub fn anthropic_system_to_chat(
+    value: &Value,
+    pointer: &str,
+) -> Result<String, UnsupportedFeatures> {
     match value {
         Value::String(s) => Ok(s.clone()),
         Value::Array(items) => {
@@ -130,7 +136,13 @@ pub fn anthropic_system_to_chat(value: &Value, pointer: &str) -> Result<String, 
                 let bp = format!("{pointer}/{i}");
                 match block.get("type").and_then(Value::as_str) {
                     Some("text") => {
-                        texts.push(block.get("text").and_then(Value::as_str).unwrap_or("").to_string());
+                        texts.push(
+                            block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        );
                         // cache_control on a text block is a lossless annotation; strip it.
                     }
                     Some("cache_control") | Some("thinking") => {
@@ -140,16 +152,20 @@ pub fn anthropic_system_to_chat(value: &Value, pointer: &str) -> Result<String, 
                             "system cache_control/thinking block is not representable in Chat",
                         ));
                     }
-                    Some(other) => return Err(UnsupportedFeatures::single(
-                        FeatureKind::UnknownBlock,
-                        bp,
-                        format!("unsupported system block type {other:?}"),
-                    )),
-                    None => return Err(UnsupportedFeatures::single(
-                        FeatureKind::UnknownBlock,
-                        bp,
-                        "system block missing type",
-                    )),
+                    Some(other) => {
+                        return Err(UnsupportedFeatures::single(
+                            FeatureKind::UnknownBlock,
+                            bp,
+                            format!("unsupported system block type {other:?}"),
+                        ))
+                    }
+                    None => {
+                        return Err(UnsupportedFeatures::single(
+                            FeatureKind::UnknownBlock,
+                            bp,
+                            "system block missing type",
+                        ))
+                    }
                 }
             }
             Ok(texts.join(""))
@@ -166,7 +182,10 @@ pub fn anthropic_system_to_chat(value: &Value, pointer: &str) -> Result<String, 
 /// `parameters` JSON schema.  Anthropic allows missing `type`, so we normalize
 /// to `{"type":"object", ...}` while preserving the rest of the schema.  A
 /// non-object schema is rejected.
-pub fn anthropic_schema_to_chat_parameters(input_schema: &Value, pointer: &str) -> Result<Value, UnsupportedFeatures> {
+pub fn anthropic_schema_to_chat_parameters(
+    input_schema: &Value,
+    pointer: &str,
+) -> Result<Value, UnsupportedFeatures> {
     let mut parameters = input_schema.clone();
     if !parameters.is_object() {
         return Err(UnsupportedFeatures::single(
@@ -201,7 +220,10 @@ pub fn anthropic_image_to_chat(block: &Value, pointer: &str) -> Result<Value, Un
                     "image URL source missing url",
                 )
             })?;
-            if !url.starts_with("http://") && !url.starts_with("https://") && !url.starts_with("data:") {
+            if !url.starts_with("http://")
+                && !url.starts_with("https://")
+                && !url.starts_with("data:")
+            {
                 return Err(UnsupportedFeatures::single(
                     FeatureKind::Media,
                     format!("{pointer}/source/url"),
@@ -211,13 +233,16 @@ pub fn anthropic_image_to_chat(block: &Value, pointer: &str) -> Result<Value, Un
             Ok(serde_json::json!({"url": url}))
         }
         Some("base64") => {
-            let media_type = source.get("media_type").and_then(Value::as_str).ok_or_else(|| {
-                UnsupportedFeatures::single(
-                    FeatureKind::Media,
-                    format!("{pointer}/source/media_type"),
-                    "base64 image missing media_type",
-                )
-            })?;
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    UnsupportedFeatures::single(
+                        FeatureKind::Media,
+                        format!("{pointer}/source/media_type"),
+                        "base64 image missing media_type",
+                    )
+                })?;
             if !media_type.starts_with("image/") {
                 return Err(UnsupportedFeatures::single(
                     FeatureKind::Media,

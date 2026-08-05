@@ -101,7 +101,11 @@ pub struct ConversionContext {
 }
 
 impl ConversionContext {
-    pub fn new(request_id: impl Into<String>, upstream_model: impl Into<String>, stream: bool) -> Self {
+    pub fn new(
+        request_id: impl Into<String>,
+        upstream_model: impl Into<String>,
+        stream: bool,
+    ) -> Self {
         Self {
             request_id: request_id.into(),
             upstream_model: upstream_model.into(),

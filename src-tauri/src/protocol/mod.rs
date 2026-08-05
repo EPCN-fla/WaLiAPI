@@ -208,7 +208,10 @@ pub fn responses_to_openai(body: &Value) -> Value {
                                 let mut params = parameters;
                                 if params.get("type").is_none() {
                                     if let Some(obj) = params.as_object_mut() {
-                                        obj.insert("type".to_string(), Value::String("object".to_string()));
+                                        obj.insert(
+                                            "type".to_string(),
+                                            Value::String("object".to_string()),
+                                        );
                                     }
                                 }
                                 params
@@ -274,13 +277,18 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
         let mut call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut output_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Map from original (possibly empty) call_id → fallback call_id
-        let mut call_id_fallback: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut call_id_fallback: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         let mut fallback_counter = 0u32;
         for item in arr {
             let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match item_type {
                 "function_call" => {
-                    let cid = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    let cid = item
+                        .get("call_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     if cid.is_empty() {
                         let fallback = format!("call_{}", fallback_counter);
                         fallback_counter += 1;
@@ -291,7 +299,11 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
                     }
                 }
                 "function_call_output" => {
-                    let cid = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    let cid = item
+                        .get("call_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     // Use fallback if one was generated for the corresponding function_call
                     let effective_cid = call_id_fallback.get(&cid).cloned().unwrap_or(cid);
                     output_ids.insert(effective_cid);
@@ -309,9 +321,16 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
                 "function_call" => {
                     let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     let arguments = item.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
-                    let original_call_id = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    let original_call_id = item
+                        .get("call_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     // Use fallback call_id if the original was empty
-                    let call_id = call_id_fallback.get(&original_call_id).cloned().unwrap_or(original_call_id);
+                    let call_id = call_id_fallback
+                        .get(&original_call_id)
+                        .cloned()
+                        .unwrap_or(original_call_id);
                     msgs.push(serde_json::json!({
                         "role": "assistant",
                         "content": null,
@@ -337,9 +356,16 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
 
                 // function_call_output: tool result → OpenAI tool message
                 "function_call_output" => {
-                    let original_call_id = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    let original_call_id = item
+                        .get("call_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     // Use fallback call_id if one was generated for the corresponding function_call
-                    let call_id = call_id_fallback.get(&original_call_id).cloned().unwrap_or(original_call_id);
+                    let call_id = call_id_fallback
+                        .get(&original_call_id)
+                        .cloned()
+                        .unwrap_or(original_call_id);
                     let output = item.get("output").and_then(|o| o.as_str()).unwrap_or("");
                     msgs.push(serde_json::json!({
                         "role": "tool",
@@ -515,7 +541,9 @@ pub fn openai_to_anthropic(openai_resp: &Value, model: &str) -> Result<Value, St
                 )
             })?;
             if !input.is_object() {
-                return Err("OpenAI response tool arguments must decode to a JSON object".to_string());
+                return Err(
+                    "OpenAI response tool arguments must decode to a JSON object".to_string(),
+                );
             }
 
             content_blocks.push(serde_json::json!({
@@ -632,8 +660,13 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
         openai_body["stop"] = stop_seq.clone();
     }
     if stream {
-        let mut options = body.get("stream_options").cloned().unwrap_or_else(|| serde_json::json!({}));
-        if !options.is_object() { return Err("stream_options must be an object".to_string()); }
+        let mut options = body
+            .get("stream_options")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !options.is_object() {
+            return Err("stream_options must be an object".to_string());
+        }
         options["include_usage"] = Value::Bool(true);
         openai_body["stream_options"] = options;
     }
@@ -935,9 +968,15 @@ mod anthropic_tests {
         assert!(openai_to_anthropic(&response, "model").is_err());
 
         let cache_in_system = serde_json::json!({"model":"model", "system":[{"type":"text", "text":"cached", "cache_control":{"type":"ephemeral"}}], "messages":[]});
-        assert_eq!(anthropic_to_openai(&cache_in_system).unwrap()["messages"][0]["content"], "cached");
+        assert_eq!(
+            anthropic_to_openai(&cache_in_system).unwrap()["messages"][0]["content"],
+            "cached"
+        );
         let cache_in_message = serde_json::json!({"model":"model", "messages":[{"role":"user", "content":[{"type":"text", "text":"cached", "cache_control":{"type":"ephemeral"}}]}]});
-        assert_eq!(anthropic_to_openai(&cache_in_message).unwrap()["messages"][0]["content"][0]["text"], "cached");
+        assert_eq!(
+            anthropic_to_openai(&cache_in_message).unwrap()["messages"][0]["content"][0]["text"],
+            "cached"
+        );
     }
 
     #[test]
@@ -948,7 +987,10 @@ mod anthropic_tests {
         assert!(converted.get("stop_sequence").is_some());
 
         let implicit_tool = serde_json::json!({"choices":[{"finish_reason":null, "message":{"role":"assistant", "content":null, "tool_calls":[{"id":"call_1", "function":{"name":"run", "arguments":"{}"}}]}}]});
-        assert_eq!(openai_to_anthropic(&implicit_tool, "model").unwrap()["stop_reason"], "tool_use");
+        assert_eq!(
+            openai_to_anthropic(&implicit_tool, "model").unwrap()["stop_reason"],
+            "tool_use"
+        );
     }
 
     #[test]

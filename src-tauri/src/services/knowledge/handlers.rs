@@ -1,19 +1,19 @@
+use super::embedder;
+use super::models::*;
+use super::processor;
+use super::rag;
+use super::repository::KbRepository;
+use super::retriever;
+use crate::db::repository::Repository;
+use crate::server::router::SharedState;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{Json, IntoResponse, Response},
+    response::{IntoResponse, Json, Response},
 };
 use serde::Deserialize;
-use crate::server::router::SharedState;
-use crate::db::repository::Repository;
-use tauri::{Manager, Emitter};
 use sha2::Digest;
-use super::models::*;
-use super::repository::KbRepository;
-use super::processor;
-use super::rag;
-use super::embedder;
-use super::retriever;
+use tauri::{Emitter, Manager};
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -25,13 +25,15 @@ pub struct ListQuery {
 
 // ─── Knowledge Base CRUD ──────────────────────────────────────────
 
-pub async fn list_knowledge_bases(
-    State(shared): State<SharedState>,
-) -> Response {
+pub async fn list_knowledge_bases(State(shared): State<SharedState>) -> Response {
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.get_all_kbs().await {
         Ok(kbs) => Json(serde_json::json!({ "data": kbs })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -42,7 +44,11 @@ pub async fn create_knowledge_base(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.create_kb(&input).await {
         Ok(kb) => (StatusCode::CREATED, Json(kb)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -65,7 +71,11 @@ pub async fn update_knowledge_base(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.update_kb(&id, &input).await {
         Ok(kb) => Json(kb).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -76,7 +86,11 @@ pub async fn delete_knowledge_base(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.delete_kb(&id).await {
         Ok(_) => (StatusCode::NO_CONTENT, "").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -89,7 +103,11 @@ pub async fn list_documents(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.get_documents(&kb_id).await {
         Ok(docs) => Json(serde_json::json!({ "data": docs })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -100,22 +118,33 @@ pub async fn upload_document(
 ) -> Response {
     let repo = KbRepository::new(shared.state.db.pool.clone());
 
-    let content = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &input.content) {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid base64: {}", e)).into_response(),
-    };
+    let content =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &input.content) {
+            Ok(c) => c,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("Invalid base64: {}", e)).into_response()
+            }
+        };
 
     let hash = sha2::Sha256::digest(&content);
     let hash_hex = hex::encode(hash);
 
     if let Ok(Some(_)) = repo.find_document_by_hash(&kb_id, &hash_hex).await {
-        return (StatusCode::CONFLICT, "Document with same content already exists").into_response();
+        return (
+            StatusCode::CONFLICT,
+            "Document with same content already exists",
+        )
+            .into_response();
     }
 
     let file_type = super::parser::get_file_type(&input.filename);
     let file_size = content.len() as i64;
 
-    let app_data_dir = shared.app.path().app_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let app_data_dir = shared
+        .app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
     let kb_dir = app_data_dir.join("kb_files").join(&kb_id);
     std::fs::create_dir_all(&kb_dir).ok();
     let doc_id = uuid::Uuid::new_v4().to_string();
@@ -123,21 +152,36 @@ pub async fn upload_document(
     std::fs::write(&file_path, &content).ok();
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    let doc = match repo.create_document(
-        &kb_id,
-        &input.filename,
-        Some(&file_path_str),
-        &file_type,
-        file_size,
-        &hash_hex,
-    ).await {
+    let doc = match repo
+        .create_document(
+            &kb_id,
+            &input.filename,
+            Some(&file_path_str),
+            &file_type,
+            file_size,
+            &hash_hex,
+        )
+        .await
+    {
         Ok(d) => d,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+                .into_response()
+        }
     };
 
     let kb = match repo.get_kb(&kb_id).await {
         Ok(k) => k,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("KB not found: {}", e)).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("KB not found: {}", e),
+            )
+                .into_response()
+        }
     };
 
     let pool = shared.state.db.pool.clone();
@@ -155,7 +199,9 @@ pub async fn upload_document(
             &filename_clone,
             &content,
             emb_model.as_deref(),
-        ).await {
+        )
+        .await
+        {
             tracing::error!("Document processing failed: {}", e);
         }
     });
@@ -191,7 +237,11 @@ pub async fn delete_document(
             repo.update_kb_counts(&kb_id).await.ok();
             (StatusCode::NO_CONTENT, "").into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -221,7 +271,9 @@ pub struct SearchQuery {
     pub top_k: usize,
 }
 
-fn default_top_k() -> usize { 5 }
+fn default_top_k() -> usize {
+    5
+}
 
 pub async fn search(
     State(shared): State<SharedState>,
@@ -231,7 +283,9 @@ pub async fn search(
 
     let emb_model = if let Some(kb_id) = &query.kb_id {
         let kb_repo = KbRepository::new(shared.state.db.pool.clone());
-        kb_repo.get_kb(kb_id).await
+        kb_repo
+            .get_kb(kb_id)
+            .await
             .ok()
             .and_then(|kb| kb.embedding_model)
             .unwrap_or_else(|| "text-embedding-3-small".to_string())
@@ -241,7 +295,13 @@ pub async fn search(
 
     let embeddings = match embedder::embed(&[query.q.clone()], &emb_model, &repo).await {
         Ok(e) => e,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Embedding failed: {}", e)).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Embedding failed: {}", e),
+            )
+                .into_response()
+        }
     };
 
     if embeddings.is_empty() {
@@ -258,21 +318,24 @@ pub async fn search(
 
     match results {
         Ok(results) => Json(serde_json::json!({ "data": results })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Search failed: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Search failed: {}", e),
+        )
+            .into_response(),
     }
 }
 
 // ─── RAG Ask (with history + token fallback) ──────────────────────
 
-pub async fn ask(
-    State(shared): State<SharedState>,
-    Json(input): Json<AskInput>,
-) -> Response {
+pub async fn ask(State(shared): State<SharedState>, Json(input): Json<AskInput>) -> Response {
     let kb_id = input.kb_id.clone().unwrap_or_default();
 
     let emb_model = if !kb_id.is_empty() {
         let kb_repo = KbRepository::new(shared.state.db.pool.clone());
-        kb_repo.get_kb(&kb_id).await
+        kb_repo
+            .get_kb(&kb_id)
+            .await
             .ok()
             .and_then(|kb| kb.embedding_model)
             .unwrap_or_else(|| "text-embedding-3-small".to_string())
@@ -291,9 +354,15 @@ pub async fn ask(
             input.top_k,
             input.max_rounds,
             &shared.app,
-        ).await {
+        )
+        .await
+        {
             Ok(answer) => Json(answer).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Deep research failed: {}", e)).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Deep research failed: {}", e),
+            )
+                .into_response(),
         }
     } else {
         // Normal RAG with history and configurable search
@@ -315,19 +384,22 @@ pub async fn ask(
             vector_weight,
             keyword_weight,
             search_mode,
-        ).await {
+        )
+        .await
+        {
             Ok(answer) => Json(answer).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("RAG failed: {}", e)).into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("RAG failed: {}", e),
+            )
+                .into_response(),
         }
     }
 }
 
 // ─── Stats ────────────────────────────────────────────────────────
 
-pub async fn kb_stats(
-    State(shared): State<SharedState>,
-    Path(kb_id): Path<String>,
-) -> Response {
+pub async fn kb_stats(State(shared): State<SharedState>, Path(kb_id): Path<String>) -> Response {
     let repo = KbRepository::new(shared.state.db.pool.clone());
 
     let kb = match repo.get_kb(&kb_id).await {
@@ -353,7 +425,8 @@ pub async fn kb_stats(
             "pending": pending_count,
         },
         "index": index_meta,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 // ════════════════════════════════════════════════════════
@@ -369,7 +442,11 @@ pub async fn list_conversations(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.get_conversations(&kb_id).await {
         Ok(convs) => Json(serde_json::json!({ "data": convs })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -380,7 +457,11 @@ pub async fn clear_conversations(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.clear_conversations(&kb_id).await {
         Ok(_) => (StatusCode::NO_CONTENT, "").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -393,7 +474,11 @@ pub async fn list_sources(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.get_sources(&kb_id).await {
         Ok(sources) => Json(serde_json::json!({ "data": sources })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -407,7 +492,11 @@ pub async fn delete_source(
             repo.update_kb_counts(&kb_id).await.ok();
             (StatusCode::NO_CONTENT, "").into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -422,15 +511,24 @@ pub async fn import_source(
     let repo = KbRepository::new(pool.clone());
 
     // Create source record
-    let source = match repo.create_source(
-        &kb_id,
-        &input.source_type,
-        input.repo_url.as_deref().or(input.url.as_deref()),
-        input.dir_path.as_deref(),
-        input.branch.as_deref(),
-    ).await {
+    let source = match repo
+        .create_source(
+            &kb_id,
+            &input.source_type,
+            input.repo_url.as_deref().or(input.url.as_deref()),
+            input.dir_path.as_deref(),
+            input.branch.as_deref(),
+        )
+        .await
+    {
         Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+                .into_response()
+        }
     };
 
     let source_id = source.id.clone();
@@ -438,17 +536,11 @@ pub async fn import_source(
 
     tokio::spawn(async move {
         let result = if source_type == "git" {
-            super::importer::import_git_repo(
-                &pool, &app, &kb_id, &source_id, &input,
-            ).await
+            super::importer::import_git_repo(&pool, &app, &kb_id, &source_id, &input).await
         } else if source_type == "url" {
-            super::importer::import_url(
-                &pool, &app, &kb_id, &source_id, &input,
-            ).await
+            super::importer::import_url(&pool, &app, &kb_id, &source_id, &input).await
         } else if source_type == "local_dir" {
-            super::importer::import_local_dir(
-                &pool, &app, &kb_id, &source_id, &input,
-            ).await
+            super::importer::import_local_dir(&pool, &app, &kb_id, &source_id, &input).await
         } else {
             Err(format!("Unknown source type: {}", source_type))
         };
@@ -456,10 +548,14 @@ pub async fn import_source(
         let repo = KbRepository::new(pool.clone());
         match result {
             Ok(count) => {
-                repo.update_source_status(&source_id, "done", count as i64, None).await.ok();
+                repo.update_source_status(&source_id, "done", count as i64, None)
+                    .await
+                    .ok();
             }
             Err(e) => {
-                repo.update_source_status(&source_id, "error", 0, Some(&e)).await.ok();
+                repo.update_source_status(&source_id, "error", 0, Some(&e))
+                    .await
+                    .ok();
                 tracing::error!("Import failed: {}", e);
             }
         }
@@ -477,21 +573,24 @@ pub async fn get_index_status(
     let repo = KbRepository::new(shared.state.db.pool.clone());
     match repo.get_index_meta(&kb_id).await {
         Ok(meta) => Json(serde_json::json!({ "data": meta })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+            .into_response(),
     }
 }
 
-pub async fn build_index(
-    State(shared): State<SharedState>,
-    Path(kb_id): Path<String>,
-) -> Response {
+pub async fn build_index(State(shared): State<SharedState>, Path(kb_id): Path<String>) -> Response {
     let pool = shared.state.db.pool.clone();
     let kb_id_clone = kb_id.clone();
     let app = shared.app.clone();
 
     // Update index status to building immediately
     let repo = KbRepository::new(pool.clone());
-    repo.update_kb_index_status(&kb_id_clone, "building").await.ok();
+    repo.update_kb_index_status(&kb_id_clone, "building")
+        .await
+        .ok();
 
     // Spawn on blocking thread pool — HNSW build is CPU-intensive
     tokio::task::spawn_blocking(move || {
@@ -501,30 +600,39 @@ pub async fn build_index(
 
         rt.block_on(async {
             // Emit progress: starting
-            let _ = app.emit("kb-index-progress", serde_json::json!({
-                "kb_id": &kb_id,
-                "status": "building",
-                "message": "正在构建 HNSW 向量索引…"
-            }));
+            let _ = app.emit(
+                "kb-index-progress",
+                serde_json::json!({
+                    "kb_id": &kb_id,
+                    "status": "building",
+                    "message": "正在构建 HNSW 向量索引…"
+                }),
+            );
 
             match retriever::build_index(&pool, &kb_id, &app).await {
                 Ok(()) => {
                     tracing::info!("HNSW index built successfully for KB {}", kb_id);
-                    let _ = app.emit("kb-index-progress", serde_json::json!({
-                        "kb_id": &kb_id,
-                        "status": "ready",
-                        "message": "索引构建完成"
-                    }));
+                    let _ = app.emit(
+                        "kb-index-progress",
+                        serde_json::json!({
+                            "kb_id": &kb_id,
+                            "status": "ready",
+                            "message": "索引构建完成"
+                        }),
+                    );
                 }
                 Err(e) => {
                     tracing::error!("Failed to build HNSW index for KB {}: {}", kb_id, e);
                     let repo = KbRepository::new(pool.clone());
                     repo.update_kb_index_status(&kb_id, "error").await.ok();
-                    let _ = app.emit("kb-index-progress", serde_json::json!({
-                        "kb_id": &kb_id,
-                        "status": "error",
-                        "message": format!("索引构建失败: {}", e)
-                    }));
+                    let _ = app.emit(
+                        "kb-index-progress",
+                        serde_json::json!({
+                            "kb_id": &kb_id,
+                            "status": "error",
+                            "message": format!("索引构建失败: {}", e)
+                        }),
+                    );
                 }
             }
         });
@@ -533,17 +641,18 @@ pub async fn build_index(
     Json(serde_json::json!({ "message": "Index build started" })).into_response()
 }
 
-pub async fn drop_index(
-    State(shared): State<SharedState>,
-    Path(kb_id): Path<String>,
-) -> Response {
+pub async fn drop_index(State(shared): State<SharedState>, Path(kb_id): Path<String>) -> Response {
     let pool = shared.state.db.pool.clone();
 
     match retriever::drop_index(&pool, &kb_id).await {
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
         Err(e) => {
             tracing::error!("Failed to drop index for KB {}: {}", kb_id, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to drop index: {}", e)).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to drop index: {}", e),
+            )
+                .into_response()
         }
     }
 }

@@ -8,7 +8,18 @@ import type {
   ServerStatus,
   BuiltinRule, CustomRule, CreateCustomRuleInput, UpdateBuiltinRuleInput,
   ChannelProtocolPresetGroup,
+  DraftChannelTestInput, DraftChannelTestResult,
 } from "../types";
+
+/**
+ * 保存前草稿连通性测试（T07）。后端 `test_channel_draft` 命令已接入。
+ *
+ * 不落库：不创建/更新渠道、不计数配额、不写生产 request log；仅执行每个已选
+ * 端点的最小非流推理探测（可能产生极少上游费用）并返回逐端点结果 + 草稿指纹。
+ */
+export async function testChannelDraft(input: DraftChannelTestInput): Promise<DraftChannelTestResult> {
+  return invoke<DraftChannelTestResult>("test_channel_draft", { input });
+}
 
 // Channel stats
 export interface ChannelStats {
@@ -37,6 +48,8 @@ export const channelApi = {
   reorder: (orderedIds: string[]) => invoke<void>("reorder_channels", { orderedIds }),
   /** 获取全部协议及其提供商模板（只读；`presets[0]` 恒为 custom option）。 */
   getPresets: () => invoke<ChannelProtocolPresetGroup[]>("get_channel_presets"),
+  /** 保存前草稿连通性测试（T07，真实后端命令，不落库）。 */
+  testDraft: (input: DraftChannelTestInput) => testChannelDraft(input),
 };
 
 // API Key commands

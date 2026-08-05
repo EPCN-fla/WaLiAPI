@@ -76,7 +76,10 @@ fn chat_request_function_tools_and_choice() {
     let out = &prepared.encoded_request;
     assert_eq!(out["tools"][0]["name"], "weather");
     assert_eq!(out["tools"][0]["input_schema"]["type"], "object");
-    assert_eq!(out["tool_choice"], json!({"type": "tool", "name": "weather"}));
+    assert_eq!(
+        out["tool_choice"],
+        json!({"type": "tool", "name": "weather"})
+    );
 }
 
 #[test]
@@ -103,7 +106,10 @@ fn chat_request_tool_calls_and_results_are_strict() {
     assert_eq!(msgs[1]["content"][0]["tool_use_id"], "call_1");
     assert_eq!(msgs[1]["content"][0]["content"][0]["type"], "text");
     assert_eq!(msgs[1]["content"][0]["content"][0]["text"], "done");
-    assert!(msgs[1].get("tool_result").is_none(), "no message-level tool_result key");
+    assert!(
+        msgs[1].get("tool_result").is_none(),
+        "no message-level tool_result key"
+    );
 }
 
 #[test]
@@ -144,9 +150,14 @@ fn chat_request_user_images() {
     let out = &prepared.encoded_request;
     assert_eq!(out["messages"][0]["content"][0]["type"], "image");
     assert_eq!(out["messages"][0]["content"][0]["source"]["type"], "base64");
-    assert_eq!(out["messages"][0]["content"][0]["source"]["media_type"], "image/png");
+    assert_eq!(
+        out["messages"][0]["content"][0]["source"]["media_type"],
+        "image/png"
+    );
     // F2: no non-canonical `_media_type` key on the image block.
-    assert!(out["messages"][0]["content"][0].get("_media_type").is_none());
+    assert!(out["messages"][0]["content"][0]
+        .get("_media_type")
+        .is_none());
 }
 
 #[test]
@@ -159,7 +170,9 @@ fn chat_request_rejects_n_gt_1_instead_of_silently_dropping() {
         "messages": [{"role": "user", "content": "u"}]
     });
     let e = CodecRegistry::chat_to_messages("m", &body).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("unsupported_feature.field")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unsupported_feature.field")));
     assert!(e.json_pointers.iter().any(|p| p == "/n"));
 }
 
@@ -171,7 +184,9 @@ fn chat_request_rejects_thinking_and_structured_output() {
         "response_format": {"type": "json_schema", "json_schema": {}}
     });
     let e = CodecRegistry::chat_to_messages("m", &body).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("structured_output")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("structured_output")));
     assert!(e.json_pointers.iter().any(|p| p == "/response_format"));
 }
 
@@ -191,7 +206,9 @@ fn chat_request_rejects_unknown_role_and_builtin_tool() {
         ]
     });
     let e = CodecRegistry::chat_to_messages("m", &body).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_role")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unknown_role")));
 
     let body = json!({
         "model": "m",
@@ -199,7 +216,9 @@ fn chat_request_rejects_unknown_role_and_builtin_tool() {
         "tools": [{"type": "web_search", "function": {"name": "x"}}]
     });
     let e = CodecRegistry::chat_to_messages("m", &body).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("builtin_tool")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("builtin_tool")));
 }
 
 #[test]
@@ -213,7 +232,9 @@ fn chat_request_rejects_invalid_tool_arguments_never_rewrites() {
         ]
     });
     let e = CodecRegistry::chat_to_messages("m", &body).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("invalid_tool_arguments")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("invalid_tool_arguments")));
     // The non-object argument case (array) must also fail, not become {}.
     let body = json!({
         "model": "m",
@@ -268,7 +289,9 @@ fn chat_response_rejects_invalid_tool_arguments() {
         "usage": {}
     });
     let e = chat::decode_chat_response_to_messages(&body, &Default::default()).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("invalid_tool_arguments")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("invalid_tool_arguments")));
     // Array arguments must not become {}.
     let body = json!({
         "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "tool_calls": [
@@ -286,7 +309,9 @@ fn chat_response_unknown_finish_reason_never_becomes_stop() {
         "usage": {}
     });
     let e = chat::decode_chat_response_to_messages(&body, &Default::default()).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("finish_reason")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("finish_reason")));
 }
 
 #[test]
@@ -337,7 +362,10 @@ fn chat_stream_arbitrary_fragmentation_and_tool_accumulation() {
     assert!(output.contains("\"stop_sequence\":null"));
     let text_stop = output.find("content_block_stop").unwrap();
     let first_tool = output.find("\"type\":\"tool_use\"").unwrap();
-    assert!(text_stop < first_tool, "text must stop before a tool block starts");
+    assert!(
+        text_stop < first_tool,
+        "text must stop before a tool block starts"
+    );
     assert!(output.find("\"id\":\"a\"").unwrap() < output.find("\"id\":\"b\"").unwrap());
     assert_eq!(output.matches("event: message_stop").count(), 1);
 }
@@ -347,31 +375,48 @@ fn chat_stream_incomplete_tool_arguments_are_rejected() {
     let mut state = chat::ChatSseState::default();
     state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"run\",\"arguments\":\"{bad\"}}]}}]}\n\n").unwrap();
     let e = state.finish().unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("invalid_tool_arguments")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("invalid_tool_arguments")));
 }
 
 #[test]
 fn chat_stream_unknown_finish_reason_rejected_at_finalize() {
     let mut state = chat::ChatSseState::default();
-    state.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n").unwrap();
-    state.feed(b"data: {\"choices\":[{\"finish_reason\":\"bizarre\"}]}\n\n").unwrap();
+    state
+        .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
+        .unwrap();
+    state
+        .feed(b"data: {\"choices\":[{\"finish_reason\":\"bizarre\"}]}\n\n")
+        .unwrap();
     let e = state.finish().unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("finish_reason")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("finish_reason")));
 }
 
 #[test]
 fn chat_stream_first_frame_invalid_is_a_codec_error() {
     let mut state = chat::ChatSseState::default();
     let e = state.feed(b"data: {not-json}\n\n").unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_event")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unknown_event")));
 }
 
 #[test]
 fn chat_stream_termination_exactly_once() {
     let mut state = chat::ChatSseState::default();
-    state.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n").unwrap();
+    state
+        .feed(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n",
+        )
+        .unwrap();
     let first = state.finish().unwrap();
-    assert_eq!(first.iter().filter(|e| e.contains("message_stop")).count(), 1);
+    assert_eq!(
+        first.iter().filter(|e| e.contains("message_stop")).count(),
+        1
+    );
     // finish() again is a no-op.
     let second = state.finish().unwrap();
     assert!(second.is_empty());
@@ -384,12 +429,16 @@ fn chat_stream_empty_stream_is_a_codec_error_not_an_empty_success() {
     let mut state = chat::ChatSseState::default();
     state.feed(b"").unwrap();
     let e = state.finish().unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_event")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unknown_event")));
 
     let mut state = chat::ChatSseState::default();
     state.feed(b"data: [DONE]\n\n").unwrap();
     let e = state.finish().unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_event")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unknown_event")));
 }
 
 #[test]
@@ -398,7 +447,11 @@ fn chat_stream_emits_prepared_model_and_request_id() {
     // per-request id from the PreparedAttempt context into the synthesized
     // message_start frame.
     let mut state = chat::ChatSseState::new("upstream-model-9", "req-42");
-    let events = state.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n").unwrap();
+    let events = state
+        .feed(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n",
+        )
+        .unwrap();
     let joined = events.join("");
     assert!(joined.contains("\"model\":\"upstream-model-9\""));
     assert!(joined.contains("\"id\":\"req-42\""));
@@ -423,7 +476,10 @@ fn messages_request_system_text_and_sampling() {
     assert_eq!(out["model"], "up");
     assert_eq!(out["max_tokens"], 64);
     assert_eq!(out["temperature"], 0.5);
-    assert_eq!(out["messages"][0], json!({"role": "system", "content": "sys"}));
+    assert_eq!(
+        out["messages"][0],
+        json!({"role": "system", "content": "sys"})
+    );
     assert_eq!(out["messages"][1]["content"], "hi");
 }
 
@@ -445,7 +501,10 @@ fn messages_request_tools_choice_and_tool_results() {
     assert_eq!(out["tools"][0]["function"]["name"], "weather");
     // No system message here, so messages[0] is the assistant with tool_calls.
     assert_eq!(out["messages"][0]["content"], "checking");
-    assert_eq!(out["messages"][0]["tool_calls"][0]["function"]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(
+        out["messages"][0]["tool_calls"][0]["function"]["arguments"],
+        "{\"city\":\"Paris\"}"
+    );
     assert_eq!(out["messages"][1]["role"], "tool");
     assert_eq!(out["messages"][2]["content"], "thanks");
 }
@@ -458,7 +517,9 @@ fn messages_request_rejects_thinking_and_builtin_tools() {
         "thinking": {"type": "enabled", "budget_tokens": 1024}
     });
     let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("beta_feature")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("beta_feature")));
 
     let body = json!({
         "model": "m",
@@ -466,7 +527,9 @@ fn messages_request_rejects_thinking_and_builtin_tools() {
         "tools": [{"type": "web_search", "name": "web"}]
     });
     let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("builtin_tool")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("builtin_tool")));
 }
 
 #[test]
@@ -476,14 +539,18 @@ fn messages_request_unknown_role_and_block_rejected() {
         "messages": [{"role": "system", "content": "x"}]
     });
     let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_role")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unknown_role")));
 
     let body = json!({
         "model": "m",
         "messages": [{"role": "user", "content": [{"type": "document", "source": {}}]}]
     });
     let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_block")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unknown_block")));
 }
 
 #[test]
@@ -508,7 +575,9 @@ fn messages_request_rejects_invalid_tool_input() {
         ]
     });
     let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("invalid_tool_arguments")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("invalid_tool_arguments")));
 }
 
 // ===========================================================================
@@ -530,28 +599,38 @@ fn messages_response_text_and_tool_use() {
     let out = messages::decode_messages_response_to_chat(&body, &Default::default()).unwrap();
     assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
     assert_eq!(out["choices"][0]["message"]["content"], "hello");
-    assert_eq!(out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], "{\"a\":1}");
+    assert_eq!(
+        out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        "{\"a\":1}"
+    );
     assert_eq!(out["usage"]["prompt_tokens"], 10);
     assert_eq!(out["usage"]["completion_tokens"], 5);
 }
 
 #[test]
 fn messages_response_maps_stop_reasons() {
-    let base = |stop: &str| json!({
-        "id": "msg_1", "type": "message", "content": [{"type": "text", "text": "x"}],
-        "stop_reason": stop, "usage": {"input_tokens": 1, "output_tokens": 1}
-    });
+    let base = |stop: &str| {
+        json!({
+            "id": "msg_1", "type": "message", "content": [{"type": "text", "text": "x"}],
+            "stop_reason": stop, "usage": {"input_tokens": 1, "output_tokens": 1}
+        })
+    };
     assert_eq!(
-        messages::decode_messages_response_to_chat(&base("end_turn"), &Default::default()).unwrap()["choices"][0]["finish_reason"],
+        messages::decode_messages_response_to_chat(&base("end_turn"), &Default::default()).unwrap()
+            ["choices"][0]["finish_reason"],
         "stop"
     );
     assert_eq!(
-        messages::decode_messages_response_to_chat(&base("max_tokens"), &Default::default()).unwrap()["choices"][0]["finish_reason"],
+        messages::decode_messages_response_to_chat(&base("max_tokens"), &Default::default())
+            .unwrap()["choices"][0]["finish_reason"],
         "length"
     );
     // Unknown stop reason is rejected, never mapped to stop.
-    let e = messages::decode_messages_response_to_chat(&base("budget_forced"), &Default::default()).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("finish_reason")));
+    let e = messages::decode_messages_response_to_chat(&base("budget_forced"), &Default::default())
+        .unwrap_err();
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("finish_reason")));
 }
 
 #[test]
@@ -562,7 +641,9 @@ fn messages_response_rejects_unknown_block_and_bad_input() {
         "stop_reason": "end_turn", "usage": {}
     });
     let e = messages::decode_messages_response_to_chat(&body, &Default::default()).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_block")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unknown_block")));
 
     let body = json!({
         "id": "msg_1", "type": "message",
@@ -570,7 +651,9 @@ fn messages_response_rejects_unknown_block_and_bad_input() {
         "stop_reason": "tool_use", "usage": {}
     });
     let e = messages::decode_messages_response_to_chat(&body, &Default::default()).unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("invalid_tool_arguments")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("invalid_tool_arguments")));
 }
 
 // ===========================================================================
@@ -587,7 +670,11 @@ fn messages_stream_text_and_tool_deltas() {
     events.extend(state.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n").unwrap());
     events.extend(state.feed(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap());
     events.extend(state.feed(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n").unwrap());
-    events.extend(state.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n").unwrap());
+    events.extend(
+        state
+            .feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+            .unwrap(),
+    );
     events.extend(state.finish().unwrap());
     let joined = events.join("");
     assert!(joined.contains("\"role\":\"assistant\""));
@@ -613,7 +700,11 @@ fn messages_stream_tool_calls_accumulate_by_index() {
     events.extend(state.feed(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap());
     events.extend(state.feed(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n").unwrap());
     events.extend(state.feed(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{}}\n\n").unwrap());
-    events.extend(state.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n").unwrap());
+    events.extend(
+        state
+            .feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+            .unwrap(),
+    );
     events.extend(state.finish().unwrap());
     let joined = events.join("");
     assert!(joined.contains("\"id\":\"call_a\""));
@@ -634,15 +725,23 @@ fn messages_stream_invalid_tool_json_is_rejected() {
     state.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{bad\"}}\n\n").unwrap();
     // content_block_stop validates the accumulated arguments and must reject the
     // malformed JSON rather than invent `{}`.
-    let e = state.feed(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("invalid_tool_arguments")));
+    let e = state
+        .feed(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+        .unwrap_err();
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("invalid_tool_arguments")));
 }
 
 #[test]
 fn messages_stream_unknown_event_is_a_codec_error() {
     let mut state = messages::MessagesSseState::default();
-    let e = state.feed(b"event: wat\ndata: {\"type\":\"wat\"}\n\n").unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_event")));
+    let e = state
+        .feed(b"event: wat\ndata: {\"type\":\"wat\"}\n\n")
+        .unwrap_err();
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unknown_event")));
 }
 
 #[test]
@@ -665,12 +764,18 @@ fn messages_stream_empty_stream_is_a_codec_error_not_an_empty_success() {
     let mut state = messages::MessagesSseState::default();
     state.feed(b"").unwrap();
     let e = state.finish().unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_event")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unknown_event")));
 
     let mut state = messages::MessagesSseState::default();
-    state.feed(b"event: ping\ndata: {\"type\":\"ping\"}\n\n").unwrap();
+    state
+        .feed(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
+        .unwrap();
     let e = state.finish().unwrap_err();
-    assert!(reject_features(&e).iter().any(|c| c.contains("unknown_event")));
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unknown_event")));
 }
 
 #[test]
@@ -685,7 +790,11 @@ fn messages_stream_emits_prepared_model() {
     events.extend(state.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n").unwrap());
     events.extend(state.feed(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap());
     events.extend(state.feed(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n").unwrap());
-    events.extend(state.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n").unwrap());
+    events.extend(
+        state
+            .feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+            .unwrap(),
+    );
     events.extend(state.finish().unwrap());
     let joined = events.join("");
     assert!(joined.contains("\"model\":\"upstream-model-9\""));
@@ -698,15 +807,42 @@ fn messages_stream_emits_prepared_model() {
 #[test]
 fn feature_kind_stable_codes() {
     assert_eq!(FeatureKind::Thinking.code(), "unsupported_feature.thinking");
-    assert_eq!(FeatureKind::StructuredOutput.code(), "unsupported_feature.structured_output");
-    assert_eq!(FeatureKind::BuiltinTool.code(), "unsupported_feature.builtin_tool");
+    assert_eq!(
+        FeatureKind::StructuredOutput.code(),
+        "unsupported_feature.structured_output"
+    );
+    assert_eq!(
+        FeatureKind::BuiltinTool.code(),
+        "unsupported_feature.builtin_tool"
+    );
     assert_eq!(FeatureKind::Document.code(), "unsupported_feature.document");
-    assert_eq!(FeatureKind::PromptCache.code(), "unsupported_feature.prompt_cache");
-    assert_eq!(FeatureKind::UnknownRole.code(), "unsupported_feature.unknown_role");
-    assert_eq!(FeatureKind::UnknownBlock.code(), "unsupported_feature.unknown_block");
-    assert_eq!(FeatureKind::UnknownEvent.code(), "unsupported_feature.unknown_event");
-    assert_eq!(FeatureKind::UnknownFinishReason.code(), "unsupported_feature.finish_reason");
-    assert_eq!(FeatureKind::InvalidToolArguments.code(), "unsupported_feature.invalid_tool_arguments");
-    assert_eq!(FeatureKind::MissingToolField.code(), "unsupported_feature.missing_tool_field");
+    assert_eq!(
+        FeatureKind::PromptCache.code(),
+        "unsupported_feature.prompt_cache"
+    );
+    assert_eq!(
+        FeatureKind::UnknownRole.code(),
+        "unsupported_feature.unknown_role"
+    );
+    assert_eq!(
+        FeatureKind::UnknownBlock.code(),
+        "unsupported_feature.unknown_block"
+    );
+    assert_eq!(
+        FeatureKind::UnknownEvent.code(),
+        "unsupported_feature.unknown_event"
+    );
+    assert_eq!(
+        FeatureKind::UnknownFinishReason.code(),
+        "unsupported_feature.finish_reason"
+    );
+    assert_eq!(
+        FeatureKind::InvalidToolArguments.code(),
+        "unsupported_feature.invalid_tool_arguments"
+    );
+    assert_eq!(
+        FeatureKind::MissingToolField.code(),
+        "unsupported_feature.missing_tool_field"
+    );
     assert_eq!(FeatureKind::Media.code(), "unsupported_media");
 }

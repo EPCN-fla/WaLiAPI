@@ -18,10 +18,7 @@ pub fn record_end(input: &[u8]) -> Option<usize> {
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map(|i| i + 4);
-    let lf = input
-        .windows(2)
-        .position(|w| w == b"\n\n")
-        .map(|i| i + 2);
+    let lf = input.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
     match (crlf, lf) {
         (Some(c), Some(l)) => Some(c.min(l)),
         (Some(c), None) => Some(c),

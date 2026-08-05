@@ -1,17 +1,17 @@
+use crate::db::repository::Repository;
+use crate::server::router::SharedState;
+use crate::services::knowledge::{embedder, rag, repository::KbRepository, retriever};
 use axum::{
-    extract::{State, Query},
-    http::{StatusCode, header},
-    response::{Json, IntoResponse, Response},
     body::Body,
+    extract::{Query, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Json, Response},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tauri::{Emitter, Manager};
 use tokio::sync::{mpsc, RwLock};
-use crate::server::router::SharedState;
-use crate::db::repository::Repository;
-use crate::services::knowledge::{repository::KbRepository, embedder, retriever, rag};
-use tauri::{Manager, Emitter};
 
 /// MCP server instructions — agent 首次连接时注入 system prompt
 const MCP_INSTRUCTIONS: &str = r#"# WaLiAPI 知识库 — 本地 RAG + 向量检索
@@ -50,7 +50,8 @@ chunk metadata 包含 symbol_name、symbol_kind、signature，可用于精确过
 type SessionSender = mpsc::UnboundedSender<String>;
 
 fn sse_sessions() -> &'static Arc<RwLock<HashMap<String, SessionSender>>> {
-    static SESSIONS: std::sync::OnceLock<Arc<RwLock<HashMap<String, SessionSender>>>> = std::sync::OnceLock::new();
+    static SESSIONS: std::sync::OnceLock<Arc<RwLock<HashMap<String, SessionSender>>>> =
+        std::sync::OnceLock::new();
     SESSIONS.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
 }
 
@@ -87,11 +88,21 @@ pub struct McpError {
 
 impl McpResponse {
     pub fn success(id: Option<serde_json::Value>, result: serde_json::Value) -> Self {
-        Self { jsonrpc: "2.0".to_string(), id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
     pub fn error(id: Option<serde_json::Value>, code: i32, message: String) -> Self {
-        Self { jsonrpc: "2.0".to_string(), id, result: None, error: Some(McpError { code, message }) }
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(McpError { code, message }),
+        }
     }
 
     pub fn to_json_string(&self) -> String {
@@ -204,7 +215,6 @@ fn get_tools() -> Vec<serde_json::Value> {
                 "required": ["kb_id"]
             }
         }),
-
         // ── Write tools: Knowledge Base lifecycle ──────────────────
         serde_json::json!({
             "name": "create_knowledge_base",
@@ -249,7 +259,6 @@ fn get_tools() -> Vec<serde_json::Value> {
                 "required": ["kb_id"]
             }
         }),
-
         // ── Write tools: Document management ───────────────────────
         serde_json::json!({
             "name": "upload_document",
@@ -287,7 +296,6 @@ fn get_tools() -> Vec<serde_json::Value> {
                 "required": ["kb_id"]
             }
         }),
-
         // ── Write tools: Index management ──────────────────────────
         serde_json::json!({
             "name": "build_index",
@@ -300,7 +308,6 @@ fn get_tools() -> Vec<serde_json::Value> {
                 "required": ["kb_id"]
             }
         }),
-
         // ── Write tools: Source import ─────────────────────────────
         serde_json::json!({
             "name": "import_source",
@@ -328,13 +335,11 @@ fn get_tools() -> Vec<serde_json::Value> {
 // ── Core JSON-RPC dispatch ────────────────────────────────────────
 
 /// Main MCP JSON-RPC handler — async dispatch
-async fn dispatch_jsonrpc_async(
-    shared: &SharedState,
-    req: &McpRequest,
-) -> McpResponse {
+async fn dispatch_jsonrpc_async(shared: &SharedState, req: &McpRequest) -> McpResponse {
     match req.method.as_str() {
-        "initialize" => {
-            McpResponse::success(req.id.clone(), serde_json::json!({
+        "initialize" => McpResponse::success(
+            req.id.clone(),
+            serde_json::json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
                     "tools": {}
@@ -344,23 +349,24 @@ async fn dispatch_jsonrpc_async(
                     "version": "0.1.0"
                 },
                 "instructions": MCP_INSTRUCTIONS
-            }))
-        }
-        "notifications/initialized" => {
-            McpResponse::success(req.id.clone(), serde_json::json!({}))
-        }
-        "tools/list" => {
-            McpResponse::success(req.id.clone(), serde_json::json!({
+            }),
+        ),
+        "notifications/initialized" => McpResponse::success(req.id.clone(), serde_json::json!({})),
+        "tools/list" => McpResponse::success(
+            req.id.clone(),
+            serde_json::json!({
                 "tools": get_tools()
-            }))
-        }
+            }),
+        ),
         "tools/call" => {
-            let tool_name = req.params
+            let tool_name = req
+                .params
                 .get("name")
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
 
-            let args = req.params
+            let args = req
+                .params
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::Value::Object(Default::default()));
@@ -370,12 +376,12 @@ async fn dispatch_jsonrpc_async(
                 Err(e) => McpResponse::error(req.id.clone(), -32603, e),
             }
         }
-        "ping" => {
-            McpResponse::success(req.id.clone(), serde_json::json!({}))
-        }
-        _ => {
-            McpResponse::error(req.id.clone(), -32601, format!("Unknown method: {}", req.method))
-        }
+        "ping" => McpResponse::success(req.id.clone(), serde_json::json!({})),
+        _ => McpResponse::error(
+            req.id.clone(),
+            -32601,
+            format!("Unknown method: {}", req.method),
+        ),
     }
 }
 
@@ -386,9 +392,7 @@ async fn dispatch_jsonrpc_async(
 // 3. Client POSTs JSON-RPC requests to that URL
 // 4. Server pushes responses back through the SSE stream
 
-pub async fn handle_mcp_sse(
-    State(_shared): State<SharedState>,
-) -> Response {
+pub async fn handle_mcp_sse(State(_shared): State<SharedState>) -> Response {
     // Generate unique session ID
     let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -516,16 +520,31 @@ async fn handle_tool_call(
 
     match tool_name {
         "search_knowledge_base" => {
-            let query = args.get("query").and_then(|q| q.as_str()).ok_or("Missing query")?;
+            let query = args
+                .get("query")
+                .and_then(|q| q.as_str())
+                .ok_or("Missing query")?;
             let kb_id = args.get("kb_id").and_then(|k| k.as_str()).unwrap_or("");
             let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(5) as usize;
-            let search_mode = args.get("search_mode").and_then(|s| s.as_str()).unwrap_or("hybrid");
-            let vector_weight = args.get("vector_weight").and_then(|w| w.as_f64()).unwrap_or(0.7) as f32;
-            let keyword_weight = args.get("keyword_weight").and_then(|w| w.as_f64()).unwrap_or(0.3) as f32;
+            let search_mode = args
+                .get("search_mode")
+                .and_then(|s| s.as_str())
+                .unwrap_or("hybrid");
+            let vector_weight = args
+                .get("vector_weight")
+                .and_then(|w| w.as_f64())
+                .unwrap_or(0.7) as f32;
+            let keyword_weight = args
+                .get("keyword_weight")
+                .and_then(|w| w.as_f64())
+                .unwrap_or(0.3) as f32;
 
             let emb_model = if !kb_id.is_empty() {
                 let kb_repo = KbRepository::new(pool.clone());
-                kb_repo.get_kb(kb_id).await.ok()
+                kb_repo
+                    .get_kb(kb_id)
+                    .await
+                    .ok()
                     .and_then(|kb| kb.embedding_model)
                     .unwrap_or_else(|| "text-embedding-3-small".to_string())
             } else {
@@ -564,18 +583,32 @@ async fn handle_tool_call(
             } else {
                 // Single-KB search with details
                 let scored = retriever::hybrid_search_with_details(
-                    pool, kb_id, query, &embeddings[0], top_k, vector_weight, keyword_weight,
-                ).await?;
+                    pool,
+                    kb_id,
+                    query,
+                    &embeddings[0],
+                    top_k,
+                    vector_weight,
+                    keyword_weight,
+                )
+                .await?;
 
-                let content: Vec<serde_json::Value> = scored.iter().map(|s| {
-                    let r = &s.result;
-                    let mut line = format!("[{}] (score: {:.2}", r.filename, r.score);
-                    if let Some(vs) = s.vector_score { line.push_str(&format!(", vec: {:.2}", vs)); }
-                    if let Some(ks) = s.keyword_score { line.push_str(&format!(", kw: {:.2}", ks)); }
-                    line.push_str(")\n");
-                    line.push_str(&r.content);
-                    serde_json::json!({ "type": "text", "text": line })
-                }).collect();
+                let content: Vec<serde_json::Value> = scored
+                    .iter()
+                    .map(|s| {
+                        let r = &s.result;
+                        let mut line = format!("[{}] (score: {:.2}", r.filename, r.score);
+                        if let Some(vs) = s.vector_score {
+                            line.push_str(&format!(", vec: {:.2}", vs));
+                        }
+                        if let Some(ks) = s.keyword_score {
+                            line.push_str(&format!(", kw: {:.2}", ks));
+                        }
+                        line.push_str(")\n");
+                        line.push_str(&r.content);
+                        serde_json::json!({ "type": "text", "text": line })
+                    })
+                    .collect();
 
                 Ok(serde_json::json!({ "content": content, "isError": false }))
             }
@@ -604,11 +637,20 @@ async fn handle_tool_call(
         }
 
         "read_document" => {
-            let _kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
-            let doc_id = args.get("doc_id").and_then(|d| d.as_str()).ok_or("Missing doc_id")?;
+            let _kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
+            let doc_id = args
+                .get("doc_id")
+                .and_then(|d| d.as_str())
+                .ok_or("Missing doc_id")?;
 
             let kb_repo = KbRepository::new(pool.clone());
-            let doc = kb_repo.get_document(doc_id).await.map_err(|e| e.to_string())?;
+            let doc = kb_repo
+                .get_document(doc_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
             let content = if let Some(path) = &doc.file_path {
                 std::fs::read_to_string(path).unwrap_or_else(|_| "Failed to read file".to_string())
@@ -626,16 +668,31 @@ async fn handle_tool_call(
         }
 
         "ask_knowledge_base" => {
-            let question = args.get("question").and_then(|q| q.as_str()).ok_or("Missing question")?;
+            let question = args
+                .get("question")
+                .and_then(|q| q.as_str())
+                .ok_or("Missing question")?;
             let kb_id = args.get("kb_id").and_then(|k| k.as_str()).unwrap_or("");
             let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(5) as usize;
-            let search_mode = args.get("search_mode").and_then(|s| s.as_str()).unwrap_or("hybrid");
-            let vector_weight = args.get("vector_weight").and_then(|w| w.as_f64()).unwrap_or(0.7) as f32;
-            let keyword_weight = args.get("keyword_weight").and_then(|w| w.as_f64()).unwrap_or(0.3) as f32;
+            let search_mode = args
+                .get("search_mode")
+                .and_then(|s| s.as_str())
+                .unwrap_or("hybrid");
+            let vector_weight = args
+                .get("vector_weight")
+                .and_then(|w| w.as_f64())
+                .unwrap_or(0.7) as f32;
+            let keyword_weight = args
+                .get("keyword_weight")
+                .and_then(|w| w.as_f64())
+                .unwrap_or(0.3) as f32;
 
             let emb_model = if !kb_id.is_empty() {
                 let kb_repo = KbRepository::new(pool.clone());
-                kb_repo.get_kb(kb_id).await.ok()
+                kb_repo
+                    .get_kb(kb_id)
+                    .await
+                    .ok()
                     .and_then(|kb| kb.embedding_model)
                     .unwrap_or_else(|| "text-embedding-3-small".to_string())
             } else {
@@ -648,11 +705,20 @@ async fn handle_tool_call(
             } else {
                 let main_repo = Repository::new(pool.clone());
                 let channels = main_repo.get_enabled_channels().await.unwrap_or_default();
-                let embedding_models = ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002", "bge-large-zh", "bge-small-zh"];
+                let embedding_models = [
+                    "text-embedding-3-small",
+                    "text-embedding-3-large",
+                    "text-embedding-ada-002",
+                    "bge-large-zh",
+                    "bge-small-zh",
+                ];
                 let mut picked: Option<String> = None;
                 for ch in &channels {
                     let models: Vec<String> = serde_json::from_str(&ch.models).unwrap_or_default();
-                    if let Some(m) = models.iter().find(|m| !embedding_models.contains(&m.as_str())) {
+                    if let Some(m) = models
+                        .iter()
+                        .find(|m| !embedding_models.contains(&m.as_str()))
+                    {
                         picked = Some(m.clone());
                         break;
                     }
@@ -661,9 +727,20 @@ async fn handle_tool_call(
             };
 
             let answer = rag::ask_with_config(
-                pool, kb_id, question, &emb_model, &chat_model, top_k, true, &[], &shared.app,
-                vector_weight, keyword_weight, search_mode,
-            ).await?;
+                pool,
+                kb_id,
+                question,
+                &emb_model,
+                &chat_model,
+                top_k,
+                true,
+                &[],
+                &shared.app,
+                vector_weight,
+                keyword_weight,
+                search_mode,
+            )
+            .await?;
 
             let mut content = vec![serde_json::json!({
                 "type": "text",
@@ -683,8 +760,12 @@ async fn handle_tool_call(
                 let mut detail_lines = String::from("\n--- Retrieval Details ---\n");
                 for d in details {
                     let mut line = format!("• {} (score: {:.2}", d.filename, d.score);
-                    if let Some(vs) = d.vector_score { line.push_str(&format!(", vec: {:.2}", vs)); }
-                    if let Some(ks) = d.keyword_score { line.push_str(&format!(", kw: {:.2}", ks)); }
+                    if let Some(vs) = d.vector_score {
+                        line.push_str(&format!(", vec: {:.2}", vs));
+                    }
+                    if let Some(ks) = d.keyword_score {
+                        line.push_str(&format!(", kw: {:.2}", ks));
+                    }
                     if let Some(sym) = &d.symbol_name {
                         line.push_str(&format!(", symbol: {}", sym));
                         if let Some(kind) = &d.symbol_kind {
@@ -708,11 +789,17 @@ async fn handle_tool_call(
         }
 
         "get_knowledge_base_stats" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+            let kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
 
             let kb_repo = KbRepository::new(pool.clone());
             let kb = kb_repo.get_kb(kb_id).await.map_err(|e| e.to_string())?;
-            let docs = kb_repo.get_documents(kb_id).await.map_err(|e| e.to_string())?;
+            let docs = kb_repo
+                .get_documents(kb_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
             Ok(serde_json::json!({
                 "content": [{
@@ -731,9 +818,11 @@ async fn handle_tool_call(
         }
 
         // ── Write tools: Knowledge Base lifecycle ──────────────────
-
         "create_knowledge_base" => {
-            let name = args.get("name").and_then(|n| n.as_str()).ok_or("Missing name")?;
+            let name = args
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or("Missing name")?;
             let description = args.get("description").and_then(|d| d.as_str());
             let embedding_model = args.get("embedding_model").and_then(|m| m.as_str());
             let embedding_channel_id = args.get("embedding_channel_id").and_then(|c| c.as_str());
@@ -764,25 +853,52 @@ async fn handle_tool_call(
         }
 
         "update_knowledge_base" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+            let kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
 
             let input = crate::services::knowledge::models::UpdateKbInput {
-                name: args.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()),
-                description: args.get("description").and_then(|d| d.as_str()).map(|s| s.to_string()),
-                embedding_model: args.get("embedding_model").and_then(|m| m.as_str()).map(|s| s.to_string()),
-                embedding_channel_id: args.get("embedding_channel_id").and_then(|c| c.as_str()).map(|s| s.to_string()),
+                name: args
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string()),
+                description: args
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(|s| s.to_string()),
+                embedding_model: args
+                    .get("embedding_model")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string()),
+                embedding_channel_id: args
+                    .get("embedding_channel_id")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string()),
                 status: args.get("status").and_then(|s| s.as_i64()),
                 mcp_enabled: args.get("mcp_enabled").and_then(|m| m.as_i64()),
                 chunk_size: args.get("chunk_size").and_then(|c| c.as_i64()),
                 chunk_overlap: args.get("chunk_overlap").and_then(|c| c.as_i64()),
-                excluded_dirs: args.get("excluded_dirs").and_then(|e| e.as_str()).map(|s| s.to_string()),
-                excluded_files: args.get("excluded_files").and_then(|e| e.as_str()).map(|s| s.to_string()),
-                included_files: args.get("included_files").and_then(|i| i.as_str()).map(|s| s.to_string()),
+                excluded_dirs: args
+                    .get("excluded_dirs")
+                    .and_then(|e| e.as_str())
+                    .map(|s| s.to_string()),
+                excluded_files: args
+                    .get("excluded_files")
+                    .and_then(|e| e.as_str())
+                    .map(|s| s.to_string()),
+                included_files: args
+                    .get("included_files")
+                    .and_then(|i| i.as_str())
+                    .map(|s| s.to_string()),
                 embedding_batch_size: args.get("embedding_batch_size").and_then(|b| b.as_i64()),
             };
 
             let kb_repo = KbRepository::new(pool.clone());
-            let kb = kb_repo.update_kb(kb_id, &input).await.map_err(|e| e.to_string())?;
+            let kb = kb_repo
+                .update_kb(kb_id, &input)
+                .await
+                .map_err(|e| e.to_string())?;
 
             Ok(serde_json::json!({
                 "content": [{
@@ -797,7 +913,10 @@ async fn handle_tool_call(
         }
 
         "delete_knowledge_base" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+            let kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
 
             let kb_repo = KbRepository::new(pool.clone());
             let kb = kb_repo.get_kb(kb_id).await.map_err(|e| e.to_string())?;
@@ -813,10 +932,15 @@ async fn handle_tool_call(
         }
 
         // ── Write tools: Document management ───────────────────────
-
         "upload_document" => {
-            let filename = args.get("filename").and_then(|f| f.as_str()).ok_or("Missing filename")?;
-            let content_b64 = args.get("content").and_then(|c| c.as_str()).ok_or("Missing content")?;
+            let filename = args
+                .get("filename")
+                .and_then(|f| f.as_str())
+                .ok_or("Missing filename")?;
+            let content_b64 = args
+                .get("content")
+                .and_then(|c| c.as_str())
+                .ok_or("Missing content")?;
 
             let kb_repo = KbRepository::new(pool.clone());
 
@@ -866,7 +990,8 @@ async fn handle_tool_call(
 
             let content = {
                 use base64::Engine;
-                base64::engine::general_purpose::STANDARD.decode(content_b64)
+                base64::engine::general_purpose::STANDARD
+                    .decode(content_b64)
                     .map_err(|e| format!("Invalid base64: {}", e))?
             };
 
@@ -891,7 +1016,10 @@ async fn handle_tool_call(
             let file_size = content.len() as i64;
 
             // Save file to disk
-            let app_data_dir = shared.app.path().app_data_dir()
+            let app_data_dir = shared
+                .app
+                .path()
+                .app_data_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
             let kb_dir = app_data_dir.join("kb_files").join(&kb_id);
             std::fs::create_dir_all(&kb_dir).ok();
@@ -900,10 +1028,17 @@ async fn handle_tool_call(
             std::fs::write(&file_path, &content).ok();
             let file_path_str = file_path.to_string_lossy().to_string();
 
-            let doc = kb_repo.create_document(
-                &kb_id, &filename, Some(&file_path_str),
-                &file_type, file_size, &hash_hex
-            ).await.map_err(|e| e.to_string())?;
+            let doc = kb_repo
+                .create_document(
+                    &kb_id,
+                    &filename,
+                    Some(&file_path_str),
+                    &file_type,
+                    file_size,
+                    &hash_hex,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
 
             let kb = kb_repo.get_kb(&kb_id).await.map_err(|e| e.to_string())?;
             let emb_model = kb.embedding_model.clone();
@@ -917,9 +1052,16 @@ async fn handle_tool_call(
 
             tokio::spawn(async move {
                 if let Err(e) = crate::services::knowledge::processor::process_document(
-                    &pool_clone, &app_clone, &kb_id_clone, &doc_id_clone,
-                    &filename_clone, &content, emb_model.as_deref()
-                ).await {
+                    &pool_clone,
+                    &app_clone,
+                    &kb_id_clone,
+                    &doc_id_clone,
+                    &filename_clone,
+                    &content,
+                    emb_model.as_deref(),
+                )
+                .await
+                {
                     tracing::error!("Document processing failed: {}", e);
                 }
             });
@@ -937,11 +1079,20 @@ async fn handle_tool_call(
         }
 
         "delete_document" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
-            let doc_id = args.get("doc_id").and_then(|d| d.as_str()).ok_or("Missing doc_id")?;
+            let kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
+            let doc_id = args
+                .get("doc_id")
+                .and_then(|d| d.as_str())
+                .ok_or("Missing doc_id")?;
 
             let kb_repo = KbRepository::new(pool.clone());
-            let doc = kb_repo.get_document(doc_id).await.map_err(|e| e.to_string())?;
+            let doc = kb_repo
+                .get_document(doc_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
             // Delete file from disk
             if let Some(path) = &doc.file_path {
@@ -950,8 +1101,14 @@ async fn handle_tool_call(
 
             // Delete chunks and document record
             kb_repo.delete_chunks_by_doc(doc_id).await.ok();
-            kb_repo.delete_document(doc_id).await.map_err(|e| e.to_string())?;
-            kb_repo.update_kb_counts(kb_id).await.map_err(|e| e.to_string())?;
+            kb_repo
+                .delete_document(doc_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            kb_repo
+                .update_kb_counts(kb_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
             Ok(serde_json::json!({
                 "content": [{
@@ -963,10 +1120,16 @@ async fn handle_tool_call(
         }
 
         "list_documents" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+            let kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
 
             let kb_repo = KbRepository::new(pool.clone());
-            let docs = kb_repo.get_documents(kb_id).await.map_err(|e| e.to_string())?;
+            let docs = kb_repo
+                .get_documents(kb_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
             if docs.is_empty() {
                 return Ok(serde_json::json!({
@@ -978,10 +1141,15 @@ async fn handle_tool_call(
                 }));
             }
 
-            let lines: Vec<String> = docs.iter().map(|d| {
-                format!("- {} | ID: {} | Status: {} | Chunks: {} | Tokens: {} | Size: {} bytes",
-                    d.filename, d.id, d.status, d.chunk_count, d.token_count, d.file_size)
-            }).collect();
+            let lines: Vec<String> = docs
+                .iter()
+                .map(|d| {
+                    format!(
+                        "- {} | ID: {} | Status: {} | Chunks: {} | Tokens: {} | Size: {} bytes",
+                        d.filename, d.id, d.status, d.chunk_count, d.token_count, d.file_size
+                    )
+                })
+                .collect();
 
             Ok(serde_json::json!({
                 "content": [{
@@ -993,9 +1161,11 @@ async fn handle_tool_call(
         }
 
         // ── Write tools: Index management ──────────────────────────
-
         "build_index" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
+            let kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
 
             let kb_repo = KbRepository::new(pool.clone());
             kb_repo.update_kb_index_status(kb_id, "building").await.ok();
@@ -1007,32 +1177,47 @@ async fn handle_tool_call(
             tokio::task::spawn_blocking(move || {
                 let rt = tokio::runtime::Handle::current();
                 rt.block_on(async {
-                    let _ = app_clone.emit("kb-index-progress", serde_json::json!({
-                        "kb_id": &kb_id_clone,
-                        "status": "building",
-                        "message": "Building HNSW index…"
-                    }));
+                    let _ = app_clone.emit(
+                        "kb-index-progress",
+                        serde_json::json!({
+                            "kb_id": &kb_id_clone,
+                            "status": "building",
+                            "message": "Building HNSW index…"
+                        }),
+                    );
 
                     match crate::services::knowledge::retriever::build_index(
-                        &pool_clone, &kb_id_clone, &app_clone
-                    ).await {
+                        &pool_clone,
+                        &kb_id_clone,
+                        &app_clone,
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             tracing::info!("HNSW index built for KB {}", kb_id_clone);
-                            let _ = app_clone.emit("kb-index-progress", serde_json::json!({
-                                "kb_id": &kb_id_clone,
-                                "status": "ready",
-                                "message": "Index build complete"
-                            }));
+                            let _ = app_clone.emit(
+                                "kb-index-progress",
+                                serde_json::json!({
+                                    "kb_id": &kb_id_clone,
+                                    "status": "ready",
+                                    "message": "Index build complete"
+                                }),
+                            );
                         }
                         Err(e) => {
                             tracing::error!("Index build failed for KB {}: {}", kb_id_clone, e);
                             let repo = KbRepository::new(pool_clone.clone());
-                            repo.update_kb_index_status(&kb_id_clone, "error").await.ok();
-                            let _ = app_clone.emit("kb-index-progress", serde_json::json!({
-                                "kb_id": &kb_id_clone,
-                                "status": "error",
-                                "message": format!("Index build failed: {}", e)
-                            }));
+                            repo.update_kb_index_status(&kb_id_clone, "error")
+                                .await
+                                .ok();
+                            let _ = app_clone.emit(
+                                "kb-index-progress",
+                                serde_json::json!({
+                                    "kb_id": &kb_id_clone,
+                                    "status": "error",
+                                    "message": format!("Index build failed: {}", e)
+                                }),
+                            );
                         }
                     }
                 });
@@ -1048,34 +1233,71 @@ async fn handle_tool_call(
         }
 
         // ── Write tools: Source import ─────────────────────────────
-
         "import_source" => {
-            let kb_id = args.get("kb_id").and_then(|k| k.as_str()).ok_or("Missing kb_id")?;
-            let source_type = args.get("source_type").and_then(|s| s.as_str()).ok_or("Missing source_type")?;
+            let kb_id = args
+                .get("kb_id")
+                .and_then(|k| k.as_str())
+                .ok_or("Missing kb_id")?;
+            let source_type = args
+                .get("source_type")
+                .and_then(|s| s.as_str())
+                .ok_or("Missing source_type")?;
             let kb_id = kb_id.to_string();
 
-            let input = crate::services::knowledge::models::ImportSourceInput {
-                source_type: source_type.to_string(),
-                repo_url: args.get("repo_url").and_then(|r| r.as_str()).map(|s| s.to_string()),
-                branch: args.get("branch").and_then(|b| b.as_str()).map(|s| s.to_string()),
-                token: args.get("token").and_then(|t| t.as_str()).map(|s| s.to_string()),
-                url: args.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()),
-                dir_path: args.get("dir_path").and_then(|d| d.as_str()).map(|s| s.to_string()),
-                excluded_dirs: args.get("excluded_dirs").and_then(|e| e.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
-                included_files: args.get("included_files").and_then(|i| i.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
-                max_file_size: args.get("max_file_size").and_then(|m| m.as_u64()).map(|v| v as usize),
-            };
+            let input =
+                crate::services::knowledge::models::ImportSourceInput {
+                    source_type: source_type.to_string(),
+                    repo_url: args
+                        .get("repo_url")
+                        .and_then(|r| r.as_str())
+                        .map(|s| s.to_string()),
+                    branch: args
+                        .get("branch")
+                        .and_then(|b| b.as_str())
+                        .map(|s| s.to_string()),
+                    token: args
+                        .get("token")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string()),
+                    url: args
+                        .get("url")
+                        .and_then(|u| u.as_str())
+                        .map(|s| s.to_string()),
+                    dir_path: args
+                        .get("dir_path")
+                        .and_then(|d| d.as_str())
+                        .map(|s| s.to_string()),
+                    excluded_dirs: args.get("excluded_dirs").and_then(|e| e.as_array()).map(
+                        |arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        },
+                    ),
+                    included_files: args.get("included_files").and_then(|i| i.as_array()).map(
+                        |arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        },
+                    ),
+                    max_file_size: args
+                        .get("max_file_size")
+                        .and_then(|m| m.as_u64())
+                        .map(|v| v as usize),
+                };
 
             let kb_repo = KbRepository::new(pool.clone());
-            let source = kb_repo.create_source(
-                &kb_id,
-                &input.source_type,
-                input.repo_url.as_deref().or(input.url.as_deref()),
-                input.dir_path.as_deref(),
-                input.branch.as_deref(),
-            ).await.map_err(|e| e.to_string())?;
+            let source = kb_repo
+                .create_source(
+                    &kb_id,
+                    &input.source_type,
+                    input.repo_url.as_deref().or(input.url.as_deref()),
+                    input.dir_path.as_deref(),
+                    input.branch.as_deref(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
 
             let source_id = source.id.clone();
             let source_type_clone = input.source_type.clone();
@@ -1086,16 +1308,31 @@ async fn handle_tool_call(
             tokio::spawn(async move {
                 let result = if source_type_clone == "git" {
                     crate::services::knowledge::importer::import_git_repo(
-                        &pool_clone, &app_clone, &kb_id_clone, &source_id, &input
-                    ).await
+                        &pool_clone,
+                        &app_clone,
+                        &kb_id_clone,
+                        &source_id,
+                        &input,
+                    )
+                    .await
                 } else if source_type_clone == "url" {
                     crate::services::knowledge::importer::import_url(
-                        &pool_clone, &app_clone, &kb_id_clone, &source_id, &input
-                    ).await
+                        &pool_clone,
+                        &app_clone,
+                        &kb_id_clone,
+                        &source_id,
+                        &input,
+                    )
+                    .await
                 } else if source_type_clone == "local_dir" {
                     crate::services::knowledge::importer::import_local_dir(
-                        &pool_clone, &app_clone, &kb_id_clone, &source_id, &input
-                    ).await
+                        &pool_clone,
+                        &app_clone,
+                        &kb_id_clone,
+                        &source_id,
+                        &input,
+                    )
+                    .await
                 } else {
                     Err(format!("Unknown source type: {}", source_type_clone))
                 };
@@ -1103,10 +1340,14 @@ async fn handle_tool_call(
                 let repo = KbRepository::new(pool_clone.clone());
                 match result {
                     Ok(count) => {
-                        repo.update_source_status(&source_id, "done", count as i64, None).await.ok();
+                        repo.update_source_status(&source_id, "done", count as i64, None)
+                            .await
+                            .ok();
                     }
                     Err(e) => {
-                        repo.update_source_status(&source_id, "error", 0, Some(&e)).await.ok();
+                        repo.update_source_status(&source_id, "error", 0, Some(&e))
+                            .await
+                            .ok();
                         tracing::error!("Import failed: {}", e);
                     }
                 }
