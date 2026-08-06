@@ -251,13 +251,33 @@ fn transport_failure(e: reqwest::Error) -> AttemptFailure {
     }
 }
 
-fn undecodable_body(e: reqwest::Error) -> AttemptFailure {
+fn undecodable_body(e: impl std::fmt::Display) -> AttemptFailure {
     AttemptFailure {
         failure_class: FailureClass::UpstreamProtocolError,
         message: format!("upstream returned an undecodable body: {e}"),
         status_code: Some(502),
         retry_after: None,
     }
+}
+
+/// Extract the first `data:` JSON payload from an SSE byte stream.  Returns
+/// `None` when the stream has no complete record or no valid JSON frame.
+/// Used ONLY for draft-test probes (see the SSE-tolerance branch above).
+fn first_sse_data_json(bytes: &[u8]) -> Option<Value> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let len = crate::endpoint_executor::sse::record_end(&bytes[offset..])?;
+        let record = &bytes[offset..offset + len];
+        offset += len;
+        let payload = crate::endpoint_executor::sse::parse_data_payload(record).ok()?;
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(&payload) {
+            return Some(v);
+        }
+    }
+    None
 }
 
 fn client(timeout_secs: i64) -> reqwest::Client {
@@ -478,10 +498,60 @@ pub async fn dispatch_executor(
     // T06 M-2: preserve safely-passthrough response headers (credentials and
     // hop-by-hop fields dropped) so the non-stream executor boundary retains
     // upstream headers and the handler can forward them downstream.
+    // Snapshot headers for the success path AND the decode-failure diagnostics
+    // before `bytes()` consumes the response.
     let response_headers = safe_response_headers(resp.headers());
-    let body: Value = match resp.json().await {
+    let content_encoding = resp
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    // Read the raw bytes once; parse JSON ourselves so the bytes stay available
+    // for diagnostics when the decode fails.
+    let bytes = resp.bytes().await.unwrap_or_default();
+    let body: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
-        Err(e) => return AttemptResult::Failure(undecodable_body(e)),
+        Err(e) => {
+            // A 2xx that fails to parse is either non-JSON content (HTML/plain
+            // text) or an undecoded compressed body (gzip etc.) — the distinction
+            // only shows up in the bytes and headers, so log them before failing.
+            let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).to_string();
+            tracing::warn!(
+                url = %final_url(
+                    &attempt.native_base_url,
+                    &endpoint_path(&attempt.upstream_protocol, &attempt.upstream_endpoint),
+                    query
+                ),
+                status = status,
+                content_encoding = ?content_encoding,
+                content_type = ?content_type,
+                body_len = bytes.len(),
+                body_preview = %preview,
+                err = %e,
+                "2xx upstream body failed JSON decode"
+            );
+            // Draft-test probes only: a gateway that ignores `stream:false` and
+            // ALWAYS returns SSE is still speaking the endpoint's protocol, so a
+            // probe must not fail it just because the body is SSE-framed rather
+            // than a single JSON document.  Extract the first `data:` JSON frame
+            // and treat that as the probe body.  Gating on the route_group (not
+            // content-type) keeps this robust against gateways that emit SSE
+            // under an `application/json` header.  Production requests never
+            // take this path (their route_group is not `draft_test/...`).
+            if attempt.route_group.starts_with("draft_test/") {
+                match first_sse_data_json(&bytes) {
+                    Some(v) => v,
+                    None => return AttemptResult::Failure(undecodable_body(e)),
+                }
+            } else {
+                return AttemptResult::Failure(undecodable_body(e));
+            }
+        }
     };
     // Legacy Gemini override: the upstream `generateContent` response must be
     // converted back to OpenAI Chat (this is the ONLY executor that converts
