@@ -52,7 +52,7 @@ export function ProviderDropdown({
         setFocusIdx(i => (i + 1) % flat.length);
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
-        setFocusIdx(i => (i - 1 + flat.length) % flat.length);
+        setFocusIdx(i => (i <= 0 ? flat.length - 1 : i - 1));
       } else if (e.key === "Enter") {
         const f = flat[focusIdx];
         if (f) {
@@ -77,7 +77,7 @@ export function ProviderDropdown({
         type="button"
         aria-haspopup="listbox"
         aria-expanded={open}
-        onClick={() => setOpen(o => !o)}
+        onClick={() => { setOpen(o => !o); setFocusIdx(-1); }}
         className={`flex w-full items-center gap-2.5 rounded-2xl border bg-background/70 px-4 py-3 text-left transition-all ${
           open ? "border-primary shadow-[0_0_0_3px_rgba(47,111,237,0.15)]" : "border-border hover:border-primary/40"
         }`}
@@ -95,6 +95,7 @@ export function ProviderDropdown({
       {open && (
         <div
           role="listbox"
+          aria-activedescendant={flat[focusIdx]?.id}
           className="absolute left-0 right-0 top-[calc(100%+6px)] z-50 max-h-80 overflow-y-auto rounded-2xl border border-border bg-white p-1.5 shadow-[0_16px_40px_rgba(15,23,42,0.16)]"
         >
           {groups.map(g => (
@@ -103,30 +104,40 @@ export function ProviderDropdown({
                 {CHANNEL_CATEGORIES[g.region]?.icon} {CHANNEL_CATEGORIES[g.region]?.label}
               </div>
               <div className={`grid gap-1 ${g.region === "custom" ? "grid-cols-1" : "grid-cols-2"}`}>
-                {g.presets.map(p => (
-                  <button
-                    key={p.id}
-                    type="button"
-                    role="option"
-                    aria-selected={p.provider === current}
-                    title={p.description}
-                    onClick={() => { onSelect(p.provider); setOpen(false); }}
-                    onMouseEnter={() => setFocusIdx(flat.indexOf(p))}
-                    className={`flex items-center gap-2.5 rounded-xl px-2.5 py-2 text-left transition-colors ${
-                      p.provider === current ? "bg-primary/10" : "hover:bg-muted/50"
-                    }`}
-                  >
-                    <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center">
-                      <span className="h-[18px] w-[18px]" dangerouslySetInnerHTML={{ __html: CHANNEL_PROVIDER_ICONS[p.icon_key] ?? "❓" }} />
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className={`block truncate text-[13.5px] font-semibold ${p.provider === current ? "text-primary" : ""}`}>
-                        {p.display_name}
+                {g.presets.map(p => {
+                  const flatIdx = flat.indexOf(p);
+                  const isCurrent = p.provider === current;
+                  const isFocused = flatIdx === focusIdx;
+                  return (
+                    <button
+                      key={p.id}
+                      id={p.id}
+                      type="button"
+                      role="option"
+                      aria-selected={isCurrent}
+                      title={p.description}
+                      onClick={() => { onSelect(p.provider); setOpen(false); }}
+                      onMouseEnter={() => setFocusIdx(flatIdx)}
+                      className={`flex items-center gap-2.5 rounded-xl px-2.5 py-2 text-left transition-colors ${
+                        isFocused
+                          ? "bg-muted/70 ring-1 ring-primary/30"
+                          : isCurrent
+                            ? "bg-primary/10"
+                            : "hover:bg-muted/50"
+                      }`}
+                    >
+                      <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center">
+                        <span className="h-[18px] w-[18px]" dangerouslySetInnerHTML={{ __html: CHANNEL_PROVIDER_ICONS[p.icon_key] ?? "❓" }} />
                       </span>
-                    </span>
-                    <span className="shrink-0 font-bold text-primary">{p.provider === current ? "✓" : ""}</span>
-                  </button>
-                ))}
+                      <span className="min-w-0 flex-1">
+                        <span className={`block truncate text-[13.5px] font-semibold ${isCurrent ? "text-primary" : ""}`}>
+                          {p.display_name}
+                        </span>
+                      </span>
+                      <span className="shrink-0 font-bold text-primary">{isCurrent ? "✓" : ""}</span>
+                    </button>
+                  );
+                })}
               </div>
             </div>
           ))}
