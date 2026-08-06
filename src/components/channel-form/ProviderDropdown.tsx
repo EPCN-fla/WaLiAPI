@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ChannelPreset, ChannelProvider, ChannelRegionGroup } from "../../types";
 import { CHANNEL_CATEGORIES, CHANNEL_PROVIDER_ICONS } from "../../lib/constants";
 
@@ -33,6 +33,15 @@ export function ProviderDropdown({
   );
   const flat = useMemo(() => groups.flatMap(g => g.presets), [groups]);
 
+  // 扁平列表 id → 索引 映射，避免渲染时逐个 indexOf（O(n²)）。
+  const flatIndexById = useMemo(() => {
+    const m = new Map<string, number>();
+    flat.forEach((p, i) => m.set(p.id, i));
+    return m;
+  }, [flat]);
+
+  const listboxId = useId();
+
   const currentPreset = presets.find(p => p.provider === current) ?? presets[0];
 
   useEffect(() => {
@@ -47,6 +56,7 @@ export function ProviderDropdown({
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
+      if (flat.length === 0) return;
       if (e.key === "ArrowDown") {
         e.preventDefault();
         setFocusIdx(i => (i + 1) % flat.length);
@@ -77,6 +87,8 @@ export function ProviderDropdown({
         type="button"
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-controls={listboxId}
+        aria-activedescendant={flat[focusIdx]?.id}
         onClick={() => { setOpen(o => !o); setFocusIdx(-1); }}
         className={`flex w-full items-center gap-2.5 rounded-2xl border bg-background/70 px-4 py-3 text-left transition-all ${
           open ? "border-primary shadow-[0_0_0_3px_rgba(47,111,237,0.15)]" : "border-border hover:border-primary/40"
@@ -94,8 +106,8 @@ export function ProviderDropdown({
 
       {open && (
         <div
+          id={listboxId}
           role="listbox"
-          aria-activedescendant={flat[focusIdx]?.id}
           className="absolute left-0 right-0 top-[calc(100%+6px)] z-50 max-h-80 overflow-y-auto rounded-2xl border border-border bg-white p-1.5 shadow-[0_16px_40px_rgba(15,23,42,0.16)]"
         >
           {groups.map(g => (
@@ -105,7 +117,7 @@ export function ProviderDropdown({
               </div>
               <div className={`grid gap-1 ${g.region === "custom" ? "grid-cols-1" : "grid-cols-2"}`}>
                 {g.presets.map(p => {
-                  const flatIdx = flat.indexOf(p);
+                  const flatIdx = flatIndexById.get(p.id) ?? 0;
                   const isCurrent = p.provider === current;
                   const isFocused = flatIdx === focusIdx;
                   return (
