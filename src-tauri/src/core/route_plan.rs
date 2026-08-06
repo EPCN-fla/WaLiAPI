@@ -469,7 +469,15 @@ fn classify_channel(
             }
         }
         EndpointKind::Responses => {
-            let debt = has_responses_debt(channel);
+            // A channel carries the Responses→Chat debt when its config records
+            // it explicitly OR when it is a legacy-inferred openai/custom row
+            // (revision-0 era) that predates the native /responses path.  The
+            // latter restores the pre-refactor de facto behavior (design 11.2).
+            let debt = has_responses_debt(channel)
+                || (id.inferred
+                    && id.identity_revision == 0
+                    && id.protocol == "openai"
+                    && !has("responses"));
             if !debt && id.protocol == "openai" && has("responses") && flags.native_responses {
                 // Native /responses passthrough.
                 Some((
@@ -1196,6 +1204,36 @@ mod tests {
     }
 
     #[test]
+    fn legacy_openai_row_gets_responses_debt_at_routing() {
+        // A revision-0 openai/custom row (no native identity, no explicit
+        // legacy_capabilities flag) must still route /v1/responses through the
+        // Responses→Chat debt path (G2), restoring the pre-refactor behavior
+        // (design 11.2) instead of being silently dropped.
+        let legacy = channel(
+            "legacy",
+            "openai",
+            "https://gw.example.com/v1",
+            &["m"],
+            1,
+            1,
+            "{}",
+        );
+        let key = api_key(&[], &[]);
+        let plan = authorize_and_plan(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &[legacy],
+            &flags(true),
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap();
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].tier, GroupTier::Conversion);
+        assert_eq!(plan.groups[0].upstream_endpoint, "chat_completions");
+    }
+
     fn responses_debt_channel_goes_to_g2_not_g1() {
         let debt = channel(
             "legacy",

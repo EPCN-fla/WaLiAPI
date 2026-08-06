@@ -184,7 +184,10 @@ fn infer_legacy(
             // T00 decision 2 / design 11.2: an old openai record must NOT be
             // reported natively capable of /responses just because it is
             // typed openai. The Responses-via-Chat legacy debt is only
-            // recorded per-row in config.legacy_capabilities.
+            // recorded per-row in config.legacy_capabilities.  (A revision-0
+            // legacy row without the debt flag is given the debt path at
+            // ROUTING time in route_plan::has_responses_debt — see there —
+            // NOT by claiming native /responses here.)
             let has_responses_debt = config
                 .get("legacy_capabilities")
                 .and_then(|v| v.as_array())
@@ -467,7 +470,7 @@ pub fn new_to_legacy(identity: &ChannelIdentity) -> (String, String) {
             let legacy_base = if identity.native_base_url.is_empty() {
                 p.legacy_base_url.clone()
             } else {
-                identity.native_base_url.clone()
+                legacy_base_for_native(&identity.protocol, &identity.native_base_url)
             };
             (legacy_type, legacy_base)
         }
@@ -478,8 +481,30 @@ pub fn new_to_legacy(identity: &ChannelIdentity) -> (String, String) {
                 "ollama" => "openai",
                 _ => "openai",
             };
-            (legacy_type.to_string(), identity.native_base_url.clone())
+            (
+                legacy_type.to_string(),
+                legacy_base_for_native(&identity.protocol, &identity.native_base_url),
+            )
         }
+    }
+}
+
+/// Compute the old-code-compatible `base_url` for a *custom* new identity.
+///
+/// The legacy adapter appends its endpoint to `base_url` (claude adds
+/// `/messages`, openai/custom adds `/chat/completions`).  The new native
+/// executor serves Anthropic at `{root}/v1/messages` and Ollama's
+/// OpenAI-compat layer at `{root}/v1/chat/completions`, so for those protocols
+/// the legacy base must carry the `/v1` segment (mirroring the frontend
+/// `deriveLegacyBaseUrl`); OpenAI custom roots already include `/v1` and are
+/// left verbatim.
+fn legacy_base_for_native(protocol: &str, native_base: &str) -> String {
+    let needs_v1 = matches!(protocol, "anthropic" | "ollama")
+        && !native_base.trim_end_matches('/').ends_with("/v1");
+    if needs_v1 {
+        format!("{}/v1", native_base.trim_end_matches('/'))
+    } else {
+        native_base.to_string()
     }
 }
 
@@ -807,6 +832,8 @@ mod tests {
         };
         let (lt, lb) = new_to_legacy(&identity);
         assert_eq!(lt, "claude");
-        assert_eq!(lb, "https://gw.internal.example.com/anthropic");
+        // The old claude adapter appends /messages, so the legacy base must
+        // carry /v1 to build {root}/v1/messages — matching the new native URL.
+        assert_eq!(lb, "https://gw.internal.example.com/anthropic/v1");
     }
 }

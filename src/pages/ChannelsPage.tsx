@@ -256,7 +256,12 @@ export function ChannelsPage() {
             const isExpanded = expandedId === ch.id;
             const keyVisible = showKeyMap[ch.id];
             // 双标签（设计 3.5）：第一 [协议]，第二 [提供商]，来自规范化身份。
-            const protocolLabel = getProtocolLabel(ch.protocol);
+            // revision 0 表示仍由 legacy 推断的身份：第一标签显示 [旧配置]，
+            // 与表单"来自旧配置"横幅语义一致（08-channel-ui 意图）。
+            const isLegacyIdentity = (ch.identity_revision ?? 0) === 0;
+            const protocolLabel = isLegacyIdentity
+              ? "旧配置"
+              : getProtocolLabel(ch.protocol);
             const providerLabel = getChannelProviderLabel(ch.provider);
             const displayBaseUrl = ch.native_base_url || ch.base_url;
             return (
