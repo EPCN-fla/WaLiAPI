@@ -88,7 +88,7 @@ export function ProviderDropdown({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={listboxId}
-        aria-activedescendant={flat[focusIdx]?.id}
+        aria-activedescendant={open ? flat[focusIdx]?.id : undefined}
         onClick={() => { setOpen(o => !o); setFocusIdx(-1); }}
         className={`flex w-full items-center gap-2.5 rounded-2xl border bg-background/70 px-4 py-3 text-left transition-all ${
           open ? "border-primary shadow-[0_0_0_3px_rgba(47,111,237,0.15)]" : "border-border hover:border-primary/40"
