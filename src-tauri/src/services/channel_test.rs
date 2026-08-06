@@ -272,17 +272,33 @@ pub async fn validate_draft_url(
     }
     let host_lower = host.to_lowercase();
     let allow_loopback = protocol == "ollama" || provider == "ollama" || provider == "custom";
+    // RFC1918 私网段仅对自定义/Ollama 渠道放行（自建/内网网关属自定义渠道）；
+    // 云元数据 169.254.169.254、组播与保留段始终拦截。
+    let allow_private = allow_loopback;
     let literal_loopback =
         host_lower == "localhost" || host_lower == "::1" || host_lower.starts_with("127.");
     if literal_loopback {
         if allow_loopback {
             return Ok(());
         }
+        tracing::warn!(
+            host = %host_lower,
+            protocol = %protocol,
+            provider = %provider,
+            "SSRF 拒绝：非 Ollama/自定义渠道指向本机回环地址"
+        );
         return Err("SSRF 策略：非 Ollama/自定义渠道不允许指向本机回环地址".to_string());
     }
     match host.parse::<IpAddr>() {
         Ok(ip) => {
-            if is_blocked_ip(ip, allow_loopback) {
+            if is_blocked_ip(ip, allow_loopback, allow_private) {
+                tracing::warn!(
+                    host = %host_lower,
+                    ip = %ip,
+                    protocol = %protocol,
+                    provider = %provider,
+                    "SSRF 拒绝：目标为被禁止的私网/保留网段"
+                );
                 return Err(format!("SSRF 策略：目标 {host} 属于被禁止的私网/保留网段"));
             }
             Ok(())
@@ -293,7 +309,17 @@ pub async fn validate_draft_url(
                 .await
                 .map(|it| it.map(|a| a.ip()).collect::<Vec<_>>())
                 .unwrap_or_default();
-            if ips.iter().any(|ip| is_blocked_ip(*ip, allow_loopback)) {
+            if ips
+                .iter()
+                .any(|ip| is_blocked_ip(*ip, allow_loopback, allow_private))
+            {
+                tracing::warn!(
+                    host = %host_lower,
+                    protocol = %protocol,
+                    provider = %provider,
+                    resolved_ips = ?ips,
+                    "SSRF 拒绝：域名解析到被禁止的私网/保留网段"
+                );
                 return Err(format!("SSRF 策略：{host} 解析到被禁止的私网/保留网段"));
             }
             Ok(())
@@ -301,7 +327,7 @@ pub async fn validate_draft_url(
     }
 }
 
-fn is_blocked_ip(ip: IpAddr, allow_loopback: bool) -> bool {
+fn is_blocked_ip(ip: IpAddr, allow_loopback: bool, allow_private: bool) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let a = v4.octets()[0];
@@ -309,10 +335,15 @@ fn is_blocked_ip(ip: IpAddr, allow_loopback: bool) -> bool {
             if a == 127 {
                 return !allow_loopback;
             }
+            // RFC1918 私网段：仅 custom/ollama 放行，其他渠道仍拦截（SSRF）。
             if a == 10
                 || (a == 172 && (16..=31).contains(&b))
                 || (a == 192 && b == 168)
-                || (a == 169 && b == 254)
+            {
+                return !allow_private;
+            }
+            // 云元数据 / 链路本地、0/8、广播、组播、保留段：始终拦截。
+            if (a == 169 && b == 254)
                 || (a == 100 && (64..=127).contains(&b))
                 || a == 0
                 || a == 255
@@ -332,13 +363,13 @@ fn is_blocked_ip(ip: IpAddr, allow_loopback: bool) -> bool {
             }
             let segments = v6.segments();
             if segments[0] & 0xfe00 == 0xfc00 {
-                return true; // fc00::/7 ULA
+                return !allow_private; // fc00::/7 ULA，私网段同规则
             }
             if segments[0] & 0xffc0 == 0xfe80 {
                 return true; // fe80::/10 link-local
             }
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_blocked_ip(IpAddr::V4(v4), allow_loopback);
+                return is_blocked_ip(IpAddr::V4(v4), allow_loopback, allow_private);
             }
             false
         }
@@ -406,6 +437,9 @@ fn probe_body(endpoint: &str, model: &str) -> Value {
             "model": model,
             "max_tokens": 1,
             "messages": [{ "role": "user", "content": "ping" }],
+            // 探测显式请求非流式：Anthropic Messages 默认非流式，但显式声明
+            // stream:false 可避免部分网关因「客户端未声明」而强制以 SSE 返回。
+            "stream": false,
         }),
         "count_tokens" => json!({
             "model": model,
@@ -1234,6 +1268,80 @@ mod channel_draft_test {
     }
 
     #[tokio::test]
+    async fn anthropic_2xx_non_json_body_is_protocol_error() {
+        // 复现 Bug 1：上游返回 2xx 但 body 无法解析为 JSON（如 HTML 拦截页、
+        // 空 body 或未解压的 gzip 字节），必须归类为 protocol 错误，且诊断
+        // 日志要能抓到 Content-Type / body 摘要，而不是只显示一行通用错误。
+        let mock = start_mock(|_path: &str| {
+            Box::pin(async move {
+                (
+                    200,
+                    b"<html><body>Bad Gateway</body></html>".to_vec(),
+                )
+            })
+        })
+        .await;
+        let base = format!("http://{}", mock.addr);
+        let input = draft(
+            "anthropic",
+            "custom",
+            &base,
+            &["messages"],
+            &["claude-sonnet-4-6"],
+            "sk-ant-xyz",
+        );
+        let result = run_draft_test(&input, "sk-ant-xyz", &store(), &cfg())
+            .await
+            .unwrap();
+        assert_eq!(result.results[0].status, "failed");
+        assert_eq!(result.results[0].category.as_deref(), Some("protocol"));
+        assert!(
+            result.results[0].message.contains("无法解析"),
+            "should surface the protocol error: {}",
+            result.results[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_gateway_that_always_streams_probe_passes() {
+        // Bug 1 真实场景：探测请求 `stream:false`，但网关忽略该字段、总是以
+        // SSE 流返回（Anthropic 合法流式格式）。探测不得因为 body 是 SSE 帧
+        // 而非单条 JSON 就报协议错误 —— 应提取首个 data: JSON 帧判定为通过。
+        let sse_body = br#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","model":"big-pickle","content":[]}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+        let mock = start_mock(|_path: &str| {
+            let body = sse_body.to_vec();
+            Box::pin(async move { (200, body) })
+        })
+        .await;
+        let base = format!("http://{}", mock.addr);
+        let input = draft(
+            "anthropic",
+            "custom",
+            &base,
+            &["messages"],
+            &["big-pickle"],
+            "sk-ant-xyz",
+        );
+        let result = run_draft_test(&input, "sk-ant-xyz", &store(), &cfg())
+            .await
+            .unwrap();
+        assert_eq!(
+            result.results[0].status, "passed",
+            "SSE-only Anthropic gateway must pass the probe: {}",
+            result.results[0].message
+        );
+    }
+
+    #[tokio::test]
     async fn ollama_empty_key_is_legal() {
         let mock = start_mock(|_path: &str| {
             Box::pin(async move {
@@ -1535,6 +1643,48 @@ mod channel_draft_test {
             validate_draft_url("http://localhost:11434/v1", "openai", "ollama")
                 .await
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn ssrf_allows_private_lan_for_ollama_and_custom() {
+        // 内网（hosts 域名解析到私网段 / 直接私网 IP）对 custom/ollama 放行。
+        assert!(
+            validate_draft_url("http://192.168.1.10/v1", "openai", "custom")
+                .await
+                .is_ok()
+        );
+        assert!(
+            validate_draft_url("http://10.0.0.5/v1", "openai", "custom")
+                .await
+                .is_ok()
+        );
+        assert!(
+            validate_draft_url("http://172.16.3.7/v1", "openai", "ollama")
+                .await
+                .is_ok()
+        );
+        // 非 custom/ollama 渠道仍拦截私网。
+        assert!(
+            validate_draft_url("http://192.168.1.10/v1", "openai", "openai")
+                .await
+                .is_err()
+        );
+        // CGNAT / 云元数据 / 组播始终拦截，即使 custom 也不放行。
+        assert!(
+            validate_draft_url("http://100.64.0.1/v1", "openai", "custom")
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_draft_url("http://169.254.169.254/latest/meta-data", "openai", "custom")
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_draft_url("http://224.0.0.1/v1", "openai", "custom")
+                .await
+                .is_err()
         );
     }
 
