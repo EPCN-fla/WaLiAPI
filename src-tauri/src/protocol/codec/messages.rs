@@ -23,24 +23,53 @@ pub fn encode_messages_to_chat(
 ) -> Result<(Value, ConversionContext), UnsupportedFeatures> {
     let mut out = Vec::new();
 
+    // Top-level fields we can map 1:1 between Messages and Chat.  `top_k` is
+    // deliberately absent: OpenAI Chat has no top_k, so it cannot be preserved
+    // and must be rejected rather than silently dropped.
+    const SUPPORTED_TOP_LEVEL: &[&str] = &[
+        "model",
+        "messages",
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "stop_sequences",
+        "stream",
+        "tools",
+        "tool_choice",
+        "system",
+        "user",
+    ];
+
     // Native Anthropic features with no Chat equivalent are rejected here,
-    // before any upstream access.
+    // before any upstream access.  Anything not in the supported whitelist is
+    // rejected with a concrete JSON pointer (never silently dropped), matching
+    // the chat_to_messages_v1 top-level scan.
     if let Some(obj) = body.as_object() {
-        for (key, _) in obj.iter() {
-            if matches!(
-                key.as_str(),
-                "thinking"
-                    | "output_config"
-                    | "container"
-                    | "context_management"
-                    | "context_management_config"
-            ) {
+        for (key, value) in obj.iter() {
+            if !SUPPORTED_TOP_LEVEL.contains(&key.as_str()) {
+                // Known beta features with no Chat equivalent keep their stable
+                // code; anything else is an unsupported field.
+                let kind = if matches!(
+                    key.as_str(),
+                    "thinking"
+                        | "output_config"
+                        | "container"
+                        | "context_management"
+                        | "context_management_config"
+                ) {
+                    FeatureKind::BetaFeature
+                } else {
+                    FeatureKind::UnsupportedField
+                };
                 request::reject(
                     &mut out,
-                    FeatureKind::BetaFeature,
+                    kind,
                     format!("/{key}"),
                     format!("Messages field {key:?} has no Chat Completions equivalent"),
                 );
+                // Keep scanning every unknown field so the caller sees the full
+                // rejection set; `value` is only read to silence the unused var.
+                let _ = value;
             }
         }
     }
@@ -114,11 +143,19 @@ pub fn encode_messages_to_chat(
     if let Some(t) = body.get("top_p") {
         chat.insert("top_p".to_string(), t.clone());
     }
-    if let Some(t) = body.get("top_k") {
-        chat.insert("top_k".to_string(), t.clone());
-    }
-    if let Some(stop) = body.get("stop_sequences").and_then(Value::as_array) {
-        chat.insert("stop".to_string(), Value::Array(stop.clone()));
+    if let Some(stop) = body.get("stop_sequences") {
+        match stop {
+            Value::Array(_) => {
+                chat.insert("stop".to_string(), stop.clone());
+            }
+            _ => {
+                return Err(UnsupportedFeatures::single(
+                    FeatureKind::UnsupportedField,
+                    "/stop_sequences",
+                    "stop_sequences must be an array of strings",
+                ))
+            }
+        }
     }
     // tools
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
@@ -208,6 +245,14 @@ fn convert_anthropic_message_to_chat(
     if let Some(items) = content_arr {
         let mut user_parts: Vec<Value> = Vec::new();
         let mut out = Vec::new();
+        // Buffer the tool messages produced by tool_result blocks so they can be
+        // inserted in order.  OpenAI requires a `role: tool` message to follow
+        // the assistant tool_calls immediately; when a user message mixes
+        // tool_result with preceding text (`[tool_result, text]` vs
+        // `[text, tool_result]`), we must not let the text push a tool message
+        // away from its assistant.  We therefore collect tool messages and emit
+        // them ahead of any buffered text (option B in the review).
+        let mut tool_messages: Vec<Value> = Vec::new();
         let flush_user = |parts: &mut Vec<Value>, out: &mut Vec<Value>| {
             if !parts.is_empty() {
                 // Chat accepts a plain string when the user content is a single
@@ -293,10 +338,16 @@ fn convert_anthropic_message_to_chat(
                                 "tool_use block missing name",
                             )
                         })?;
-                    let input = block
-                        .get("input")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({}));
+                    // A tool_use block without `input` is malformed: never
+                    // fabricate `{}`.  `input: {}` is fine only when explicitly
+                    // present.
+                    let input = block.get("input").ok_or_else(|| {
+                        UnsupportedFeatures::single(
+                            FeatureKind::MissingToolField,
+                            format!("{bp}/input"),
+                            "tool_use block missing input",
+                        )
+                    })?;
                     if !input.is_object() {
                         return Err(UnsupportedFeatures::single(
                             FeatureKind::InvalidToolArguments,
@@ -304,6 +355,7 @@ fn convert_anthropic_message_to_chat(
                             "tool_use input must be a JSON object",
                         ));
                     }
+                    let input = input.clone();
                     let arguments = serde_json::to_string(&input).map_err(|e| {
                         UnsupportedFeatures::single(
                             FeatureKind::InvalidToolArguments,
@@ -325,7 +377,6 @@ fn convert_anthropic_message_to_chat(
                             "tool_result blocks must be in a user message",
                         ));
                     }
-                    flush_user(&mut user_parts, &mut out);
                     let tool_use_id = block
                         .get("tool_use_id")
                         .and_then(Value::as_str)
@@ -343,7 +394,7 @@ fn convert_anthropic_message_to_chat(
                     } else {
                         text
                     };
-                    out.push(serde_json::json!({
+                    tool_messages.push(serde_json::json!({
                         "role": "tool",
                         "tool_call_id": tool_use_id,
                         "content": content
@@ -391,6 +442,9 @@ fn convert_anthropic_message_to_chat(
             }
             out.push(assistant);
         } else {
+            // Emit tool messages ahead of the buffered text so they stay
+            // adjacent to the assistant tool_calls message they answer.
+            out.append(&mut tool_messages);
             flush_user(&mut user_parts, &mut out);
         }
         Ok(out)
@@ -511,7 +565,24 @@ fn convert_anthropic_tool_to_chat(
 /// Convert an Anthropic tool_choice to a Chat tool_choice.
 fn anthropic_tool_choice_to_chat(tc: &Value, pointer: &str) -> Result<Value, UnsupportedFeatures> {
     if let Some(s) = tc.as_str() {
-        return Ok(Value::String(s.to_string()));
+        // Anthropic accepts the bare strings auto/any; OpenAI only accepts
+        // auto/none/required, so map (never pass through verbatim).
+        return match s {
+            "auto" => Ok(Value::String("auto".to_string())),
+            "any" => Ok(Value::String("required".to_string())),
+            // "tool" as a bare string carries no tool name; reject rather than
+            // emit an empty-named Chat tool_choice.
+            "tool" => Err(UnsupportedFeatures::single(
+                FeatureKind::MissingToolField,
+                format!("{pointer}/name"),
+                "bare string tool_choice \"tool\" requires an explicit name (use the object form)",
+            )),
+            other => Err(UnsupportedFeatures::single(
+                FeatureKind::UnsupportedField,
+                pointer,
+                format!("unsupported tool_choice string {other:?}"),
+            )),
+        };
     }
     let ty = tc.get("type").and_then(Value::as_str).ok_or_else(|| {
         UnsupportedFeatures::single(
@@ -624,10 +695,14 @@ pub fn decode_messages_response_to_chat(
                             "tool_use block missing name",
                         )
                     })?;
-                let input = block
-                    .get("input")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
+                // A tool_use without `input` is malformed: never fabricate `{}`.
+                let input = block.get("input").ok_or_else(|| {
+                    UnsupportedFeatures::single(
+                        FeatureKind::MissingToolField,
+                        format!("{bp}/input"),
+                        "tool_use block missing input",
+                    )
+                })?;
                 if !input.is_object() {
                     return Err(UnsupportedFeatures::single(
                         FeatureKind::InvalidToolArguments,
@@ -635,6 +710,7 @@ pub fn decode_messages_response_to_chat(
                         "tool_use input must be a JSON object",
                     ));
                 }
+                let input = input.clone();
                 let arguments = serde_json::to_string(&input).map_err(|e| {
                     UnsupportedFeatures::single(
                         FeatureKind::InvalidToolArguments,
@@ -647,6 +723,15 @@ pub fn decode_messages_response_to_chat(
                     "type": "function",
                     "function": {"name": name, "arguments": arguments}
                 }));
+            }
+            Some("thinking") | Some("redacted_thinking") => {
+                // Responses carrying reasoning are not representable in Chat for
+                // this version; reject with the stable thinking code (R7/R29).
+                return Err(UnsupportedFeatures::single(
+                    FeatureKind::Thinking,
+                    format!("{bp}/type"),
+                    "thinking blocks in a Messages response have no Chat equivalent",
+                ));
             }
             Some(other) => {
                 return Err(UnsupportedFeatures::single(
@@ -882,16 +967,42 @@ impl MessagesSseState {
                     Some("text") => {
                         self.text_content_index = Some(index);
                     }
+                    Some("thinking") | Some("redacted_thinking") => {
+                        // Reasoning has no Chat streaming equivalent; reject at
+                        // block start with the stable thinking code (R29) rather
+                        // than surfacing a later unknown-event error.
+                        return Err(UnsupportedFeatures::single(
+                            FeatureKind::Thinking,
+                            "/content_block_start/content_block/type",
+                            "thinking blocks have no Chat streaming equivalent",
+                        ));
+                    }
                     Some("tool_use") => {
+                        // id and name are mandatory on a tool_use block; never
+                        // emit an empty-id/empty-name tool call (R22).
                         let id = block
                             .get("id")
                             .and_then(Value::as_str)
-                            .unwrap_or("")
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(|| {
+                                UnsupportedFeatures::single(
+                                    FeatureKind::MissingToolField,
+                                    "/content_block_start/content_block/id",
+                                    "tool_use block missing id",
+                                )
+                            })?
                             .to_string();
                         let name = block
                             .get("name")
                             .and_then(Value::as_str)
-                            .unwrap_or("")
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(|| {
+                                UnsupportedFeatures::single(
+                                    FeatureKind::MissingToolField,
+                                    "/content_block_start/content_block/name",
+                                    "tool_use block missing name",
+                                )
+                            })?
                             .to_string();
                         let tool_index = self.next_tool_index;
                         self.next_tool_index += 1;
@@ -943,6 +1054,15 @@ impl MessagesSseState {
                                 tool.arguments.push_str(partial);
                             }
                         }
+                    }
+                    Some("thinking_delta") | Some("signature_delta") => {
+                        // Reasoning deltas have no Chat streaming equivalent;
+                        // reject with the stable thinking code (R29).
+                        return Err(UnsupportedFeatures::single(
+                            FeatureKind::Thinking,
+                            "/content_block_delta/delta/type",
+                            "thinking_delta has no Chat streaming equivalent",
+                        ));
                     }
                     _ => {
                         return Err(UnsupportedFeatures::single(

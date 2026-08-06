@@ -145,11 +145,18 @@ pub fn anthropic_system_to_chat(
                         );
                         // cache_control on a text block is a lossless annotation; strip it.
                     }
-                    Some("cache_control") | Some("thinking") => {
+                    Some("cache_control") => {
                         return Err(UnsupportedFeatures::single(
                             FeatureKind::PromptCache,
                             bp,
-                            "system cache_control/thinking block is not representable in Chat",
+                            "system cache_control block is not representable in Chat",
+                        ));
+                    }
+                    Some("thinking") => {
+                        return Err(UnsupportedFeatures::single(
+                            FeatureKind::Thinking,
+                            bp,
+                            "system thinking block is not representable in Chat",
                         ));
                     }
                     Some(other) => {

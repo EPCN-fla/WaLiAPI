@@ -161,6 +161,33 @@ fn chat_request_user_images() {
 }
 
 #[test]
+fn chat_request_rejects_invalid_images() {
+    // R15: Chat image_url must be a valid image — non-image media type, or a
+    // non-http(s) url, is rejected rather than forwarded.
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:application/octet-stream;base64,aGVsbG8="}}
+        ]}]
+    });
+    let e = CodecRegistry::chat_to_messages("m", &body).unwrap_err();
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unsupported_media")));
+
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "javascript:alert(1)"}}
+        ]}]
+    });
+    let e = CodecRegistry::chat_to_messages("m", &body).unwrap_err();
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unsupported_media")));
+}
+
+#[test]
 fn chat_request_rejects_n_gt_1_instead_of_silently_dropping() {
     // `n` is not in the support matrix: Messages always returns one completion,
     // so n>1 must be rejected (never silently yield a single completion).
@@ -580,6 +607,141 @@ fn messages_request_rejects_invalid_tool_input() {
         .any(|c| c.contains("invalid_tool_arguments")));
 }
 
+#[test]
+fn messages_request_rejects_unknown_top_level_fields() {
+    // R4: unknown top-level Messages fields are rejected with a JSON pointer,
+    // never silently dropped.  A whitelist mirrors chat_to_messages_v1.
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "u"}],
+        "metadata": {"user_id": "u1"}
+    });
+    let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unsupported_feature.field")));
+    assert!(e.json_pointers.iter().any(|p| p == "/metadata"));
+}
+
+#[test]
+fn messages_request_rejects_non_array_stop_sequences() {
+    // R12: a non-array stop_sequences must be rejected, not silently dropped.
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "u"}],
+        "stop_sequences": "END"
+    });
+    let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unsupported_feature.field")));
+}
+
+#[test]
+fn messages_request_tool_choice_strings_are_mapped_not_passed_through() {
+    // R9: bare Anthropic tool_choice strings map to Chat values; unknown
+    // strings and a bare "tool" (which needs a name) are rejected.
+    for (input, expected) in [("auto", "auto"), ("any", "required")] {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "u"}],
+            "tool_choice": input
+        });
+        let prepared = CodecRegistry::messages_to_chat("m", &body).unwrap();
+        assert_eq!(prepared.encoded_request["tool_choice"], expected);
+    }
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "u"}],
+        "tool_choice": "tool"
+    });
+    let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("missing_tool_field")));
+
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "u"}],
+        "tool_choice": "bogus"
+    });
+    let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("unsupported_feature.field")));
+}
+
+#[test]
+fn messages_request_tool_use_requires_input_not_fabricated() {
+    // R8/R21: a tool_use without `input` is malformed and must be rejected; we
+    // never fabricate `{}`.  An explicit `input: {}` is accepted.
+    let body = json!({
+        "model": "m",
+        "messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "c", "name": "run"}]}
+        ]
+    });
+    let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("missing_tool_field")));
+    assert!(e.json_pointers.iter().any(|p| p.ends_with("/input")));
+
+    let body = json!({
+        "model": "m",
+        "messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "c", "name": "run", "input": {}}]}
+        ]
+    });
+    let prepared = CodecRegistry::messages_to_chat("m", &body).unwrap();
+    assert_eq!(
+        prepared.encoded_request["messages"][0]["tool_calls"][0]["function"]["arguments"],
+        "{}"
+    );
+}
+
+#[test]
+fn messages_request_tool_results_stay_adjacent_to_assistant() {
+    // tool ordering: a user message mixing text-before-tool_result must keep the
+    // tool message adjacent to the assistant tool_calls it answers.  Expected
+    // order: assistant(tool_calls) -> tool -> user(text).
+    let body = json!({
+        "model": "m",
+        "messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "call_1", "name": "w", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "text", "text": "before"},
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "result"}
+            ]}
+        ]
+    });
+    let prepared = CodecRegistry::messages_to_chat("m", &body).unwrap();
+    let msgs = prepared.encoded_request["messages"].as_array().unwrap();
+    assert_eq!(msgs[0]["role"], "assistant");
+    assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_1");
+    // tool message must immediately follow the assistant, ahead of the text.
+    assert_eq!(msgs[1]["role"], "tool");
+    assert_eq!(msgs[1]["tool_call_id"], "call_1");
+    assert_eq!(msgs[2]["role"], "user");
+    assert_eq!(msgs[2]["content"], "before");
+}
+
+#[test]
+fn messages_response_tool_use_requires_input_not_fabricated() {
+    // R8/R21 response side: a non-stream tool_use without `input` is rejected,
+    // not fabricated as `{}`.
+    let body = json!({
+        "id": "msg_1", "type": "message",
+        "content": [{"type": "tool_use", "id": "c", "name": "run"}],
+        "stop_reason": "tool_use", "usage": {}
+    });
+    let e = messages::decode_messages_response_to_chat(&body, &Default::default()).unwrap_err();
+    assert!(reject_features(&e)
+        .iter()
+        .any(|c| c.contains("missing_tool_field")));
+    assert!(e.json_pointers.iter().any(|p| p.ends_with("/input")));
+}
+
 // ===========================================================================
 // messages_to_chat_v1 — non-stream response
 // ===========================================================================
@@ -641,9 +803,9 @@ fn messages_response_rejects_unknown_block_and_bad_input() {
         "stop_reason": "end_turn", "usage": {}
     });
     let e = messages::decode_messages_response_to_chat(&body, &Default::default()).unwrap_err();
-    assert!(reject_features(&e)
-        .iter()
-        .any(|c| c.contains("unknown_block")));
+    // R29: thinking in a response rejects with the stable thinking code (not
+    // unknown_block), matching the request-side rejection.
+    assert!(reject_features(&e).iter().any(|c| c.contains("thinking")));
 
     let body = json!({
         "id": "msg_1", "type": "message",

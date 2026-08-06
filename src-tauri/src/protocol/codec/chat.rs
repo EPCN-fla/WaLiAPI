@@ -265,7 +265,10 @@ fn convert_chat_message_to_anthropic(
                                 }
                             }
                             Some("image_url") => {
-                                // Chat image_url -> Anthropic image block.
+                                // Chat image_url -> Anthropic image block.  A
+                                // Chat `image_url` may carry either a data URL or
+                                // a plain http(s) URL; both are validated to
+                                // mirror the request-side image gate (R15).
                                 let url = item
                                     .pointer("/image_url/url")
                                     .and_then(Value::as_str)
@@ -278,12 +281,33 @@ fn convert_chat_message_to_anthropic(
                                     })?;
                                 let (_media_type, base64) = parse_data_url(url);
                                 let source = if let Some((mt, data)) = base64 {
+                                    if !mt.starts_with("image/") {
+                                        return Err(UnsupportedFeatures::single(
+                                            FeatureKind::Media,
+                                            format!("{bp}/image_url/url"),
+                                            format!("data URL media type {mt:?} is not an image"),
+                                        ));
+                                    }
+                                    if data.len() > request::MAX_IMAGE_BYTES {
+                                        return Err(UnsupportedFeatures::single(
+                                            FeatureKind::Media,
+                                            format!("{bp}/image_url/url"),
+                                            "data URL image exceeds the size limit",
+                                        ));
+                                    }
                                     serde_json::json!({
                                         "type": "base64",
                                         "media_type": mt,
                                         "data": data
                                     })
                                 } else {
+                                    if !url.starts_with("http://") && !url.starts_with("https://") {
+                                        return Err(UnsupportedFeatures::single(
+                                            FeatureKind::Media,
+                                            format!("{bp}/image_url/url"),
+                                            "image_url url must be http(s) or a data URL",
+                                        ));
+                                    }
                                     serde_json::json!({"type": "url", "url": url})
                                 };
                                 blocks.push(serde_json::json!({
