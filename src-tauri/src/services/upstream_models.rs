@@ -7,7 +7,7 @@
 //! | 协议 | 接口 | 解析 | 鉴权 |
 //! |---|---|---|---|
 //! | openai | `GET {base}/models` | `data[].id` | Bearer |
-//! | anthropic | `GET {base}/v1/models` | `data[].id`（兼容网关也可能返回 OpenAI 格式） | x-api-key + anthropic-version |
+//! | anthropic | `GET {base}/models`（Base 自带 /v1） | `data[].id`（兼容网关也可能返回 OpenAI 格式） | x-api-key + anthropic-version |
 //! | ollama | `GET {base}/api/tags` | `models[].name` | 可选 Bearer |
 
 use crate::core::channel_identity::ChannelIdentity;
@@ -57,7 +57,8 @@ pub async fn fetch_upstream_models(
     // 协议分派：openai/anthropic 都用 OpenAI 兼容 `/models`（`data[].id`），
     // ollama 用 `/api/tags`（`models[].name`）。
     let (path, parse): (&str, fn(&Value) -> Vec<String>) = match identity.protocol.as_str() {
-        "anthropic" => ("v1/models", parse_openai_list),
+        // main 分支约定：anthropic Base 自带 /v1，端点只补 /models。
+        "anthropic" => ("/models", parse_openai_list),
         "ollama" => ("api/tags", parse_ollama_tags),
         _ => ("models", parse_openai_list),
     };
@@ -108,8 +109,7 @@ pub async fn fetch_upstream_models(
 }
 
 /// 解析后的 Native 根：直接使用身份解析出的规范根（不含尾部斜杠）。
-/// Anthropic 的 `v1/models` 由 path 拼接；旧 claude 渠道的身份解析已剥离 `base_url`
-/// 末尾的 `/v1`，因此不会出现 `/v1/v1/models`。
+/// Anthropic 的 Base 自带 `/v1`，`/models` 由 path 拼接，因此最终为 `{base}/models`。
 fn normalize_base(identity: &ChannelIdentity) -> String {
     identity.native_base_url.trim_end_matches('/').to_string()
 }
@@ -266,14 +266,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_uses_v1_models_and_x_api_key() {
+    async fn anthropic_uses_models_path_and_x_api_key() {
+        // main 分支约定：Anthropic Base 自带 /v1，path 模板是 /models；
+        // 这里 mock base 是根，因此请求应为 GET /models（不再是 /v1/models）。
         let m = start_mock(json!({"data": [{"id": "claude-sonnet-5"}]})).await;
         let input = draft("anthropic", &m.addr);
         let r = fetch_upstream_models(&input, "k2", 5).await.unwrap();
         assert_eq!(r.models, vec!["claude-sonnet-5"]);
         assert_eq!(r.protocol, "anthropic");
         let reqs = m.received.lock().await.clone();
-        assert!(reqs[0].0.contains("GET /v1/models"));
+        assert!(reqs[0].0.contains("GET /models"));
         assert!(reqs[0].2.contains("k2"), "should send x-api-key header");
     }
 

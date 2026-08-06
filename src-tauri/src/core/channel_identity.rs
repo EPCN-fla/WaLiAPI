@@ -220,14 +220,10 @@ fn infer_legacy(
         ),
         "claude" => {
             let provider = infer_claude_provider(base_url);
-            // Legacy claude base_url is the old-adaptor root (already
-            // includes "/v1"); the new-code executor appends "v1/messages"
-            // to native_base_url, so the native root must drop a trailing
-            // "/v1" to avoid ".../v1/v1/messages". Trim trailing '/' FIRST
-            // so "…/v1/" (trailing slash after /v1) also collapses to the
-            // vendor root and never yields a double "/v1/v1/messages".
-            let trimmed = base_url.trim_end_matches('/');
-            let native = trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string();
+            // main 分支约定：legacy claude base_url 已是带 /v1 的旧适配器根
+            // （如 api.anthropic.com/v1），executor 端点只补 /messages。native
+            // root 保持 base_url 原样，不再剥 /v1（剥除会造成 .../v1//messages）。
+            let native = base_url.trim_end_matches('/').to_string();
             // T06 I-4 (leader adjudication 2026-08-05): legacy `type ==
             // "claude"` served /v1/messages/count_tokens under the old
             // predicate, so a revision-0 claude row must infer
@@ -572,11 +568,11 @@ mod tests {
     }
 
     #[test]
-    fn claude_trailing_slash_v1_does_not_double_v1() {
-        // "…/v1/" must collapse to the vendor root so the new executor builds
-        // exactly one "/v1/messages", not "/v1/v1/messages".
+    fn claude_trailing_slash_v1_keeps_v1_root() {
+        // "…/v1/" trims to "…/v1" (native root keeps the /v1 per main 约定),
+        // so the executor builds exactly one "/v1/messages", not "/v1/v1/messages".
         let id = resolve_channel_identity(&row("claude", "https://api.anthropic.com/v1/", 0));
-        assert_eq!(id.native_base_url, "https://api.anthropic.com");
+        assert_eq!(id.native_base_url, "https://api.anthropic.com/v1");
         // T06 I-4: legacy claude infers [messages, count_tokens].
         assert_eq!(id.native_endpoints, vec!["messages", "count_tokens"]);
     }
@@ -594,21 +590,21 @@ mod tests {
         let id = resolve_channel_identity(&row("claude", "https://api.anthropic.com/v1", 0));
         assert_eq!(id.protocol, "anthropic");
         assert_eq!(id.provider, "anthropic");
-        // legacy claude base is already the /v1 root; the native root drops
-        // the "/v1" so the new executor appends "v1/messages" exactly once.
-        assert_eq!(id.native_base_url, "https://api.anthropic.com");
+        // main 分支约定：legacy claude base 已是带 /v1 的根；native root 保持
+        // 原样，executor 端点只补 /messages，最终 /v1/messages 恰一次。
+        assert_eq!(id.native_base_url, "https://api.anthropic.com/v1");
         // T06 I-4: legacy claude infers [messages, count_tokens].
         assert_eq!(id.native_endpoints, vec!["messages", "count_tokens"]);
         assert_eq!(id.executor_kind, "messages");
     }
 
     #[test]
-    fn claude_base_without_v1_keeps_unchanged_native_root() {
-        // e.g. a private gateway rooted at the vendor path (no /v1): native
-        // root stays as-is; new executor appends "v1/messages".
+    fn claude_base_without_v1_is_custom_and_keeps_unchanged_native_root() {
+        // 统一带 /v1 后，deepseek 预设 base 是 …/anthropic/v1；一个不带 /v1 的
+        // vendor 根不再命中预设 → provider=custom，native root 保持原样（不伪造）。
         let id = resolve_channel_identity(&row("claude", "https://api.deepseek.com/anthropic", 0));
         assert_eq!(id.native_base_url, "https://api.deepseek.com/anthropic");
-        assert_eq!(id.provider, "deepseek");
+        assert_eq!(id.provider, "custom");
     }
 
     /// T06 I-4 (leader adjudication): legacy revision-0 `type == "claude"`
@@ -628,7 +624,8 @@ mod tests {
 
     #[test]
     fn claude_deepseek_compat_maps_to_deepseek() {
-        let id = resolve_channel_identity(&row("claude", "https://api.deepseek.com/anthropic", 0));
+        // main 约定：deepseek anthropic 兼容 base 带 /v1 才命中预设。
+        let id = resolve_channel_identity(&row("claude", "https://api.deepseek.com/anthropic/v1", 0));
         assert_eq!(id.protocol, "anthropic");
         assert_eq!(id.provider, "deepseek");
     }
@@ -776,8 +773,8 @@ mod tests {
         let mut r = row("claude", "http://localhost:11434/v1", 0);
         r.protocol = None;
         let id = resolve_channel_identity(&r);
-        // base_url http://localhost:11434/v1 -> native root is 11434
-        // which matches anthropic:ollama preset via starts_with
+        // main 分支约定：claude 分支不再剥 /v1，native root 保持 11434/v1，
+        // 经 starts_with 匹配 anthropic:ollama 预设。
         assert_eq!(id.protocol, "anthropic");
         assert_eq!(id.provider, "ollama");
         let (lt, lb) = new_to_legacy(&id);
@@ -820,10 +817,12 @@ mod tests {
 
     #[test]
     fn new_to_legacy_anthropic_custom_uses_claude_alias_and_native_root() {
+        // main 分支约定：native root 自带 /v1（表单输入即 /v1 结尾）；custom
+        // 渠道 legacy base 保持原样，旧适配器拼 /messages → …/v1/messages。
         let identity = ChannelIdentity {
             protocol: "anthropic".to_string(),
             provider: "custom".to_string(),
-            native_base_url: "https://gw.internal.example.com/anthropic".to_string(),
+            native_base_url: "https://gw.internal.example.com/anthropic/v1".to_string(),
             native_endpoints: vec!["messages".to_string()],
             identity_revision: 1,
             legacy_executor_override: None,
@@ -832,8 +831,8 @@ mod tests {
         };
         let (lt, lb) = new_to_legacy(&identity);
         assert_eq!(lt, "claude");
-        // The old claude adapter appends /messages, so the legacy base must
-        // carry /v1 to build {root}/v1/messages — matching the new native URL.
+        // legacy base 保持 native root（已带 /v1），旧适配器拼 /messages 得到
+        // {root}/v1/messages —— 与新 executor 的 {native}/messages 完全一致。
         assert_eq!(lb, "https://gw.internal.example.com/anthropic/v1");
     }
 }

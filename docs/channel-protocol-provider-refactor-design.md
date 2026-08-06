@@ -43,7 +43,7 @@
 | 协议 | Base URL 说明 | 端点控件 | API Key |
 | --- | --- | --- | --- |
 | OpenAI | 不包含端点路径；通常以 `/v1` 或兼容服务根路径结束 | 多选：`/chat/completions` 与 `/responses`；两项至少选一项，可同时选 | 必填（Ollama 式兼容服务除外） |
-| Anthropic | 不包含 `/v1/messages`；不要以斜杠结尾 | 固定显示 `/v1/messages`；如厂商支持，显示只读的 `/v1/messages/count_tokens` 能力 | 必填 |
+| Anthropic | 以 `/v1` 结尾（main 分支约定，如 `https://api.anthropic.com/v1`）；不要以斜杠结尾 | 固定显示 `/messages`；如厂商支持，显示只读的 `/messages/count_tokens` 能力 | 必填 |
 | Ollama | 本机或远程 Ollama 的主机与端口 | 固定 `/api/chat`；模型发现用 `/api/tags` | 可选，默认空；远程反向代理可填写 |
 
 OpenAI 的两个端点是**同一渠道的两个能力开关，不是两个 URL 输入框，也不是二选一**。保存时为 `native_endpoints: ["chat_completions", "responses"]`。若只勾选 Chat，Responses 原生组不可选该渠道；反之亦然。旧渠道的 Responses→Chat 兼容债务不属于原生端点，只能记录在 `config.legacy_capabilities`。
@@ -120,12 +120,12 @@ Ollama 已有 OpenAI 与 Anthropic 兼容层，因此在相应协议的供应商
 | OpenAI / 字节豆包 | `https://ark.cn-beijing.volces.com/api/v3` | Chat | `doubao-seed-2-0-pro-260215`、`doubao-seed-2-0-lite-260215`、`doubao-seed-1-6` | 模型 ID 与区域/接入点绑定，支持同步而非写死 |
 | OpenAI / Moonshot AI | `https://api.moonshot.ai/v1` | Chat | `kimi-k2.5`、`kimi-k2-thinking`、`kimi-k2-turbo-preview` | 模型目录更新频繁，首选同步结果 |
 | OpenAI / Ollama（本地） | `http://localhost:11434/v1` | Chat、Responses | 空（从 `/v1/models` 获取） | API Key 可留空；仅接入已安装的本地/自管 Ollama |
-| Anthropic / Anthropic | `https://api.anthropic.com` | Messages、Count Tokens | `claude-opus-4-6`、`claude-sonnet-4-6`、`claude-haiku-4-5-20251001` | 原生透传；不把 `/v1` 填进 Base URL，避免形成 `/v1/v1/messages` |
-| Anthropic / DeepSeek | `https://api.deepseek.com/anthropic` | Messages | `deepseek-v4-pro`、`deepseek-v4-flash` | 官方明确提供 Anthropic 兼容面；`count_tokens` 不标为可用 |
-| Anthropic / 通义千问 | `https://dashscope.aliyuncs.com/apps/anthropic` | Messages | `qwen3.7-plus`、`qwen3-coder-next` | 只对文档明确列出的模型/地域开放；新域名由厂商控制台覆盖 |
-| Anthropic / 智谱 GLM | `https://open.bigmodel.cn/api/anthropic` | Messages | `glm-4.7`、`glm-4.7-flash` | 按已确认的智谱 Anthropic 根地址预填；不启用 `count_tokens`，除非厂商正式提供 |
-| Anthropic / 字节豆包（Coding Plan） | `https://ark.cn-beijing.volces.com/api/coding` | Messages | Coding Plan 当前开通模型 | 名称必须完整显示“字节豆包（Coding Plan）”；此为 Coding Plan 专用兼容网关，非通用 Ark v3 |
-| Anthropic / Ollama（本地） | `http://localhost:11434` | Messages | 空（从本地模型列表获取） | API Key 可留空；Ollama 不支持精确 `/v1/messages/count_tokens` |
+| Anthropic / Anthropic | `https://api.anthropic.com/v1` | Messages、Count Tokens | `claude-opus-4-6`、`claude-sonnet-4-6`、`claude-haiku-4-5-20251001` | 原生透传；Base 自带 `/v1`（main 分支约定），端点模板只补 `/messages` |
+| Anthropic / DeepSeek | `https://api.deepseek.com/anthropic/v1` | Messages | `deepseek-v4-pro`、`deepseek-v4-flash` | 官方明确提供 Anthropic 兼容面；`count_tokens` 不标为可用 |
+| Anthropic / 通义千问 | `https://dashscope.aliyuncs.com/apps/anthropic/v1` | Messages | `qwen3.7-plus`、`qwen3-coder-next` | 只对文档明确列出的模型/地域开放；新域名由厂商控制台覆盖 |
+| Anthropic / 智谱 GLM | `https://open.bigmodel.cn/api/anthropic/v1` | Messages | `glm-4.7`、`glm-4.7-flash` | 按已确认的智谱 Anthropic 根地址预填；不启用 `count_tokens`，除非厂商正式提供 |
+| Anthropic / 字节豆包（Coding Plan） | `https://ark.cn-beijing.volces.com/api/coding/v1` | Messages | Coding Plan 当前开通模型 | 名称必须完整显示“字节豆包（Coding Plan）”；此为 Coding Plan 专用兼容网关，非通用 Ark v3 |
+| Anthropic / Ollama（本地） | `http://localhost:11434/v1` | Messages | 空（从本地模型列表获取） | API Key 可留空；Ollama 不支持精确 `/v1/messages/count_tokens` |
 | Ollama / Ollama（本地） | `http://localhost:11434` | `/api/chat` | 空（从 `/api/tags` 获取） | 默认无 API Key；远程部署时用户改 URL 与密钥 |
 
 Moonshot AI 没有 Anthropic 协议，故**不在 Anthropic Tab 的提供商下拉中展示**，也不生成 Anthropic/Moonshot 预设。
@@ -182,7 +182,7 @@ ALTER TABLE channels ADD COLUMN legacy_executor_override TEXT;
 | Anthropic（所有 provider，含 DeepSeek/智谱/豆包/Ollama） | `claude` | 每个预设经测试的“旧 Claude 适配器拼接根” | 不能直接保存规范根；旧代码只追加 `/messages`，缺失 `/v1` 或厂商路径时会请求错误 URL |
 | Ollama 原生 | `openai` | `http://localhost:11434/v1` | `native_base_url` 保存 `http://localhost:11434`；新代码用原生 `/api/chat`，旧代码退化使用 Ollama OpenAI 兼容层 |
 
-因此，`base_url` 是旧代码的可运行兼容 URL，`native_base_url` 是新协议规范根；registry 必须为每个 provider/协议保存并以 mock 上游测试这两种 URL 的最终拼接结果。以 Anthropic 官方为例，UI 根可为 `https://api.anthropic.com`，但旧兼容根必须保证旧版最终请求为 `https://api.anthropic.com/v1/messages`。这一双写只服务过渡期，避免旧版本把原生 Ollama 根拼成 `/api/chat/chat/completions`。建议在下一主版本、完成数据迁移验证后才评估删除 `type`。
+因此，`base_url` 是旧代码的可运行兼容 URL，`native_base_url` 是新协议规范根；registry 必须为每个 provider/协议保存并以 mock 上游测试这两种 URL 的最终拼接结果。以 Anthropic 官方为例，Base 自带 `/v1`（`https://api.anthropic.com/v1`），端点模板只补 `/messages`，最终请求为 `https://api.anthropic.com/v1/messages`。这一双写只服务过渡期，避免旧版本把原生 Ollama 根拼成 `/api/chat/chat/completions`。建议在下一主版本、完成数据迁移验证后才评估删除 `type`。
 
 ### 5.2 前后端 DTO
 
@@ -364,8 +364,8 @@ AuditedRequest {
 - 三个协议 Tab 等宽；每个 Tab 仅出现指定供应商，DeepSeek 标签为“国内”。
 - 每个协议 Tab 的提供商选择器顶部都有默认选中的“自定义配置”；它保留当前协议语义，但不预填厂商 URL、模型或密钥。
 - OpenAI/任意供应商可同时勾选 Chat Completions 和 Responses，提交 payload 两项都存在。
-- Anthropic 选择 DeepSeek 后默认 `https://api.deepseek.com/anthropic` 与 `/v1/messages`；Ollama 默认 `http://localhost:11434` 与 `/api/chat`、空 Key 合法。
-- OpenAI、Anthropic 两个 Tab 都显示 Ollama（本地）；Anthropic Tab 不显示 Moonshot AI，字节选项完整显示“字节豆包（Coding Plan）”，智谱默认 `https://open.bigmodel.cn/api/anthropic`。
+- Anthropic 选择 DeepSeek 后默认 `https://api.deepseek.com/anthropic/v1` 与 `/messages`；Ollama 默认 `http://localhost:11434` 与 `/api/chat`、空 Key 合法。
+- OpenAI、Anthropic 两个 Tab 都显示 Ollama（本地）；Anthropic Tab 不显示 Moonshot AI，字节选项完整显示“字节豆包（Coding Plan）”，智谱默认 `https://open.bigmodel.cn/api/anthropic/v1`。
 - 渠道列表每条名称后始终按 `[协议] [提供商]` 展示两个标签；自定义渠道显示 `[协议] [自定义]`，旧渠道通过身份解析显示而非直接使用历史 `type`。
 - 切换预设不会未经确认覆盖用户 URL/模型/映射；编辑旧记录显示正确推断值。
 - 键盘、窄屏、错误提示与保存中状态可用。

@@ -172,7 +172,7 @@ async fn protocol_routing_integration_chat_native_first_then_conversion() {
         "c1",
         "anthropic",
         "deepseek",
-        "https://api.deepseek.com/anthropic",
+        "https://api.deepseek.com/anthropic/v1",
         &["messages"],
         100,
     );

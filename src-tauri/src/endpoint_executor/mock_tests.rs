@@ -326,7 +326,7 @@ async fn anthropic_messages_url_auth_version() {
         200,
     )
     .await;
-    let base = format!("http://{}", mock.addr);
+    let base = format!("http://{}/v1", mock.addr);
     let attempt = prepared(
         &base,
         "anthropic",
@@ -360,7 +360,7 @@ async fn anthropic_messages_url_auth_version() {
 #[tokio::test]
 async fn anthropic_count_tokens_url() {
     let mock = MockUpstream::start(br#"{"input_tokens":7}"#.to_vec(), 200).await;
-    let base = format!("http://{}", mock.addr);
+    let base = format!("http://{}/v1", mock.addr);
     let attempt = prepared(
         &base,
         "anthropic",
@@ -388,7 +388,7 @@ async fn anthropic_messages_forwards_safe_query() {
         200,
     )
     .await;
-    let base = format!("http://{}", mock.addr);
+    let base = format!("http://{}/v1", mock.addr);
     let attempt = prepared(
         &base,
         "anthropic",
@@ -700,7 +700,7 @@ fn final_url_matrix_is_covered() {
         "https://api.openai.com/v1/responses"
     );
     assert_eq!(
-        final_url("https://api.anthropic.com", "v1/messages", None),
+        final_url("https://api.anthropic.com/v1", "/messages", None),
         "https://api.anthropic.com/v1/messages"
     );
     assert_eq!(
@@ -709,7 +709,7 @@ fn final_url_matrix_is_covered() {
     );
     assert_eq!(
         endpoint_path("anthropic", "count_tokens"),
-        "v1/messages/count_tokens"
+        "/messages/count_tokens"
     );
     assert_eq!(endpoint_path("openai", "embeddings"), "embeddings");
 }

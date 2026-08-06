@@ -49,11 +49,11 @@ registry 不能只保存一个 Base URL。每个模板 fixture 必须同时断�
 | 组合 | native base | 新代码最终推理 URL | legacy type/base | 旧代码最终推理 URL |
 | --- | --- | --- | --- | --- |
 | OpenAI / OpenAI | `https://api.openai.com/v1` | `https://api.openai.com/v1/chat/completions`、`https://api.openai.com/v1/responses` | `openai` / 同 native base | `https://api.openai.com/v1/chat/completions` |
-| Anthropic / Anthropic | `https://api.anthropic.com` | `https://api.anthropic.com/v1/messages` | `claude` / `https://api.anthropic.com/v1` | `https://api.anthropic.com/v1/messages` |
-| Anthropic / DeepSeek | `https://api.deepseek.com/anthropic` | `https://api.deepseek.com/anthropic/v1/messages` | `claude` / `https://api.deepseek.com/anthropic/v1` | 同左最终 URL |
-| Anthropic / 智谱 | `https://open.bigmodel.cn/api/anthropic` | `https://open.bigmodel.cn/api/anthropic/v1/messages` | `claude` / `https://open.bigmodel.cn/api/anthropic/v1` | 同左最终 URL |
-| Anthropic / 豆包 Coding Plan | `https://ark.cn-beijing.volces.com/api/coding` | `https://ark.cn-beijing.volces.com/api/coding/v1/messages` | `claude` / `https://ark.cn-beijing.volces.com/api/coding/v1` | 同左最终 URL |
-| Anthropic / Ollama | `http://localhost:11434` | `http://localhost:11434/v1/messages` | `claude` / `http://localhost:11434/v1` | 同左最终 URL |
+| Anthropic / Anthropic | `https://api.anthropic.com/v1` | `https://api.anthropic.com/v1/messages` | `claude` / `https://api.anthropic.com/v1` | `https://api.anthropic.com/v1/messages` |
+| Anthropic / DeepSeek | `https://api.deepseek.com/anthropic/v1` | `https://api.deepseek.com/anthropic/v1/messages` | `claude` / `https://api.deepseek.com/anthropic/v1` | 同左最终 URL |
+| Anthropic / 智谱 | `https://open.bigmodel.cn/api/anthropic/v1` | `https://open.bigmodel.cn/api/anthropic/v1/messages` | `claude` / `https://open.bigmodel.cn/api/anthropic/v1` | 同左最终 URL |
+| Anthropic / 豆包 Coding Plan | `https://ark.cn-beijing.volces.com/api/coding/v1` | `https://ark.cn-beijing.volces.com/api/coding/v1/messages` | `claude` / `https://ark.cn-beijing.volces.com/api/coding/v1` | 同左最终 URL |
+| Anthropic / Ollama | `http://localhost:11434/v1` | `http://localhost:11434/v1/messages` | `claude` / `http://localhost:11434/v1` | 同左最终 URL |
 | Ollama / Ollama | `http://localhost:11434` | `http://localhost:11434/api/chat` | `openai` / `http://localhost:11434/v1` | `http://localhost:11434/v1/chat/completions` |
 
 通义 Anthropic 的最终路径也必须按其官方文档落入 fixture；若官方 endpoint 规则与通用 `/v1/messages` 不同，以带 `verified_at/source_url` 的模板规则为准。任何尚未核实最终 URL 的模板不得作为可选预设发布，只能由 custom 承载。

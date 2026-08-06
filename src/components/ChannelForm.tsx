@@ -30,7 +30,7 @@ const PROTOCOL_ENDPOINT_OPTIONS: Record<ChannelProtocol, ChannelEndpoint[]> = {
 
 const PROTOCOL_BASE_URL_HINTS: Record<ChannelProtocol, string> = {
   openai: "不包含端点路径；通常以 /v1 或兼容服务根路径结束",
-  anthropic: "不包含 /v1/messages；不要以斜杠结尾",
+  anthropic: "以 /v1 结尾（如 https://api.anthropic.com/v1），端点自动补 /messages",
   ollama: "本机或远程 Ollama 的主机与端口（例如 http://localhost:11434）",
 };
 
@@ -502,7 +502,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
       return "OpenAI 协议至少勾选一个端点（Chat Completions 或 Responses）";
     }
     if (form.protocol === "anthropic" && !form.native_endpoints.includes("messages")) {
-      return "Anthropic 协议必须包含 /v1/messages 端点";
+      return "Anthropic 协议必须包含 /messages 端点";
     }
     if (form.protocol === "ollama" && !form.native_endpoints.includes("api_chat")) {
       return "Ollama 协议必须包含 /api/chat 端点";
@@ -693,7 +693,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
                     <label key={ep} className="flex cursor-default items-center gap-2 rounded-[14px] border border-border bg-background/40 px-3.5 py-2.5 text-[13px]">
                       <input type="checkbox" checked disabled className="h-4 w-4 accent-[#2f6fed]" />
                       <span className="shrink-0 font-semibold">{ENDPOINT_LABELS[ep]}</span>
-                      <span className="font-mono text-xs text-muted-foreground">{ep === "messages" ? "/v1/messages" : "/api/chat"}</span>
+                      <span className="font-mono text-xs text-muted-foreground">{ep === "messages" ? "/messages" : "/api/chat"}</span>
                     </label>
                   ))}
                 </div>

@@ -484,7 +484,7 @@ fn anthropic_presets() -> Vec<ChannelPreset> {
             RegionGroup::International,
             "Anthropic Claude Code 官方 Messages API。",
             "claudecode",
-            "https://api.anthropic.com",
+            "https://api.anthropic.com/v1",
             "https://api.anthropic.com/v1",
             "claude",
             vec![NativeEndpoint::Messages],
@@ -505,7 +505,7 @@ fn anthropic_presets() -> Vec<ChannelPreset> {
             RegionGroup::Domestic,
             "DeepSeek 官方 Anthropic 接口。",
             "deepseek",
-            "https://api.deepseek.com/anthropic",
+            "https://api.deepseek.com/anthropic/v1",
             "https://api.deepseek.com/anthropic/v1",
             "claude",
             vec![NativeEndpoint::Messages],
@@ -525,7 +525,7 @@ fn anthropic_presets() -> Vec<ChannelPreset> {
             RegionGroup::Domestic,
             "阿里云百炼 Anthropic 接口。",
             "qwen",
-            "https://dashscope.aliyuncs.com/apps/anthropic",
+            "https://dashscope.aliyuncs.com/apps/anthropic/v1",
             "https://dashscope.aliyuncs.com/apps/anthropic/v1",
             "claude",
             vec![NativeEndpoint::Messages],
@@ -545,7 +545,7 @@ fn anthropic_presets() -> Vec<ChannelPreset> {
             RegionGroup::Domestic,
             "智谱 GLM 官方 Anthropic 接口。",
             "zhipu",
-            "https://open.bigmodel.cn/api/anthropic",
+            "https://open.bigmodel.cn/api/anthropic/v1",
             "https://open.bigmodel.cn/api/anthropic/v1",
             "claude",
             vec![NativeEndpoint::Messages],
@@ -565,7 +565,7 @@ fn anthropic_presets() -> Vec<ChannelPreset> {
             RegionGroup::Domestic,
             "字节豆包官方 Anthropic 接口。",
             "doubao_coding_plan",
-            "https://ark.cn-beijing.volces.com/api/coding",
+            "https://ark.cn-beijing.volces.com/api/coding/v1",
             "https://ark.cn-beijing.volces.com/api/coding/v1",
             "claude",
             vec![NativeEndpoint::Messages],
@@ -585,7 +585,7 @@ fn anthropic_presets() -> Vec<ChannelPreset> {
             RegionGroup::Local,
             "本机或远程 Ollama 的 Anthropic Messages 接口。",
             "ollama",
-            "http://localhost:11434",
+            "http://localhost:11434/v1",
             "http://localhost:11434/v1",
             "claude",
             vec![NativeEndpoint::Messages],
@@ -826,7 +826,10 @@ mod tests {
             .into_iter()
             .find(|p| p.provider == ChannelProvider::Zhipu)
             .unwrap();
-        assert_eq!(p.native_base_url, "https://open.bigmodel.cn/api/anthropic");
+        assert_eq!(
+            p.native_base_url,
+            "https://open.bigmodel.cn/api/anthropic/v1"
+        );
         assert_eq!(
             p.legacy_base_url,
             "https://open.bigmodel.cn/api/anthropic/v1"
@@ -843,7 +846,7 @@ mod tests {
         assert_eq!(p.description, "字节豆包官方 Anthropic 接口。");
         assert_eq!(
             p.native_base_url,
-            "https://ark.cn-beijing.volces.com/api/coding"
+            "https://ark.cn-beijing.volces.com/api/coding/v1"
         );
     }
 
@@ -932,9 +935,9 @@ mod tests {
         );
         // Anthropic / Anthropic
         let p = f(ChannelProtocol::Anthropic, ChannelProvider::Anthropic);
-        assert_eq!(p.native_base_url, "https://api.anthropic.com");
+        assert_eq!(p.native_base_url, "https://api.anthropic.com/v1");
         assert_eq!(
-            join(&p.native_base_url, "v1/messages"),
+            join(&p.native_base_url, "messages"),
             "https://api.anthropic.com/v1/messages"
         );
         assert_eq!(p.legacy_type, "claude");
@@ -945,9 +948,9 @@ mod tests {
         );
         // Anthropic / DeepSeek
         let p = f(ChannelProtocol::Anthropic, ChannelProvider::DeepSeek);
-        assert_eq!(p.native_base_url, "https://api.deepseek.com/anthropic");
+        assert_eq!(p.native_base_url, "https://api.deepseek.com/anthropic/v1");
         assert_eq!(
-            join(&p.native_base_url, "v1/messages"),
+            join(&p.native_base_url, "messages"),
             "https://api.deepseek.com/anthropic/v1/messages"
         );
         assert_eq!(p.legacy_type, "claude");
@@ -958,9 +961,9 @@ mod tests {
         );
         // Anthropic / 智谱
         let p = f(ChannelProtocol::Anthropic, ChannelProvider::Zhipu);
-        assert_eq!(p.native_base_url, "https://open.bigmodel.cn/api/anthropic");
+        assert_eq!(p.native_base_url, "https://open.bigmodel.cn/api/anthropic/v1");
         assert_eq!(
-            join(&p.native_base_url, "v1/messages"),
+            join(&p.native_base_url, "messages"),
             "https://open.bigmodel.cn/api/anthropic/v1/messages"
         );
         assert_eq!(p.legacy_type, "claude");
@@ -979,10 +982,10 @@ mod tests {
         );
         assert_eq!(
             p.native_base_url,
-            "https://ark.cn-beijing.volces.com/api/coding"
+            "https://ark.cn-beijing.volces.com/api/coding/v1"
         );
         assert_eq!(
-            join(&p.native_base_url, "v1/messages"),
+            join(&p.native_base_url, "messages"),
             "https://ark.cn-beijing.volces.com/api/coding/v1/messages"
         );
         assert_eq!(p.legacy_type, "claude");
@@ -996,9 +999,9 @@ mod tests {
         );
         // Anthropic / Ollama
         let p = f(ChannelProtocol::Anthropic, ChannelProvider::Ollama);
-        assert_eq!(p.native_base_url, "http://localhost:11434");
+        assert_eq!(p.native_base_url, "http://localhost:11434/v1");
         assert_eq!(
-            join(&p.native_base_url, "v1/messages"),
+            join(&p.native_base_url, "messages"),
             "http://localhost:11434/v1/messages"
         );
         assert_eq!(p.legacy_type, "claude");
@@ -1035,10 +1038,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             p.native_base_url,
-            "https://dashscope.aliyuncs.com/apps/anthropic"
+            "https://dashscope.aliyuncs.com/apps/anthropic/v1"
         );
         assert_eq!(
-            join(&p.native_base_url, "v1/messages"),
+            join(&p.native_base_url, "messages"),
             "https://dashscope.aliyuncs.com/apps/anthropic/v1/messages"
         );
         // 模型建议必须带 verified_at/source_url

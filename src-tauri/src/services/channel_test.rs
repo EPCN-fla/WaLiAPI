@@ -1239,7 +1239,8 @@ mod channel_draft_test {
             Box::pin(async move { (200, body) })
         })
         .await;
-        let base = format!("http://{}", mock.addr);
+        // base 带 /v1（main 分支约定），executor 端点只补 /messages → 最终 /v1/messages。
+        let base = format!("http://{}/v1", mock.addr);
         // provider=custom keeps the loopback mock legal under the SSRF policy
         // while still exercising the anthropic protocol's x-api-key + version
         // header wiring (auth scheme is derived from the protocol).

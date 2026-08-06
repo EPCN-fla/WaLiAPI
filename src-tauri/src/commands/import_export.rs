@@ -953,7 +953,7 @@ mod tests {
             timeout_secs: 123, // non-default — must survive
             protocol: Some("anthropic".into()),
             provider: Some("deepseek".into()),
-            native_base_url: Some("https://api.deepseek.com/anthropic".into()),
+            native_base_url: Some("https://api.deepseek.com/anthropic/v1".into()),
             native_endpoints: Some("[\"messages\"]".into()),
             preset_revision: Some("2026-08-04".into()),
             identity_revision: 1,
@@ -1050,7 +1050,7 @@ mod tests {
         assert_eq!(exported.provider.as_deref(), Some("deepseek"));
         assert_eq!(
             exported.native_base_url.as_deref(),
-            Some("https://api.deepseek.com/anthropic")
+            Some("https://api.deepseek.com/anthropic/v1")
         );
         assert_eq!(
             exported.native_endpoints.as_deref(),
@@ -1070,7 +1070,7 @@ mod tests {
         assert_eq!(written.provider.as_deref(), Some("deepseek"));
         assert_eq!(
             written.native_base_url.as_deref(),
-            Some("https://api.deepseek.com/anthropic")
+            Some("https://api.deepseek.com/anthropic/v1")
         );
         assert_eq!(written.identity_revision, 1);
     }
@@ -1148,12 +1148,12 @@ mod tests {
         assert_eq!(input.config["custom_unknown_key"], "keep-me");
         // Degraded to a re-inferred identity, revision 0.
         assert_eq!(input.identity_revision, 0);
-        // channel_type=claude + deepseek anthropic URL -> anthropic/deepseek.
+        // channel_type=claude + deepseek anthropic URL（带 /v1）-> anthropic/deepseek。
         assert_eq!(input.protocol.as_deref(), Some("anthropic"));
         assert_eq!(input.provider.as_deref(), Some("deepseek"));
         assert_eq!(
             input.native_base_url.as_deref(),
-            Some("https://api.deepseek.com/anthropic")
+            Some("https://api.deepseek.com/anthropic/v1")
         );
     }
 

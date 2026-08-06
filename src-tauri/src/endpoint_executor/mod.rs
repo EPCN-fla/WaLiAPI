@@ -13,8 +13,8 @@
 //! | openai   | chat_completions    | `<native_base>/chat/completions`|
 //! | openai   | responses           | `<native_base>/responses`       |
 //! | openai   | embeddings          | `<native_base>/embeddings`      |
-//! | anthropic| messages            | `<native_base>/v1/messages`     |
-//! | anthropic| count_tokens        | `<native_base>/v1/messages/count_tokens` |
+//! | anthropic| messages            | `<native_base>/messages`（Base 自带 /v1） |
+//! | anthropic| count_tokens        | `<native_base>/messages/count_tokens` |
 //! | ollama   | api_chat            | `<native_base>/api/chat`        |
 //! | gemini   | (legacy override)   | `<base>/v1beta/models/{m}:generateContent?key=` |
 //!
@@ -171,8 +171,10 @@ pub fn endpoint_path(protocol: &str, endpoint: &str) -> String {
         ("openai", "chat_completions") => "chat/completions".to_string(),
         ("openai", "responses") => "responses".to_string(),
         ("openai", "embeddings") => "embeddings".to_string(),
-        ("anthropic", "messages") => "v1/messages".to_string(),
-        ("anthropic", "count_tokens") => "v1/messages/count_tokens".to_string(),
+        // main 分支约定：Anthropic Base URL 自带 /v1（如 api.anthropic.com/v1），
+        // 端点只补 /messages（T01 url_fixtures 硬性样例）。
+        ("anthropic", "messages") => "/messages".to_string(),
+        ("anthropic", "count_tokens") => "/messages/count_tokens".to_string(),
         ("ollama", "api_chat") => "api/chat".to_string(),
         _ => endpoint.to_string(),
     }
@@ -747,7 +749,7 @@ mod tests {
             "https://api.openai.com/v1/chat/completions"
         );
         assert_eq!(
-            final_url("https://api.anthropic.com", "v1/messages", None),
+            final_url("https://api.anthropic.com/v1", "/messages", None),
             "https://api.anthropic.com/v1/messages"
         );
         assert_eq!(
@@ -787,10 +789,10 @@ mod tests {
         );
         assert_eq!(endpoint_path("openai", "responses"), "responses");
         assert_eq!(endpoint_path("openai", "embeddings"), "embeddings");
-        assert_eq!(endpoint_path("anthropic", "messages"), "v1/messages");
+        assert_eq!(endpoint_path("anthropic", "messages"), "/messages");
         assert_eq!(
             endpoint_path("anthropic", "count_tokens"),
-            "v1/messages/count_tokens"
+            "/messages/count_tokens"
         );
         assert_eq!(endpoint_path("ollama", "api_chat"), "api/chat");
     }

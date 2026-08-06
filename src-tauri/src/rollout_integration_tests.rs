@@ -2626,7 +2626,7 @@ async fn drill_backup_and_restore_file_db_preserves_everything() {
         "bk1",
         "anthropic",
         "deepseek",
-        "https://api.deepseek.com/anthropic",
+        "https://api.deepseek.com/anthropic/v1",
         &["messages", "count_tokens"],
         &["m"],
         3,
@@ -2690,7 +2690,7 @@ async fn drill_backup_and_restore_file_db_preserves_everything() {
     assert_eq!(restored_ch.provider.as_deref(), Some("deepseek"));
     assert_eq!(
         restored_ch.native_base_url.as_deref(),
-        Some("https://api.deepseek.com/anthropic")
+        Some("https://api.deepseek.com/anthropic/v1")
     );
     assert_eq!(restored_ch.identity_revision, 1);
     let cfg: Value = serde_json::from_str(&restored_ch.config).unwrap();
