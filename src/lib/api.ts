@@ -90,11 +90,19 @@ export const statsApi = {
 };
 
 // Settings commands
+export interface FeatureFlagsDto {
+  new_routeplan: boolean;
+  cross_protocol_codec: boolean;
+  native_responses: boolean;
+  ollama_native: boolean;
+}
+
 export const settingsApi = {
   get: () => invoke<Settings>("get_settings"),
   save: (settings: Settings) => invoke<void>("save_settings", { settings }),
   applyTheme: (theme: string) => invoke<void>("apply_theme", { theme }),
   setAutoStart: (enabled: boolean) => invoke<void>("set_auto_start", { enabled }),
+  getFeatureFlags: () => invoke<FeatureFlagsDto>("get_feature_flags"),
 };
 
 // Server commands

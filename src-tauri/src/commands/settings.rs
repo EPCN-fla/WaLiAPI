@@ -111,6 +111,30 @@ fn get_bool(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str, default: b
     store.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
+/// Feature-flag snapshot exposed to the UI (T00 decision 9 / T10 rollout).
+///
+/// The frontend uses these to disable/hide protocol tabs whose backend path is
+/// not yet enabled (e.g. Ollama when `ollama_native` is OFF) so a user never
+/// creates a channel that 503s at runtime.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FeatureFlagsDto {
+    pub new_routeplan: bool,
+    pub cross_protocol_codec: bool,
+    pub native_responses: bool,
+    pub ollama_native: bool,
+}
+
+#[tauri::command]
+pub fn get_feature_flags(app: AppHandle) -> Result<FeatureFlagsDto, String> {
+    let f = crate::core::feature_flags::read_feature_flags(&app);
+    Ok(FeatureFlagsDto {
+        new_routeplan: f.new_routeplan,
+        cross_protocol_codec: f.cross_protocol_codec,
+        native_responses: f.native_responses,
+        ollama_native: f.ollama_native,
+    })
+}
+
 #[tauri::command]
 pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
     let store = app.store("settings.json").map_err(|e| e.to_string())?;

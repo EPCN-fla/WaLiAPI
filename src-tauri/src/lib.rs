@@ -157,6 +157,7 @@ pub fn run() {
             commands::log::get_log_stats,
             commands::stats::get_dashboard_stats,
             commands::settings::get_settings,
+            commands::settings::get_feature_flags,
             commands::settings::save_settings,
             commands::settings::apply_theme,
             commands::settings::set_auto_start,
