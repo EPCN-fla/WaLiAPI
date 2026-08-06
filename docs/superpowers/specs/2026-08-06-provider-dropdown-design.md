@@ -75,7 +75,7 @@
 - 面板内分组：**自定义配置**（置顶固定一项）→ **国际** → **国内** → **本地**，按 `region` 分组。
 - 每项：SVG 品牌图标（`CHANNEL_PROVIDER_ICONS`）+ `display_name`；悬停 `title` 显示 `desc`。
 - 每项下拉面板项 = 原型 `PROVIDERS[protocol]` 的内容，数据来自后端 `get_channel_presets`。
-- 每个协议 Tab 记住自己上次选中的 provider（参照原型 `state` 记忆逻辑），切换 Tab 不丢失。
+- 切换协议时 provider 重置为该协议的自定义配置（与原型 `selectProtocol` 一致，不记忆上次选择）。
 
 ### 4.3 切换语义：无确认弹窗
 
@@ -105,7 +105,7 @@
 
 ```
 点击协议 Tab
-  └─ 切换 form.protocol；provider 恢复为自定义 / 上次记忆；端点重置为该协议默认
+  └─ 切换 form.protocol；provider 恢复为该协议自定义配置；端点重置为该协议默认
 点击下拉框某项 provider
   └─ applyPreset(preset, true)
        ├─ 只写 connection 字段（url / endpoints / models / preset_revision）
