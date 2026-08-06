@@ -355,7 +355,7 @@ export function ChannelsPage() {
                 {result && (
                   <div className={`mt-2 flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs ${result.success ? "bg-emerald-50 text-emerald-700" : "bg-red-50 text-red-700"}`}>
                     {result.success ? <><span className="text-emerald-500">✓</span> 连接成功</> : <><span className="text-red-500">✗</span> {result.message}</>}
-                    <span className="text-slate-400">({result.latency_ms}ms)</span>
+                    <span className="text-slate-400">({result.latency_ms.toFixed(2)}ms)</span>
                   </div>
                 )}
 
