@@ -188,8 +188,8 @@ pub struct ProtocolPresetGroup {
     pub presets: Vec<ChannelPreset>,
 }
 
-/// 当前 registry revision（YYYY-MM-DD，2026-08-04 基线）。
-pub const PRESET_REVISION: &str = "2026-08-04";
+/// 当前 registry revision（YYYY-MM-DD，2026-08-06 基线）。
+pub const PRESET_REVISION: &str = "2026-08-06";
 
 const SRC_OPENAI: &str = "https://platform.openai.com/docs/api-reference/chat";
 const SRC_GEMINI_MODELS: &str = "https://ai.google.dev/gemini-api/docs/models";
@@ -327,7 +327,7 @@ fn openai_presets() -> Vec<ChannelPreset> {
             ChannelProvider::Google,
             "Google",
             RegionGroup::International,
-            "Google Gemini（仅官方 OpenAI 兼容面）。",
+            "Google Gemini 官方 OpenAI 接口。",
             "google",
             "https://generativelanguage.googleapis.com/v1beta/openai",
             "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -348,7 +348,7 @@ fn openai_presets() -> Vec<ChannelPreset> {
             ChannelProvider::DeepSeek,
             "DeepSeek",
             RegionGroup::Domestic,
-            "DeepSeek 官方 OpenAI 兼容面。",
+            "DeepSeek 官方 OpenAI 接口。",
             "deepseek",
             "https://api.deepseek.com",
             "https://api.deepseek.com",
@@ -376,7 +376,7 @@ fn openai_presets() -> Vec<ChannelPreset> {
             ChannelProvider::Qwen,
             "通义千问",
             RegionGroup::Domestic,
-            "阿里云百炼 OpenAI 兼容面。",
+            "阿里云百炼 OpenAI 接口。",
             "qwen",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -397,7 +397,7 @@ fn openai_presets() -> Vec<ChannelPreset> {
             ChannelProvider::Zhipu,
             "智谱 GLM",
             RegionGroup::Domestic,
-            "智谱 GLM OpenAI 兼容面（PAAS v4）。",
+            "智谱 GLM OpenAI 接口（PAAS v4）。",
             "zhipu",
             "https://open.bigmodel.cn/api/paas/v4",
             "https://open.bigmodel.cn/api/paas/v4",
@@ -416,9 +416,9 @@ fn openai_presets() -> Vec<ChannelPreset> {
         preset(
             ChannelProtocol::OpenAI,
             ChannelProvider::Doubao,
-            "字节豆包",
+            "字节豆包 (Coding Plan)",
             RegionGroup::Domestic,
-            "火山方舟豆包 OpenAI 兼容面（Ark v3）。",
+            "字节豆包官方 OpenAI 接口。",
             "doubao",
             "https://ark.cn-beijing.volces.com/api/v3",
             "https://ark.cn-beijing.volces.com/api/v3",
@@ -437,9 +437,9 @@ fn openai_presets() -> Vec<ChannelPreset> {
         preset(
             ChannelProtocol::OpenAI,
             ChannelProvider::Moonshot,
-            "Moonshot AI",
+            "Moonshot(Kimi)",
             RegionGroup::Domestic,
-            "Moonshot Kimi OpenAI 兼容面。",
+            "Moonshot Kimi OpenAI 接口。",
             "moonshot",
             "https://api.moonshot.ai/v1",
             "https://api.moonshot.ai/v1",
@@ -460,7 +460,7 @@ fn openai_presets() -> Vec<ChannelPreset> {
             ChannelProvider::Ollama,
             "Ollama（本地）",
             RegionGroup::Local,
-            "本机/自管 Ollama 的 OpenAI 兼容层。",
+            "本机或远程 Ollama 的 OpenAI 接口。",
             "ollama",
             "http://localhost:11434/v1",
             "http://localhost:11434/v1",
@@ -482,12 +482,12 @@ fn anthropic_presets() -> Vec<ChannelPreset> {
             ChannelProvider::Anthropic,
             "Anthropic",
             RegionGroup::International,
-            "Anthropic 官方 Messages API。",
-            "anthropic",
+            "Anthropic Claude Code 官方 Messages API。",
+            "claudecode",
             "https://api.anthropic.com",
             "https://api.anthropic.com/v1",
             "claude",
-            vec![NativeEndpoint::Messages, NativeEndpoint::CountTokens],
+            vec![NativeEndpoint::Messages],
             vec![NativeEndpoint::Messages],
             AuthScheme::XApiKey,
             vec![
@@ -503,7 +503,7 @@ fn anthropic_presets() -> Vec<ChannelPreset> {
             ChannelProvider::DeepSeek,
             "DeepSeek",
             RegionGroup::Domestic,
-            "DeepSeek 官方 Anthropic 兼容面。",
+            "DeepSeek 官方 Anthropic 接口。",
             "deepseek",
             "https://api.deepseek.com/anthropic",
             "https://api.deepseek.com/anthropic/v1",
@@ -523,7 +523,7 @@ fn anthropic_presets() -> Vec<ChannelPreset> {
             ChannelProvider::Qwen,
             "通义千问",
             RegionGroup::Domestic,
-            "阿里云百炼 Anthropic 兼容面（app/anthropic 网关）。",
+            "阿里云百炼 Anthropic 接口。",
             "qwen",
             "https://dashscope.aliyuncs.com/apps/anthropic",
             "https://dashscope.aliyuncs.com/apps/anthropic/v1",
@@ -543,7 +543,7 @@ fn anthropic_presets() -> Vec<ChannelPreset> {
             ChannelProvider::Zhipu,
             "智谱 GLM",
             RegionGroup::Domestic,
-            "智谱 GLM 官方 Anthropic 兼容根地址。",
+            "智谱 GLM 官方 Anthropic 接口。",
             "zhipu",
             "https://open.bigmodel.cn/api/anthropic",
             "https://open.bigmodel.cn/api/anthropic/v1",
@@ -561,9 +561,9 @@ fn anthropic_presets() -> Vec<ChannelPreset> {
         preset(
             ChannelProtocol::Anthropic,
             ChannelProvider::DoubaoCodingPlan,
-            "字节豆包（Coding Plan）",
+            "字节豆包 (Coding Plan)",
             RegionGroup::Domestic,
-            "火山方舟 Coding Plan 专用 Anthropic 兼容网关。",
+            "字节豆包官方 Anthropic 接口。",
             "doubao_coding_plan",
             "https://ark.cn-beijing.volces.com/api/coding",
             "https://ark.cn-beijing.volces.com/api/coding/v1",
@@ -583,7 +583,7 @@ fn anthropic_presets() -> Vec<ChannelPreset> {
             ChannelProvider::Ollama,
             "Ollama（本地）",
             RegionGroup::Local,
-            "本机/自管 Ollama 的 Anthropic Messages 兼容层。",
+            "本机或远程 Ollama 的 Anthropic Messages 接口。",
             "ollama",
             "http://localhost:11434",
             "http://localhost:11434/v1",
@@ -839,11 +839,51 @@ mod tests {
             .into_iter()
             .find(|p| p.provider == ChannelProvider::DoubaoCodingPlan)
             .unwrap();
-        assert_eq!(p.display_name, "字节豆包（Coding Plan）");
+        assert_eq!(p.display_name, "字节豆包 (Coding Plan)");
+        assert_eq!(p.description, "字节豆包官方 Anthropic 接口。");
         assert_eq!(
             p.native_base_url,
             "https://ark.cn-beijing.volces.com/api/coding"
         );
+    }
+
+    #[test]
+    fn anthropic_icon_and_endpoints_matched_spec() {
+        let p = presets_for_protocol(ChannelProtocol::Anthropic)
+            .into_iter()
+            .find(|p| p.provider == ChannelProvider::Anthropic)
+            .unwrap();
+        assert_eq!(p.icon_key, "claudecode");
+        assert_eq!(p.description, "Anthropic Claude Code 官方 Messages API。");
+        assert!(!p.native_endpoints.contains(&NativeEndpoint::CountTokens));
+        assert_eq!(p.native_endpoints, vec![NativeEndpoint::Messages]);
+        assert_eq!(p.default_checked_endpoints, vec![NativeEndpoint::Messages]);
+    }
+
+    #[test]
+    fn moonshot_and_doubao_openai_names_match_spec() {
+        let moonshot = presets_for_protocol(ChannelProtocol::OpenAI)
+            .into_iter()
+            .find(|p| p.provider == ChannelProvider::Moonshot)
+            .unwrap();
+        assert_eq!(moonshot.display_name, "Moonshot(Kimi)");
+        assert_eq!(moonshot.description, "Moonshot Kimi OpenAI 接口。");
+
+        let doubao = presets_for_protocol(ChannelProtocol::OpenAI)
+            .into_iter()
+            .find(|p| p.provider == ChannelProvider::Doubao)
+            .unwrap();
+        assert_eq!(doubao.display_name, "字节豆包 (Coding Plan)");
+        assert_eq!(doubao.description, "字节豆包官方 OpenAI 接口。");
+    }
+
+    #[test]
+    fn no_compatibility_jargon_in_any_preset() {
+        for p in all_channel_presets() {
+            for bad in ["兼容面", "兼容层", "兼容网关", "兼容根地址"] {
+                assert!(!p.description.contains(bad), "{}: {}", p.id, p.description);
+            }
+        }
     }
 
     #[test]
