@@ -2125,7 +2125,171 @@ async fn security_codec_reject_zero_upstream() {
     );
 }
 
-/// Redaction: the upstream forward body is redacted when redact_secrets is on;
+#[tokio::test]
+async fn codec_messages_to_chat_thinking_reject_zero_upstream() {
+    // R7/R29: a Messages→Chat request carrying thinking must be rejected
+    // before any upstream access (call_count 0), not silently dropped.
+    let conv_mock = MockUpstream::start_fixed(
+        br#"{"type":"message","id":"msg_1","role":"assistant","model":"claude","content":[]}"#
+            .to_vec(),
+        200,
+    )
+    .await;
+    let pool = fresh_db().await;
+    let key = api_key();
+    insert_api_key(&pool, &key).await;
+    let conv = channel(
+        "c1",
+        "openai",
+        "custom",
+        &format!("http://{}", conv_mock.addr),
+        &["chat_completions"],
+        &["m"],
+        1,
+        "{}",
+    );
+    insert_channel(&pool, &conv).await;
+
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "u"}],
+        "thinking": {"type": "enabled", "budget_tokens": 1024}
+    });
+    let audit = audited(
+        DownstreamProtocol::Messages,
+        "/v1/messages",
+        "m",
+        body.clone(),
+        false,
+    );
+    let plan = plan_for(
+        &pool,
+        &key,
+        EndpointKind::Messages,
+        "m",
+        &flags(true, true, false),
+        &body,
+    )
+    .await
+    .expect("plan");
+    assert_eq!(plan.groups[0].tier.as_str(), "conversion");
+    let resp = run_non_stream(&pool, &key, &audit, plan, "chat").await;
+    assert_eq!(resp.status(), 400, "thinking must 4xx before upstream");
+    assert_eq!(conv_mock.call_count().await, 0);
+}
+
+#[tokio::test]
+async fn codec_messages_to_chat_unknown_field_reject_zero_upstream() {
+    // R4: an unknown top-level Messages field must be rejected pre-upstream
+    // with a JSON pointer, never silently dropped.
+    let conv_mock = MockUpstream::start_fixed(
+        br#"{"type":"message","id":"msg_1","role":"assistant","model":"claude","content":[]}"#
+            .to_vec(),
+        200,
+    )
+    .await;
+    let pool = fresh_db().await;
+    let key = api_key();
+    insert_api_key(&pool, &key).await;
+    let conv = channel(
+        "c1",
+        "openai",
+        "custom",
+        &format!("http://{}", conv_mock.addr),
+        &["chat_completions"],
+        &["m"],
+        1,
+        "{}",
+    );
+    insert_channel(&pool, &conv).await;
+
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "u"}],
+        "metadata": {"user_id": "u1"}
+    });
+    let audit = audited(
+        DownstreamProtocol::Messages,
+        "/v1/messages",
+        "m",
+        body.clone(),
+        false,
+    );
+    let plan = plan_for(
+        &pool,
+        &key,
+        EndpointKind::Messages,
+        "m",
+        &flags(true, true, false),
+        &body,
+    )
+    .await
+    .expect("plan");
+    assert_eq!(plan.groups[0].tier.as_str(), "conversion");
+    let resp = run_non_stream(&pool, &key, &audit, plan, "chat").await;
+    assert_eq!(resp.status(), 400, "unknown field must 4xx before upstream");
+    assert_eq!(conv_mock.call_count().await, 0);
+}
+
+#[tokio::test]
+async fn codec_chat_to_messages_invalid_tool_args_reject_zero_upstream() {
+    // R8/R21: a Chat→Messages request with invalid/non-object tool arguments
+    // must be rejected pre-upstream, never rewritten to {}.
+    let conv_mock = MockUpstream::start_fixed(
+        br#"{"type":"message","id":"msg_1","role":"assistant","model":"claude","content":[]}"#
+            .to_vec(),
+        200,
+    )
+    .await;
+    let pool = fresh_db().await;
+    let key = api_key();
+    insert_api_key(&pool, &key).await;
+    let conv = channel(
+        "c1",
+        "anthropic",
+        "anthropic",
+        &format!("http://{}", conv_mock.addr),
+        &["messages"],
+        &["m"],
+        1,
+        "{}",
+    );
+    insert_channel(&pool, &conv).await;
+
+    let body = json!({
+        "model": "m",
+        "messages": [
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "[1,2]"}}
+            ]}
+        ]
+    });
+    let audit = audited(
+        DownstreamProtocol::ChatCompletions,
+        "/v1/chat/completions",
+        "m",
+        body.clone(),
+        false,
+    );
+    let plan = plan_for(
+        &pool,
+        &key,
+        EndpointKind::ChatCompletions,
+        "m",
+        &flags(true, true, false),
+        &body,
+    )
+    .await
+    .expect("plan");
+    assert_eq!(plan.groups[0].tier.as_str(), "conversion");
+    let resp = run_non_stream(&pool, &key, &audit, plan, "chat").await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "invalid tool args must 4xx before upstream"
+    );
+    assert_eq!(conv_mock.call_count().await, 0);
+}
 /// the persisted log body is ALWAYS redacted and never contains the secret.
 #[tokio::test]
 async fn security_redacted_forward_body_no_secret() {
