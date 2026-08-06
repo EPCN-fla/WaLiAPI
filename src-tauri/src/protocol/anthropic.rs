@@ -17,6 +17,7 @@ pub struct AnthropicStreamState {
     output_tokens: u64,
     next_content_index: usize,
     open_text: Option<usize>,
+    open_thinking: Option<usize>,
     tools: BTreeMap<usize, ToolState>,
 }
 
@@ -100,14 +101,28 @@ impl AnthropicStreamState {
             .flatten()
         {
             let delta = choice.get("delta").unwrap_or(&Value::Null);
-            if delta
+            // Fail-open: upstream reasoning is emitted as a Messages `thinking`
+            // block (start/delta/stop), never rejected.  Some OpenAI-compat
+            // providers surface it as `reasoning_content` (string) or a
+            // `thinking` object; both are accepted.
+            let reasoning_text = delta
                 .get("reasoning_content")
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
-                .is_some()
-                || delta.get("thinking").is_some()
-            {
-                return Err("OpenAI upstream returned thinking content, which cannot be converted to Anthropic Messages safely".to_string());
+                .map(str::to_string)
+                .or_else(|| match delta.get("thinking") {
+                    Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                    Some(Value::Object(m)) => m
+                        .get("text")
+                        .or_else(|| m.get("thinking"))
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_string),
+                    _ => None,
+                });
+            if let Some(text) = reasoning_text {
+                let index = self.ensure_thinking(events);
+                events.push(event("content_block_delta", serde_json::json!({"type":"content_block_delta", "index":index, "delta":{"type":"thinking_delta", "thinking":text}})));
             }
             if let Some(text) = delta
                 .get("content")
@@ -160,6 +175,17 @@ impl AnthropicStreamState {
         index
     }
 
+    fn ensure_thinking(&mut self, events: &mut Vec<String>) -> usize {
+        if let Some(index) = self.open_thinking {
+            return index;
+        }
+        let index = self.next_content_index;
+        self.next_content_index += 1;
+        self.open_thinking = Some(index);
+        events.push(event("content_block_start", serde_json::json!({"type":"content_block_start", "index":index, "content_block":{"type":"thinking", "thinking":""}})));
+        index
+    }
+
     fn consume_tool_call(&mut self, call: &Value) -> Result<(), String> {
         let source_index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
         let id = call.get("id").and_then(Value::as_str);
@@ -189,6 +215,12 @@ impl AnthropicStreamState {
             return Ok(());
         }
         if let Some(index) = self.open_text.take() {
+            events.push(event(
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop", "index":index}),
+            ));
+        }
+        if let Some(index) = self.open_thinking.take() {
             events.push(event(
                 "content_block_stop",
                 serde_json::json!({"type":"content_block_stop", "index":index}),
@@ -337,6 +369,34 @@ mod tests {
         );
         assert!(output.find("\"id\":\"a\"").unwrap() < output.find("\"id\":\"b\"").unwrap());
         assert_eq!(output.matches("event: message_stop").count(), 1);
+    }
+
+    #[test]
+    fn reasoning_content_streams_as_thinking_block_fail_open() {
+        let mut state = AnthropicStreamState::default();
+        let events = [
+            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"se\"}}]}\n\n".as_ref(),
+            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"cret\"}}]}\n\n".as_ref(),
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".as_ref(),
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n".as_ref(),
+        ];
+        let mut output = Vec::new();
+        for frame in events {
+            output.extend(state.feed(frame, "model", "msg_1").unwrap());
+        }
+        output.extend(state.finish("model", "msg_1").unwrap());
+        let joined = output.join("");
+        // serde_json here sorts object keys (no preserve_order), so assert on
+        // order-independent fragments rather than `"type":"thinking"` adjacency.
+        assert!(joined.contains("\"type\":\"thinking\""));
+        assert!(joined.contains("\"thinking\":\"se\""));
+        assert!(joined.contains("\"thinking\":\"cret\""));
+        assert!(joined.contains("\"text\":\"hi\""));
+        assert_eq!(
+            output.iter().filter(|e| e.contains("content_block_stop")).count(),
+            2,
+            "thinking + text blocks both stop"
+        );
     }
 
     #[test]

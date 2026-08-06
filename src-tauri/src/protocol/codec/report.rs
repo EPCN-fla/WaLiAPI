@@ -98,6 +98,10 @@ pub struct ConversionContext {
     /// inside the codec).
     pub upstream_model: String,
     pub stream: bool,
+    /// JSON pointers (e.g. `/container`) of fields the encoder dropped or
+    /// transformed in a fail-open way during request encoding.  Populated by
+    /// the encoder and surfaced through the [`ConversionReport`].
+    pub normalized: Vec<String>,
 }
 
 impl ConversionContext {
@@ -110,6 +114,7 @@ impl ConversionContext {
             request_id: request_id.into(),
             upstream_model: upstream_model.into(),
             stream,
+            normalized: Vec::new(),
         }
     }
 }

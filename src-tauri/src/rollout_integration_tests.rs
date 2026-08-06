@@ -2126,11 +2126,14 @@ async fn security_codec_reject_zero_upstream() {
 }
 
 #[tokio::test]
-async fn codec_messages_to_chat_thinking_reject_zero_upstream() {
-    // R7/R29: a Messages→Chat request carrying thinking must be rejected
-    // before any upstream access (call_count 0), not silently dropped.
+async fn codec_messages_to_chat_thinking_fail_open_maps_reasoning_effort() {
+    // Fail-open (CPA): a Messages→Chat request carrying thinking is mapped to
+    // `reasoning_effort` and forwarded upstream, never rejected.
+    // Downstream Messages → upstream Chat: the conversion target is an OpenAI
+    // Chat endpoint, so the fixed upstream body must be a Chat completion, not
+    // an Anthropic message.
     let conv_mock = MockUpstream::start_fixed(
-        br#"{"type":"message","id":"msg_1","role":"assistant","model":"claude","content":[]}"#
+        br#"{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"from-conv"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
             .to_vec(),
         200,
     )
@@ -2174,8 +2177,13 @@ async fn codec_messages_to_chat_thinking_reject_zero_upstream() {
     .expect("plan");
     assert_eq!(plan.groups[0].tier.as_str(), "conversion");
     let resp = run_non_stream(&pool, &key, &audit, plan, "chat").await;
-    assert_eq!(resp.status(), 400, "thinking must 4xx before upstream");
-    assert_eq!(conv_mock.call_count().await, 0);
+    assert_eq!(resp.status(), 200, "thinking must forward, not 4xx");
+    assert_eq!(conv_mock.call_count().await, 1, "upstream must be called");
+    // The upstream request carries the mapped reasoning_effort (budget 1024 -> low).
+    let captured = conv_mock.captured().await;
+    let upstream_body: Value =
+        serde_json::from_str(&captured[0].body).expect("upstream request body is JSON");
+    assert_eq!(upstream_body["reasoning_effort"], "low");
 }
 
 #[tokio::test]

@@ -22,6 +22,8 @@ pub fn encode_messages_to_chat(
     model: &str,
 ) -> Result<(Value, ConversionContext), UnsupportedFeatures> {
     let mut out = Vec::new();
+    // Fail-open drops/transforms recorded as JSON pointers for the report.
+    let mut normalized: Vec<String> = Vec::new();
 
     // Top-level fields we can map 1:1 between Messages and Chat.  `top_k` is
     // deliberately absent: OpenAI Chat has no top_k, so it cannot be preserved
@@ -43,33 +45,35 @@ pub fn encode_messages_to_chat(
     // Native Anthropic features with no Chat equivalent are rejected here,
     // before any upstream access.  Anything not in the supported whitelist is
     // rejected with a concrete JSON pointer (never silently dropped), matching
-    // the chat_to_messages_v1 top-level scan.
+    // the chat_to_messages_v1 top-level scan.  Two classes are exceptions,
+    // both fail-open by decision (T13):
+    //   - `thinking`/`output_config` are *mapped* to `reasoning_effort` below
+    //     (CLIProxyAPI semantics); they are never rejected.
+    //   - `container`/`context_management`/`context_management_config` have no
+    //     Chat equivalent and are dropped, recorded on the report's
+    //     `normalized` list rather than rejected.
     if let Some(obj) = body.as_object() {
         for (key, value) in obj.iter() {
             if !SUPPORTED_TOP_LEVEL.contains(&key.as_str()) {
-                // Known beta features with no Chat equivalent keep their stable
-                // code; anything else is an unsupported field.
-                let kind = if matches!(
-                    key.as_str(),
-                    "thinking"
-                        | "output_config"
-                        | "container"
-                        | "context_management"
-                        | "context_management_config"
-                ) {
-                    FeatureKind::BetaFeature
-                } else {
-                    FeatureKind::UnsupportedField
-                };
-                request::reject(
-                    &mut out,
-                    kind,
-                    format!("/{key}"),
-                    format!("Messages field {key:?} has no Chat Completions equivalent"),
-                );
-                // Keep scanning every unknown field so the caller sees the full
-                // rejection set; `value` is only read to silence the unused var.
-                let _ = value;
+                match key.as_str() {
+                    "thinking" | "output_config" => {
+                        // Mapped to `reasoning_effort` in the assembly section.
+                        let _ = value;
+                    }
+                    "container" | "context_management" | "context_management_config" => {
+                        normalized.push(format!("/{key}"));
+                        let _ = value;
+                    }
+                    other => {
+                        request::reject(
+                            &mut out,
+                            FeatureKind::UnsupportedField,
+                            format!("/{other}"),
+                            format!("Messages field {other:?} has no Chat Completions equivalent"),
+                        );
+                        let _ = value;
+                    }
+                }
             }
         }
     }
@@ -92,7 +96,7 @@ pub fn encode_messages_to_chat(
     // system -> single system message (order preserved, annotations stripped).
     let mut system_text: Option<String> = None;
     if let Some(sys) = body.get("system") {
-        match request::anthropic_system_to_chat(sys, "/system") {
+        match request::anthropic_system_to_chat(sys, "/system", &mut normalized) {
             Ok(text) => {
                 if !text.is_empty() {
                     system_text = Some(text);
@@ -105,7 +109,7 @@ pub fn encode_messages_to_chat(
     let mut chat_messages: Vec<Value> = Vec::new();
     for (i, msg) in messages.iter().enumerate() {
         let mp = format!("/messages/{i}");
-        match convert_anthropic_message_to_chat(msg, &mp) {
+        match convert_anthropic_message_to_chat(msg, &mp, &mut normalized) {
             Ok(mut msgs) => chat_messages.append(&mut msgs),
             Err(e) => out.extend(e.fields),
         }
@@ -202,16 +206,59 @@ pub fn encode_messages_to_chat(
         chat.insert("stream_options".to_string(), options);
     }
 
+    // thinking / output_config -> reasoning_effort (fail-open mapping, CPA
+    // semantics).  Only present when the downstream asked for thinking; absent
+    // thinking leaves `reasoning_effort` unset so the upstream applies its own
+    // default.  The upstream (not us) adjudicates whether the model supports it.
+    if let Some(effort) = anthropic_thinking_to_reasoning_effort(body) {
+        chat.insert("reasoning_effort".to_string(), Value::String(effort));
+    }
+
     let request_id = body
         .get("id")
         .and_then(Value::as_str)
         .map(String::from)
         .unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4().simple()));
 
-    Ok((
-        Value::Object(chat),
-        ConversionContext::new(request_id, model.to_string(), stream),
-    ))
+    let mut context = ConversionContext::new(request_id, model.to_string(), stream);
+    context.normalized = normalized;
+    Ok((Value::Object(chat), context))
+}
+
+/// Map an Anthropic `thinking` config to an OpenAI `reasoning_effort` value,
+/// following CLIProxyAPI's `ConvertClaudeRequestToOpenAI`.  Returns `None`
+/// when the downstream did not ask for thinking (or asked for an unrecognized
+/// type), in which case `reasoning_effort` is left unset.
+fn anthropic_thinking_to_reasoning_effort(body: &Value) -> Option<String> {
+    let thinking = body.get("thinking")?;
+    if !thinking.is_object() {
+        return None;
+    }
+    let ty = thinking.get("type").and_then(Value::as_str)?;
+    match ty {
+        "enabled" => {
+            // budget_tokens present -> ConvertBudgetToLevel; absent -> auto.
+            match thinking.get("budget_tokens").and_then(Value::as_i64) {
+                Some(budget) => crate::protocol::thinking::budget_to_level(budget).map(String::from),
+                None => Some("auto".to_string()),
+            }
+        }
+        "adaptive" | "auto" => {
+            // Explicit output_config.effort passes through (lowercased); else xhigh.
+            match body
+                .get("output_config")
+                .and_then(|oc| oc.get("effort"))
+                .and_then(Value::as_str)
+            {
+                Some(effort) if !effort.trim().is_empty() => {
+                    Some(effort.trim().to_ascii_lowercase())
+                }
+                _ => Some("xhigh".to_string()),
+            }
+        }
+        "disabled" => Some("none".to_string()),
+        _ => None,
+    }
 }
 
 /// Convert one Anthropic message (content array or string) into zero or more
@@ -221,6 +268,7 @@ pub fn encode_messages_to_chat(
 fn convert_anthropic_message_to_chat(
     msg: &Value,
     pointer: &str,
+    normalized: &mut Vec<String>,
 ) -> Result<Vec<Value>, UnsupportedFeatures> {
     let role = msg.get("role").and_then(Value::as_str).ok_or_else(|| {
         UnsupportedFeatures::single(
@@ -274,6 +322,7 @@ fn convert_anthropic_message_to_chat(
             }
         };
         let mut assistant_text: Vec<String> = Vec::new();
+        let mut assistant_reasoning = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
         for (bi, block) in items.iter().enumerate() {
             let bp = format!("{pointer}/content/{bi}");
@@ -400,12 +449,24 @@ fn convert_anthropic_message_to_chat(
                         "content": content
                     }));
                 }
-                "thinking" | "redacted_thinking" => {
-                    return Err(UnsupportedFeatures::single(
-                        FeatureKind::Thinking,
-                        bp,
-                        "thinking blocks require a native Anthropic Messages channel",
-                    ))
+                "thinking" => {
+                    // Fail-open: assistant reasoning is carried into the Chat
+                    // message as `reasoning_content` (OpenAI non-stream field);
+                    // reasoning on any other role is dropped — we never inject
+                    // thinking into a user/system channel.  `redacted_thinking`
+                    // has no readable text and is ignored.
+                    if role == "assistant" {
+                        if let Some(t) = block.get("thinking").and_then(Value::as_str) {
+                            if !t.is_empty() {
+                                assistant_reasoning.push_str(t);
+                            }
+                        }
+                        normalized.push(bp);
+                    }
+                }
+                "redacted_thinking" => {
+                    // No readable text; nothing to forward.
+                    normalized.push(bp);
                 }
                 "cache_control" => {
                     return Err(UnsupportedFeatures::single(
@@ -429,7 +490,14 @@ fn convert_anthropic_message_to_chat(
             } else {
                 Value::String(assistant_text.join(""))
             };
-            if tool_calls.is_empty() && content.is_null() {
+            // Reasoning content extracted from assistant `thinking` blocks
+            // (fail-open mapping to OpenAI's non-stream reasoning_content).
+            let reasoning = if assistant_reasoning.is_empty() {
+                None
+            } else {
+                Some(assistant_reasoning)
+            };
+            if tool_calls.is_empty() && content.is_null() && reasoning.is_none() {
                 return Err(UnsupportedFeatures::single(
                     FeatureKind::UnknownBlock,
                     pointer,
@@ -437,6 +505,9 @@ fn convert_anthropic_message_to_chat(
                 ));
             }
             let mut assistant = serde_json::json!({"role": "assistant", "content": content});
+            if let Some(r) = reasoning {
+                assistant["reasoning_content"] = Value::String(r);
+            }
             if !tool_calls.is_empty() {
                 assistant["tool_calls"] = Value::Array(tool_calls);
             }
@@ -665,6 +736,7 @@ pub fn decode_messages_response_to_chat(
         })?;
 
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     for (i, block) in content.iter().enumerate() {
         let bp = format!("/content/{i}");
@@ -724,14 +796,16 @@ pub fn decode_messages_response_to_chat(
                     "function": {"name": name, "arguments": arguments}
                 }));
             }
-            Some("thinking") | Some("redacted_thinking") => {
-                // Responses carrying reasoning are not representable in Chat for
-                // this version; reject with the stable thinking code (R7/R29).
-                return Err(UnsupportedFeatures::single(
-                    FeatureKind::Thinking,
-                    format!("{bp}/type"),
-                    "thinking blocks in a Messages response have no Chat equivalent",
-                ));
+            Some("thinking") => {
+                // Fail-open: reasoning is surfaced as OpenAI `reasoning_content`
+                // (string), never rejected.  Only the visible text is kept; the
+                // signature/encrypted forms are dropped.
+                if let Some(t) = block.get("thinking").and_then(Value::as_str) {
+                    reasoning.push_str(t);
+                }
+            }
+            Some("redacted_thinking") => {
+                // No usable text; skip.
             }
             Some(other) => {
                 return Err(UnsupportedFeatures::single(
@@ -788,6 +862,9 @@ pub fn decode_messages_response_to_chat(
         "role": "assistant",
         "content": if text.is_empty() { Value::Null } else { Value::String(text) },
     });
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = Value::String(reasoning);
+    }
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
     }
@@ -968,14 +1045,12 @@ impl MessagesSseState {
                         self.text_content_index = Some(index);
                     }
                     Some("thinking") | Some("redacted_thinking") => {
-                        // Reasoning has no Chat streaming equivalent; reject at
-                        // block start with the stable thinking code (R29) rather
-                        // than surfacing a later unknown-event error.
-                        return Err(UnsupportedFeatures::single(
-                            FeatureKind::Thinking,
-                            "/content_block_start/content_block/type",
-                            "thinking blocks have no Chat streaming equivalent",
-                        ));
+                        // Fail-open: reasoning is forwarded as OpenAI
+                        // `reasoning_content` deltas.  `redacted_thinking` has
+                        // no visible text (signature only) — its deltas are
+                        // ignored but not rejected.  current_block is already
+                        // recorded above, so text_delta-like handling below
+                        // routes on the delta type, not the block type.
                     }
                     Some("tool_use") => {
                         // id and name are mandatory on a tool_use block; never
@@ -1055,14 +1130,20 @@ impl MessagesSseState {
                             }
                         }
                     }
-                    Some("thinking_delta") | Some("signature_delta") => {
-                        // Reasoning deltas have no Chat streaming equivalent;
-                        // reject with the stable thinking code (R29).
-                        return Err(UnsupportedFeatures::single(
-                            FeatureKind::Thinking,
-                            "/content_block_delta/delta/type",
-                            "thinking_delta has no Chat streaming equivalent",
-                        ));
+                    Some("thinking_delta") => {
+                        let reasoning = delta
+                            .get("thinking")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if !reasoning.is_empty() {
+                            events.push(sse::data_frame(serde_json::json!({
+                                "choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": null}]
+                            })));
+                        }
+                    }
+                    Some("signature_delta") => {
+                        // Encrypted/reference signature — no usable text for
+                        // the Chat downstream; drop fail-open.
                     }
                     _ => {
                         return Err(UnsupportedFeatures::single(

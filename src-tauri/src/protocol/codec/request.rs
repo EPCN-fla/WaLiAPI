@@ -124,9 +124,14 @@ pub fn chat_tool_choice_to_anthropic(
 
 /// Validate an Anthropic `system` value and reduce it to the Chat-compatible
 /// form (system role message content).  Returns the joined text.
+///
+/// A `thinking` block inside the system array is dropped fail-open (recorded
+/// on `normalized`); `cache_control` blocks remain rejected (PromptCache is a
+/// hard error, not a silent drop).
 pub fn anthropic_system_to_chat(
     value: &Value,
     pointer: &str,
+    normalized: &mut Vec<String>,
 ) -> Result<String, UnsupportedFeatures> {
     match value {
         Value::String(s) => Ok(s.clone()),
@@ -153,11 +158,9 @@ pub fn anthropic_system_to_chat(
                         ));
                     }
                     Some("thinking") => {
-                        return Err(UnsupportedFeatures::single(
-                            FeatureKind::Thinking,
-                            bp,
-                            "system thinking block is not representable in Chat",
-                        ));
+                        // Fail-open: reasoning instructions are dropped, not
+                        // rejected.  Recorded for the report.
+                        normalized.push(bp);
                     }
                     Some(other) => {
                         return Err(UnsupportedFeatures::single(

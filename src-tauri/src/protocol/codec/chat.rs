@@ -30,6 +30,7 @@ const SUPPORTED_TOP_LEVEL: &[&str] = &[
     "stop",
     "tools",
     "tool_choice",
+    "reasoning_effort",
 ];
 
 /// Encode a Chat Completions request into an Anthropic Messages request.
@@ -181,6 +182,29 @@ pub fn encode_chat_to_messages(
         }
     }
     claude.insert("stream".to_string(), Value::Bool(stream));
+
+    // reasoning_effort -> thinking (fail-open mapping, CPA semantics).  Only
+    // when the downstream asked for a reasoning effort; absent effort leaves
+    // thinking unset so the upstream applies its own default.
+    if let Some(effort) = body.get("reasoning_effort").and_then(Value::as_str) {
+        let e = effort.to_ascii_lowercase();
+        match e.as_str() {
+            "none" | "off" => {
+                claude.insert("thinking".to_string(), serde_json::json!({"type": "disabled"}));
+            }
+            "auto" => {
+                claude.insert("thinking".to_string(), serde_json::json!({"type": "adaptive"}));
+            }
+            _ => {
+                let mapped = crate::protocol::thinking::map_effort_to_claude(&e);
+                claude.insert("thinking".to_string(), serde_json::json!({"type": "adaptive"}));
+                claude.insert(
+                    "output_config".to_string(),
+                    serde_json::json!({"effort": mapped}),
+                );
+            }
+        }
+    }
 
     if !out.is_empty() {
         return Err(UnsupportedFeatures::new(out));
@@ -710,16 +734,11 @@ pub fn decode_chat_response_to_messages(
         )
     })?;
 
-    if message.get("reasoning_content").is_some()
-        || message.get("thinking").is_some()
-        || message.get("reasoning").is_some()
-    {
-        return Err(UnsupportedFeatures::single(
-            FeatureKind::Thinking,
-            "/choices/0/message/reasoning_content",
-            "OpenAI upstream returned thinking/reasoning content, which cannot be represented safely in Messages",
-        ));
-    }
+    // Reasoning content from an OpenAI upstream is carried into Messages as a
+    // `thinking` block (fail-open, CPA semantics: it is always preserved even
+    // when `content` is non-empty).  `reasoning_content` may be a plain string
+    // or an object `{"text": ...}`; `redacted_thinking` has no readable text.
+    let reasoning_text = extract_reasoning_text(message);
 
     let content_text = match message.get("content") {
         None | Some(Value::Null) => "",
@@ -770,6 +789,11 @@ pub fn decode_chat_response_to_messages(
     let usage = usage_from_chat(body);
 
     let mut content_blocks: Vec<Value> = Vec::new();
+    // Thinking block precedes the text block, mirroring the assistant message
+    // shape Claude produces natively.
+    if !reasoning_text.is_empty() {
+        content_blocks.push(serde_json::json!({"type": "thinking", "thinking": reasoning_text}));
+    }
     if !content_text.is_empty() {
         content_blocks.push(serde_json::json!({"type": "text", "text": content_text}));
     }
@@ -851,6 +875,29 @@ pub fn decode_chat_response_to_messages(
     }))
 }
 
+/// Extract reasoning text from a Chat assistant message, supporting both the
+/// plain-string and `{"text": ...}` shapes of `reasoning_content`, plus the
+/// `thinking`/`reasoning` aliases some providers use.  Returns `""` when no
+/// reasoning is present.
+fn extract_reasoning_text(message: &Value) -> String {
+    let candidate = message
+        .get("reasoning_content")
+        .or_else(|| message.get("thinking"))
+        .or_else(|| message.get("reasoning"));
+    let Some(c) = candidate else {
+        return String::new();
+    };
+    match c {
+        Value::String(s) => s.clone(),
+        Value::Object(o) => o
+            .get("text")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 /// Extract real usage from a Chat response.  `usage_unknown` is surfaced to the
 /// gateway via the report; a 0 is only ever a protocol-mandated placeholder.
 pub fn usage_from_chat(body: &Value) -> Usage {
@@ -901,6 +948,7 @@ pub struct ChatSseState {
     usage: Usage,
     next_content_index: usize,
     open_text: Option<usize>,
+    open_thinking: Option<usize>,
     tools: BTreeMap<usize, ToolAccum>,
     /// The mapped upstream model (from the PreparedAttempt) to emit in the
     /// synthesized `message_start` frame; the codec never re-maps models.
@@ -1003,17 +1051,34 @@ impl ChatSseState {
             .flatten()
         {
             let delta = choice.get("delta").unwrap_or(&Value::Null);
-            if delta
+            // Fail-open: upstream reasoning is emitted as a Messages `thinking`
+            // block (start/delta/stop), never rejected.  Some OpenAI-compat
+            // providers surface it as `reasoning_content` (string) or a
+            // `thinking` object; both are accepted.
+            let reasoning_text = delta
                 .get("reasoning_content")
                 .and_then(Value::as_str)
                 .filter(|t| !t.is_empty())
-                .is_some()
-                || delta.get("thinking").is_some()
-            {
-                return Err(UnsupportedFeatures::single(
-                    FeatureKind::Thinking,
-                    "/choices/0/delta/reasoning_content",
-                    "OpenAI upstream returned thinking content, which cannot be converted to Messages safely",
+                .map(str::to_string)
+                .or_else(|| match delta.get("thinking") {
+                    Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                    Some(Value::Object(m)) => m
+                        .get("text")
+                        .or_else(|| m.get("thinking"))
+                        .and_then(Value::as_str)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string),
+                    _ => None,
+                });
+            if let Some(text) = reasoning_text {
+                let index = self.ensure_thinking(events);
+                events.push(sse::event(
+                    "content_block_delta",
+                    serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "thinking_delta", "thinking": text}
+                    }),
                 ));
             }
             if let Some(text) = delta
@@ -1094,6 +1159,24 @@ impl ChatSseState {
         index
     }
 
+    fn ensure_thinking(&mut self, events: &mut Vec<String>) -> usize {
+        if let Some(index) = self.open_thinking {
+            return index;
+        }
+        let index = self.next_content_index;
+        self.next_content_index += 1;
+        self.open_thinking = Some(index);
+        events.push(sse::event(
+            "content_block_start",
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "thinking", "thinking": ""}
+            }),
+        ));
+        index
+    }
+
     fn consume_tool_call(&mut self, call: &Value) -> Result<(), UnsupportedFeatures> {
         let source_index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
         if let Some(id) = call.get("id").and_then(Value::as_str) {
@@ -1135,6 +1218,15 @@ impl ChatSseState {
             ));
         }
         if let Some(index) = self.open_text.take() {
+            events.push(sse::event(
+                "content_block_stop",
+                serde_json::json!({
+                    "type": "content_block_stop",
+                    "index": index
+                }),
+            ));
+        }
+        if let Some(index) = self.open_thinking.take() {
             events.push(sse::event(
                 "content_block_stop",
                 serde_json::json!({

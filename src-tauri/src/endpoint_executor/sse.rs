@@ -703,25 +703,31 @@ mod tests {
         assert!(core.committed());
     }
 
-    /// C-1: a conversion-mode first record the codec rejects is a pre-commit
-    /// failure (Err from new), NOT a committed downstream emission.
+    /// C-1: a conversion-mode first record carrying reasoning is now fail-open:
+    /// the ChatToMessages decoder maps it to a Messages `thinking` block and
+    /// `new()` succeeds (no pre-commit rejection).
     #[test]
-    fn conversion_first_frame_rejection_fails_closed_before_commit() {
-        // A Chat record with unsupported reasoning content → the ChatToMessages
-        // decoder rejects it (thinking), so new() must return Err.
+    fn conversion_first_frame_thinking_fail_open_before_commit() {
         let raw_first =
             b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"secret chain\"}}]}\n\n";
-        let result = StreamPumpCore::new(
+        let mut core = StreamPumpCore::new(
             native_supervisor(),
             SseMode::ChatToMessages,
             decoder_for(SseMode::ChatToMessages, "up-model", ""),
             raw_first.to_vec(),
             Vec::new(),
             "up-model".to_string(),
-        );
+        )
+        .expect("thinking first frame must be accepted fail-open");
+        let first = core.start().unwrap();
+        let text = String::from_utf8_lossy(&first);
+        assert!(text.contains("message_start"), "first frame emits message_start: {text}");
+        // serde_json sorts object keys (no preserve_order), so assert on
+        // order-independent fragments rather than `"type":"thinking"` adjacency.
         assert!(
-            result.is_err(),
-            "codec rejection of the first frame must fail closed"
+            text.contains("\"type\":\"thinking\"") &&
+                text.contains("\"thinking\":\"secret chain\""),
+            "reasoning must surface as a Messages thinking block: {text}"
         );
     }
 }

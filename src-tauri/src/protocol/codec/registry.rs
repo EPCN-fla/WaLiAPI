@@ -141,7 +141,9 @@ impl CodecRegistry {
             )
         })?;
         let (encoded_request, context) = (dir.encode)(request, model)?;
-        let report = ConversionReport::ok();
+        // The encoder records fail-open drops/transforms on the context; fold
+        // them into the report so callers can observe what was normalized.
+        let report = ConversionReport::new(vec![], context.normalized.clone());
         let non_stream = (dir.non_stream)(&context);
         let streaming = (dir.streaming)(&context);
         Ok(PreparedConversion {
