@@ -9,6 +9,7 @@ import type {
   BuiltinRule, CustomRule, CreateCustomRuleInput, UpdateBuiltinRuleInput,
   ChannelProtocolPresetGroup,
   DraftChannelTestInput, DraftChannelTestResult,
+  UpstreamModelsResult,
 } from "../types";
 
 /**
@@ -50,6 +51,9 @@ export const channelApi = {
   getPresets: () => invoke<ChannelProtocolPresetGroup[]>("get_channel_presets"),
   /** 保存前草稿连通性测试（T07，真实后端命令，不落库）。 */
   testDraft: (input: DraftChannelTestInput) => testChannelDraft(input),
+  /** 拉取上游模型列表（T14）。绝不写库：不覆盖已有模型列表，返回结果供弹窗勾选合并。 */
+  syncUpstreamModels: (input: DraftChannelTestInput) =>
+    invoke<UpstreamModelsResult>("sync_upstream_models", { input }),
 };
 
 // API Key commands

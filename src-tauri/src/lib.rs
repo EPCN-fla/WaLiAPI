@@ -141,6 +141,7 @@ pub fn run() {
             commands::channel::delete_channel,
             commands::channel::test_channel,
             commands::channel::test_channel_draft,
+            commands::channel::sync_upstream_models,
             commands::channel::get_channel_stats,
             commands::channel::reorder_channels,
             commands::api_key::get_api_keys,

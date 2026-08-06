@@ -6,6 +6,12 @@
 
 架构约束：[00-architecture-decisions.md](00-architecture-decisions.md)
 
+复核基准：[T12 CLIProxyAPI 映射基准](12-cliproxy-anthropic-to-chat.md)
+
+待评审方案：[T13 thinking fail-open 转换](13-thinking-fail-open-conversion.md)
+
+已验收原型：[T14 同步上游模型（弹窗勾选应用）](14-model-upstream-sync.md) · [原型 HTML](14-model-sync-prototype.html)
+
 ## 交付目标
 
 在不破坏现有 Chat、Responses、Anthropic Messages、模型映射、权重调度、导入导出和旧数据库的前提下，将渠道的协议、提供商和原生端点能力拆开，并交付：

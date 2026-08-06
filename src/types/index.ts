@@ -412,3 +412,15 @@ export interface DraftChannelTestInput {
   preset_revision?: string;
   legacy_executor_override?: string;
 }
+
+// ── 上游模型同步（T14）─────────────────────────────────────────────────────────
+// `sync_upstream_models` 命令的输出：绝不写库，仅返回拉取结果供弹窗勾选合并。
+
+export interface UpstreamModelsResult {
+  /** 上游返回的模型 ID 列表（openai `data[].id` / ollama `models[].name`）。 */
+  models: string[];
+  /** 判定出的上游协议：`openai` / `anthropic` / `ollama`。 */
+  protocol: ChannelProtocol | string;
+  /** 拉取时使用的根 URL（便于展示/排障）。 */
+  base_url: string;
+}

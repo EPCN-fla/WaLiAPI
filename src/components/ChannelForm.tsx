@@ -5,6 +5,7 @@ import type {
   ChannelProtocol, ChannelProvider, ChannelEndpoint, ChannelAuthScheme,
   ChannelPreset, ChannelProtocolPresetGroup,
   DraftChannelTestResult, DraftChannelTestInput,
+  UpstreamModelsResult,
 } from "../types";
 import {
   PROTOCOL_LABELS, ENDPOINT_LABELS,
@@ -12,6 +13,7 @@ import {
 import { X, Plus, Check, RefreshCw, KeyRound, Undo, Loader2 } from "lucide-react";
 import { MappingRow } from "./channel-form/MappingRow";
 import { DraftTestModal } from "./channel-form/DraftTestModal";
+import { ModelSyncModal } from "./channel-form/ModelSyncModal";
 import { ProviderDropdown } from "./channel-form/ProviderDropdown";
 
 // ─── 协议级结构（UI 结构常量，非厂商模板副本）────────────────────────────────
@@ -192,6 +194,15 @@ export function ChannelForm({ editing, onClose, onSaved }: {
   const [clearKeyRequested, setClearKeyRequested] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  // ── T14 同步上游模型 ─────────────────────────────────────────────────────
+  const [syncState, setSyncState] = useState<"idle" | "loading">("idle");
+  const [syncResult, setSyncResult] = useState<UpstreamModelsResult | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [toastMsg, setToastMsg] = useState<string | null>(null);
+  /** 本次应用后新增的模型（绿色高亮动画用）。 */
+  const [addedModels, setAddedModels] = useState<string[]>([]);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const highlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const currentPreset = useMemo(() => {
     const group = presetGroups.find(g => g.protocol === form.protocol);
@@ -380,6 +391,47 @@ export function ChannelForm({ editing, onClose, onSaved }: {
       legacy_executor_override: form.legacy_executor_override,
     };
   }
+
+  // ── T14 同步上游模型流程 ────────────────────────────────────────────────
+  function showToast(msg: string) {
+    setToastMsg(msg);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToastMsg(null), 2600);
+  }
+
+  async function handleSync() {
+    if (saving || syncState === "loading") return;
+    setSyncState("loading");
+    setSyncError(null);
+    try {
+      // 后端绝不写库；api_key 复用草稿语义（编辑留空回填已存 Key）。
+      const result = await channelApi.syncUpstreamModels(buildDraftInput());
+      setSyncResult(result);
+    } catch (e) {
+      setSyncError(String(e));
+    } finally {
+      setSyncState("idle");
+    }
+  }
+
+  /** 合并去重（保序：已有顺序 + 新增追加），新增 chip 高亮 + toast。 */
+  function applySync(selected: string[]) {
+    const existing = new Set(form.models);
+    const toAdd = selected.filter(m => !existing.has(m));
+    if (toAdd.length === 0) { setSyncResult(null); return; }
+    onModelListChange([...form.models, ...toAdd]);
+    setAddedModels(toAdd);
+    setSyncResult(null);
+    showToast(`已添加 ${toAdd.length} 个模型到「${form.name || "渠道"}」`);
+    if (highlightTimer.current) clearTimeout(highlightTimer.current);
+    highlightTimer.current = setTimeout(() => setAddedModels([]), 1800);
+  }
+
+  // 卸载时清理 toast/高亮计时器。
+  useEffect(() => () => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    if (highlightTimer.current) clearTimeout(highlightTimer.current);
+  }, []);
 
   type ReceiptFields = { test_run_id: string; draft_fingerprint: string; force_save: boolean };
 
@@ -691,13 +743,31 @@ export function ChannelForm({ editing, onClose, onSaved }: {
                 placeholder="输入模型名称，回车添加"
               />
               <button type="button" onClick={addModel} className="action-secondary px-4 py-3"><Plus size={16} /></button>
-              <button type="button" disabled title="上游模型同步接口尚未开放（后端提供）；失败时不会覆盖已有模型列表" className="action-secondary px-3 py-3 disabled:opacity-40 disabled:cursor-not-allowed">
-                <RefreshCw size={14} /> 同步上游模型
+              <button
+                type="button"
+                onClick={handleSync}
+                disabled={syncState === "loading" || saving}
+                title="按协议拉取上游模型列表，弹窗勾选后合并进模型列表；失败时不会覆盖已有模型列表"
+                className="action-secondary px-3 py-3 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {syncState === "loading"
+                  ? <Loader2 size={14} className="animate-spin" />
+                  : <RefreshCw size={14} />}
+                同步上游模型
               </button>
             </div>
+            {syncError && (
+              <p className="mb-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                同步失败：{syncError}
+              </p>
+            )}
             <div className="flex flex-wrap gap-2">
               {form.models.map(m => (
-                <span key={m} className="inline-flex items-center gap-1 rounded-full bg-primary/12 px-3 py-1.5 text-xs text-primary">
+                <span
+                  key={m}
+                  className="inline-flex items-center gap-1 rounded-full bg-primary/12 px-3 py-1.5 text-xs text-primary"
+                  style={addedModels.includes(m) ? { animation: "model-pop 1.8s ease" } : undefined}
+                >
                   {m}
                   <button type="button" onClick={() => removeModel(m)} className="hover:text-red-300"><X size={12} /></button>
                 </span>
@@ -812,6 +882,25 @@ export function ChannelForm({ editing, onClose, onSaved }: {
           onModify={() => { setTestPhase("idle"); setTestResult(null); setSaveError(null); }}
           onForceSave={handleForceSave}
         />
+      )}
+
+      {/* T14 同步上游模型弹窗（仅在拉取成功后打开；失败走表单内错误提示，不覆盖列表） */}
+      {syncResult && (
+        <ModelSyncModal
+          result={syncResult}
+          channelName={form.name || "渠道"}
+          existingModels={form.models}
+          onApply={applySync}
+          onClose={() => setSyncResult(null)}
+        />
+      )}
+
+      {/* 应用后 toast */}
+      {toastMsg && (
+        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-2 rounded-2xl bg-slate-900 px-4 py-2.5 text-sm font-medium text-white shadow-xl animate-[fadeInUp_0.2s_ease]">
+          <Check size={15} className="text-emerald-400" />
+          {toastMsg}
+        </div>
       )}
     </div>
   );

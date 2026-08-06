@@ -1,6 +1,7 @@
 pub mod channel_test;
 pub mod knowledge;
 pub mod mcp;
+pub mod upstream_models;
 
 use crate::server::router::SharedState;
 use crate::AppState;

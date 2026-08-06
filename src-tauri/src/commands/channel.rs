@@ -8,6 +8,7 @@ use crate::db::repository::Repository;
 use crate::services::channel_test::{
     self, DraftChannelTestInput, DraftChannelTestResult, SaveReceiptCheck,
 };
+use crate::services::upstream_models::UpstreamModelsResult;
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 
@@ -320,6 +321,20 @@ pub async fn test_channel_draft(
     let api_key = channel_test::resolve_draft_api_key(&input, &repo).await?;
     let config = channel_test::DraftTestConfig::default();
     channel_test::run_draft_test(&input, &api_key, &state.test_receipts, &config).await
+}
+
+/// 拉取上游模型列表（T14）。返回模型 ID 数组 + 判定协议 + 根 URL，供编辑页
+/// 弹窗勾选后合并进模型列表。**绝不写库**：不创建/更新渠道、不写 request log、
+/// 不覆盖已有模型列表。API Key 复用草稿测试的解析语义（编辑留空回填已存 Key）。
+#[tauri::command]
+pub async fn sync_upstream_models(
+    input: DraftChannelTestInput,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<UpstreamModelsResult, String> {
+    let repo = Repository::new(state.db.pool.clone());
+    let api_key = channel_test::resolve_draft_api_key(&input, &repo).await?;
+    let timeout = input.timeout_secs.unwrap_or(60).max(1) as u64;
+    crate::services::upstream_models::fetch_upstream_models(&input, &api_key, timeout).await
 }
 
 #[tauri::command]
