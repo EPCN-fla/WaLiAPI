@@ -136,24 +136,25 @@ pub fn apply_model_mapping(
     let mut body = body.clone();
     if let Some(model) = body.get("model").and_then(|m| m.as_str()) {
         if let Some(mapped) = mapping.get(model) {
-            // Support both single string and array of strings
+            // Single-string mappings are still applied here for direct callers.
+            // Array mappings are NOT re-sampled: the sampled upstream model is
+            // resolved exactly once per attempt and pre-baked into the body by
+            // the caller (proxy.rs / handlers.rs), so the actual request, log
+            // and statistics all share the same model (design 11.4).  An array
+            // here therefore means the caller already chose; keep the body.
             let chosen = if let Some(s) = mapped.as_str() {
                 s.to_string()
-            } else if let Some(arr) = mapped.as_array() {
-                // Pick a random model from the array (load balancing)
-                let models: Vec<String> = arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect();
-                if models.is_empty() {
-                    return sanitize_messages(body);
-                }
-                let idx = rand::Rng::random_range(&mut rand::rng(), 0..models.len());
-                models[idx].clone()
+            } else if mapped.is_array() {
+                body["model"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
             } else {
                 return sanitize_messages(body);
             };
-            body["model"] = serde_json::Value::String(chosen);
+            if !chosen.is_empty() {
+                body["model"] = serde_json::Value::String(chosen);
+            }
         }
     }
     sanitize_messages(body)

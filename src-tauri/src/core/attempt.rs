@@ -189,8 +189,12 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
     let channel_id = candidate.channel.id.clone();
     let channel_name = candidate.channel.name.clone();
     let route_group = group.id.clone();
-    let upstream_protocol = group.upstream_protocol.as_str().to_string();
-    let upstream_endpoint = group.upstream_endpoint.clone();
+    // Use the CANDIDATE's own protocol/endpoint, not the group's: a native group
+    // may (legitimately) hold more than one upstream protocol when ollama_native
+    // is enabled (e.g. OpenAI chat_completions and Ollama api_chat), and the
+    // group-level fields only mirror the first candidate.
+    let upstream_protocol = candidate.upstream_protocol.as_str().to_string();
+    let upstream_endpoint = candidate.upstream_endpoint.clone();
     let native_base_url = candidate.identity.native_base_url.clone();
 
     match group.tier {
@@ -254,7 +258,13 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
             } else {
                 // Legacy Responses→Chat debt conversion (not in the codec
                 // registry; handled by the existing protocol helpers).
-                let encoded = crate::protocol::responses_to_openai(&audit.forward_json);
+                let mut encoded = crate::protocol::responses_to_openai(&audit.forward_json);
+                // The sampled upstream model must be baked into the encoded body
+                // (matching the native and codec paths) so the actual request,
+                // logs and statistics all use the SAME model (§11.4).
+                if let Some(obj) = encoded.as_object_mut() {
+                    obj.insert("model".into(), Value::String(upstream_model.clone()));
+                }
                 Ok(PreparedAttempt {
                     channel_id,
                     channel_name,

@@ -99,8 +99,11 @@ where
                         channel_id: candidate.channel.id.clone(),
                         channel_name: candidate.channel.name.clone(),
                         route_group: group.id.clone(),
-                        upstream_protocol: group.upstream_protocol.as_str().to_string(),
-                        upstream_endpoint: group.upstream_endpoint.clone(),
+                        // Candidate-level protocol/endpoint (a native group may
+                        // hold mixed upstream protocols when ollama_native is on;
+                        // group-level mirrors only the first candidate).
+                        upstream_protocol: candidate.upstream_protocol.as_str().to_string(),
+                        upstream_endpoint: candidate.upstream_endpoint.clone(),
                         provider: candidate.identity.provider.clone(),
                         identity_revision: candidate.identity.identity_revision,
                     };

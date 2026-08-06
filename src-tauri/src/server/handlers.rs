@@ -517,12 +517,6 @@ async fn handle_stream(
         return (StatusCode::SERVICE_UNAVAILABLE, "No channel for model").into_response();
     }
 
-    let request = ProxyRequest {
-        model: model.clone(),
-        body: forward_json.clone(),
-        stream: true,
-    };
-
     let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.app);
     let max_attempts = if retry_enabled {
         (retry_times.max(0) as usize + 1).min(selected_channels.len())
@@ -536,8 +530,22 @@ async fn handle_stream(
         let config = Dispatcher::channel_to_config(&channel);
         let adaptor = get_adaptor(&channel.channel_type);
 
-        // Compute the actual upstream model after mapping
+        // Compute the actual upstream model after mapping and bake it into the
+        // body ONCE so the actual request and the log share the same model
+        // (design 11.4); apply_model_mapping no longer re-samples arrays.
         let upstream_model = resolve_mapped_model(&config.model_mapping, &model);
+        let mut attempt_body = forward_json.clone();
+        if let Some(obj) = attempt_body.as_object_mut() {
+            obj.insert(
+                "model".into(),
+                serde_json::Value::String(upstream_model.clone()),
+            );
+        }
+        let request = ProxyRequest {
+            model: model.clone(),
+            body: attempt_body,
+            stream: true,
+        };
 
         match adaptor.forward_stream(&request, &config).await {
             Ok(resp) => {
@@ -2263,11 +2271,6 @@ async fn handle_responses_stream(
         return (StatusCode::SERVICE_UNAVAILABLE, "No channel for model").into_response();
     }
 
-    let request = ProxyRequest {
-        model: model.clone(),
-        body: forward_json.clone(),
-        stream: true,
-    };
     let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.app);
     let max_attempts = if retry_enabled {
         (retry_times.max(0) as usize + 1).min(selected_channels.len())
@@ -2280,7 +2283,22 @@ async fn handle_responses_stream(
     for (attempt, channel) in selected_channels.into_iter().take(max_attempts).enumerate() {
         let config = Dispatcher::channel_to_config(&channel);
         let adaptor = get_adaptor(&channel.channel_type);
+        // Bake the sampled upstream model into the body ONCE per attempt so the
+        // actual request and the log share the same model (design 11.4);
+        // apply_model_mapping no longer re-samples arrays.
         let upstream_model = resolve_mapped_model(&config.model_mapping, &model);
+        let mut attempt_body = forward_json.clone();
+        if let Some(obj) = attempt_body.as_object_mut() {
+            obj.insert(
+                "model".into(),
+                serde_json::Value::String(upstream_model.clone()),
+            );
+        }
+        let request = ProxyRequest {
+            model: model.clone(),
+            body: attempt_body,
+            stream: true,
+        };
 
         match adaptor.forward_stream(&request, &config).await {
             Ok(resp) => {
