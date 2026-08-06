@@ -7,12 +7,12 @@ import type {
   DraftChannelTestResult, DraftChannelTestInput,
 } from "../types";
 import {
-  CHANNEL_CATEGORIES, CHANNEL_PROVIDER_ICONS, PROTOCOL_LABELS, ENDPOINT_LABELS,
+  PROTOCOL_LABELS, ENDPOINT_LABELS,
 } from "../lib/constants";
 import { X, Plus, Check, RefreshCw, KeyRound, Undo, Loader2 } from "lucide-react";
 import { MappingRow } from "./channel-form/MappingRow";
 import { DraftTestModal } from "./channel-form/DraftTestModal";
-import { ConfirmSwitchDialog } from "./channel-form/ConfirmSwitchDialog";
+import { ProviderDropdown } from "./channel-form/ProviderDropdown";
 
 // ─── 协议级结构（UI 结构常量，非厂商模板副本）────────────────────────────────
 // 这些描述的是「协议本身的语义」（设计 3.2）：OpenAI 有两个可选端点，
@@ -77,11 +77,6 @@ function deriveLegacyBaseUrl(protocol: ChannelProtocol, native: string): string 
   return root.endsWith("/v1") ? root : `${root}/v1`;
 }
 
-function sameEndpoints(a: string[], b: string[]): boolean {
-  if (a.length !== b.length) return false;
-  return [...a].sort().join(",") === [...b].sort().join(",");
-}
-
 interface FormState {
   name: string;
   protocol: ChannelProtocol;
@@ -97,10 +92,6 @@ interface FormState {
   preset_revision: string | null;
   legacy_executor_override?: string;
 }
-
-type PendingSwitch =
-  | { kind: "protocol"; protocol: ChannelProtocol }
-  | { kind: "provider"; provider: ChannelProvider };
 
 function initForm(editing: Channel | null): FormState {
   if (editing) {
@@ -187,17 +178,13 @@ export function ChannelForm({ editing, onClose, onSaved }: {
     return () => { alive = false; };
   }, []);
 
+  // 三协议 Tab 常驻（无功能开关依赖）。
+  const availableProtocols = PROTOCOLS;
+
   // ── 连接参数 / 测试 receipt 状态 ─────────────────────────────────────────
-  const [connEdited, setConnEdited] = useState(false);
-  // 挂载时的连接字段初始值：连接参数恢复原状时清除 dirty 标记（Q6）。
-  const [initialConn] = useState(() => {
-    const f = initForm(editing);
-    return { url: f.native_base_url, models: f.models, endpoints: f.native_endpoints };
-  });
   // 编辑态下已保存的渠道名视为「用户已命名」，切换预设不自动改名。
   const [nameTouched, setNameTouched] = useState(!!editing);
   const autoNameRef = useRef<string | null>(null);
-  const [pendingSwitch, setPendingSwitch] = useState<PendingSwitch | null>(null);
   const [receipt, setReceipt] = useState<DraftChannelTestResult | null>(null);
   const [testPhase, setTestPhase] = useState<"idle" | "running" | "failed">("idle");
   const [testResult, setTestResult] = useState<DraftChannelTestResult | null>(null);
@@ -210,11 +197,6 @@ export function ChannelForm({ editing, onClose, onSaved }: {
     const group = presetGroups.find(g => g.protocol === form.protocol);
     return group?.presets.find(p => p.provider === form.provider) ?? null;
   }, [presetGroups, form.protocol, form.provider]);
-
-  const customPreset = useMemo(() => {
-    const group = presetGroups.find(g => g.protocol === form.protocol);
-    return group?.presets.find(p => p.provider === "custom") ?? null;
-  }, [presetGroups, form.protocol]);
 
   const authScheme: ChannelAuthScheme = currentPreset?.auth_scheme ?? PROTOCOL_DEFAULT_AUTH[form.protocol];
   const keyRequired = authScheme !== "optional_bearer";
@@ -245,18 +227,6 @@ export function ChannelForm({ editing, onClose, onSaved }: {
     setSaveError(null);
   }
 
-  /** 连接参数是否已恢复到挂载时初始值；是则清除 dirty（Q6），否则保持 dirty。 */
-  function syncConnDirty(nextUrl: string, nextModels: string[], nextEndpoints: ChannelEndpoint[]) {
-    const restored =
-      nextUrl === initialConn.url &&
-      nextModels.length === initialConn.models.length &&
-      nextModels.every((m, i) => m === initialConn.models[i]) &&
-      sameEndpoints(nextEndpoints, initialConn.endpoints);
-    setConnEdited(!restored);
-  }
-
-  const hasConnectionValues = connEdited || form.native_base_url.trim() !== "" || form.models.length > 0;
-
   function findPreset(protocol: ChannelProtocol, provider: ChannelProvider): ChannelPreset | null {
     const group = presetGroups.find(g => g.protocol === protocol);
     return group?.presets.find(p => p.provider === provider) ?? null;
@@ -285,7 +255,6 @@ export function ChannelForm({ editing, onClose, onSaved }: {
         } : {}),
       };
     });
-    setConnEdited(false);
     invalidateReceipt();
   }
 
@@ -299,82 +268,26 @@ export function ChannelForm({ editing, onClose, onSaved }: {
       native_endpoints: defaultEndpointsFor(protocol),
       models: [],
     }));
-    setConnEdited(false);
     invalidateReceipt();
   }
 
   function requestProtocolSwitch(protocol: ChannelProtocol) {
     if (protocol === form.protocol || saving) return;
-    if (hasConnectionValues) {
-      setPendingSwitch({ kind: "protocol", protocol });
-    } else {
-      const custom = findPreset(protocol, "custom");
-      if (custom) applyPreset(custom, true);
-      else applyProtocolDefaults(protocol);
-    }
+    // 无确认：回该协议 custom 模板（连接参数重置，Key/名称/映射/P/W/超时保留）。
+    const custom = findPreset(protocol, "custom");
+    if (custom) applyPreset(custom, true);
+    else applyProtocolDefaults(protocol);
   }
 
-  function requestProviderSwitch(provider: ChannelProvider) {
+  function selectProvider(provider: ChannelProvider) {
     if (provider === form.provider || saving) return;
     const target = findPreset(form.protocol, provider);
-    if (hasConnectionValues) {
-      setPendingSwitch({ kind: "provider", provider });
-    } else {
-      if (target) applyPreset(target, true);
-    }
-  }
-
-  function onConfirmApply() {
-    if (!pendingSwitch) return;
-    if (pendingSwitch.kind === "protocol") {
-      const custom = findPreset(pendingSwitch.protocol, "custom");
-      if (custom) applyPreset(custom, true);
-      else applyProtocolDefaults(pendingSwitch.protocol);
-    } else {
-      const target = findPreset(form.protocol, pendingSwitch.provider);
-      if (target) applyPreset(target, true);
-    }
-    setPendingSwitch(null);
-  }
-
-  function onConfirmKeep() {
-    if (!pendingSwitch) return;
-    if (pendingSwitch.kind === "protocol") {
-      const newProtocol = pendingSwitch.protocol;
-      const providerExists = presetGroups
-        .find(g => g.protocol === newProtocol)
-        ?.presets.some(p => p.provider === form.provider) ?? false;
-      const targetProvider: ChannelProvider = providerExists ? form.provider : "custom";
-      // 「保留当前连接参数」：URL/模型/Key/映射/名称/priority/weight/timeout 保留；
-      // 端点按新协议结构重算（Anthropic 固定 Messages、Ollama /api/chat），
-      // 避免把 OpenAI 端点带入 Anthropic 造成无法修复的非法配置。
-      const targetDefaultEps = findPreset(newProtocol, targetProvider)?.default_checked_endpoints
-        ?? defaultEndpointsFor(newProtocol);
-      setForm(prev => ({
-        ...prev,
-        protocol: newProtocol,
-        provider: targetProvider,
-        native_endpoints: [...targetDefaultEps],
-        preset_revision: findPreset(newProtocol, targetProvider)?.preset_revision ?? null,
-      }));
-    } else {
-      const target = findPreset(form.protocol, pendingSwitch.provider);
-      setForm(prev => ({
-        ...prev,
-        provider: pendingSwitch.provider,
-        preset_revision: target?.preset_revision ?? null,
-      }));
-    }
-    setReceipt(null); // protocol/provider 已变 → receipt 失效
-    setTestPhase("idle");
-    setTestResult(null);
-    setPendingSwitch(null);
+    if (target) applyPreset(target, true);
   }
 
   // ── 连接字段变更 ─────────────────────────────────────────────────────────
   function onUrlChange(v: string) {
     setForm(prev => ({ ...prev, native_base_url: v }));
-    syncConnDirty(v, form.models, form.native_endpoints);
     invalidateReceipt();
   }
   function onKeyChange(v: string) {
@@ -388,7 +301,6 @@ export function ChannelForm({ editing, onClose, onSaved }: {
   }
   function onModelListChange(nextModels: string[]) {
     setForm(prev => ({ ...prev, models: nextModels }));
-    syncConnDirty(form.native_base_url, nextModels, form.native_endpoints);
     invalidateReceipt();
   }
   function toggleEndpoint(ep: ChannelEndpoint, checked: boolean) {
@@ -396,10 +308,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
     const next = checked
       ? (has ? form.native_endpoints : [...form.native_endpoints, ep])
       : form.native_endpoints.filter(e => e !== ep);
-    // OpenAI：至少保留一个端点
-    if (!checked && form.protocol === "openai" && next.length === 0) return;
     setForm(prev => ({ ...prev, native_endpoints: next }));
-    syncConnDirty(form.native_base_url, form.models, next);
     invalidateReceipt();
   }
   function requestClearKey() {
@@ -410,9 +319,6 @@ export function ChannelForm({ editing, onClose, onSaved }: {
   function undoClearKey() {
     setClearKeyRequested(false);
   }
-
-  const isLastEndpoint = (ep: ChannelEndpoint) =>
-    form.protocol === "openai" && form.native_endpoints.length === 1 && form.native_endpoints[0] === ep;
 
   // ── 模型列表 ────────────────────────────────────────────────────────────
   function addModel() {
@@ -606,20 +512,11 @@ export function ChannelForm({ editing, onClose, onSaved }: {
   }
 
   // ── 渲染用派生数据 ───────────────────────────────────────────────────────
-  const groupedPresets = useMemo(() => {
-    const group = presetGroups.find(g => g.protocol === form.protocol);
-    const vendors = group?.presets.filter(p => p.provider !== "custom") ?? [];
-    const order = ["international", "domestic", "local"] as const;
-    return order
-      .map(region => ({ region, presets: vendors.filter(p => p.region === region) }))
-      .filter(g => g.presets.length > 0);
-  }, [presetGroups, form.protocol]);
-
   function onTabKeyDown(e: React.KeyboardEvent, idx: number) {
-    if (e.key === "ArrowRight") { e.preventDefault(); requestProtocolSwitch(PROTOCOLS[(idx + 1) % PROTOCOLS.length]); }
-    else if (e.key === "ArrowLeft") { e.preventDefault(); requestProtocolSwitch(PROTOCOLS[(idx - 1 + PROTOCOLS.length) % PROTOCOLS.length]); }
-    else if (e.key === "Home") { e.preventDefault(); requestProtocolSwitch(PROTOCOLS[0]); }
-    else if (e.key === "End") { e.preventDefault(); requestProtocolSwitch(PROTOCOLS[PROTOCOLS.length - 1]); }
+    if (e.key === "ArrowRight") { e.preventDefault(); requestProtocolSwitch(availableProtocols[(idx + 1) % availableProtocols.length]); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); requestProtocolSwitch(availableProtocols[(idx - 1 + availableProtocols.length) % availableProtocols.length]); }
+    else if (e.key === "Home") { e.preventDefault(); requestProtocolSwitch(availableProtocols[0]); }
+    else if (e.key === "End") { e.preventDefault(); requestProtocolSwitch(availableProtocols[availableProtocols.length - 1]); }
   }
 
   const editingLegacy = editing !== null && editing.identity_revision === 0;
@@ -641,7 +538,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
           <div>
             <label className="mb-2 block text-sm font-medium">协议</label>
             <div role="tablist" aria-label="协议" className="grid grid-cols-3 gap-2 rounded-2xl bg-muted p-1.5">
-              {PROTOCOLS.map((p, idx) => {
+              {availableProtocols.map((p, idx) => {
                 const active = form.protocol === p;
                 return (
                   <button
@@ -697,34 +594,11 @@ export function ChannelForm({ editing, onClose, onSaved }: {
                 提供商模板加载失败（{presetsError}）。已禁用厂商预设，可继续使用自定义配置手动填写；恢复后刷新重试。
               </div>
             ) : (
-              <div className="space-y-3">
-                {/* 顶部固定「自定义配置」整行卡片（registry 的 custom 预设，恒存在） */}
-                {customPreset && (
-                  <PresetCard
-                    preset={customPreset}
-                    selected={form.provider === "custom"}
-                    onSelect={() => requestProviderSwitch("custom")}
-                  />
-                )}
-                {groupedPresets.map(group => (
-                  <div key={group.region}>
-                    <div className="mb-1.5 flex items-center gap-1.5 px-1 text-xs font-semibold text-muted-foreground">
-                      <span>{CHANNEL_CATEGORIES[group.region]?.icon}</span>
-                      <span>{CHANNEL_CATEGORIES[group.region]?.label}</span>
-                    </div>
-                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                      {group.presets.map(p => (
-                        <PresetCard
-                          key={p.id}
-                          preset={p}
-                          selected={form.provider === p.provider}
-                          onSelect={() => requestProviderSwitch(p.provider)}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
+              <ProviderDropdown
+                presets={presetGroups.find(g => g.protocol === form.protocol)?.presets ?? []}
+                current={form.provider}
+                onSelect={selectProvider}
+              />
             )}
           </div>
 
@@ -746,35 +620,31 @@ export function ChannelForm({ editing, onClose, onSaved }: {
             {/* 端点 */}
             <div className="mt-4">
               <label className="mb-2 block text-sm font-medium">端点</label>
-              {form.protocol === "openai" && (
-                <div className="flex flex-wrap gap-3">
+              {form.protocol === "openai" ? (
+                <div className="flex flex-wrap gap-2.5">
                   {PROTOCOL_ENDPOINT_OPTIONS.openai.map(ep => (
-                    <label key={ep} className={`flex items-center gap-2 rounded-2xl border px-4 py-3 text-sm transition-all ${form.native_endpoints.includes(ep) ? "border-primary/40 bg-primary/8 font-medium text-primary" : "border-border bg-background/40 hover:border-primary/30"}`}>
+                    <label key={ep} className={`flex items-center gap-2 rounded-[14px] border px-3.5 py-2.5 text-[13px] transition-all ${form.native_endpoints.includes(ep) ? "border-primary/40 bg-primary/8 font-medium text-primary" : "border-border bg-background/40 hover:border-primary/30"}`}>
                       <input
                         type="checkbox"
                         checked={form.native_endpoints.includes(ep)}
-                        disabled={isLastEndpoint(ep)}
                         onChange={e => toggleEndpoint(ep, e.target.checked)}
                         className="h-4 w-4 accent-[#2f6fed]"
                       />
-                      <span>
-                        <span className="block font-medium">{ENDPOINT_LABELS[ep]}</span>
-                        <span className="block text-xs text-muted-foreground">{ep === "chat_completions" ? "/chat/completions" : "/responses"}</span>
-                      </span>
+                      <span className="shrink-0 font-medium">{ENDPOINT_LABELS[ep]}</span>
+                      <span className="font-mono text-xs text-muted-foreground">{ep === "chat_completions" ? "/chat/completions" : "/responses"}</span>
                     </label>
                   ))}
                 </div>
-              )}
-              {form.protocol === "anthropic" && (
-                <div className="space-y-2">
-                  <FixedEndpoint label="Messages" path="/v1/messages" note="固定" />
-                  {form.native_endpoints.includes("count_tokens") && (
-                    <FixedEndpoint label="Count Tokens" path="/v1/messages/count_tokens" note="模板声明能力" />
-                  )}
+              ) : (
+                <div className="space-y-2.5">
+                  {(form.protocol === "anthropic" ? ["messages"] : ["api_chat"]).map(ep => (
+                    <label key={ep} className="flex cursor-default items-center gap-2 rounded-[14px] border border-border bg-background/40 px-3.5 py-2.5 text-[13px]">
+                      <input type="checkbox" checked disabled className="h-4 w-4 accent-[#2f6fed]" />
+                      <span className="shrink-0 font-semibold">{ENDPOINT_LABELS[ep]}</span>
+                      <span className="font-mono text-xs text-muted-foreground">{ep === "messages" ? "/v1/messages" : "/api/chat"}</span>
+                    </label>
+                  ))}
                 </div>
-              )}
-              {form.protocol === "ollama" && (
-                <FixedEndpoint label="Chat" path="/api/chat" note="固定" />
               )}
             </div>
 
@@ -804,7 +674,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
                 <p className="mt-1.5 text-xs text-muted-foreground">Ollama 本地默认无 API Key，可留空；远程反向代理可填写。</p>
               )}
               {!keyRequired && form.protocol !== "ollama" && (
-                <p className="mt-1.5 text-xs text-muted-foreground">该提供商为可选鉴权（如 Ollama 兼容层），API Key 可留空。</p>
+                <p className="mt-1.5 text-xs text-muted-foreground">该提供商为可选鉴权（如 Ollama 接口），API Key 可留空。</p>
               )}
             </div>
           </div>
@@ -943,61 +813,8 @@ export function ChannelForm({ editing, onClose, onSaved }: {
           onForceSave={handleForceSave}
         />
       )}
-
-      {/* 切换确认弹窗 */}
-      {pendingSwitch && !saving && (
-        <ConfirmSwitchDialog
-          onApply={onConfirmApply}
-          onKeep={onConfirmKeep}
-          onCancel={() => setPendingSwitch(null)}
-        />
-      )}
     </div>
   );
 }
 
-// ─── PresetCard ─────────────────────────────────────────────────────────────
-
-function PresetCard({
-  preset,
-  selected,
-  onSelect,
-}: {
-  preset: ChannelPreset;
-  selected: boolean;
-  onSelect: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onSelect}
-      aria-pressed={selected}
-      className={`flex items-center gap-2.5 rounded-2xl border px-4 py-3 text-left transition-all w-full ${
-        selected
-          ? "border-primary/40 bg-primary/8 text-primary shadow-sm"
-          : "border-border bg-white text-foreground hover:border-primary/30 hover:bg-muted/40"
-      }`}
-    >
-      <span className="text-lg">{CHANNEL_PROVIDER_ICONS[preset.icon_key] ?? "❓"}</span>
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-sm font-medium">{preset.display_name}</span>
-        {preset.description && <span className="block truncate text-xs text-muted-foreground">{preset.description}</span>}
-      </span>
-      {selected && <Check size={14} className="shrink-0 text-primary" />}
-    </button>
-  );
-}
-
-// ─── FixedEndpoint ──────────────────────────────────────────────────────────
-
-function FixedEndpoint({ label, path, note }: { label: string; path: string; note: string }) {
-  return (
-    <div className="flex items-center gap-2 rounded-2xl border border-border bg-background/40 px-4 py-3 text-sm">
-      <span className="flex h-4 w-4 items-center justify-center rounded border border-primary/40 bg-primary/10 text-[9px] font-bold text-primary">✓</span>
-      <span className="shrink-0 font-semibold">{label}</span>
-      <span className="font-mono text-muted-foreground">{path}</span>
-      <span className="ml-auto shrink-0 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">{note}</span>
-    </div>
-  );
-}
 
