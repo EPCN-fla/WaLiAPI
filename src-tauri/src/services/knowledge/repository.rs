@@ -1,6 +1,6 @@
 use super::models::*;
-use sqlx::SqlitePool;
 use crate::db::models::now_iso;
+use sqlx::SqlitePool;
 
 pub struct KbRepository {
     pool: SqlitePool,
@@ -15,7 +15,7 @@ impl KbRepository {
 
     pub async fn get_all_kbs(&self) -> Result<Vec<KbKnowledgeBase>, sqlx::Error> {
         sqlx::query_as::<_, KbKnowledgeBase>(
-            "SELECT * FROM kb_knowledge_bases ORDER BY created_at DESC"
+            "SELECT * FROM kb_knowledge_bases ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -48,7 +48,11 @@ impl KbRepository {
         self.get_kb(&id).await
     }
 
-    pub async fn update_kb(&self, id: &str, input: &UpdateKbInput) -> Result<KbKnowledgeBase, sqlx::Error> {
+    pub async fn update_kb(
+        &self,
+        id: &str,
+        input: &UpdateKbInput,
+    ) -> Result<KbKnowledgeBase, sqlx::Error> {
         let now = now_iso();
         let mut q = sqlx::QueryBuilder::new("UPDATE kb_knowledge_bases SET updated_at = ");
         q.push_bind(now);
@@ -87,7 +91,8 @@ impl KbRepository {
             q.push(", included_files = ").push_bind(included_files);
         }
         if let Some(embedding_batch_size) = input.embedding_batch_size {
-            q.push(", embedding_batch_size = ").push_bind(embedding_batch_size);
+            q.push(", embedding_batch_size = ")
+                .push_bind(embedding_batch_size);
         }
 
         q.push(" WHERE id = ").push_bind(id);
@@ -105,11 +110,12 @@ impl KbRepository {
     }
 
     pub async fn update_kb_counts(&self, kb_id: &str) -> Result<(), sqlx::Error> {
-        let doc_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_documents WHERE kb_id = ?")
-            .bind(kb_id)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0);
+        let doc_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM kb_documents WHERE kb_id = ?")
+                .bind(kb_id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
 
         let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_chunks WHERE kb_id = ?")
             .bind(kb_id)
@@ -117,11 +123,13 @@ impl KbRepository {
             .await
             .unwrap_or(0);
 
-        let total_tokens: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(token_count), 0) FROM kb_chunks WHERE kb_id = ?")
-            .bind(kb_id)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0);
+        let total_tokens: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(token_count), 0) FROM kb_chunks WHERE kb_id = ?",
+        )
+        .bind(kb_id)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
 
         let now = now_iso();
         sqlx::query("UPDATE kb_knowledge_bases SET doc_count = ?, chunk_count = ?, total_tokens = ?, updated_at = ? WHERE id = ?")
@@ -136,7 +144,11 @@ impl KbRepository {
         Ok(())
     }
 
-    pub async fn update_kb_index_status(&self, kb_id: &str, status: &str) -> Result<(), sqlx::Error> {
+    pub async fn update_kb_index_status(
+        &self,
+        kb_id: &str,
+        status: &str,
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
         sqlx::query("UPDATE kb_knowledge_bases SET index_status = ?, updated_at = ? WHERE id = ?")
             .bind(status)
@@ -161,10 +173,12 @@ impl KbRepository {
     // ==================== Document ====================
 
     pub async fn get_documents(&self, kb_id: &str) -> Result<Vec<KbDocument>, sqlx::Error> {
-        sqlx::query_as::<_, KbDocument>("SELECT * FROM kb_documents WHERE kb_id = ? ORDER BY created_at DESC")
-            .bind(kb_id)
-            .fetch_all(&self.pool)
-            .await
+        sqlx::query_as::<_, KbDocument>(
+            "SELECT * FROM kb_documents WHERE kb_id = ? ORDER BY created_at DESC",
+        )
+        .bind(kb_id)
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn get_document(&self, id: &str) -> Result<KbDocument, sqlx::Error> {
@@ -174,15 +188,29 @@ impl KbRepository {
             .await
     }
 
-    pub async fn find_document_by_hash(&self, kb_id: &str, hash: &str) -> Result<Option<KbDocument>, sqlx::Error> {
-        sqlx::query_as::<_, KbDocument>("SELECT * FROM kb_documents WHERE kb_id = ? AND content_hash = ?")
-            .bind(kb_id)
-            .bind(hash)
-            .fetch_optional(&self.pool)
-            .await
+    pub async fn find_document_by_hash(
+        &self,
+        kb_id: &str,
+        hash: &str,
+    ) -> Result<Option<KbDocument>, sqlx::Error> {
+        sqlx::query_as::<_, KbDocument>(
+            "SELECT * FROM kb_documents WHERE kb_id = ? AND content_hash = ?",
+        )
+        .bind(kb_id)
+        .bind(hash)
+        .fetch_optional(&self.pool)
+        .await
     }
 
-    pub async fn create_document(&self, kb_id: &str, filename: &str, file_path: Option<&str>, file_type: &str, file_size: i64, content_hash: &str) -> Result<KbDocument, sqlx::Error> {
+    pub async fn create_document(
+        &self,
+        kb_id: &str,
+        filename: &str,
+        file_path: Option<&str>,
+        file_type: &str,
+        file_size: i64,
+        content_hash: &str,
+    ) -> Result<KbDocument, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
         sqlx::query(
@@ -204,7 +232,18 @@ impl KbRepository {
         self.get_document(&id).await
     }
 
-    pub async fn create_document_with_source(&self, kb_id: &str, filename: &str, file_path: Option<&str>, file_type: &str, file_size: i64, content_hash: &str, source_type: &str, source_url: Option<&str>, source_path: Option<&str>) -> Result<KbDocument, sqlx::Error> {
+    pub async fn create_document_with_source(
+        &self,
+        kb_id: &str,
+        filename: &str,
+        file_path: Option<&str>,
+        file_type: &str,
+        file_size: i64,
+        content_hash: &str,
+        source_type: &str,
+        source_url: Option<&str>,
+        source_path: Option<&str>,
+    ) -> Result<KbDocument, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
         sqlx::query(
@@ -229,27 +268,41 @@ impl KbRepository {
         self.get_document(&id).await
     }
 
-    pub async fn update_document_status(&self, id: &str, status: &str, error: Option<&str>) -> Result<(), sqlx::Error> {
+    pub async fn update_document_status(
+        &self,
+        id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
-        sqlx::query("UPDATE kb_documents SET status = ?, error_message = ?, updated_at = ? WHERE id = ?")
-            .bind(status)
-            .bind(error)
-            .bind(&now)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE kb_documents SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(status)
+        .bind(error)
+        .bind(&now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
-    pub async fn update_document_counts(&self, id: &str, chunk_count: i64, token_count: i64) -> Result<(), sqlx::Error> {
+    pub async fn update_document_counts(
+        &self,
+        id: &str,
+        chunk_count: i64,
+        token_count: i64,
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
-        sqlx::query("UPDATE kb_documents SET chunk_count = ?, token_count = ?, updated_at = ? WHERE id = ?")
-            .bind(chunk_count)
-            .bind(token_count)
-            .bind(&now)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE kb_documents SET chunk_count = ?, token_count = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(chunk_count)
+        .bind(token_count)
+        .bind(&now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -298,25 +351,31 @@ impl KbRepository {
         Ok(())
     }
 
-    pub async fn get_chunks_by_kb(&self, kb_id: &str) -> Result<Vec<(String, String, String, Vec<u8>, String, String)>, sqlx::Error> {
+    pub async fn get_chunks_by_kb(
+        &self,
+        kb_id: &str,
+    ) -> Result<Vec<(String, String, String, Vec<u8>, String, String)>, sqlx::Error> {
         sqlx::query_as(
             "SELECT c.id, c.content, c.metadata, c.embedding, d.filename, c.doc_id
              FROM kb_chunks c
              JOIN kb_documents d ON c.doc_id = d.id
              WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'
-             ORDER BY c.id"
+             ORDER BY c.id",
         )
         .bind(kb_id)
         .fetch_all(&self.pool)
         .await
     }
 
-    pub async fn get_chunks_by_kb_with_dim(&self, kb_id: &str) -> Result<Vec<ChunkWithEmbedding>, sqlx::Error> {
+    pub async fn get_chunks_by_kb_with_dim(
+        &self,
+        kb_id: &str,
+    ) -> Result<Vec<ChunkWithEmbedding>, sqlx::Error> {
         sqlx::query_as(
             "SELECT c.id, c.content, c.metadata, c.embedding, c.embedding_dim, d.filename, c.doc_id
              FROM kb_chunks c
              JOIN kb_documents d ON c.doc_id = d.id
-             WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'"
+             WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'",
         )
         .bind(kb_id)
         .fetch_all(&self.pool)
@@ -324,15 +383,23 @@ impl KbRepository {
     }
 
     pub async fn get_chunk_count_by_kb(&self, kb_id: &str) -> Result<i64, sqlx::Error> {
-        sqlx::query_scalar("SELECT COUNT(*) FROM kb_chunks WHERE kb_id = ? AND embedding IS NOT NULL")
-            .bind(kb_id)
-            .fetch_one(&self.pool)
-            .await
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM kb_chunks WHERE kb_id = ? AND embedding IS NOT NULL",
+        )
+        .bind(kb_id)
+        .fetch_one(&self.pool)
+        .await
     }
 
     // ==================== Task ====================
 
-    pub async fn create_task(&self, kb_id: &str, doc_id: Option<&str>, task_type: &str, total_items: i64) -> Result<KbTask, sqlx::Error> {
+    pub async fn create_task(
+        &self,
+        kb_id: &str,
+        doc_id: Option<&str>,
+        task_type: &str,
+        total_items: i64,
+    ) -> Result<KbTask, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
         sqlx::query(
@@ -354,7 +421,12 @@ impl KbRepository {
             .await
     }
 
-    pub async fn update_task_progress(&self, id: &str, done_items: i64, progress: i64) -> Result<(), sqlx::Error> {
+    pub async fn update_task_progress(
+        &self,
+        id: &str,
+        done_items: i64,
+        progress: i64,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE kb_tasks SET done_items = ?, progress = ? WHERE id = ?")
             .bind(done_items)
             .bind(progress)
@@ -366,7 +438,11 @@ impl KbRepository {
 
     pub async fn complete_task(&self, id: &str, error: Option<&str>) -> Result<(), sqlx::Error> {
         let now = now_iso();
-        let status = if error.is_some() { "failed" } else { "completed" };
+        let status = if error.is_some() {
+            "failed"
+        } else {
+            "completed"
+        };
         sqlx::query("UPDATE kb_tasks SET status = ?, error_message = ?, progress = 100, completed_at = ? WHERE id = ?")
             .bind(status)
             .bind(error)
@@ -378,24 +454,34 @@ impl KbRepository {
     }
 
     pub async fn get_tasks(&self, kb_id: &str) -> Result<Vec<KbTask>, sqlx::Error> {
-        sqlx::query_as::<_, KbTask>("SELECT * FROM kb_tasks WHERE kb_id = ? ORDER BY created_at DESC LIMIT 20")
-            .bind(kb_id)
-            .fetch_all(&self.pool)
-            .await
-    }
-
-    // ==================== Conversation History ====================
-
-    pub async fn get_conversations(&self, kb_id: &str) -> Result<Vec<KbConversation>, sqlx::Error> {
-        sqlx::query_as::<_, KbConversation>(
-            "SELECT * FROM kb_conversations WHERE kb_id = ? ORDER BY created_at ASC"
+        sqlx::query_as::<_, KbTask>(
+            "SELECT * FROM kb_tasks WHERE kb_id = ? ORDER BY created_at DESC LIMIT 20",
         )
         .bind(kb_id)
         .fetch_all(&self.pool)
         .await
     }
 
-    pub async fn add_conversation(&self, kb_id: &str, role: &str, content: &str, sources: Option<&str>, model: Option<&str>, tokens_used: i64) -> Result<(), sqlx::Error> {
+    // ==================== Conversation History ====================
+
+    pub async fn get_conversations(&self, kb_id: &str) -> Result<Vec<KbConversation>, sqlx::Error> {
+        sqlx::query_as::<_, KbConversation>(
+            "SELECT * FROM kb_conversations WHERE kb_id = ? ORDER BY created_at ASC",
+        )
+        .bind(kb_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn add_conversation(
+        &self,
+        kb_id: &str,
+        role: &str,
+        content: &str,
+        sources: Option<&str>,
+        model: Option<&str>,
+        tokens_used: i64,
+    ) -> Result<(), sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
         sqlx::query(
@@ -427,14 +513,21 @@ impl KbRepository {
 
     pub async fn get_sources(&self, kb_id: &str) -> Result<Vec<KbSource>, sqlx::Error> {
         sqlx::query_as::<_, KbSource>(
-            "SELECT * FROM kb_sources WHERE kb_id = ? ORDER BY created_at DESC"
+            "SELECT * FROM kb_sources WHERE kb_id = ? ORDER BY created_at DESC",
         )
         .bind(kb_id)
         .fetch_all(&self.pool)
         .await
     }
 
-    pub async fn create_source(&self, kb_id: &str, source_type: &str, source_url: Option<&str>, source_path: Option<&str>, branch: Option<&str>) -> Result<KbSource, sqlx::Error> {
+    pub async fn create_source(
+        &self,
+        kb_id: &str,
+        source_type: &str,
+        source_url: Option<&str>,
+        source_path: Option<&str>,
+        branch: Option<&str>,
+    ) -> Result<KbSource, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
         sqlx::query(
@@ -458,7 +551,13 @@ impl KbRepository {
             .await
     }
 
-    pub async fn update_source_status(&self, id: &str, status: &str, file_count: i64, error: Option<&str>) -> Result<(), sqlx::Error> {
+    pub async fn update_source_status(
+        &self,
+        id: &str,
+        status: &str,
+        file_count: i64,
+        error: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
         sqlx::query("UPDATE kb_sources SET status = ?, file_count = ?, error = ?, updated_at = ? WHERE id = ?")
             .bind(status)
@@ -488,7 +587,14 @@ impl KbRepository {
             .await
     }
 
-    pub async fn upsert_index_meta(&self, kb_id: &str, dim: i64, chunk_count: i64, index_path: Option<&str>, status: &str) -> Result<(), sqlx::Error> {
+    pub async fn upsert_index_meta(
+        &self,
+        kb_id: &str,
+        dim: i64,
+        chunk_count: i64,
+        index_path: Option<&str>,
+        status: &str,
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
         sqlx::query(
             "INSERT INTO kb_index_meta (kb_id, index_type, embedding_dim, chunk_count, index_path, built_at, status)

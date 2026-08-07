@@ -1,11 +1,11 @@
 use super::models::ImportSourceInput;
-use super::processor;
 use super::parser;
+use super::processor;
 use super::repository::KbRepository;
-use sqlx::SqlitePool;
-use tauri::{AppHandle, Emitter};
-use std::path::PathBuf;
 use sha2::Digest;
+use sqlx::SqlitePool;
+use std::path::PathBuf;
+use tauri::{AppHandle, Emitter};
 
 /// Import a Git repository: clone → filter → process files
 pub async fn import_git_repo(
@@ -15,7 +15,9 @@ pub async fn import_git_repo(
     source_id: &str,
     input: &ImportSourceInput,
 ) -> Result<usize, String> {
-    let repo_url = input.repo_url.as_ref()
+    let repo_url = input
+        .repo_url
+        .as_ref()
         .ok_or("repo_url is required for git import")?;
 
     let branch = input.branch.as_deref().unwrap_or("main");
@@ -39,7 +41,15 @@ pub async fn import_git_repo(
     emit_import_progress(app, kb_id, source_id, 0, "Cloning repository...");
 
     let clone_result = tokio::process::Command::new("git")
-        .args(&["clone", "--depth", "1", "--branch", branch, &clone_url, temp_dir.to_str().unwrap()])
+        .args(&[
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            branch,
+            &clone_url,
+            temp_dir.to_str().unwrap(),
+        ])
         .output()
         .await
         .map_err(|e| format!("Failed to run git clone: {}", e))?;
@@ -48,7 +58,10 @@ pub async fn import_git_repo(
         let err = String::from_utf8_lossy(&clone_result.stderr);
         // Clean up
         std::fs::remove_dir_all(&temp_dir).ok();
-        return Err(format!("Git clone failed: {}", err.chars().take(500).collect::<String>()));
+        return Err(format!(
+            "Git clone failed: {}",
+            err.chars().take(500).collect::<String>()
+        ));
     }
 
     // Process files from cloned repo
@@ -57,10 +70,19 @@ pub async fn import_git_repo(
     let max_file_size = input.max_file_size.unwrap_or(1024 * 1024); // 1MB default
 
     let result = process_directory_files(
-        pool, app, kb_id, source_id, &temp_dir,
-        &excluded_dirs, &included_files, max_file_size,
-        "git", Some(repo_url), None,
-    ).await;
+        pool,
+        app,
+        kb_id,
+        source_id,
+        &temp_dir,
+        &excluded_dirs,
+        &included_files,
+        max_file_size,
+        "git",
+        Some(repo_url),
+        None,
+    )
+    .await;
 
     // Clean up temp dir
     std::fs::remove_dir_all(&temp_dir).ok();
@@ -92,12 +114,17 @@ pub async fn import_url(
         return Err(format!("HTTP {}: {}", resp.status(), url));
     }
 
-    let content_type = resp.headers().get("content-type")
+    let content_type = resp
+        .headers()
+        .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("text/plain")
         .to_string();
 
-    let content = resp.bytes().await.map_err(|e| format!("Failed to read body: {}", e))?;
+    let content = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read body: {}", e))?;
 
     // Determine filename from URL
     let filename = url.rsplit('/').next().unwrap_or("imported").to_string();
@@ -124,10 +151,20 @@ pub async fn import_url(
         return Ok(0);
     }
 
-    let doc = repo.create_document_with_source(
-        kb_id, &filename, None, &file_type, content.len() as i64, &hash_hex,
-        "url", Some(url), None,
-    ).await.map_err(|e| e.to_string())?;
+    let doc = repo
+        .create_document_with_source(
+            kb_id,
+            &filename,
+            None,
+            &file_type,
+            content.len() as i64,
+            &hash_hex,
+            "url",
+            Some(url),
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Get KB embedding model
     let kb = repo.get_kb(kb_id).await.map_err(|e| e.to_string())?;
@@ -136,8 +173,15 @@ pub async fn import_url(
     emit_import_progress(app, kb_id, source_id, 30, "Processing document...");
 
     processor::process_document(
-        pool, app, kb_id, &doc.id, &filename, &content, emb_model.as_deref(),
-    ).await?;
+        pool,
+        app,
+        kb_id,
+        &doc.id,
+        &filename,
+        &content,
+        emb_model.as_deref(),
+    )
+    .await?;
 
     emit_import_progress(app, kb_id, source_id, 100, "URL import complete");
     Ok(1)
@@ -151,7 +195,9 @@ pub async fn import_local_dir(
     source_id: &str,
     input: &ImportSourceInput,
 ) -> Result<usize, String> {
-    let dir_path = input.dir_path.as_ref()
+    let dir_path = input
+        .dir_path
+        .as_ref()
         .ok_or("dir_path is required for local_dir import")?;
 
     let path = PathBuf::from(dir_path);
@@ -164,10 +210,19 @@ pub async fn import_local_dir(
     let max_file_size = input.max_file_size.unwrap_or(1024 * 1024);
 
     process_directory_files(
-        pool, app, kb_id, source_id, &path,
-        &excluded_dirs, &included_files, max_file_size,
-        "local_dir", None, Some(dir_path),
-    ).await
+        pool,
+        app,
+        kb_id,
+        source_id,
+        &path,
+        &excluded_dirs,
+        &included_files,
+        max_file_size,
+        "local_dir",
+        None,
+        Some(dir_path),
+    )
+    .await
 }
 
 /// Common: process all files in a directory with filtering
@@ -189,7 +244,13 @@ async fn process_directory_files(
     let files = scan_directory(dir, excluded_dirs, included_files, max_file_size)?;
 
     if files.is_empty() {
-        emit_import_progress(app, kb_id, source_id, 100, "No files found matching criteria");
+        emit_import_progress(
+            app,
+            kb_id,
+            source_id,
+            100,
+            "No files found matching criteria",
+        );
         return Ok(0);
     }
 
@@ -202,12 +263,19 @@ async fn process_directory_files(
     let mut skipped = 0usize;
 
     for (i, file_path) in files.iter().enumerate() {
-        let filename = file_path.file_name()
+        let filename = file_path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| format!("file_{}", i));
 
         let pct = 10 + ((i as f64 / total as f64) * 80.0) as u8;
-        emit_import_progress(app, kb_id, source_id, pct, &format!("Processing {}/{}: {}", i + 1, total, filename));
+        emit_import_progress(
+            app,
+            kb_id,
+            source_id,
+            pct,
+            &format!("Processing {}/{}: {}", i + 1, total, filename),
+        );
 
         // Read file
         let content = match std::fs::read(file_path) {
@@ -233,17 +301,26 @@ async fn process_directory_files(
         let file_size = content.len() as i64;
 
         // Create document record with source info
-        let rel_path = file_path.strip_prefix(dir)
+        let rel_path = file_path
+            .strip_prefix(dir)
             .unwrap_or(file_path)
             .to_string_lossy()
             .to_string();
 
-        let doc = match repo.create_document_with_source(
-            kb_id, &filename,
-            Some(&file_path.to_string_lossy()),
-            &file_type, file_size, &hash_hex,
-            source_type, source_url, Some(&rel_path),
-        ).await {
+        let doc = match repo
+            .create_document_with_source(
+                kb_id,
+                &filename,
+                Some(&file_path.to_string_lossy()),
+                &file_type,
+                file_size,
+                &hash_hex,
+                source_type,
+                source_url,
+                Some(&rel_path),
+            )
+            .await
+        {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("Failed to create document record for {}: {}", filename, e);
@@ -254,8 +331,16 @@ async fn process_directory_files(
 
         // Process document
         if let Err(e) = processor::process_document(
-            pool, app, kb_id, &doc.id, &filename, &content, emb_model.as_deref(),
-        ).await {
+            pool,
+            app,
+            kb_id,
+            &doc.id,
+            &filename,
+            &content,
+            emb_model.as_deref(),
+        )
+        .await
+        {
             tracing::warn!("Failed to process document {}: {}", filename, e);
             skipped += 1;
         } else {
@@ -266,7 +351,13 @@ async fn process_directory_files(
     // Update KB counts
     repo.update_kb_counts(kb_id).await.ok();
 
-    emit_import_progress(app, kb_id, source_id, 100, &format!("Done: {} processed, {} skipped", processed, skipped));
+    emit_import_progress(
+        app,
+        kb_id,
+        source_id,
+        100,
+        &format!("Done: {} processed, {} skipped", processed, skipped),
+    );
     Ok(processed)
 }
 
@@ -281,10 +372,25 @@ fn scan_directory(
 
     // Default excluded dirs
     let default_excluded = vec![
-        ".git", ".svn", ".hg", "node_modules", "__pycache__",
-        ".venv", "venv", "env", ".env", "dist", "build",
-        "target", ".next", ".nuxt", ".output", "vendor",
-        "vendor", ".idea", ".vscode",
+        ".git",
+        ".svn",
+        ".hg",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "env",
+        ".env",
+        "dist",
+        "build",
+        "target",
+        ".next",
+        ".nuxt",
+        ".output",
+        "vendor",
+        "vendor",
+        ".idea",
+        ".vscode",
     ];
 
     let mut all_excluded: Vec<&str> = default_excluded.iter().copied().collect();
@@ -292,7 +398,13 @@ fn scan_directory(
         all_excluded.push(d.as_str());
     }
 
-    scan_directory_recursive(dir, &all_excluded, included_files, max_file_size, &mut files)?;
+    scan_directory_recursive(
+        dir,
+        &all_excluded,
+        included_files,
+        max_file_size,
+        &mut files,
+    )?;
 
     files.sort();
     Ok(files)
@@ -331,7 +443,8 @@ fn scan_directory_recursive(
             }
 
             // Check extension
-            let ext = path.extension()
+            let ext = path
+                .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_lowercase();
@@ -359,30 +472,62 @@ fn scan_directory_recursive(
 }
 
 fn is_supported_extension(ext: &str) -> bool {
-    matches!(ext,
-        "md" | "markdown" |
-        "txt" | "rst" | "log" |
-        "rs" | "go" | "py" | "ts" | "tsx" | "js" | "jsx" |
-        "java" | "c" | "cpp" | "h" | "hpp" | "cs" | "php" |
-        "swift" | "kt" | "rb" | "scala" | "clj" | "sh" | "bash" |
-        "vue" | "svelte" | "sql" | "proto" | "gradle" |
-        "json" | "yaml" | "yml" | "toml" | "xml" | "html" | "csv" |
-        "env" | "ini" | "conf" | "cfg" | "svg" |
-        "pdf"
+    matches!(
+        ext,
+        "md" | "markdown"
+            | "txt"
+            | "rst"
+            | "log"
+            | "rs"
+            | "go"
+            | "py"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "java"
+            | "c"
+            | "cpp"
+            | "h"
+            | "hpp"
+            | "cs"
+            | "php"
+            | "swift"
+            | "kt"
+            | "rb"
+            | "scala"
+            | "clj"
+            | "sh"
+            | "bash"
+            | "vue"
+            | "svelte"
+            | "sql"
+            | "proto"
+            | "gradle"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "xml"
+            | "html"
+            | "csv"
+            | "env"
+            | "ini"
+            | "conf"
+            | "cfg"
+            | "svg"
+            | "pdf"
     )
 }
 
-fn emit_import_progress(
-    app: &AppHandle,
-    kb_id: &str,
-    source_id: &str,
-    progress: u8,
-    detail: &str,
-) {
-    let _ = app.emit("kb-import-progress", serde_json::json!({
-        "kb_id": kb_id,
-        "source_id": source_id,
-        "progress": progress,
-        "detail": detail,
-    }));
+fn emit_import_progress(app: &AppHandle, kb_id: &str, source_id: &str, progress: u8, detail: &str) {
+    let _ = app.emit(
+        "kb-import-progress",
+        serde_json::json!({
+            "kb_id": kb_id,
+            "source_id": source_id,
+            "progress": progress,
+            "detail": detail,
+        }),
+    );
 }

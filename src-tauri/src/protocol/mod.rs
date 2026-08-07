@@ -1,5 +1,7 @@
 pub mod anthropic;
+pub mod codec;
 pub mod responses;
+pub mod thinking;
 
 use serde_json::Value;
 
@@ -207,7 +209,10 @@ pub fn responses_to_openai(body: &Value) -> Value {
                                 let mut params = parameters;
                                 if params.get("type").is_none() {
                                     if let Some(obj) = params.as_object_mut() {
-                                        obj.insert("type".to_string(), Value::String("object".to_string()));
+                                        obj.insert(
+                                            "type".to_string(),
+                                            Value::String("object".to_string()),
+                                        );
                                     }
                                 }
                                 params
@@ -273,13 +278,18 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
         let mut call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut output_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Map from original (possibly empty) call_id → fallback call_id
-        let mut call_id_fallback: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut call_id_fallback: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         let mut fallback_counter = 0u32;
         for item in arr {
             let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match item_type {
                 "function_call" => {
-                    let cid = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    let cid = item
+                        .get("call_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     if cid.is_empty() {
                         let fallback = format!("call_{}", fallback_counter);
                         fallback_counter += 1;
@@ -290,7 +300,11 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
                     }
                 }
                 "function_call_output" => {
-                    let cid = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    let cid = item
+                        .get("call_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     // Use fallback if one was generated for the corresponding function_call
                     let effective_cid = call_id_fallback.get(&cid).cloned().unwrap_or(cid);
                     output_ids.insert(effective_cid);
@@ -308,9 +322,16 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
                 "function_call" => {
                     let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     let arguments = item.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
-                    let original_call_id = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    let original_call_id = item
+                        .get("call_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     // Use fallback call_id if the original was empty
-                    let call_id = call_id_fallback.get(&original_call_id).cloned().unwrap_or(original_call_id);
+                    let call_id = call_id_fallback
+                        .get(&original_call_id)
+                        .cloned()
+                        .unwrap_or(original_call_id);
                     msgs.push(serde_json::json!({
                         "role": "assistant",
                         "content": null,
@@ -336,9 +357,16 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
 
                 // function_call_output: tool result → OpenAI tool message
                 "function_call_output" => {
-                    let original_call_id = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    let original_call_id = item
+                        .get("call_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     // Use fallback call_id if one was generated for the corresponding function_call
-                    let call_id = call_id_fallback.get(&original_call_id).cloned().unwrap_or(original_call_id);
+                    let call_id = call_id_fallback
+                        .get(&original_call_id)
+                        .cloned()
+                        .unwrap_or(original_call_id);
                     let output = item.get("output").and_then(|o| o.as_str()).unwrap_or("");
                     msgs.push(serde_json::json!({
                         "role": "tool",
@@ -431,9 +459,30 @@ pub fn openai_to_anthropic(openai_resp: &Value, model: &str) -> Result<Value, St
 
     let message = message
         .ok_or_else(|| "OpenAI response does not contain a completion message".to_string())?;
-    if message.get("reasoning_content").is_some() || message.get("thinking").is_some() {
-        return Err("OpenAI upstream returned thinking content, which cannot be represented safely by this Anthropic compatibility endpoint".to_string());
-    }
+    // Fail-open (CPA semantics): upstream reasoning is surfaced as a Messages
+    // `thinking` block, always kept (even when content is also present).  Only
+    // the visible text is used; `{text: ...}` object form is unwrapped.
+    let reasoning_text = message
+        .get("reasoning_content")
+        .and_then(|v| match v {
+            Value::String(s) if !s.is_empty() => Some(s.clone()),
+            Value::Object(m) => m
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            _ => None,
+        })
+        .or_else(|| match message.get("thinking") {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            Some(Value::Object(m)) => m
+                .get("thinking")
+                .or_else(|| m.get("text"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            _ => None,
+        });
     let content_text = match message.get("content") {
         None | Some(Value::Null) => "",
         Some(Value::String(value)) => value,
@@ -476,8 +525,16 @@ pub fn openai_to_anthropic(openai_resp: &Value, model: &str) -> Result<Value, St
         .and_then(|t| t.as_u64())
         .unwrap_or(0);
 
-    // Build content array: text blocks + tool_use blocks
+    // Build content array: thinking block (if any) + text blocks + tool_use
     let mut content_blocks = Vec::new();
+
+    // Add thinking block first (reasoning precedes visible text)
+    if let Some(rt) = reasoning_text.as_ref().filter(|s| !s.is_empty()) {
+        content_blocks.push(serde_json::json!({
+            "type": "thinking",
+            "thinking": rt
+        }));
+    }
 
     // Add text block if present
     if !content_text.is_empty() {
@@ -514,7 +571,9 @@ pub fn openai_to_anthropic(openai_resp: &Value, model: &str) -> Result<Value, St
                 )
             })?;
             if !input.is_object() {
-                return Err("OpenAI response tool arguments must decode to a JSON object".to_string());
+                return Err(
+                    "OpenAI response tool arguments must decode to a JSON object".to_string(),
+                );
             }
 
             content_blocks.push(serde_json::json!({
@@ -554,17 +613,9 @@ pub fn openai_to_anthropic(openai_resp: &Value, model: &str) -> Result<Value, St
 /// This converter intentionally accepts only the intersection which can be
 /// represented by Chat Completions. Native Anthropic channels must bypass it.
 pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
-    if body.get("thinking").is_some()
-        || body.get("output_config").is_some()
-        || body.get("container").is_some()
-        || body.get("context_management").is_some()
-        || body.get("context_management_config").is_some()
-    {
-        return Err(
-            "thinking, containers, output_config, and context management require a native Anthropic Messages channel"
-                .to_string(),
-        );
-    }
+    // Fail-open (CLIProxyAPI semantics): thinking/output_config are mapped to
+    // `reasoning_effort` below; container/context_management are dropped.  The
+    // upstream provider adjudicates capability; we never reject thinking.
     let model = body
         .get("model")
         .and_then(|m| m.as_str())
@@ -596,7 +647,11 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
                 // channels still receive the original body unchanged.
                 match block.get("type").and_then(|t| t.as_str()) {
                     Some("text") => texts.push(block.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
-                    Some("cache_control") | Some("thinking") => return Err("system cache/thinking blocks require a native Anthropic Messages channel".to_string()),
+                    Some("thinking") => {
+                        // Fail-open: reasoning instructions on the system prompt
+                        // are dropped (no Chat equivalent), not rejected.
+                    }
+                    Some("cache_control") => return Err("system cache_control blocks require a native Anthropic Messages channel".to_string()),
                     _ => return Err("unsupported non-text system content requires a native Anthropic Messages channel".to_string()),
                 }
             }
@@ -631,8 +686,13 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
         openai_body["stop"] = stop_seq.clone();
     }
     if stream {
-        let mut options = body.get("stream_options").cloned().unwrap_or_else(|| serde_json::json!({}));
-        if !options.is_object() { return Err("stream_options must be an object".to_string()); }
+        let mut options = body
+            .get("stream_options")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !options.is_object() {
+            return Err("stream_options must be an object".to_string());
+        }
         options["include_usage"] = Value::Bool(true);
         openai_body["stream_options"] = options;
     }
@@ -720,7 +780,46 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
         openai_body["parallel_tool_calls"] = Value::Bool(false);
     }
 
+    // Fail-open thinking mapping: Anthropic `thinking` / `output_config` →
+    // OpenAI `reasoning_effort` (CPA semantics).  Only set when the downstream
+    // asked for thinking; otherwise leave unset so the upstream applies its own
+    // default.  `container`/`context_management`/`context_management_config`
+    // have no Chat equivalent and were dropped above (fail-open).
+    if let Some(effort) = anthropic_thinking_to_reasoning_effort(body) {
+        openai_body["reasoning_effort"] = Value::String(effort);
+    }
+
     Ok(openai_body)
+}
+
+/// Map an Anthropic `thinking` config to an OpenAI `reasoning_effort` value.
+///
+/// `None` when the downstream did not ask for thinking (or asked for an
+/// unrecognized type), in which case `reasoning_effort` is left unset.
+fn anthropic_thinking_to_reasoning_effort(body: &Value) -> Option<String> {
+    let thinking = body.get("thinking")?;
+    if !thinking.is_object() {
+        return None;
+    }
+    let ty = thinking.get("type").and_then(Value::as_str)?;
+    match ty {
+        "enabled" => match thinking.get("budget_tokens").and_then(Value::as_i64) {
+            Some(budget) => crate::protocol::thinking::budget_to_level(budget).map(String::from),
+            None => Some("auto".to_string()),
+        },
+        "adaptive" | "auto" => match body
+            .get("output_config")
+            .and_then(|oc| oc.get("effort"))
+            .and_then(Value::as_str)
+        {
+            Some(effort) if !effort.trim().is_empty() => {
+                Some(effort.trim().to_ascii_lowercase())
+            }
+            _ => Some("xhigh".to_string()),
+        },
+        "disabled" => Some("none".to_string()),
+        _ => None,
+    }
 }
 
 /// Estimate structured Anthropic request size for the optional count_tokens endpoint.
@@ -789,6 +888,7 @@ fn convert_anthropic_messages_to_openai(
             if let Some(content_arr) = msg.get("content").and_then(|c| c.as_array()) {
                 let mut parts: Vec<Value> = Vec::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
+                let mut assistant_reasoning = String::new();
                 let flush_user_parts = |parts: &mut Vec<Value>, msgs: &mut Vec<Value>| {
                     if !parts.is_empty() {
                         msgs.push(
@@ -827,7 +927,21 @@ fn convert_anthropic_messages_to_openai(
                             let is_error = block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
                             msgs.push(serde_json::json!({"role": "tool", "tool_call_id": tool_use_id, "content": if is_error { format!("Tool execution error:\n{}", result_content) } else { result_content }}));
                         }
-                        "thinking" | "redacted_thinking" => return Err("Anthropic thinking blocks require a native Anthropic Messages channel".to_string()),
+                        "thinking" => {
+                            // Fail-open: assistant reasoning is carried into
+                            // the Chat message as `reasoning_content` (OpenAI
+                            // non-stream field).  Reasoning on any other role is
+                            // dropped — we never inject thinking into a
+                            // user/system channel.
+                            if role == "assistant" {
+                                if let Some(t) = block.get("thinking").and_then(|t| t.as_str()) {
+                                    assistant_reasoning.push_str(t);
+                                }
+                            }
+                        }
+                        "redacted_thinking" => {
+                            // Encrypted/signature form — no usable text; drop.
+                        }
                         "cache_control" => return Err("Anthropic cache controls require a native Anthropic Messages channel".to_string()),
                         _ => return Err("unsupported Anthropic content block requires a native Anthropic Messages channel".to_string()),
                     }
@@ -848,11 +962,21 @@ fn convert_anthropic_messages_to_openai(
                     } else {
                         Value::Array(parts)
                     };
-                    if tool_calls.is_empty() && content.is_null() {
+                    // Reasoning content extracted from assistant `thinking`
+                    // blocks (fail-open mapping to OpenAI `reasoning_content`).
+                    let reasoning = if assistant_reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(assistant_reasoning)
+                    };
+                    if tool_calls.is_empty() && content.is_null() && reasoning.is_none() {
                         return Err("assistant message is empty".to_string());
                     }
                     let mut assistant =
                         serde_json::json!({"role": "assistant", "content": content});
+                    if let Some(r) = reasoning {
+                        assistant["reasoning_content"] = Value::String(r);
+                    }
                     if !tool_calls.is_empty() {
                         assistant["tool_calls"] = Value::Array(tool_calls);
                     }
@@ -934,9 +1058,15 @@ mod anthropic_tests {
         assert!(openai_to_anthropic(&response, "model").is_err());
 
         let cache_in_system = serde_json::json!({"model":"model", "system":[{"type":"text", "text":"cached", "cache_control":{"type":"ephemeral"}}], "messages":[]});
-        assert_eq!(anthropic_to_openai(&cache_in_system).unwrap()["messages"][0]["content"], "cached");
+        assert_eq!(
+            anthropic_to_openai(&cache_in_system).unwrap()["messages"][0]["content"],
+            "cached"
+        );
         let cache_in_message = serde_json::json!({"model":"model", "messages":[{"role":"user", "content":[{"type":"text", "text":"cached", "cache_control":{"type":"ephemeral"}}]}]});
-        assert_eq!(anthropic_to_openai(&cache_in_message).unwrap()["messages"][0]["content"][0]["text"], "cached");
+        assert_eq!(
+            anthropic_to_openai(&cache_in_message).unwrap()["messages"][0]["content"][0]["text"],
+            "cached"
+        );
     }
 
     #[test]
@@ -947,7 +1077,10 @@ mod anthropic_tests {
         assert!(converted.get("stop_sequence").is_some());
 
         let implicit_tool = serde_json::json!({"choices":[{"finish_reason":null, "message":{"role":"assistant", "content":null, "tool_calls":[{"id":"call_1", "function":{"name":"run", "arguments":"{}"}}]}}]});
-        assert_eq!(openai_to_anthropic(&implicit_tool, "model").unwrap()["stop_reason"], "tool_use");
+        assert_eq!(
+            openai_to_anthropic(&implicit_tool, "model").unwrap()["stop_reason"],
+            "tool_use"
+        );
     }
 
     #[test]
@@ -956,5 +1089,71 @@ mod anthropic_tests {
         let converted = anthropic_to_openai(&request).unwrap();
         assert_eq!(converted["stream_options"]["include_usage"], true);
         assert_eq!(converted["stream_options"]["custom"], true);
+    }
+
+    #[test]
+    fn anthropic_to_openai_maps_thinking_fail_open() {
+        // thinking enabled + budget_tokens 1024 -> reasoning_effort "low".
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "u"}],
+            "thinking": {"type": "enabled", "budget_tokens": 1024}
+        });
+        let converted = anthropic_to_openai(&body).unwrap();
+        assert_eq!(converted["reasoning_effort"], "low");
+
+        // adaptive + output_config.effort passthrough (lowercased).
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "u"}],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "HIGH"}
+        });
+        let converted = anthropic_to_openai(&body).unwrap();
+        assert_eq!(converted["reasoning_effort"], "high");
+
+        // container / context_management dropped fail-open (no error).
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "u"}],
+            "container": {"type": "super_container"},
+            "context_management": {"turns": 4}
+        });
+        let converted = anthropic_to_openai(&body).unwrap();
+        assert!(converted.get("container").is_none());
+        assert!(converted.get("context_management").is_none());
+
+        // system thinking block dropped.
+        let body = serde_json::json!({
+            "model": "m",
+            "system": [{"type": "thinking", "thinking": "instruct"}],
+            "messages": []
+        });
+        let converted = anthropic_to_openai(&body).unwrap();
+        assert_eq!(converted["messages"][0]["content"], "");
+
+        // assistant thinking block -> reasoning_content; redacted dropped.
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "chain"},
+                {"type": "redacted_thinking", "data": "sig"},
+                {"type": "text", "text": "answer"}
+            ]}]
+        });
+        let converted = anthropic_to_openai(&body).unwrap();
+        assert_eq!(converted["messages"][0]["reasoning_content"], "chain");
+        assert_eq!(converted["messages"][0]["content"], "answer");
+    }
+
+    #[test]
+    fn openai_to_anthropic_maps_reasoning_fail_open() {
+        // reasoning_content -> Messages thinking block, kept even with content.
+        let response = serde_json::json!({"choices":[{"finish_reason":"stop", "message":{"role":"assistant", "reasoning_content":"chain", "content":"answer"}}]});
+        let converted = openai_to_anthropic(&response, "model").unwrap();
+        assert_eq!(converted["content"][0]["type"], "thinking");
+        assert_eq!(converted["content"][0]["thinking"], "chain");
+        assert_eq!(converted["content"][1]["type"], "text");
+        assert_eq!(converted["content"][1]["text"], "answer");
     }
 }

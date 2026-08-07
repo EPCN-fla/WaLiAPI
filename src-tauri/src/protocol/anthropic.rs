@@ -17,6 +17,7 @@ pub struct AnthropicStreamState {
     output_tokens: u64,
     next_content_index: usize,
     open_text: Option<usize>,
+    open_thinking: Option<usize>,
     tools: BTreeMap<usize, ToolState>,
 }
 
@@ -34,7 +35,9 @@ fn event(name: &str, value: Value) -> String {
 }
 
 impl AnthropicStreamState {
-    pub fn usage(&self) -> (i64, i64) { (self.input_tokens as i64, self.output_tokens as i64) }
+    pub fn usage(&self) -> (i64, i64) {
+        (self.input_tokens as i64, self.output_tokens as i64)
+    }
     /// Feed arbitrary network bytes.  A TCP chunk may split a UTF-8 codepoint,
     /// an SSE field, or the CRLF event delimiter, so bytes are retained until a
     /// complete event is available.
@@ -98,14 +101,28 @@ impl AnthropicStreamState {
             .flatten()
         {
             let delta = choice.get("delta").unwrap_or(&Value::Null);
-            if delta
+            // Fail-open: upstream reasoning is emitted as a Messages `thinking`
+            // block (start/delta/stop), never rejected.  Some OpenAI-compat
+            // providers surface it as `reasoning_content` (string) or a
+            // `thinking` object; both are accepted.
+            let reasoning_text = delta
                 .get("reasoning_content")
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
-                .is_some()
-                || delta.get("thinking").is_some()
-            {
-                return Err("OpenAI upstream returned thinking content, which cannot be converted to Anthropic Messages safely".to_string());
+                .map(str::to_string)
+                .or_else(|| match delta.get("thinking") {
+                    Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                    Some(Value::Object(m)) => m
+                        .get("text")
+                        .or_else(|| m.get("thinking"))
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_string),
+                    _ => None,
+                });
+            if let Some(text) = reasoning_text {
+                let index = self.ensure_thinking(events);
+                events.push(event("content_block_delta", serde_json::json!({"type":"content_block_delta", "index":index, "delta":{"type":"thinking_delta", "thinking":text}})));
             }
             if let Some(text) = delta
                 .get("content")
@@ -116,7 +133,9 @@ impl AnthropicStreamState {
                 events.push(event("content_block_delta", serde_json::json!({"type":"content_block_delta", "index":index, "delta":{"type":"text_delta", "text":text}})));
             }
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                for call in calls { self.consume_tool_call(call)?; }
+                for call in calls {
+                    self.consume_tool_call(call)?;
+                }
             }
             if let Some(reason) = choice
                 .get("finish_reason")
@@ -156,6 +175,17 @@ impl AnthropicStreamState {
         index
     }
 
+    fn ensure_thinking(&mut self, events: &mut Vec<String>) -> usize {
+        if let Some(index) = self.open_thinking {
+            return index;
+        }
+        let index = self.next_content_index;
+        self.next_content_index += 1;
+        self.open_thinking = Some(index);
+        events.push(event("content_block_start", serde_json::json!({"type":"content_block_start", "index":index, "content_block":{"type":"thinking", "thinking":""}})));
+        index
+    }
+
     fn consume_tool_call(&mut self, call: &Value) -> Result<(), String> {
         let source_index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
         let id = call.get("id").and_then(Value::as_str);
@@ -168,9 +198,15 @@ impl AnthropicStreamState {
             .and_then(|f| f.get("arguments"))
             .and_then(Value::as_str);
         let tool = self.tools.entry(source_index).or_default();
-        if let Some(id) = id { tool.id = id.to_string(); }
-        if let Some(name) = name { tool.name = name.to_string(); }
-        if let Some(arguments) = arguments { tool.arguments.push_str(arguments); }
+        if let Some(id) = id {
+            tool.id = id.to_string();
+        }
+        if let Some(name) = name {
+            tool.name = name.to_string();
+        }
+        if let Some(arguments) = arguments {
+            tool.arguments.push_str(arguments);
+        }
         Ok(())
     }
 
@@ -184,20 +220,35 @@ impl AnthropicStreamState {
                 serde_json::json!({"type":"content_block_stop", "index":index}),
             ));
         }
+        if let Some(index) = self.open_thinking.take() {
+            events.push(event(
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop", "index":index}),
+            ));
+        }
         // OpenAI deltas for parallel calls may interleave. Anthropic content
         // blocks may not: serialize each complete tool block only after every
         // text block has stopped.
         for tool in self.tools.values_mut() {
-            if tool.id.is_empty() || tool.name.is_empty() { return Err("OpenAI stream ended with an incomplete tool call".to_string()); }
-            let input: Value = serde_json::from_str(&tool.arguments).map_err(|error| format!("OpenAI stream ended with invalid tool arguments: {error}"))?;
-            if !input.is_object() { return Err("OpenAI stream tool arguments must decode to a JSON object".to_string()); }
+            if tool.id.is_empty() || tool.name.is_empty() {
+                return Err("OpenAI stream ended with an incomplete tool call".to_string());
+            }
+            let input: Value = serde_json::from_str(&tool.arguments).map_err(|error| {
+                format!("OpenAI stream ended with invalid tool arguments: {error}")
+            })?;
+            if !input.is_object() {
+                return Err("OpenAI stream tool arguments must decode to a JSON object".to_string());
+            }
             let index = self.next_content_index;
             self.next_content_index += 1;
             tool.content_index = Some(index);
             events.push(event("content_block_start", serde_json::json!({"type":"content_block_start", "index":index, "content_block":{"type":"tool_use", "id":tool.id, "name":tool.name, "input":{}}})));
             events.push(event("content_block_delta", serde_json::json!({"type":"content_block_delta", "index":index, "delta":{"type":"input_json_delta", "partial_json":tool.arguments}})));
             tool.stopped = true;
-            events.push(event("content_block_stop", serde_json::json!({"type":"content_block_stop", "index":index})));
+            events.push(event(
+                "content_block_stop",
+                serde_json::json!({"type":"content_block_stop", "index":index}),
+            ));
         }
         let stop_reason = match self.finish_reason.as_deref() {
             Some("length") => "max_tokens",
@@ -312,9 +363,40 @@ mod tests {
         assert!(output.contains("\"stop_sequence\":null"));
         let text_stop = output.find("content_block_stop").unwrap();
         let first_tool = output.find("\"type\":\"tool_use\"").unwrap();
-        assert!(text_stop < first_tool, "text must stop before a tool block starts");
+        assert!(
+            text_stop < first_tool,
+            "text must stop before a tool block starts"
+        );
         assert!(output.find("\"id\":\"a\"").unwrap() < output.find("\"id\":\"b\"").unwrap());
         assert_eq!(output.matches("event: message_stop").count(), 1);
+    }
+
+    #[test]
+    fn reasoning_content_streams_as_thinking_block_fail_open() {
+        let mut state = AnthropicStreamState::default();
+        let events = [
+            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"se\"}}]}\n\n".as_ref(),
+            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"cret\"}}]}\n\n".as_ref(),
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".as_ref(),
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n".as_ref(),
+        ];
+        let mut output = Vec::new();
+        for frame in events {
+            output.extend(state.feed(frame, "model", "msg_1").unwrap());
+        }
+        output.extend(state.finish("model", "msg_1").unwrap());
+        let joined = output.join("");
+        // serde_json here sorts object keys (no preserve_order), so assert on
+        // order-independent fragments rather than `"type":"thinking"` adjacency.
+        assert!(joined.contains("\"type\":\"thinking\""));
+        assert!(joined.contains("\"thinking\":\"se\""));
+        assert!(joined.contains("\"thinking\":\"cret\""));
+        assert!(joined.contains("\"text\":\"hi\""));
+        assert_eq!(
+            output.iter().filter(|e| e.contains("content_block_stop")).count(),
+            2,
+            "thinking + text blocks both stop"
+        );
     }
 
     #[test]
@@ -322,10 +404,24 @@ mod tests {
         let mut state = AnthropicStreamState::default();
         let tool = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}}]}\n\n";
         state.feed(tool, "model", "msg_1").unwrap();
-        assert!(state.finish("model", "msg_1").unwrap().join("").contains("\"stop_reason\":\"tool_use\""));
+        assert!(state
+            .finish("model", "msg_1")
+            .unwrap()
+            .join("")
+            .contains("\"stop_reason\":\"tool_use\""));
 
         let mut refusal = AnthropicStreamState::default();
-        refusal.feed(b"data: {\"choices\":[{\"delta\":{\"refusal\":\"no\"}}]}\n\n", "model", "msg_2").unwrap();
-        assert!(refusal.finish("model", "msg_2").unwrap().join("").contains("\"stop_reason\":\"refusal\""));
+        refusal
+            .feed(
+                b"data: {\"choices\":[{\"delta\":{\"refusal\":\"no\"}}]}\n\n",
+                "model",
+                "msg_2",
+            )
+            .unwrap();
+        assert!(refusal
+            .finish("model", "msg_2")
+            .unwrap()
+            .join("")
+            .contains("\"stop_reason\":\"refusal\""));
     }
 }

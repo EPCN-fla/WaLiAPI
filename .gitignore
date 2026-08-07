@@ -42,3 +42,6 @@ xapi_usage_guide_*.md
 /.walicode/memory/core_memory.json
 /.walicode/output.json
 dist/
+
+# CodeGraph index
+.codegraph/

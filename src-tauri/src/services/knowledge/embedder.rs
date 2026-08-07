@@ -37,7 +37,10 @@ pub async fn embed(
                 if !embeddings.is_empty() {
                     tracing::info!(
                         "Embedding success: channel={}, model={}, texts={}, dim={}",
-                        channel.name, model, texts.len(), embeddings[0].len()
+                        channel.name,
+                        model,
+                        texts.len(),
+                        embeddings[0].len()
                     );
                 }
                 return Ok(embeddings);
@@ -45,7 +48,9 @@ pub async fn embed(
             Err(e) => {
                 tracing::warn!(
                     "Embedding failed on channel {} (model={}): {} — trying next channel",
-                    channel.name, model, e
+                    channel.name,
+                    model,
+                    e
                 );
                 continue;
             }
@@ -89,10 +94,17 @@ async fn try_embed_with_channel(
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("HTTP {}: {}", status, text.chars().take(300).collect::<String>()));
+        return Err(format!(
+            "HTTP {}: {}",
+            status,
+            text.chars().take(300).collect::<String>()
+        ));
     }
 
-    let json: serde_json::Value = resp.json().await.map_err(|e| format!("Parse response failed: {}", e))?;
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Parse response failed: {}", e))?;
 
     let data = json
         .get("data")
@@ -102,13 +114,11 @@ async fn try_embed_with_channel(
     let embeddings: Vec<Vec<f32>> = data
         .iter()
         .filter_map(|item| {
-            item.get("embedding")
-                .and_then(|e| e.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_f64().map(|f| f as f32))
-                        .collect()
-                })
+            item.get("embedding").and_then(|e| e.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect()
+            })
         })
         .collect();
 
@@ -127,13 +137,16 @@ async fn try_embed_with_channel(
             if emb.len() != dim {
                 return Err(format!(
                     "Inconsistent embedding dimensions: item 0 has dim {}, item {} has dim {}",
-                    dim, i, emb.len()
+                    dim,
+                    i,
+                    emb.len()
                 ));
             }
         }
         tracing::debug!(
             "Embeddings validated: {} items, dim {}",
-            embeddings.len(), dim
+            embeddings.len(),
+            dim
         );
     }
 

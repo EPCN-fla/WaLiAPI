@@ -2,7 +2,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { channelApi, importExportApi } from "../lib/api";
 import type { ChannelStats } from "../lib/api";
 import type { Channel } from "../types";
-import { CHANNEL_TYPES, formatTime, formatNumber, formatDuration } from "../lib/constants";
+import { getProtocolLabel, getChannelProviderLabel, formatTime, formatNumber, formatDuration } from "../lib/constants";
 import { Plus, Radio, Trash2, Zap, Power, Edit, Download, ChevronDown, Upload, Loader2, X, Activity, Clock, GripVertical, Eye, EyeOff, Copy, Check, AlertCircle } from "lucide-react";
 import { ChannelForm } from "../components/ChannelForm";
 import { ImportDialog } from "../components/ImportDialog";
@@ -249,13 +249,18 @@ export function ChannelsPage() {
       ) : (
         <div className="space-y-3">
           {channels.map((ch, idx) => {
-            const typeInfo = CHANNEL_TYPES.find(t => t.value === ch.type);
             const result = testResult[ch.id];
             const stats = channelStats[ch.id];
             const isDragging = draggedId === ch.id;
             const isDragOver = dragOverId === ch.id;
             const isExpanded = expandedId === ch.id;
             const keyVisible = showKeyMap[ch.id];
+            // 双标签（设计 3.5）：第一 [协议]，第二 [提供商]，来自规范化身份。
+            // 后端 DTO 对旧配置也实时推断 protocol/provider，故直接显示真实协议；
+            // 仅当协议值未知/缺失时才回退到 getProtocolLabel 的 "旧配置"。
+            const protocolLabel = getProtocolLabel(ch.protocol);
+            const providerLabel = getChannelProviderLabel(ch.provider);
+            const displayBaseUrl = ch.native_base_url || ch.base_url;
             return (
               <div
                 key={ch.id}
@@ -284,16 +289,19 @@ export function ChannelsPage() {
                   {/* 状态点 */}
                   <span className={`h-2 w-2 shrink-0 rounded-full ${ch.status === 1 ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]" : "bg-zinc-400"}`} />
 
-                  {/* 名称 + 类型 */}
+                  {/* 名称 + 双标签（[协议] [提供商]）+ 规范 Base URL */}
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-1.5">
                       <h3 className="truncate text-sm font-semibold tracking-tight">{ch.name}</h3>
-                      <span className="shrink-0 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-500">
-                        {typeInfo?.label || ch.type}
+                      <span className="shrink-0 rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[10px] font-semibold text-blue-600">
+                        [{protocolLabel}]
+                      </span>
+                      <span className="shrink-0 rounded-full border border-purple-200 bg-purple-50 px-2 py-0.5 text-[10px] font-semibold text-purple-600">
+                        [{providerLabel}]
                       </span>
                     </div>
-                    <div className="mt-0.5 truncate text-xs font-mono text-slate-400" title={ch.base_url}>
-                      {ch.base_url}
+                    <div className="mt-0.5 truncate text-xs font-mono text-slate-400" title={displayBaseUrl}>
+                      {displayBaseUrl}
                     </div>
                   </div>
 
@@ -347,7 +355,7 @@ export function ChannelsPage() {
                 {result && (
                   <div className={`mt-2 flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs ${result.success ? "bg-emerald-50 text-emerald-700" : "bg-red-50 text-red-700"}`}>
                     {result.success ? <><span className="text-emerald-500">✓</span> 连接成功</> : <><span className="text-red-500">✗</span> {result.message}</>}
-                    <span className="text-slate-400">({result.latency_ms}ms)</span>
+                    <span className="text-slate-400">({result.latency_ms.toFixed(2)}ms)</span>
                   </div>
                 )}
 
@@ -575,7 +583,7 @@ function DeleteConfirmDialog({
         <div className="mt-4 rounded-2xl border border-border bg-background/50 px-4 py-3 text-sm">
           <div className="text-muted-foreground">渠道名称</div>
           <div className="mt-1 font-medium">{target.name}</div>
-          <div className="mt-2 text-xs font-mono text-muted-foreground truncate">{target.base_url}</div>
+          <div className="mt-2 text-xs font-mono text-muted-foreground truncate">{target.native_base_url || target.base_url}</div>
         </div>
         <div className="mt-5 flex justify-end gap-2">
           <button onClick={onClose} className="action-secondary">取消</button>

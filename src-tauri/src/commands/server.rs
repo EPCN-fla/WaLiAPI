@@ -10,8 +10,12 @@ pub struct ServerStatus {
 }
 
 #[tauri::command]
-pub async fn get_server_status(state: tauri::State<'_, Arc<AppState>>) -> Result<ServerStatus, String> {
-    let running = state.server_running.load(std::sync::atomic::Ordering::SeqCst);
+pub async fn get_server_status(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<ServerStatus, String> {
+    let running = state
+        .server_running
+        .load(std::sync::atomic::Ordering::SeqCst);
     let port = *state.server_port.read().await;
     Ok(ServerStatus {
         running,
@@ -21,13 +25,18 @@ pub async fn get_server_status(state: tauri::State<'_, Arc<AppState>>) -> Result
 }
 
 #[tauri::command]
-pub async fn restart_server(app: tauri::AppHandle, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+pub async fn restart_server(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
     // Stop existing server
     let mut handle_guard = state.server_handle.write().await;
     if let Some(handle) = handle_guard.take() {
         handle.abort();
     }
-    state.server_running.store(false, std::sync::atomic::Ordering::SeqCst);
+    state
+        .server_running
+        .store(false, std::sync::atomic::Ordering::SeqCst);
 
     // Start new server
     let app_clone = app.clone();

@@ -1,18 +1,31 @@
-use async_trait::async_trait;
 use super::*;
+use async_trait::async_trait;
 
 pub struct OpenAIAdaptor;
 
 #[async_trait]
 impl Adaptor for OpenAIAdaptor {
-    fn channel_type(&self) -> &'static str { "openai" }
-    fn default_models(&self) -> Vec<&'static str> { vec!["gpt-5.4", "gpt-5.5", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"] }
-    fn default_base_url(&self) -> &str { "https://api.openai.com/v1" }
+    fn channel_type(&self) -> &'static str {
+        "openai"
+    }
+    fn default_models(&self) -> Vec<&'static str> {
+        vec![
+            "gpt-5.4",
+            "gpt-5.5",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4-turbo",
+            "gpt-3.5-turbo",
+        ]
+    }
+    fn default_base_url(&self) -> &str {
+        "https://api.openai.com/v1"
+    }
 
     async fn test(&self, config: &ChannelConfig) -> Result<TestResult, anyhow::Error> {
         let start = std::time::Instant::now();
         let url = format!("{}/models", config.base_url.trim_end_matches('/'));
-        
+
         let client = reqwest::Client::new();
         let resp = client
             .get(&url)
@@ -25,16 +38,32 @@ impl Adaptor for OpenAIAdaptor {
             Ok(r) => {
                 let latency = start.elapsed().as_millis() as u64;
                 if r.status().is_success() {
-                    Ok(TestResult { success: true, message: "连接成功".to_string(), latency_ms: latency })
+                    Ok(TestResult {
+                        success: true,
+                        message: "连接成功".to_string(),
+                        latency_ms: latency,
+                    })
                 } else {
                     let status = r.status();
                     let body = r.text().await.unwrap_or_default();
-                    Ok(TestResult { success: false, message: format!("HTTP {}: {}", status, body.chars().take(200).collect::<String>()), latency_ms: latency })
+                    Ok(TestResult {
+                        success: false,
+                        message: format!(
+                            "HTTP {}: {}",
+                            status,
+                            body.chars().take(200).collect::<String>()
+                        ),
+                        latency_ms: latency,
+                    })
                 }
             }
             Err(e) => {
                 let latency = start.elapsed().as_millis() as u64;
-                Ok(TestResult { success: false, message: format!("连接失败: {}", e), latency_ms: latency })
+                Ok(TestResult {
+                    success: false,
+                    message: format!("连接失败: {}", e),
+                    latency_ms: latency,
+                })
             }
         }
     }
@@ -60,7 +89,7 @@ impl Adaptor for OpenAIAdaptor {
             .await?;
 
         let status = resp.status().as_u16();
-        let json: serde_json::Value = resp.json().await?;;
+        let json: serde_json::Value = resp.json().await?;
 
         let usage = json.get("usage").and_then(|u| {
             Some(TokenUsage {
@@ -97,30 +126,35 @@ impl Adaptor for OpenAIAdaptor {
     }
 }
 
-pub fn apply_model_mapping(body: &serde_json::Value, mapping: &serde_json::Value) -> serde_json::Value {
+pub fn apply_model_mapping(
+    body: &serde_json::Value,
+    mapping: &serde_json::Value,
+) -> serde_json::Value {
     if mapping.is_null() || !mapping.is_object() {
         return sanitize_messages(body.clone());
     }
     let mut body = body.clone();
     if let Some(model) = body.get("model").and_then(|m| m.as_str()) {
         if let Some(mapped) = mapping.get(model) {
-            // Support both single string and array of strings
+            // Single-string mappings are still applied here for direct callers.
+            // Array mappings are NOT re-sampled: the sampled upstream model is
+            // resolved exactly once per attempt and pre-baked into the body by
+            // the caller (proxy.rs / handlers.rs), so the actual request, log
+            // and statistics all share the same model (design 11.4).  An array
+            // here therefore means the caller already chose; keep the body.
             let chosen = if let Some(s) = mapped.as_str() {
                 s.to_string()
-            } else if let Some(arr) = mapped.as_array() {
-                // Pick a random model from the array (load balancing)
-                let models: Vec<String> = arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect();
-                if models.is_empty() {
-                    return sanitize_messages(body);
-                }
-                let idx = rand::Rng::random_range(&mut rand::rng(), 0..models.len());
-                models[idx].clone()
+            } else if mapped.is_array() {
+                body["model"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
             } else {
                 return sanitize_messages(body);
             };
-            body["model"] = serde_json::Value::String(chosen);
+            if !chosen.is_empty() {
+                body["model"] = serde_json::Value::String(chosen);
+            }
         }
     }
     sanitize_messages(body)

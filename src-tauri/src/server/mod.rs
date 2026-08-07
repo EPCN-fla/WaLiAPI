@@ -1,11 +1,14 @@
-pub mod router;
 pub mod handlers;
+pub mod router;
 
 use crate::AppState;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_store::StoreExt;
 
-pub async fn start_server(app: AppHandle, state: std::sync::Arc<AppState>) -> Result<(), anyhow::Error> {
+pub async fn start_server(
+    app: AppHandle,
+    state: std::sync::Arc<AppState>,
+) -> Result<(), anyhow::Error> {
     let host = get_server_host(&app);
     let port = get_server_port(&app);
 
@@ -15,7 +18,9 @@ pub async fn start_server(app: AppHandle, state: std::sync::Arc<AppState>) -> Re
     let actual_port = local_addr.port();
 
     *state.server_port.write().await = actual_port;
-    state.server_running.store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .server_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 
     let router = router::create_router(app.clone(), state.clone());
 
@@ -28,11 +33,17 @@ pub async fn start_server(app: AppHandle, state: std::sync::Arc<AppState>) -> Re
     )
     .ok();
 
-    tracing::info!("WaLiAPI server listening on http://{}:{}", host, actual_port);
+    tracing::info!(
+        "WaLiAPI server listening on http://{}:{}",
+        host,
+        actual_port
+    );
 
     axum::serve(listener, router).await?;
 
-    state.server_running.store(false, std::sync::atomic::Ordering::SeqCst);
+    state
+        .server_running
+        .store(false, std::sync::atomic::Ordering::SeqCst);
 
     Ok(())
 }

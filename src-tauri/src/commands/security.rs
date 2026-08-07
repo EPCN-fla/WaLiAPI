@@ -1,6 +1,6 @@
 use crate::security::rules::{
-    BuiltinRule, BuiltinRuleRepository, CustomRule, CustomRuleRepository,
-    CreateCustomRuleInput, UpdateBuiltinRuleInput, seed_builtin_rules,
+    seed_builtin_rules, BuiltinRule, BuiltinRuleRepository, CreateCustomRuleInput, CustomRule,
+    CustomRuleRepository, UpdateBuiltinRuleInput,
 };
 use crate::AppState;
 

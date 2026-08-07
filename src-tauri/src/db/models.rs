@@ -17,13 +17,21 @@ pub struct Channel {
     pub config: String,
     pub model_mapping: String,
     pub timeout_secs: i64,
+    // --- T02 protocol identity columns (migration 015) ---
+    pub protocol: Option<String>,
+    pub provider: Option<String>,
+    pub native_base_url: Option<String>,
+    pub native_endpoints: Option<String>,
+    pub preset_revision: Option<String>,
+    pub identity_revision: i64,
+    pub legacy_executor_override: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub last_test_at: Option<String>,
     pub last_test_ok: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CreateChannelInput {
     pub name: String,
     #[serde(rename = "type")]
@@ -36,9 +44,33 @@ pub struct CreateChannelInput {
     pub config: Option<serde_json::Value>,
     pub model_mapping: Option<serde_json::Value>,
     pub timeout_secs: Option<i64>,
+    // --- T02 protocol identity fields (all Option + serde(default)) ---
+    // Missing => legacy inference from type/base_url/config.
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub native_base_url: Option<String>,
+    /// Serialized JSON array of endpoint strings; missing => legacy inference.
+    #[serde(default)]
+    pub native_endpoints: Option<Vec<String>>,
+    #[serde(default)]
+    pub preset_revision: Option<String>,
+    #[serde(default)]
+    pub legacy_executor_override: Option<String>,
+    // --- T07 draft-test receipt. Backend validates these against the current
+    // draft when present; force_save saves despite failed/skipped tests as long
+    // as the same draft was tested at least once. Legacy payloads omit them. ---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_save: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UpdateChannelInput {
     pub id: String,
     pub name: Option<String>,
@@ -53,6 +85,74 @@ pub struct UpdateChannelInput {
     pub config: Option<serde_json::Value>,
     pub model_mapping: Option<serde_json::Value>,
     pub timeout_secs: Option<i64>,
+    // --- T02 protocol identity fields. None = keep current value. ---
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub native_base_url: Option<String>,
+    /// None = keep; explicit empty Vec is REJECTED (must be non-empty or absent).
+    #[serde(default)]
+    pub native_endpoints: Option<Vec<String>>,
+    #[serde(default)]
+    pub preset_revision: Option<String>,
+    #[serde(default)]
+    pub legacy_executor_override: Option<String>,
+    /// Distinguish "edit leave-blank = keep key" from "Ollama explicitly clear
+    /// key": true => persist an empty api_key (clears the stored key).
+    #[serde(default)]
+    pub clear_api_key: Option<bool>,
+    // --- T07 draft-test receipt (see CreateChannelInput). ---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_save: Option<bool>,
+}
+
+/// Import-write input (T09).  Unlike `CreateChannelInput` (whose repository
+/// writer hard-codes status=1 and a default timeout), this input carries the
+/// full business field set so import/export round-trips are per-field exact:
+/// status, priority, weight, timeout_secs, config unknown keys, URL, key,
+/// models and array model_mapping.  Identity columns are `Option`: a v1 /
+/// legacy import passes `None` (identity_revision 0) so the resolver live-infers;
+/// a v2 import passes the validated identity verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ImportChannelInput {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub channel_type: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub models: Vec<String>,
+    pub status: i64,
+    pub priority: i64,
+    pub weight: i64,
+    pub config: serde_json::Value,
+    pub model_mapping: serde_json::Value,
+    pub timeout_secs: i64,
+    // --- T02 protocol identity columns (None => legacy-infer on read) ---
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub native_base_url: Option<String>,
+    #[serde(default)]
+    pub native_endpoints: Option<Vec<String>>,
+    #[serde(default)]
+    pub preset_revision: Option<String>,
+    #[serde(default)]
+    pub identity_revision: i64,
+    #[serde(default)]
+    pub legacy_executor_override: Option<String>,
+    // --- test-status fields (preserved so an exported test badge survives) ---
+    #[serde(default)]
+    pub last_test_at: Option<String>,
+    #[serde(default)]
+    pub last_test_ok: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -79,7 +179,11 @@ pub struct CreateApiKeyInput {
     pub expires_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+/// A persisted request-log row.  All T09 observability columns are NULLABLE
+/// (migration 016) so legacy rows and old queries keep working; `Default` is
+/// derived so a struct literal can use `..Default::default()` for the fields a
+/// given code path does not produce yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RequestLog {
     pub id: String,
     pub seq: Option<i64>,
@@ -108,6 +212,18 @@ pub struct RequestLog {
     pub sanitized: i64,
     pub blocked_reason: Option<String>,
     pub trace_id: Option<String>,
+    // --- T09 observability (migration 016; all nullable) ---
+    pub downstream_protocol: Option<String>,
+    pub downstream_endpoint: Option<String>,
+    pub route_group: Option<String>,
+    pub upstream_protocol: Option<String>,
+    pub upstream_endpoint: Option<String>,
+    pub provider: Option<String>,
+    pub codec_version: Option<String>,
+    pub failure_class: Option<String>,
+    pub identity_revision: Option<i64>,
+    pub client_cancelled: Option<i64>,
+    pub stream_committed: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,7 +277,6 @@ pub struct ApiKeyStats {
 pub fn now_iso() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RequestSecurityFinding {

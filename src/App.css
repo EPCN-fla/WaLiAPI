@@ -125,6 +125,22 @@ textarea:focus {
   }
 }
 
+/* T14：同步上游模型「应用」后新增 chip 的绿色高亮动画（对齐已验收原型）。 */
+@keyframes model-pop {
+  0% {
+    background: rgba(31, 143, 95, 0.55);
+    color: #fff;
+  }
+  60% {
+    background: rgba(31, 143, 95, 0.3);
+    color: var(--color-success);
+  }
+  100% {
+    background: rgba(31, 143, 95, 0.16);
+    color: var(--color-success);
+  }
+}
+
 .page-shell {
   padding: 28px;
   animation: fadeInUp 0.2s ease;

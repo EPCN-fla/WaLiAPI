@@ -30,6 +30,18 @@ pub struct LogDto {
     pub sanitized: bool,
     pub blocked_reason: Option<String>,
     pub trace_id: Option<String>,
+    // --- T09 observability fields (nullable; legacy rows are NULL) ---
+    pub downstream_protocol: Option<String>,
+    pub downstream_endpoint: Option<String>,
+    pub route_group: Option<String>,
+    pub upstream_protocol: Option<String>,
+    pub upstream_endpoint: Option<String>,
+    pub provider: Option<String>,
+    pub codec_version: Option<String>,
+    pub failure_class: Option<String>,
+    pub identity_revision: Option<i64>,
+    pub client_cancelled: Option<bool>,
+    pub stream_committed: Option<bool>,
 }
 
 impl From<RequestLog> for LogDto {
@@ -60,6 +72,17 @@ impl From<RequestLog> for LogDto {
             sanitized: l.sanitized == 1,
             blocked_reason: l.blocked_reason,
             trace_id: l.trace_id,
+            downstream_protocol: l.downstream_protocol,
+            downstream_endpoint: l.downstream_endpoint,
+            route_group: l.route_group,
+            upstream_protocol: l.upstream_protocol,
+            upstream_endpoint: l.upstream_endpoint,
+            provider: l.provider,
+            codec_version: l.codec_version,
+            failure_class: l.failure_class,
+            identity_revision: l.identity_revision,
+            client_cancelled: l.client_cancelled.map(|v| v == 1),
+            stream_committed: l.stream_committed.map(|v| v == 1),
         }
     }
 }
@@ -140,12 +163,14 @@ pub async fn get_logs(
             input.trace_id.as_deref(),
             limit,
             offset,
-        ).await
+        )
+        .await
     } else {
         repo.get_logs(limit, offset).await
     };
 
-    logs.map_err(|e| e.to_string()).map(|ls| ls.into_iter().map(Into::into).collect())
+    logs.map_err(|e| e.to_string())
+        .map(|ls| ls.into_iter().map(Into::into).collect())
 }
 
 #[tauri::command]
@@ -154,7 +179,10 @@ pub async fn get_log(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<LogDto, String> {
     let repo = Repository::new(state.db.pool.clone());
-    repo.get_log(&id).await.map_err(|e| e.to_string()).map(Into::into)
+    repo.get_log(&id)
+        .await
+        .map_err(|e| e.to_string())
+        .map(Into::into)
 }
 
 #[tauri::command]
@@ -163,7 +191,10 @@ pub async fn get_log_security_findings(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<Vec<SecurityFindingDto>, String> {
     let repo = Repository::new(state.db.pool.clone());
-    repo.get_security_findings(&log_id).await.map_err(|e| e.to_string()).map(|fs| fs.into_iter().map(Into::into).collect())
+    repo.get_security_findings(&log_id)
+        .await
+        .map_err(|e| e.to_string())
+        .map(|fs| fs.into_iter().map(Into::into).collect())
 }
 
 #[tauri::command]
@@ -181,7 +212,9 @@ pub async fn delete_logs_before(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<u64, String> {
     let repo = Repository::new(state.db.pool.clone());
-    repo.delete_logs_before(&before_date).await.map_err(|e| e.to_string())
+    repo.delete_logs_before(&before_date)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -200,8 +233,22 @@ pub struct LogStatsDto {
 }
 
 #[tauri::command]
-pub async fn get_log_stats(days: Option<i64>, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<Vec<LogStatsDto>, String> {
+pub async fn get_log_stats(
+    days: Option<i64>,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<Vec<LogStatsDto>, String> {
     let repo = Repository::new(state.db.pool.clone());
     let days = days.unwrap_or(7);
-    repo.get_log_stats(days).await.map_err(|e| e.to_string()).map(|ss| ss.into_iter().map(|s| LogStatsDto { date: s.date, count: s.count, total_tokens: s.total_tokens }).collect())
+    repo.get_log_stats(days)
+        .await
+        .map_err(|e| e.to_string())
+        .map(|ss| {
+            ss.into_iter()
+                .map(|s| LogStatsDto {
+                    date: s.date,
+                    count: s.count,
+                    total_tokens: s.total_tokens,
+                })
+                .collect()
+        })
 }

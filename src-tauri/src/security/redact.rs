@@ -74,7 +74,13 @@ fn redact_string(s: &str) -> String {
         let chars: Vec<char> = result.chars().collect();
         let mut i = 0;
         while i < chars.len() {
-            if i + 7 <= chars.len() && chars[i..i+7].iter().collect::<String>().to_ascii_lowercase() == "bearer " {
+            if i + 7 <= chars.len()
+                && chars[i..i + 7]
+                    .iter()
+                    .collect::<String>()
+                    .to_ascii_lowercase()
+                    == "bearer "
+            {
                 out.push_str("Bearer ");
                 // Skip until whitespace or end
                 i += 7;
@@ -84,7 +90,7 @@ fn redact_string(s: &str) -> String {
                         // Keep first 2 chars
                         if i + 2 <= chars.len() {
                             out.push(chars[i]);
-                            out.push(chars[i+1]);
+                            out.push(chars[i + 1]);
                             i += 2;
                         }
                         token_started = true;
@@ -107,9 +113,18 @@ fn redact_string(s: &str) -> String {
         || result.contains("-----BEGIN PRIVATE KEY-----")
     {
         result = result
-            .replace("-----BEGIN OPENSSH PRIVATE KEY-----", "-----BEGIN [REDACTED PRIVATE KEY]-----")
-            .replace("-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN [REDACTED PRIVATE KEY]-----")
-            .replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN [REDACTED PRIVATE KEY]-----");
+            .replace(
+                "-----BEGIN OPENSSH PRIVATE KEY-----",
+                "-----BEGIN [REDACTED PRIVATE KEY]-----",
+            )
+            .replace(
+                "-----BEGIN RSA PRIVATE KEY-----",
+                "-----BEGIN [REDACTED PRIVATE KEY]-----",
+            )
+            .replace(
+                "-----BEGIN PRIVATE KEY-----",
+                "-----BEGIN [REDACTED PRIVATE KEY]-----",
+            );
         // Remove key body lines
         let mut out = String::new();
         let mut in_key = false;
@@ -174,16 +189,39 @@ fn mask_string(s: &str) -> String {
         return "****".to_string();
     }
     let prefix: String = chars.iter().take(4).collect();
-    let suffix: String = chars.iter().rev().take(4).copied().collect::<Vec<_>>().iter().rev().copied().collect();
+    let suffix: String = chars
+        .iter()
+        .rev()
+        .take(4)
+        .copied()
+        .collect::<Vec<_>>()
+        .iter()
+        .rev()
+        .copied()
+        .collect();
     format!("{}****{}", prefix, suffix)
 }
 
 fn is_secret_field(key: &str) -> bool {
     matches!(
         key,
-        "api_key" | "apikey" | "secret" | "secret_key" | "access_key"
-            | "access_token" | "auth_token" | "token" | "password" | "passwd"
-            | "authorization" | "cookie" | "session" | "sessionid" | "private_key"
-            | "client_secret" | "aws_secret_access_key" | "secretkey"
+        "api_key"
+            | "apikey"
+            | "secret"
+            | "secret_key"
+            | "access_key"
+            | "access_token"
+            | "auth_token"
+            | "token"
+            | "password"
+            | "passwd"
+            | "authorization"
+            | "cookie"
+            | "session"
+            | "sessionid"
+            | "private_key"
+            | "client_secret"
+            | "aws_secret_access_key"
+            | "secretkey"
     )
 }

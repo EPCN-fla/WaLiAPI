@@ -1,4 +1,4 @@
-use crate::db::models::{ApiKey, CreateApiKeyInput, ApiKeyStats};
+use crate::db::models::{ApiKey, ApiKeyStats, CreateApiKeyInput};
 use crate::db::repository::Repository;
 use crate::AppState;
 use serde::{Deserialize, Serialize};
@@ -37,15 +37,26 @@ impl From<ApiKey> for ApiKeyDto {
 }
 
 #[tauri::command]
-pub async fn get_api_keys(state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<Vec<ApiKeyDto>, String> {
+pub async fn get_api_keys(
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<Vec<ApiKeyDto>, String> {
     let repo = Repository::new(state.db.pool.clone());
-    repo.get_all_api_keys().await.map_err(|e| e.to_string()).map(|ks| ks.into_iter().map(Into::into).collect())
+    repo.get_all_api_keys()
+        .await
+        .map_err(|e| e.to_string())
+        .map(|ks| ks.into_iter().map(Into::into).collect())
 }
 
 #[tauri::command]
-pub async fn create_api_key(input: CreateApiKeyInput, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<ApiKeyDto, String> {
+pub async fn create_api_key(
+    input: CreateApiKeyInput,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<ApiKeyDto, String> {
     let repo = Repository::new(state.db.pool.clone());
-    repo.create_api_key(&input).await.map_err(|e| e.to_string()).map(Into::into)
+    repo.create_api_key(&input)
+        .await
+        .map_err(|e| e.to_string())
+        .map(Into::into)
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,22 +66,32 @@ pub struct UpdateApiKeyInput {
 }
 
 #[tauri::command]
-pub async fn update_api_key(input: UpdateApiKeyInput, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<(), String> {
+pub async fn update_api_key(
+    input: UpdateApiKeyInput,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<(), String> {
     let repo = Repository::new(state.db.pool.clone());
     if let Some(status) = input.status {
-        repo.update_api_key_status(&input.id, status).await.map_err(|e| e.to_string())?;
+        repo.update_api_key_status(&input.id, status)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
 #[tauri::command]
-pub async fn delete_api_key(id: String, state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<(), String> {
+pub async fn delete_api_key(
+    id: String,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<(), String> {
     let repo = Repository::new(state.db.pool.clone());
     repo.delete_api_key(&id).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn get_api_key_stats(state: tauri::State<'_, std::sync::Arc<AppState>>) -> Result<Vec<ApiKeyStats>, String> {
+pub async fn get_api_key_stats(
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<Vec<ApiKeyStats>, String> {
     let repo = Repository::new(state.db.pool.clone());
     repo.get_api_key_stats().await.map_err(|e| e.to_string())
 }

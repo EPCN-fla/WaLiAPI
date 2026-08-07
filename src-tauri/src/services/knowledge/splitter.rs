@@ -311,7 +311,12 @@ fn estimate_tokens(text: &str) -> usize {
 }
 
 /// Main split dispatcher
-pub fn split(content: &str, file_type: &str, config: &SplitConfig, metadata: &ChunkMetadata) -> Vec<Chunk> {
+pub fn split(
+    content: &str,
+    file_type: &str,
+    config: &SplitConfig,
+    metadata: &ChunkMetadata,
+) -> Vec<Chunk> {
     match file_type {
         "markdown" => split_markdown(content, config, metadata),
         _ => split_text(content, config, metadata),

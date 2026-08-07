@@ -1,6 +1,6 @@
+use super::index::HnswIndex;
 use super::models::SearchResult;
 use super::repository::KbRepository;
-use super::index::HnswIndex;
 use sqlx::SqlitePool;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
@@ -37,7 +37,11 @@ fn load_index(kb_id: &str) -> Option<HnswIndex> {
             }
             Ok(_) => None,
             Err(e) => {
-                tracing::warn!("Failed to load HNSW index for KB {} (likely incompatible old format): {}", kb_id, e);
+                tracing::warn!(
+                    "Failed to load HNSW index for KB {} (likely incompatible old format): {}",
+                    kb_id,
+                    e
+                );
                 None
             }
         }
@@ -82,7 +86,9 @@ pub async fn search(
                 let mapped: Vec<SearchResult> = hnsw_results
                     .into_iter()
                     .filter_map(|r| {
-                        if let Some((content, metadata, _emb, filename, doc_id)) = chunk_map.get(&r.id) {
+                        if let Some((content, metadata, _emb, filename, doc_id)) =
+                            chunk_map.get(&r.id)
+                        {
                             let meta: serde_json::Value =
                                 serde_json::from_str(metadata).unwrap_or(serde_json::json!({}));
                             tracing::debug!("Mapped chunk ID {} to filename {}", r.id, filename);
@@ -105,12 +111,16 @@ pub async fn search(
                     return Ok(mapped);
                 }
 
-                tracing::warn!("HNSW index returned results but mapping failed, falling back to linear scan");
+                tracing::warn!(
+                    "HNSW index returned results but mapping failed, falling back to linear scan"
+                );
             }
         } else {
             tracing::warn!(
                 "HNSW index dim ({}) != query dim ({}) for KB {}, falling back to linear scan",
-                index.dim, query_embedding.len(), kb_id
+                index.dim,
+                query_embedding.len(),
+                kb_id
             );
         }
     }
@@ -156,7 +166,9 @@ async fn linear_search(
     if dim_mismatches > 0 {
         tracing::warn!(
             "Skipped {} chunks with mismatched embedding dimensions (expected {}) in KB {}",
-            dim_mismatches, query_dim, kb_id
+            dim_mismatches,
+            query_dim,
+            kb_id
         );
     }
 
@@ -171,7 +183,8 @@ async fn linear_search(
         .into_iter()
         .filter_map(|(score, i, _)| {
             let (id, content, metadata, _emb, filename, doc_id) = &chunks[i];
-            let meta: serde_json::Value = serde_json::from_str(metadata).unwrap_or(serde_json::json!({}));
+            let meta: serde_json::Value =
+                serde_json::from_str(metadata).unwrap_or(serde_json::json!({}));
             Some(SearchResult {
                 chunk_id: id.clone(),
                 doc_id: doc_id.clone(),
@@ -180,7 +193,8 @@ async fn linear_search(
                 score,
                 metadata: meta,
             })
-        }).collect();
+        })
+        .collect();
 
     Ok(results)
 }
@@ -289,14 +303,17 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Res
 
     // Emit initial progress with total count
     let total_items = items.len();
-    let _ = app.emit("kb-index-progress", serde_json::json!({
-        "kb_id": kb_id,
-        "status": "building",
-        "progress": 0,
-        "current": 0,
-        "total": total_items,
-        "message": format!("准备构建索引：{} 个切片，维度 {}", total_items, dim)
-    }));
+    let _ = app.emit(
+        "kb-index-progress",
+        serde_json::json!({
+            "kb_id": kb_id,
+            "status": "building",
+            "progress": 0,
+            "current": 0,
+            "total": total_items,
+            "message": format!("准备构建索引：{} 个切片，维度 {}", total_items, dim)
+        }),
+    );
 
     let app_clone = app.clone();
     let kb_id_clone = kb_id.to_string();
@@ -305,15 +322,22 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Res
     let index = tokio::task::spawn_blocking(move || {
         let mut index = HnswIndex::new(dim, DEFAULT_M, DEFAULT_EF_CONSTRUCTION, DEFAULT_EF_SEARCH);
         index.build_with_progress(&items, |current, total| {
-            let pct = if total > 0 { current * 100 / total } else { 100 };
-            let _ = app_clone.emit("kb-index-progress", serde_json::json!({
-                "kb_id": &kb_id_clone,
-                "status": "building",
-                "progress": pct,
-                "current": current,
-                "total": total,
-                "message": format!("构建中 {}/{} ({}%)", current, total, pct)
-            }));
+            let pct = if total > 0 {
+                current * 100 / total
+            } else {
+                100
+            };
+            let _ = app_clone.emit(
+                "kb-index-progress",
+                serde_json::json!({
+                    "kb_id": &kb_id_clone,
+                    "status": "building",
+                    "progress": pct,
+                    "current": current,
+                    "total": total,
+                    "message": format!("构建中 {}/{} ({}%)", current, total, pct)
+                }),
+            );
         });
         index
     })
@@ -329,9 +353,15 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Res
         .map_err(|e| format!("Failed to save index: {}", e))?;
 
     // Update DB metadata
-    repo.upsert_index_meta(kb_id, dim as i64, total_items as i64, Some(path.to_str().unwrap_or("")), "ready")
-        .await
-        .map_err(|e| format!("Failed to update index meta: {}", e))?;
+    repo.upsert_index_meta(
+        kb_id,
+        dim as i64,
+        total_items as i64,
+        Some(path.to_str().unwrap_or("")),
+        "ready",
+    )
+    .await
+    .map_err(|e| format!("Failed to update index meta: {}", e))?;
 
     repo.update_kb_index_status(kb_id, "ready")
         .await
@@ -339,7 +369,10 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Res
 
     tracing::info!(
         "HNSW index built for KB {}: {} nodes, dim {}, saved to {:?}",
-        kb_id, total_items, dim, path
+        kb_id,
+        total_items,
+        dim,
+        path
     );
 
     Ok(())
@@ -352,8 +385,7 @@ pub async fn drop_index(pool: &SqlitePool, kb_id: &str) -> Result<(), String> {
     // Delete index file
     let path = index_path(kb_id);
     if path.exists() {
-        std::fs::remove_file(&path)
-            .map_err(|e| format!("Failed to remove index file: {}", e))?;
+        std::fs::remove_file(&path).map_err(|e| format!("Failed to remove index file: {}", e))?;
     }
 
     // Update DB metadata
@@ -371,7 +403,10 @@ pub async fn drop_index(pool: &SqlitePool, kb_id: &str) -> Result<(), String> {
 }
 
 /// Get index metadata from DB.
-pub async fn get_index_status(pool: &SqlitePool, kb_id: &str) -> Result<Option<super::models::KbIndexMeta>, String> {
+pub async fn get_index_status(
+    pool: &SqlitePool,
+    kb_id: &str,
+) -> Result<Option<super::models::KbIndexMeta>, String> {
     let repo = KbRepository::new(pool.clone());
     repo.get_index_meta(kb_id)
         .await
@@ -398,7 +433,7 @@ async fn fts5_search(
          JOIN kb_documents d ON c.doc_id = d.id \
          WHERE c.kb_id = ? AND d.status = 'ready' AND kb_chunks_fts MATCH ? \
          ORDER BY rank \
-         LIMIT ?"
+         LIMIT ?",
     )
     .bind(kb_id)
     .bind(&fts_query)
@@ -406,18 +441,22 @@ async fn fts5_search(
     .fetch_all(pool)
     .await
     .map_err(|e| format!("FTS5 search failed: {}", e))?;
-    let results = rows.into_iter().enumerate().map(|(idx, (id, content, metadata, filename, doc_id))| {
-        let score = 1.0 / (1.0 + idx as f32 * 0.1);
-        let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap_or_default();
-        SearchResult {
-            chunk_id: id,
-            doc_id,
-            filename,
-            content,
-            score,
-            metadata: meta,
-        }
-    }).collect();
+    let results = rows
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (id, content, metadata, filename, doc_id))| {
+            let score = 1.0 / (1.0 + idx as f32 * 0.1);
+            let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap_or_default();
+            SearchResult {
+                chunk_id: id,
+                doc_id,
+                filename,
+                content,
+                score,
+                metadata: meta,
+            }
+        })
+        .collect();
 
     Ok(results)
 }
@@ -431,7 +470,8 @@ fn build_fts_query(query: &str) -> String {
     }
 
     // FTS5: OR-connected prefix terms for broader recall
-    tokens.iter()
+    tokens
+        .iter()
         .map(|t| format!("\"{}\"*", t.replace('"', "")))
         .collect::<Vec<_>>()
         .join(" OR ")
@@ -490,7 +530,30 @@ fn tokenize_query(query: &str) -> Vec<String> {
                     break;
                 }
                 // Split on whitespace and common punctuation
-                if c.is_whitespace() || matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '`' | '/' | '\\' | '|' | '<' | '>') {
+                if c.is_whitespace()
+                    || matches!(
+                        c,
+                        '.' | ','
+                            | '!'
+                            | '?'
+                            | ';'
+                            | ':'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                            | '"'
+                            | '\''
+                            | '`'
+                            | '/'
+                            | '\\'
+                            | '|'
+                            | '<'
+                            | '>'
+                    )
+                {
                     break;
                 }
                 word.push(c);
@@ -511,7 +574,10 @@ fn tokenize_query(query: &str) -> Vec<String> {
 
     // Deduplicate while preserving order
     let mut seen = std::collections::HashSet::new();
-    tokens.into_iter().filter(|t| seen.insert(t.clone())).collect()
+    tokens
+        .into_iter()
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
 }
 
 /// Search result with individual score breakdowns for retrieval visualization.
@@ -534,7 +600,13 @@ pub async fn hybrid_search(
     keyword_weight: f32,
 ) -> Result<Vec<SearchResult>, String> {
     let scored = hybrid_search_with_details(
-        pool, kb_id, query, query_embedding, top_k, vector_weight, keyword_weight,
+        pool,
+        kb_id,
+        query,
+        query_embedding,
+        top_k,
+        vector_weight,
+        keyword_weight,
     )
     .await?;
     Ok(scored.into_iter().map(|s| s.result).collect())
@@ -559,12 +631,14 @@ pub async fn hybrid_search_with_details(
     let keyword_results = keyword_results.unwrap_or_default();
 
     // Build lookup maps: chunk_id -> (SearchResult, raw_score)
-    let mut vector_map: std::collections::HashMap<String, (SearchResult, f32)> = std::collections::HashMap::new();
+    let mut vector_map: std::collections::HashMap<String, (SearchResult, f32)> =
+        std::collections::HashMap::new();
     for r in &vector_results {
         vector_map.insert(r.chunk_id.clone(), (r.clone(), r.score));
     }
 
-    let mut keyword_map: std::collections::HashMap<String, (SearchResult, f32)> = std::collections::HashMap::new();
+    let mut keyword_map: std::collections::HashMap<String, (SearchResult, f32)> =
+        std::collections::HashMap::new();
     for r in &keyword_results {
         keyword_map.insert(r.chunk_id.clone(), (r.clone(), r.score));
     }
@@ -579,8 +653,8 @@ pub async fn hybrid_search_with_details(
     for id in &all_ids {
         let v_score = vector_map.get(id).map(|(_, s)| *s);
         let k_score = keyword_map.get(id).map(|(_, s)| *s);
-        let weighted = v_score.unwrap_or(0.0) * vector_weight
-            + k_score.unwrap_or(0.0) * keyword_weight;
+        let weighted =
+            v_score.unwrap_or(0.0) * vector_weight + k_score.unwrap_or(0.0) * keyword_weight;
         scored.push((id.clone(), weighted, v_score, k_score));
     }
 
@@ -592,7 +666,9 @@ pub async fn hybrid_search_with_details(
     let mut results = Vec::with_capacity(scored.len());
     for (id, final_score, v_score, k_score) in scored {
         // Prefer vector result (has embedding metadata), fallback to keyword result
-        let base = vector_map.get(&id).map(|(r, _)| r.clone())
+        let base = vector_map
+            .get(&id)
+            .map(|(r, _)| r.clone())
             .or_else(|| keyword_map.get(&id).map(|(r, _)| r.clone()));
         if let Some(mut r) = base {
             r.score = final_score;

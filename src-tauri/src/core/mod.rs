@@ -1,2 +1,8 @@
+pub mod attempt;
+pub mod channel_identity;
 pub mod dispatcher;
+pub mod feature_flags;
+pub mod plan_executor;
 pub mod proxy;
+pub mod route_plan;
+pub mod stream_supervisor;

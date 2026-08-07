@@ -12,6 +12,15 @@ export interface Channel {
   config: Record<string, unknown>;
   model_mapping: Record<string, string | string[]>;
   timeout_secs: number;
+  // --- T02 normalized protocol identity (output DTO always returns these) ---
+  protocol: "openai" | "anthropic" | "ollama" | string;
+  provider: string;
+  native_base_url: string;
+  native_endpoints: string[];
+  identity_revision: number;
+  preset_revision?: string | null;
+  legacy_executor_override?: string | null;
+  executor_kind: string;
   created_at: string;
   updated_at: string;
   last_test_at: string | null;
@@ -29,6 +38,19 @@ export interface CreateChannelInput {
   config?: Record<string, unknown>;
   model_mapping?: Record<string, string | string[]>;
   timeout_secs?: number;
+  // --- T02 optional new identity fields (missing => legacy inference) ---
+  protocol?: "openai" | "anthropic" | "ollama" | string;
+  provider?: string;
+  native_base_url?: string;
+  native_endpoints?: string[];
+  preset_revision?: string;
+  legacy_executor_override?: string;
+  // --- T07 draft-test receipt. Backend validates these against the current
+  // draft when present; force_save saves despite failed/skipped tests as long
+  // as the same draft was tested at least once. ---
+  test_run_id?: string;
+  draft_fingerprint?: string;
+  force_save?: boolean;
 }
 
 export interface UpdateChannelInput {
@@ -44,6 +66,20 @@ export interface UpdateChannelInput {
   config?: Record<string, unknown>;
   model_mapping?: Record<string, string | string[]>;
   timeout_secs?: number;
+  // --- T02 optional new identity fields. None = keep; explicit empty
+  // native_endpoints is rejected by the backend. ---
+  protocol?: "openai" | "anthropic" | "ollama" | string;
+  provider?: string;
+  native_base_url?: string;
+  native_endpoints?: string[];
+  preset_revision?: string;
+  legacy_executor_override?: string;
+  /** Distinguish "edit leave-blank = keep key" from explicit clear (Ollama). */
+  clear_api_key?: boolean;
+  // --- T07 draft-test receipt (see CreateChannelInput). ---
+  test_run_id?: string;
+  draft_fingerprint?: string;
+  force_save?: boolean;
 }
 
 export interface TestChannelResult {
@@ -114,6 +150,18 @@ export interface RequestLog {
   sanitized: boolean;
   blocked_reason: string | null;
   trace_id: string | null;
+  // --- T09 observability fields (nullable; legacy rows are null) ---
+  downstream_protocol: string | null;
+  downstream_endpoint: string | null;
+  route_group: string | null;
+  upstream_protocol: string | null;
+  upstream_endpoint: string | null;
+  provider: string | null;
+  codec_version: string | null;
+  failure_class: string | null;
+  identity_revision: number | null;
+  client_cancelled: boolean | null;
+  stream_committed: boolean | null;
 }
 
 export interface SecurityFinding {
@@ -228,4 +276,151 @@ export interface ChannelTypeInfo {
   category: string;
   default_base_url: string;
   models: string[];
+}
+
+// ── Provider preset DTO（T01，与 src-tauri/src/channel_presets.rs 保持一致）──
+// 序列化字符串必须与 Rust 枚举的 serde 输出完全一致。
+
+export type ChannelProtocol = "openai" | "anthropic" | "ollama";
+
+export type ChannelProvider =
+  | "openai"
+  | "google"
+  | "deepseek"
+  | "qwen"
+  | "zhipu"
+  | "doubao"
+  | "doubao_coding_plan"
+  | "moonshot"
+  | "anthropic"
+  | "ollama"
+  | "custom";
+
+export type ChannelEndpoint =
+  | "chat_completions"
+  | "responses"
+  | "messages"
+  | "count_tokens"
+  | "embeddings"
+  | "api_chat";
+
+export type ChannelAuthScheme =
+  | "bearer"
+  | "x_api_key"
+  | "query_key"
+  | "optional_bearer";
+
+export type ChannelRegionGroup =
+  | "custom"
+  | "international"
+  | "domestic"
+  | "local";
+
+export type ChannelModelEnumStrategy = "static_only" | "static_plus_sync" | "sync_only";
+
+export type ChannelEndpointTestStrategy = "probe_first_model" | "list_models";
+
+export interface ChannelModelSuggestion {
+  id: string;
+  verified_at: string;
+  source_url: string;
+}
+
+/** 渠道提供商模板（T01）。URL/模型/能力唯一真相在后端 registry。 */
+export interface ChannelPreset {
+  id: string;
+  protocol: ChannelProtocol;
+  provider: ChannelProvider;
+  display_name: string;
+  region: ChannelRegionGroup;
+  description: string;
+  icon_key: string;
+  native_base_url: string;
+  legacy_base_url: string;
+  legacy_type: string;
+  native_endpoints: ChannelEndpoint[];
+  default_checked_endpoints: ChannelEndpoint[];
+  auth_scheme: ChannelAuthScheme;
+  model_suggestions: ChannelModelSuggestion[];
+  model_enum_strategy: ChannelModelEnumStrategy;
+  endpoint_test_strategy: ChannelEndpointTestStrategy;
+  preset_revision: string;
+}
+
+/** 每个协议一组；`presets[0]` 恒为固定 custom option。 */
+export interface ChannelProtocolPresetGroup {
+  protocol: ChannelProtocol;
+  presets: ChannelPreset[];
+}
+
+// ── 草稿连通性测试（T07）─────────────────────────────────────────────────────
+// 字段名与设计 5.2 及 T07 API 契约逐字一致，不得改名。
+
+export type DraftEndpointTestStatus = "passed" | "failed" | "skipped";
+
+export type DraftEndpointTestFailureCategory =
+  | "network"
+  | "timeout"
+  | "authentication"
+  | "endpoint_unsupported"
+  | "model"
+  | "request"
+  | "protocol"
+  | "unknown";
+
+export interface DraftEndpointTestResult {
+  endpoint: ChannelEndpoint;
+  status: DraftEndpointTestStatus;
+  category?: DraftEndpointTestFailureCategory;
+  /** 已脱敏 message（绝不包含 API Key 或完整请求体）。 */
+  message: string;
+  latency_ms: number;
+  /** 本次测试实际探测的模型。 */
+  tested_model: string | null;
+  /** 该端点的验证是否可能产生极少上游费用。 */
+  cost_possible: boolean;
+}
+
+export interface DraftChannelTestResult {
+  /** 覆盖 protocol/provider/规范 URL/模型/端点/timeout/Key 的后端不可逆指纹。 */
+  draft_fingerprint: string;
+  tested_at: string;
+  test_run_id: string;
+  results: DraftEndpointTestResult[];
+}
+
+/** `test_channel_draft` 的输入：完整未保存草稿（T07 API 契约）。 */
+export interface DraftChannelTestInput {
+  /** 编辑场景提供已保存渠道 id，供后端在 API Key 留空时读取现有 Key（T07）。 */
+  id?: string;
+  name: string;
+  type: string;
+  base_url: string;
+  api_key: string;
+  /** 显式清除已保存 Key（T02）：为 true 时后端把留空的 Key 解析为空串，而非沿用已存 Key。 */
+  clear_api_key?: boolean;
+  models: string[];
+  priority?: number;
+  weight?: number;
+  config?: Record<string, unknown>;
+  model_mapping?: Record<string, string | string[]>;
+  timeout_secs?: number;
+  protocol?: ChannelProtocol | string;
+  provider?: ChannelProvider | string;
+  native_base_url?: string;
+  native_endpoints?: ChannelEndpoint[];
+  preset_revision?: string;
+  legacy_executor_override?: string;
+}
+
+// ── 上游模型同步（T14）─────────────────────────────────────────────────────────
+// `sync_upstream_models` 命令的输出：绝不写库，仅返回拉取结果供弹窗勾选合并。
+
+export interface UpstreamModelsResult {
+  /** 上游返回的模型 ID 列表（openai `data[].id` / ollama `models[].name`）。 */
+  models: string[];
+  /** 判定出的上游协议：`openai` / `anthropic` / `ollama`。 */
+  protocol: ChannelProtocol | string;
+  /** 拉取时使用的根 URL（便于展示/排障）。 */
+  base_url: string;
 }

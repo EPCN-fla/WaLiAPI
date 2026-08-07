@@ -41,16 +41,36 @@ pub struct Settings {
     pub security_block_on_critical: bool,
 }
 
-fn default_port() -> u16 { 8777 }
-fn default_host() -> String { "127.0.0.1".to_string() }
-fn default_theme() -> String { "dark".to_string() }
-fn default_language() -> String { "zh-CN".to_string() }
-fn default_true() -> bool { true }
-fn default_false() -> bool { false }
-fn default_retry_enabled() -> bool { true }
-fn default_retry_times() -> i32 { 2 }
-fn default_security_enabled() -> bool { true }
-fn default_security_mode() -> String { "audit".to_string() }
+fn default_port() -> u16 {
+    8777
+}
+fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_theme() -> String {
+    "dark".to_string()
+}
+fn default_language() -> String {
+    "zh-CN".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_false() -> bool {
+    false
+}
+fn default_retry_enabled() -> bool {
+    true
+}
+fn default_retry_times() -> i32 {
+    2
+}
+fn default_security_enabled() -> bool {
+    true
+}
+fn default_security_mode() -> String {
+    "audit".to_string()
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -77,7 +97,8 @@ impl Default for Settings {
 }
 
 fn get_str(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str, default: &str) -> String {
-    store.get(key)
+    store
+        .get(key)
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| default.to_string())
 }
@@ -88,6 +109,30 @@ fn get_u64(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str, default: u6
 
 fn get_bool(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str, default: bool) -> bool {
     store.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
+/// Feature-flag snapshot exposed to the UI (T00 decision 9 / T10 rollout).
+///
+/// The frontend uses these to disable/hide protocol tabs whose backend path is
+/// not yet enabled (e.g. Ollama when `ollama_native` is OFF) so a user never
+/// creates a channel that 503s at runtime.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FeatureFlagsDto {
+    pub new_routeplan: bool,
+    pub cross_protocol_codec: bool,
+    pub native_responses: bool,
+    pub ollama_native: bool,
+}
+
+#[tauri::command]
+pub fn get_feature_flags(app: AppHandle) -> Result<FeatureFlagsDto, String> {
+    let f = crate::core::feature_flags::read_feature_flags(&app);
+    Ok(FeatureFlagsDto {
+        new_routeplan: f.new_routeplan,
+        cross_protocol_codec: f.cross_protocol_codec,
+        native_responses: f.native_responses,
+        ollama_native: f.ollama_native,
+    })
 }
 
 #[tauri::command]
@@ -134,7 +179,10 @@ pub async fn save_settings(settings: Settings, app: AppHandle) -> Result<(), Str
     store.set("security.scan_network", settings.security_scan_network);
     store.set("security.scan_response", settings.security_scan_response);
     store.set("security.redact_secrets", settings.security_redact_secrets);
-    store.set("security.block_on_critical", settings.security_block_on_critical);
+    store.set(
+        "security.block_on_critical",
+        settings.security_block_on_critical,
+    );
     store.save().map_err(|e| e.to_string())?;
     Ok(())
 }

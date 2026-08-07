@@ -191,9 +191,15 @@ pub struct AskInput {
     pub search_mode: Option<String>,
 }
 
-fn default_top_k() -> usize { 5 }
-fn default_chat_model() -> String { "gpt-4o".to_string() }
-fn default_max_rounds() -> usize { 5 }
+fn default_top_k() -> usize {
+    5
+}
+fn default_chat_model() -> String {
+    "gpt-4o".to_string()
+}
+fn default_max_rounds() -> usize {
+    5
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct KbSource {

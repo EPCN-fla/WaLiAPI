@@ -7,8 +7,8 @@
 //! Zero external dependencies beyond `bincode` (already in Cargo.toml).
 
 use bincode::{deserialize, serialize};
-use std::collections::{BinaryHeap, HashSet};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashSet};
 use std::path::Path;
 
 /// A node in the HNSW graph.
@@ -130,7 +130,9 @@ impl HnswIndex {
             let query = &self.nodes[i].vector;
             let mut dists: Vec<(f32, usize)> = Vec::with_capacity(n - 1);
             for j in 0..n {
-                if j == i { continue; }
+                if j == i {
+                    continue;
+                }
                 dists.push((cosine_distance(query, &self.nodes[j].vector), j));
             }
 
@@ -149,7 +151,9 @@ impl HnswIndex {
 
             // Add reverse edges
             for &neighbour_idx in &top_m {
-                if neighbour_idx == i { continue; }
+                if neighbour_idx == i {
+                    continue;
+                }
                 if neighbour_idx < self.nodes.len() {
                     let node = &mut self.nodes[neighbour_idx];
                     if !node.neighbours.contains(&i) && node.neighbours.len() < max_m {
@@ -171,7 +175,10 @@ impl HnswIndex {
 
         tracing::info!(
             "HNSW index built: {} nodes, dim {}, M={}, ef_search={}",
-            n, self.dim, self.max_m, self.ef_search
+            n,
+            self.dim,
+            self.max_m,
+            self.ef_search
         );
     }
 
@@ -228,12 +235,13 @@ impl HnswIndex {
         });
         visited.insert(start);
 
-        while let Some(SearchItem { distance: dist, id: curr }) = candidates.pop() {
+        while let Some(SearchItem {
+            distance: dist,
+            id: curr,
+        }) = candidates.pop()
+        {
             // Check if we should stop
-            let furthest_in_results = results
-                .peek()
-                .map(|r| r.distance)
-                .unwrap_or(f32::MAX);
+            let furthest_in_results = results.peek().map(|r| r.distance).unwrap_or(f32::MAX);
 
             if results.len() >= ef && dist > furthest_in_results {
                 break;
@@ -248,10 +256,7 @@ impl HnswIndex {
 
                 let neighbour_dist = cosine_distance(query, &self.nodes[neighbour_idx].vector);
 
-                let furthest = results
-                    .peek()
-                    .map(|r| r.distance)
-                    .unwrap_or(f32::MAX);
+                let furthest = results.peek().map(|r| r.distance).unwrap_or(f32::MAX);
 
                 if results.len() < ef || neighbour_dist < furthest {
                     candidates.push(SearchItem {
@@ -276,7 +281,9 @@ impl HnswIndex {
         // Sort results by distance (ascending)
         let mut sorted: Vec<SearchItem> = results.drain().collect();
         sorted.sort_by(|a, b| {
-            a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal)
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(Ordering::Equal)
         });
         sorted
     }
@@ -398,7 +405,12 @@ mod tests {
     fn test_serialization() {
         let mut index = HnswIndex::new(3, 8, 50, 20);
         let items: Vec<(String, Vec<f32>)> = (0..10)
-            .map(|i| (format!("chunk-{}", i), vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0]))
+            .map(|i| {
+                (
+                    format!("chunk-{}", i),
+                    vec![i as f32, (i as f32) * 2.0, (i as f32) * 3.0],
+                )
+            })
             .collect();
         index.build(&items);
 

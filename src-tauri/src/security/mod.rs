@@ -2,9 +2,11 @@ use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
-pub mod scanner;
+pub mod features;
+pub mod gate;
 pub mod redact;
 pub mod rules;
+pub mod scanner;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -41,7 +43,7 @@ impl RiskLevel {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SecurityAction {
     Allow,
@@ -138,16 +140,46 @@ pub fn get_security_settings(app: &AppHandle) -> SecuritySettings {
     };
 
     SecuritySettings {
-        enabled: store.get("security.enabled").and_then(|v| v.as_bool()).unwrap_or(defaults.enabled),
-        mode: store.get("security.mode").and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or(defaults.mode),
-        scan_request: store.get("security.scan_request").and_then(|v| v.as_bool()).unwrap_or(defaults.scan_request),
-        scan_response: store.get("security.scan_response").and_then(|v| v.as_bool()).unwrap_or(defaults.scan_response),
-        scan_unicode: store.get("security.scan_unicode").and_then(|v| v.as_bool()).unwrap_or(defaults.scan_unicode),
-        scan_tools: store.get("security.scan_tools").and_then(|v| v.as_bool()).unwrap_or(defaults.scan_tools),
-        scan_network: store.get("security.scan_network").and_then(|v| v.as_bool()).unwrap_or(defaults.scan_network),
-        redact_secrets: store.get("security.redact_secrets").and_then(|v| v.as_bool()).unwrap_or(defaults.redact_secrets),
-        block_on_critical: store.get("security.block_on_critical").and_then(|v| v.as_bool()).unwrap_or(defaults.block_on_critical),
-        max_scan_bytes: store.get("security.max_scan_bytes").and_then(|v| v.as_u64()).unwrap_or(defaults.max_scan_bytes as u64) as usize,
+        enabled: store
+            .get("security.enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.enabled),
+        mode: store
+            .get("security.mode")
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or(defaults.mode),
+        scan_request: store
+            .get("security.scan_request")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.scan_request),
+        scan_response: store
+            .get("security.scan_response")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.scan_response),
+        scan_unicode: store
+            .get("security.scan_unicode")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.scan_unicode),
+        scan_tools: store
+            .get("security.scan_tools")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.scan_tools),
+        scan_network: store
+            .get("security.scan_network")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.scan_network),
+        redact_secrets: store
+            .get("security.redact_secrets")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.redact_secrets),
+        block_on_critical: store
+            .get("security.block_on_critical")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.block_on_critical),
+        max_scan_bytes: store
+            .get("security.max_scan_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(defaults.max_scan_bytes as u64) as usize,
     }
 }
 
@@ -161,16 +193,32 @@ pub fn decide_action(result: &mut SecurityScanResult, settings: &SecuritySetting
     result.action = match mode {
         "off" | "audit" => SecurityAction::Allow,
         "warn" => {
-            if result.risk_level.rank() >= RiskLevel::Medium.rank() { SecurityAction::Warn } else { SecurityAction::Allow }
+            if result.risk_level.rank() >= RiskLevel::Medium.rank() {
+                SecurityAction::Warn
+            } else {
+                SecurityAction::Allow
+            }
         }
         "redact" => {
-            if result.risk_level.rank() >= RiskLevel::High.rank() { SecurityAction::Redact } else { SecurityAction::Allow }
+            if result.risk_level.rank() >= RiskLevel::High.rank() {
+                SecurityAction::Redact
+            } else {
+                SecurityAction::Allow
+            }
         }
         "confirm" => {
-            if result.risk_level.rank() >= RiskLevel::High.rank() { SecurityAction::Confirm } else { SecurityAction::Allow }
+            if result.risk_level.rank() >= RiskLevel::High.rank() {
+                SecurityAction::Confirm
+            } else {
+                SecurityAction::Allow
+            }
         }
         "block" => {
-            if result.risk_level.rank() >= RiskLevel::High.rank() { SecurityAction::Block } else { SecurityAction::Allow }
+            if result.risk_level.rank() >= RiskLevel::High.rank() {
+                SecurityAction::Block
+            } else {
+                SecurityAction::Allow
+            }
         }
         _ => SecurityAction::Allow,
     };
@@ -188,24 +236,72 @@ pub fn scan_request(body: &serde_json::Value, settings: &SecuritySettings) -> Se
     if !settings.enabled || !settings.scan_request {
         return SecurityScanResult::default();
     }
-    let mut result = scanner::scan_json(body, "request", settings);
+    let mut result =
+        scanner::scan_with_budget(body, "request", settings, &scanner::ScanBudget::default())
+            .unwrap_or_else(|err| {
+                // Over-budget must fail closed as a high-risk block, never clean.
+                let mut blocked = SecurityScanResult::default();
+                blocked.risk_level = RiskLevel::Critical;
+                blocked.risk_score = 100;
+                blocked.action = SecurityAction::Block;
+                blocked.blocked_reason = Some(blocked.summary.clone());
+                blocked.summary = match err {
+                    scanner::BudgetError::Exceeded(msg) => msg,
+                };
+                blocked.blocked_reason = Some(blocked.summary.clone());
+                blocked.findings.push(SecurityFinding {
+                    phase: "request".to_string(),
+                    category: "budget".to_string(),
+                    rule_id: "budget.scan_exceeded".to_string(),
+                    severity: RiskLevel::Critical,
+                    title: "安全扫描预算超限".to_string(),
+                    description: "整个请求的扫描预算被超过，请求被 fail-closed 拒绝。".to_string(),
+                    location: "$".to_string(),
+                    evidence_masked: "budget exceeded".to_string(),
+                });
+                blocked
+            });
     decide_action(&mut result, settings);
     result
 }
 
 /// Scan an upstream response for risks (sensitive info, tracking, etc.)
+/// Uses a response-side budget with a looser default (responses may be large).
 pub fn scan_response(body: &serde_json::Value, settings: &SecuritySettings) -> SecurityScanResult {
     if !settings.enabled || !settings.scan_response {
         return SecurityScanResult::default();
     }
-    let mut result = scanner::scan_json(body, "response", settings);
+    let budget = scanner::ScanBudget {
+        max_total_bytes: Some(64 * 1024 * 1024),
+        max_string_nodes: Some(100_000),
+        max_depth: Some(256),
+        max_elapsed: Some(std::time::Duration::from_millis(800)),
+        max_text_bytes_per_string: Some(64 * 1024),
+    };
+    let mut result =
+        scanner::scan_with_budget(body, "response", settings, &budget).unwrap_or_else(|err| {
+            match err {
+                scanner::BudgetError::Exceeded(msg) => {
+                    let mut blocked = SecurityScanResult::default();
+                    blocked.risk_level = RiskLevel::Critical;
+                    blocked.risk_score = 100;
+                    blocked.action = SecurityAction::Block;
+                    blocked.summary = msg;
+                    blocked.blocked_reason = Some(blocked.summary.clone());
+                    blocked
+                }
+            }
+        });
     decide_action(&mut result, settings);
     result
 }
 
 /// Redact sensitive data from the request body before forwarding upstream.
 /// Returns a new JSON value with secrets replaced.
-pub fn redact_request_body(body: &serde_json::Value, settings: &SecuritySettings) -> (serde_json::Value, bool) {
+pub fn redact_request_body(
+    body: &serde_json::Value,
+    settings: &SecuritySettings,
+) -> (serde_json::Value, bool) {
     if !settings.enabled || !settings.redact_secrets {
         return (body.clone(), false);
     }
