@@ -8,7 +8,7 @@ import type {
   UpstreamModelsResult,
 } from "../types";
 import {
-  PROTOCOL_LABELS, ENDPOINT_LABELS,
+  PROTOCOL_LABELS, ENDPOINT_LABELS, ENDPOINT_PATHS,
 } from "../lib/constants";
 import { X, Plus, Check, RefreshCw, KeyRound, Undo, Loader2 } from "lucide-react";
 import { MappingRow } from "./channel-form/MappingRow";
@@ -77,6 +77,13 @@ function deriveLegacyBaseUrl(protocol: ChannelProtocol, native: string): string 
   if (!root) return "";
   if (protocol === "openai") return root;
   return root.endsWith("/v1") ? root : `${root}/v1`;
+}
+
+/** Base URL（去尾斜杠）+ 端点路径（去首斜杠）→ 实际请求 URL；Base 为空返回空串。 */
+function joinUrl(base: string, path: string): string {
+  const root = base.trim().replace(/\/+$/, "");
+  if (!root) return "";
+  return `${root}/${path.replace(/^\/+/, "")}`;
 }
 
 interface FormState {
@@ -683,7 +690,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
                         className="h-4 w-4 accent-[#2f6fed]"
                       />
                       <span className="shrink-0 font-medium">{ENDPOINT_LABELS[ep]}</span>
-                      <span className="font-mono text-xs text-muted-foreground">{ep === "chat_completions" ? "/chat/completions" : "/responses"}</span>
+                      <span className="font-mono text-xs text-muted-foreground">{ENDPOINT_PATHS[ep]}</span>
                     </label>
                   ))}
                 </div>
@@ -693,10 +700,31 @@ export function ChannelForm({ editing, onClose, onSaved }: {
                     <label key={ep} className="flex cursor-default items-center gap-2 rounded-[14px] border border-border bg-background/40 px-3.5 py-2.5 text-[13px]">
                       <input type="checkbox" checked disabled className="h-4 w-4 accent-[#2f6fed]" />
                       <span className="shrink-0 font-semibold">{ENDPOINT_LABELS[ep]}</span>
-                      <span className="font-mono text-xs text-muted-foreground">{ep === "messages" ? "/messages" : "/api/chat"}</span>
+                      <span className="font-mono text-xs text-muted-foreground">{ENDPOINT_PATHS[ep]}</span>
                     </label>
                   ))}
                 </div>
+              )}
+            </div>
+
+            {/* 实际请求 URL 预览：Base URL + 端点路径，随输入实时派生 */}
+            <div className="mt-4">
+              <label className="mb-2 block text-sm font-medium">实际请求 URL</label>
+              {form.native_base_url.trim() === "" ? (
+                <div className="rounded-2xl border border-dashed border-border bg-background/40 px-3.5 py-2.5 text-xs text-muted-foreground">
+                  填写 Base URL 后显示各端点的实际请求地址
+                </div>
+              ) : (
+                <ul className="space-y-2">
+                  {form.native_endpoints.map(ep => (
+                    <li key={ep} className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 rounded-2xl border border-border bg-background/40 px-3.5 py-2.5">
+                      <span className="shrink-0 text-xs font-medium">{ENDPOINT_LABELS[ep]}</span>
+                      <code className="break-all font-mono text-xs text-muted-foreground">
+                        {joinUrl(form.native_base_url, ENDPOINT_PATHS[ep])}
+                      </code>
+                    </li>
+                  ))}
+                </ul>
               )}
             </div>
 
