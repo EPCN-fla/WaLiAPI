@@ -77,6 +77,18 @@ export const ENDPOINT_LABELS: Record<string, string> = {
   api_chat: "/api/chat",
 };
 
+// 端点 → 请求路径模板（与后端 endpoint_executor::endpoint_path 对齐；
+// Anthropic Base 自带 /v1，故 messages/count_tokens 只补 /messages）。实际请求
+// URL = native_base_url 去尾斜杠 + 本路径去首斜杠（见 ChannelForm.joinUrl）。
+export const ENDPOINT_PATHS: Record<string, string> = {
+  chat_completions: "/chat/completions",
+  responses: "/responses",
+  messages: "/messages",
+  count_tokens: "/messages/count_tokens",
+  embeddings: "/embeddings",
+  api_chat: "/api/chat",
+};
+
 export function getChannelProviderLabel(provider: string): string {
   return CHANNEL_PROVIDER_LABELS[provider] || "自定义";
 }
