@@ -892,6 +892,12 @@ pub async fn run_draft_test(
         // Legacy Gemini has no native endpoint list; probe the override executor.
         endpoints.push("chat_completions".to_string());
     }
+    // count_tokens 是 T06 legacy 推断附加的计费/规划能力端点（对 legacy claude
+    // 注入 ["messages","count_tokens"]），不是连通性端点：探测 /messages 已足以
+    // 证明网关可达，故保存前草稿测试绝不请求 /messages/count_tokens。指纹（下方
+    // compute_draft_fingerprint）仍覆盖完整端点集，因此测试与保存两侧指纹一致，
+    // 保存时 receipt 校验不会被误判为「草稿已改变」。
+    endpoints.retain(|ep| ep != "count_tokens");
 
     // OpenAI local rejection (T07): at least one of Chat / Responses must be
     // selected, otherwise reject WITHOUT testing.  The check honors the draft's
@@ -1266,6 +1272,51 @@ mod channel_draft_test {
             .headers
             .iter()
             .any(|(k, v)| k == "anthropic-version" && v == "2023-06-01"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_draft_skips_count_tokens_probe() {
+        // count_tokens 是 T06 legacy 推断附加的能力端点，不是连通性端点：
+        // 保存前草稿测试只探测 /messages，绝不请求 /messages/count_tokens；
+        // 指纹仍覆盖完整端点集（messages + count_tokens），保证保存时
+        // receipt 校验（test/save 两侧指纹一致）通过。
+        let mock = start_mock(|_path: &str| {
+            let body = anthropic_messages_success();
+            Box::pin(async move { (200, body) })
+        })
+        .await;
+        let base = format!("http://{}/v1", mock.addr);
+        let input = draft(
+            "anthropic",
+            "custom",
+            &base,
+            &["messages", "count_tokens"],
+            &["claude-sonnet-4-6"],
+            "sk-ant-xyz",
+        );
+        let result = run_draft_test(&input, "sk-ant-xyz", &store(), &cfg())
+            .await
+            .unwrap();
+        assert_eq!(
+            result.results.len(),
+            1,
+            "count_tokens 必须被排除出探测列表"
+        );
+        assert_eq!(result.results[0].endpoint, "messages");
+        let captured = mock.captured().await;
+        assert_eq!(captured.len(), 1, "count_tokens must not be probed");
+        assert_eq!(captured[0].path_and_query, "/v1/messages");
+        // 指纹仍覆盖完整端点集（含 count_tokens），与保存路径一致。
+        let full = compute_draft_fingerprint(
+            "anthropic",
+            "custom",
+            base.trim_end_matches('/'),
+            &["messages".to_string(), "count_tokens".to_string()],
+            &["claude-sonnet-4-6".to_string()],
+            30,
+            "sk-ant-xyz",
+        );
+        assert_eq!(result.draft_fingerprint, full);
     }
 
     #[tokio::test]
