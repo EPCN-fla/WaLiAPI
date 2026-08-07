@@ -707,21 +707,18 @@ export function ChannelForm({ editing, onClose, onSaved }: {
               )}
             </div>
 
-            {/* 实际请求 URL 预览：Base URL + 端点路径，随输入实时派生 */}
+            {/* 实际请求 URL 预览：Base URL + 端点路径，随输入实时派生。纯文本靠左；
+                count_tokens 不在表单展示（T06 legacy 推断的能力保留，仅 UI 隐藏）。 */}
             <div className="mt-4">
               <label className="mb-2 block text-sm font-medium">实际请求 URL</label>
               {form.native_base_url.trim() === "" ? (
-                <div className="rounded-2xl border border-dashed border-border bg-background/40 px-3.5 py-2.5 text-xs text-muted-foreground">
-                  填写 Base URL 后显示各端点的实际请求地址
-                </div>
+                <p className="text-xs text-muted-foreground">填写 Base URL 后显示各端点的实际请求地址</p>
               ) : (
-                <ul className="space-y-2">
-                  {form.native_endpoints.map(ep => (
-                    <li key={ep} className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 rounded-2xl border border-border bg-background/40 px-3.5 py-2.5">
-                      <span className="shrink-0 text-xs font-medium">{ENDPOINT_LABELS[ep]}</span>
-                      <code className="break-all font-mono text-xs text-muted-foreground">
-                        {joinUrl(form.native_base_url, ENDPOINT_PATHS[ep])}
-                      </code>
+                <ul className="space-y-1.5 text-xs text-muted-foreground">
+                  {form.native_endpoints.filter(ep => ep !== "count_tokens").map(ep => (
+                    <li key={ep} className="text-left">
+                      <span className="font-medium text-foreground">{ENDPOINT_LABELS[ep]}</span>{" "}
+                      <code className="break-all font-mono">{joinUrl(form.native_base_url, ENDPOINT_PATHS[ep])}</code>
                     </li>
                   ))}
                 </ul>
