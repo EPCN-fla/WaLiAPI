@@ -715,37 +715,44 @@ async fn handle_stream(
                             Ok(bytes) => {
                                 // Normalize the chunk through the bridge, then
                                 // accumulate usage/content and relay the records.
-                                if let Ok(text) = std::str::from_utf8(&bytes) {
-                                    match sse_bridge.push(text) {
-                                        Ok(records) => {
-                                            for record in records {
-                                                accumulate_openai_chat_record(
-                                                    &record,
-                                                    &mut usage_prompt,
-                                                    &mut usage_completion,
-                                                    &mut usage_total,
-                                                    &mut accumulated_content,
-                                                    &mut accumulated_reasoning,
-                                                    &mut response_role,
-                                                    &mut finish_reason,
-                                                    &mut tool_calls_map,
-                                                );
-                                                yield Ok::<_, std::io::Error>(record.into_bytes().into());
-                                            }
-                                        }
-                                        Err(e) => {
-                                            had_error = true;
-                                            let err_chunk = format!(
-                                                "data: {{\"error\":{{\"message\":\"Upstream conversion failed: {}\",\"type\":\"server_error\"}}}}\n\n",
-                                                e
+                                //
+                                // Feed RAW bytes, never `str::from_utf8`-gated:
+                                // a chunk boundary can split a multibyte UTF-8
+                                // codepoint (CJK text is 3 bytes/char), and such
+                                // a chunk previously fell into an else-branch
+                                // that yielded the raw Anthropic frame straight
+                                // to the OpenAI client (Opencode "Type validation
+                                // failed ... expected array for `choices`").  The
+                                // bridge buffers bytes and decodes only COMPLETE
+                                // records, so a mid-codepoint split is held and
+                                // reassembled across calls — never escaped raw.
+                                match sse_bridge.push(&bytes) {
+                                    Ok(records) => {
+                                        for record in records {
+                                            accumulate_openai_chat_record(
+                                                &record,
+                                                &mut usage_prompt,
+                                                &mut usage_completion,
+                                                &mut usage_total,
+                                                &mut accumulated_content,
+                                                &mut accumulated_reasoning,
+                                                &mut response_role,
+                                                &mut finish_reason,
+                                                &mut tool_calls_map,
                                             );
-                                            yield Ok::<_, std::io::Error>(err_chunk.into_bytes().into());
-                                            yield Ok::<_, std::io::Error>(b"data: [DONE]\n\n".to_vec().into());
-                                            break;
+                                            yield Ok::<_, std::io::Error>(bytes::Bytes::from(record.into_bytes()));
                                         }
                                     }
-                                } else {
-                                    yield Ok::<_, std::io::Error>(bytes);
+                                    Err(e) => {
+                                        had_error = true;
+                                        let err_chunk = format!(
+                                            "data: {{\"error\":{{\"message\":\"Upstream conversion failed: {}\",\"type\":\"server_error\"}}}}\n\n",
+                                            e
+                                        );
+                                        yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_chunk.into_bytes()));
+                                        yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
+                                        break;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -754,8 +761,8 @@ async fn handle_stream(
                                     "data: {{\"error\":{{\"message\":\"Stream connection interrupted: {}\",\"type\":\"server_error\"}}}}\n\n",
                                     e
                                 );
-                                yield Ok::<_, std::io::Error>(err_chunk.into_bytes().into());
-                                yield Ok::<_, std::io::Error>(b"data: [DONE]\n\n".to_vec().into());
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_chunk.into_bytes()));
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
                                 break;
                             }
                         }
@@ -779,7 +786,7 @@ async fn handle_stream(
                                         &mut finish_reason,
                                         &mut tool_calls_map,
                                     );
-                                    yield Ok::<_, std::io::Error>(record.into_bytes().into());
+                                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(record.into_bytes()));
                                 }
                             }
                             Err(e) => {
@@ -788,8 +795,8 @@ async fn handle_stream(
                                     "data: {{\"error\":{{\"message\":\"Upstream conversion failed: {}\",\"type\":\"server_error\"}}}}\n\n",
                                     e
                                 );
-                                yield Ok::<_, std::io::Error>(err_chunk.into_bytes().into());
-                                yield Ok::<_, std::io::Error>(b"data: [DONE]\n\n".to_vec().into());
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_chunk.into_bytes()));
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
                             }
                         }
                     }
@@ -2497,7 +2504,7 @@ async fn handle_responses_stream(
 
                     // Emit response.created event
                     let created = crate::protocol::responses::create_response_created_event(&model_clone, &response_id);
-                    yield Ok::<_, std::io::Error>(created.into_bytes().into());
+                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(created.into_bytes()));
 
                     let mut usage_prompt: i64 = 0;
                     let mut usage_completion: i64 = 0;
@@ -2514,12 +2521,18 @@ async fn handle_responses_stream(
                     while let Some(chunk_result) = upstream_stream.next().await {
                         match chunk_result {
                             Ok(bytes) => {
-                                if let Ok(text) = std::str::from_utf8(&bytes) {
-                                    // The bridge reassembles fragmented records AND, on
-                                    // Anthropic channels, converts Anthropic SSE → OpenAI
-                                    // SSE. The downstream pipeline below only ever sees
-                                    // complete OpenAI `data:` records.
-                                    match sse_bridge.push(text) {
+                                // The bridge reassembles fragmented records AND, on
+                                // Anthropic channels, converts Anthropic SSE → OpenAI
+                                // SSE. The downstream pipeline below only ever sees
+                                // complete OpenAI `data:` records.
+                                //
+                                // Feed RAW bytes, never `str::from_utf8`-gated: a
+                                // chunk boundary can split a multibyte UTF-8 codepoint,
+                                // and the old else-branch leaked the raw Anthropic
+                                // frame to the OpenAI client.  The bridge buffers bytes
+                                // and decodes only complete records, so a mid-codepoint
+                                // split is held and reassembled across calls.
+                                match sse_bridge.push(&bytes) {
                                         Ok(records) => {
                                             for record in records {
                                                 let events = process_openai_record_for_responses(
@@ -2534,7 +2547,7 @@ async fn handle_responses_stream(
                                                     &mut usage_total,
                                                 );
                                                 for event in events {
-                                                    yield Ok::<_, std::io::Error>(event.into_bytes().into());
+                                                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(event.into_bytes()));
                                                 }
                                             }
                                         }
@@ -2544,12 +2557,9 @@ async fn handle_responses_stream(
                                                 "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response_id\":\"{}\",\"error\":{{\"message\":\"Upstream conversion failed: {}\"}}}}\n\n",
                                                 response_id, e
                                             );
-                                            yield Ok::<_, std::io::Error>(err_event.into_bytes().into());
+                                            yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_event.into_bytes()));
                                             break;
                                         }
-                                    }
-                                } else {
-                                    yield Ok::<_, std::io::Error>(bytes);
                                 }
                             }
                             Err(e) => {
@@ -2558,7 +2568,7 @@ async fn handle_responses_stream(
                                     "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response_id\":\"{}\",\"error\":{{\"message\":\"Stream interrupted: {}\"}}}}\n\n",
                                     response_id, e
                                 );
-                                yield Ok::<_, std::io::Error>(err_event.into_bytes().into());
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_event.into_bytes()));
                                 break;
                             }
                         }
@@ -2586,7 +2596,7 @@ async fn handle_responses_stream(
                                     &mut usage_total,
                                 );
                                 for event in events {
-                                    yield Ok::<_, std::io::Error>(event.into_bytes().into());
+                                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(event.into_bytes()));
                                 }
                             }
                         }
@@ -2596,7 +2606,7 @@ async fn handle_responses_stream(
                                 "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response_id\":\"{}\",\"error\":{{\"message\":\"Upstream conversion failed: {}\"}}}}\n\n",
                                 response_id, e
                             );
-                            yield Ok::<_, std::io::Error>(err_event.into_bytes().into());
+                            yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_event.into_bytes()));
                         }
                     }
                     if !had_error {
@@ -2609,10 +2619,10 @@ async fn handle_responses_stream(
                             usage_completion,
                         );
                         for ev in synth_events {
-                            yield Ok::<_, std::io::Error>(ev.into_bytes().into());
+                            yield Ok::<_, std::io::Error>(bytes::Bytes::from(ev.into_bytes()));
                         }
                         // Emit [DONE] after response.completed
-                        yield Ok::<_, std::io::Error>(b"data: [DONE]\n\n".to_vec().into());
+                        yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
                     }
 
                     // Build response_choices for logging

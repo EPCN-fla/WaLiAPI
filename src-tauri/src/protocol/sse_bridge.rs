@@ -49,10 +49,16 @@ impl UpstreamSseBridge {
 
     /// Feed one upstream chunk; returns every complete OpenAI
     /// `data: {json}\n\n` record produced so far.
-    pub fn push(&mut self, chunk: &str) -> Result<Vec<String>, String> {
+    ///
+    /// Takes raw bytes, not `&str`: a TCP/HTTP chunk boundary can fall in the
+    /// middle of a UTF-8 codepoint (very common with 3-byte CJK text), so the
+    /// caller must not gate on `str::from_utf8`.  Both variants buffer bytes
+    /// internally and only decode COMPLETE records, so a mid-codepoint split is
+    /// reassembled across calls — never dropped and never escaped raw.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, String> {
         match self {
             Self::OpenAi(assembler) => Ok(assembler.push(chunk)),
-            Self::Anthropic(state) => state.feed(chunk.as_bytes()).map_err(|e| e.to_string()),
+            Self::Anthropic(state) => state.feed(chunk).map_err(|e| e.to_string()),
         }
     }
 
@@ -103,7 +109,7 @@ mod tests {
         let mut bridge = UpstreamSseBridge::for_upstream(true, "claude-3-5");
         let out = bridge
             .push(
-                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":5}}}\n\n",
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":5}}}\n\n",
             )
             .unwrap();
         // role frame first
@@ -114,7 +120,8 @@ mod tests {
 
         let out = bridge
             .push(
-                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你\"}}\n\n",
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你\"}}\n\n"
+                    .as_bytes(),
             )
             .unwrap();
         assert_eq!(out.len(), 1);
@@ -124,7 +131,7 @@ mod tests {
 
         let out = bridge
             .push(
-                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n\
+                b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n\
                  event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             )
             .unwrap();
@@ -145,12 +152,12 @@ mod tests {
         let mut bridge = UpstreamSseBridge::for_upstream(true, "claude-3-5");
         bridge
             .push(
-                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{}}}\n\n",
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{}}}\n\n",
             )
             .unwrap();
         bridge
             .push(
-                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n\
+                b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n\
                  event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             )
             .unwrap();
@@ -167,13 +174,13 @@ mod tests {
         let mut bridge = UpstreamSseBridge::for_upstream(true, "claude-3-5");
         bridge
             .push(
-                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":7}}}\n\n\
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":7}}}\n\n\
                  event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
             )
             .unwrap();
         bridge
             .push(
-                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n\
+                b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n\
                  event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             )
             .unwrap();
@@ -193,6 +200,50 @@ mod tests {
         assert_eq!(out[1], "data: [DONE]\n\n");
     }
 
+    /// Regression (Opencode "Type validation failed ... expected array for
+    /// `choices`" on a raw `content_block_delta` frame): a TCP/HTTP chunk that
+    /// ends in the middle of a UTF-8 codepoint (e.g. a 3-byte Chinese char in
+    /// `text`/`thinking`) makes `std::str::from_utf8` fail.  The OLD handler
+    /// treated that as "not valid UTF-8" and yielded the raw Anthropic record
+    /// straight to the OpenAI client.  The bridge must instead hold the partial
+    /// record in its byte buffer and convert it once the next chunk completes
+    /// the codepoint.
+    #[test]
+    fn anthropic_chunk_split_mid_codepoint_is_converted_not_leaked() {
+        let mut bridge = UpstreamSseBridge::for_upstream(true, "claude-3-5");
+        // A complete Anthropic text_delta record carrying a 2-char Chinese word.
+        // 现 = e7 8e b0, 状 = e7 8a b6 (3 bytes each).
+        let full = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"\xe7\x8e\xb0\xe7\x8a\xb6\"}}\n\n";
+        let cut = full
+            .windows(6)
+            .position(|w| w == b"\xe7\x8e\xb0\xe7\x8a\xb6")
+            .unwrap()
+            + 2; // split 2 bytes INTO 现
+        let (a, b) = full.split_at(cut);
+        // The trigger: this exact boundary is INVALID as a &str...
+        assert!(
+            std::str::from_utf8(a).is_err(),
+            "test setup: chunk a must end mid-codepoint so from_utf8 fails"
+        );
+        // ...yet the bridge must accept the bytes and buffer the record, NOT
+        // return a raw frame.
+        let out = bridge.push(a).unwrap();
+        assert!(
+            out.is_empty(),
+            "partial record must be held, never surfaced as a raw frame: {out:?}"
+        );
+        let out = bridge.push(b).unwrap();
+        assert_eq!(out.len(), 1, "completed record must convert: {out:?}");
+        let json: serde_json::Value =
+            serde_json::from_str(out[0].trim_start_matches("data:").trim()).unwrap();
+        assert_eq!(json["choices"][0]["delta"]["content"], "现状");
+        // Every emitted frame must carry `choices` (OpenAI-compat contract).
+        assert!(
+            json.get("choices").is_some(),
+            "converted frame must carry choices: {json}"
+        );
+    }
+
     #[test]
     fn anthropic_fragmented_records_are_reassembled() {
         let mut bridge = UpstreamSseBridge::for_upstream(true, "claude-3-5");
@@ -201,15 +252,15 @@ mod tests {
         let (a, b) = split_mid(
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{}}}\n\n",
         );
-        assert!(bridge.push(&a).unwrap().is_empty());
-        let out = bridge.push(&b).unwrap();
+        assert!(bridge.push(a.as_bytes()).unwrap().is_empty());
+        let out = bridge.push(b.as_bytes()).unwrap();
         assert_eq!(out.len(), 1);
 
         let (c, d) = split_mid(
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
         );
-        assert!(bridge.push(&c).unwrap().is_empty());
-        let out = bridge.push(&d).unwrap();
+        assert!(bridge.push(c.as_bytes()).unwrap().is_empty());
+        let out = bridge.push(d.as_bytes()).unwrap();
         assert_eq!(out.len(), 1);
         let delta = serde_json::from_str::<serde_json::Value>(out[0].trim_start_matches("data:").trim())
             .unwrap();
@@ -217,7 +268,7 @@ mod tests {
 
         bridge
             .push(
-                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n\
+                b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n\
                  event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             )
             .unwrap();
@@ -229,7 +280,7 @@ mod tests {
     fn openai_stream_passes_through_records_verbatim() {
         let mut bridge = UpstreamSseBridge::for_upstream(false, "");
         let record = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
-        let out = bridge.push(record).unwrap();
+        let out = bridge.push(record.as_bytes()).unwrap();
         assert_eq!(out, vec![record.to_string()]);
         assert!(bridge.finish().unwrap().is_empty());
     }
@@ -243,14 +294,14 @@ mod tests {
         let mut bridge = UpstreamSseBridge::for_upstream(true, "claude-3-5");
         let mut records = bridge
             .push(
-                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{}}}\n\n\
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{}}}\n\n\
                  event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
             )
             .unwrap();
         records.extend(
             bridge
                 .push(
-                    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n\
+                    b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n\
                      event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
                 )
                 .unwrap(),
@@ -307,13 +358,13 @@ mod tests {
         let mut bridge = UpstreamSseBridge::for_upstream(true, "claude-3-5");
         let mut records = bridge
             .push(
-                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":10}}}\n\n",
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":10}}}\n\n",
             )
             .unwrap();
         records.extend(
             bridge
                 .push(
-                    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"exec_command\"}}\n\n\
+                    b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"exec_command\"}}\n\n\
                      event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\\\"git sta\"}}\n\n",
                 )
                 .unwrap(),
@@ -321,7 +372,7 @@ mod tests {
         records.extend(
             bridge
                 .push(
-                    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"tus\\\"}\"}}\n\n\
+                    b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"tus\\\"}\"}}\n\n\
                      event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
                 )
                 .unwrap(),
@@ -329,7 +380,7 @@ mod tests {
         records.extend(
             bridge
                 .push(
-                    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}\n\n\
+                    b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}\n\n\
                      event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
                 )
                 .unwrap(),
