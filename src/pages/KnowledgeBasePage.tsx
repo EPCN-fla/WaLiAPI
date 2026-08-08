@@ -4187,7 +4187,7 @@ function useForceSimulation(graph: WikiGraphData | null) {
   // Initialize nodes when graph changes
   useEffect(() => {
     if (!graph || graph.nodes.length === 0) { nodesRef.current = []; return; }
-    const cx = 400, cy = 400;
+    const cx = 400, cy = 225;
     nodesRef.current = graph.nodes.map((n, i) => {
       const angle = (i / graph.nodes.length) * Math.PI * 2;
       return {
@@ -4195,8 +4195,8 @@ function useForceSimulation(graph: WikiGraphData | null) {
         label: n.label,
         node_type: n.node_type,
         link_count: n.link_count,
-        x: cx + Math.cos(angle) * 200 + (Math.random() - 0.5) * 20,
-        y: cy + Math.sin(angle) * 200 + (Math.random() - 0.5) * 20,
+        x: cx + Math.cos(angle) * 180 + (Math.random() - 0.5) * 20,
+        y: cy + Math.sin(angle) * 120 + (Math.random() - 0.5) * 20,
         vx: 0, vy: 0,
         fx: null, fy: null,
       };
@@ -4219,7 +4219,7 @@ function useForceSimulation(graph: WikiGraphData | null) {
   // Animation loop
   useEffect(() => {
     if (!graph || graph.nodes.length === 0) return;
-    const W = 800, H = 800;
+    const W = 800, H = 450;
     const repulsion = 1500; // Charge strength
     const linkDistance = 120;
     const linkStrength = 0.08;
@@ -4276,7 +4276,7 @@ function useForceSimulation(graph: WikiGraphData | null) {
       // Center gravity
       for (const n of ns) {
         n.vx += (400 - n.x) * centerForce * alpha;
-        n.vy += (400 - n.y) * centerForce * alpha;
+        n.vy += (225 - n.y) * centerForce * alpha;
       }
 
       // Apply velocity with damping and boundary
@@ -4426,9 +4426,9 @@ function WikiGraphTab({ project }: { project: WikiProject }) {
         </div>
         <svg
           ref={svgRef}
-          viewBox="0 0 800 800"
+          viewBox="0 0 800 450"
           className="w-full select-none"
-          style={{ aspectRatio: "1 / 1", width: "70%", margin: "0 auto", cursor: "default" }}
+          style={{ aspectRatio: "16 / 9", width: "100%", margin: "0 auto", cursor: "default" }}
         >
           <defs>
             {Object.entries(NODE_COLORS).map(([type, color]) => (
@@ -4455,8 +4455,8 @@ function WikiGraphTab({ project }: { project: WikiProject }) {
             const dx = t.x - s.x;
             const dy = t.y - s.y;
             const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-            const sRadius = 6 + (s.link_count / maxLinks) * 10;
-            const tRadius = 6 + (t.link_count / maxLinks) * 10;
+            const sRadius = 10 + (s.link_count / maxLinks) * 16;
+            const tRadius = 10 + (t.link_count / maxLinks) * 16;
             const x1 = s.x + (dx / dist) * sRadius;
             const y1 = s.y + (dy / dist) * sRadius;
             const x2 = t.x - (dx / dist) * (tRadius + 4);
@@ -4482,7 +4482,7 @@ function WikiGraphTab({ project }: { project: WikiProject }) {
           })}
           {/* Nodes */}
           {sim.nodes.map((node) => {
-            const radius = 6 + (node.link_count / maxLinks) * 10;
+            const radius = 10 + (node.link_count / maxLinks) * 16;
             const color = NODE_COLORS[node.node_type] || "#64748b";
             const highlighted = isHighlighted(node.id);
             const dimmed = (hoveredId || selectedNode) && !highlighted;
@@ -4522,7 +4522,7 @@ function WikiGraphTab({ project }: { project: WikiProject }) {
                     textAnchor="middle"
                     className={highlighted || isSelected ? "fill-slate-900" : "fill-slate-600"}
                     style={{
-                      fontSize: highlighted || isSelected ? "11px" : "9px",
+                      fontSize: highlighted || isSelected ? "14px" : "11px",
                       fontWeight: highlighted || isSelected ? 700 : 500,
                       pointerEvents: "none",
                       paintOrder: "stroke",
