@@ -398,21 +398,6 @@ export interface WikiSearchResult {
     page_type: string;
 }
 
-export interface WikiReview {
-    id: string;
-    project_id: string;
-    review_type: string;
-    title: string;
-    description: string | null;
-    source_path: string | null;
-    affected_pages: string;
-    search_queries: string;
-    options_json: string;
-    resolved: number;
-    created_at: string;
-    resolved_at: string | null;
-}
-
 export interface WikiGraphData {
     nodes: Array<{
         id: string;
@@ -457,7 +442,6 @@ export const wikiApi = {
     deleteSource: (sourceId: string) => invoke<void>("delete_wiki_source", { sourceId }),
     search: (projectId: string, query: string, topK?: number) => invoke<WikiSearchResult[]>("search_wiki", { projectId, query, topK }),
     getGraph: (projectId: string) => invoke<WikiGraphData>("get_wiki_graph", { projectId }),
-    getReviews: (projectId: string, resolved?: boolean) => invoke<WikiReview[]>("get_wiki_reviews", { projectId, resolved }),
     getStats: (projectId: string) => invoke<Record<string, unknown>>("get_wiki_stats", { projectId }),
     ingestSource: (projectId: string, sourceId: string) => invoke<{ status: string; pages_created: number; page_paths: string[] }>("ingest_wiki_source", { projectId, sourceId }),
     rescanSources: (projectId: string) => invoke<{ status: string; processed: number; results: unknown[] }>("rescan_wiki_sources", { projectId }),

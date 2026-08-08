@@ -113,22 +113,6 @@ pub struct WikiIngestTask {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct WikiReview {
-    pub id: String,
-    pub project_id: String,
-    pub review_type: String,
-    pub title: String,
-    pub description: Option<String>,
-    pub source_path: Option<String>,
-    pub affected_pages: String,
-    pub search_queries: String,
-    pub options_json: String,
-    pub resolved: i64,
-    pub created_at: String,
-    pub resolved_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct WikiSession {
     pub id: String,
     pub project_id: String,

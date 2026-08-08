@@ -43,20 +43,6 @@ pub fn create_router(_state: Arc<AppState>) -> Router<SharedState> {
         .route("/api/wiki/projects/{id}/graph",
             get(handlers::get_graph))
 
-        // ── Reviews ──
-        .route("/api/wiki/projects/{id}/reviews",
-            get(handlers::list_reviews))
-        .route("/api/wiki/projects/{id}/reviews/{rid}/resolve",
-            post(handlers::resolve_review))
-
-        // ── Lint ──
-        .route("/api/wiki/projects/{id}/lint",
-            post(handlers::run_lint))
-
-        // ── Deep Research ──
-        .route("/api/wiki/projects/{id}/deep-research",
-            post(handlers::deep_research))
-
         // ── Sessions ──
         .route("/api/wiki/projects/{id}/sessions",
             get(handlers::list_sessions).delete(handlers::clear_sessions))

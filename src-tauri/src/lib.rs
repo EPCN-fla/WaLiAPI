@@ -215,7 +215,6 @@ pub fn run() {
             commands::wiki::delete_wiki_source,
             commands::wiki::search_wiki,
             commands::wiki::get_wiki_graph,
-            commands::wiki::get_wiki_reviews,
             commands::wiki::get_wiki_stats,
             commands::wiki::ingest_wiki_source,
             commands::wiki::rescan_wiki_sources,

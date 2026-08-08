@@ -392,32 +392,6 @@ impl WikiRepository {
         .map_err(|e| format!("DB error: {}", e))
     }
 
-    // ── Reviews ──
-
-    pub async fn list_reviews(&self, project_id: &str, resolved: Option<bool>) -> Result<Vec<WikiReview>, String> {
-        let query = match resolved {
-            None => "SELECT * FROM wiki_reviews WHERE project_id = ? ORDER BY created_at DESC",
-            Some(false) => "SELECT * FROM wiki_reviews WHERE project_id = ? AND resolved = 0 ORDER BY created_at DESC",
-            Some(true) => "SELECT * FROM wiki_reviews WHERE project_id = ? AND resolved = 1 ORDER BY created_at DESC",
-        };
-        sqlx::query_as::<_, WikiReview>(query)
-            .bind(project_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| format!("DB error: {}", e))
-    }
-
-    pub async fn resolve_review(&self, review_id: &str) -> Result<(), String> {
-        let now = Self::now();
-        sqlx::query("UPDATE wiki_reviews SET resolved = 1, resolved_at = ? WHERE id = ?")
-            .bind(&now)
-            .bind(review_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
-        Ok(())
-    }
-
     // ── Sessions ──
 
     pub async fn list_sessions(&self, project_id: &str) -> Result<Vec<WikiSession>, String> {

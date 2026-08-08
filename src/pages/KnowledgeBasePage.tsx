@@ -20,7 +20,6 @@ import {
   type WikiSource,
   type WikiSearchResult,
   type WikiGraphData,
-  type WikiReview,
   type WikiTag,
   type ServiceStatus,
 } from "../lib/api";
@@ -3042,7 +3041,7 @@ function WikiSection() {
   const [loading, setLoading] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [wikiTab, setWikiTab] = useState<"overview" | "pages" | "sources" | "search" | "graph" | "reviews" | "settings">("overview");
+  const [wikiTab, setWikiTab] = useState<"overview" | "pages" | "sources" | "search" | "graph" | "settings">("overview");
 
   const fetchProjects = useCallback(async () => {
     setLoading(true);
@@ -3350,8 +3349,8 @@ function WikiProjectDetail({
   onRefresh,
 }: {
   project: WikiProject;
-  tab: "overview" | "pages" | "sources" | "search" | "graph" | "reviews" | "settings";
-  setTab: (t: "overview" | "pages" | "sources" | "search" | "graph" | "reviews" | "settings") => void;
+  tab: "overview" | "pages" | "sources" | "search" | "graph" | "settings";
+  setTab: (t: "overview" | "pages" | "sources" | "search" | "graph" | "settings") => void;
   onBack: () => void;
   onRefresh: () => void;
 }) {
@@ -3362,7 +3361,6 @@ function WikiProjectDetail({
     { key: "sources" as const, label: "源", icon: FolderOpen },
     { key: "search" as const, label: "搜索", icon: Search },
     { key: "graph" as const, label: "图谱", icon: Network },
-    { key: "reviews" as const, label: "审核", icon: AlertTriangle },
     { key: "settings" as const, label: "设置", icon: SettingsIcon },
   ];
 
@@ -3400,7 +3398,6 @@ function WikiProjectDetail({
       {tab === "sources" && <WikiSourcesTab project={project} onRefresh={onRefresh} onNavigateSettings={() => setTab("settings")} />}
       {tab === "search" && <WikiSearchTab project={project} initialQuery={initialSearchQuery} onInitialQueryConsumed={() => setInitialSearchQuery(null)} />}
       {tab === "graph" && <WikiGraphTab project={project} />}
-      {tab === "reviews" && <WikiReviewsTab project={project} />}
       {tab === "settings" && <WikiSettingsTab project={project} onRefresh={onRefresh} />}
     </div>
   );
@@ -3484,7 +3481,6 @@ function WikiOverview({ project, onTagClick }: { project: WikiProject; onTagClic
   const metrics = [
     { label: "页面数", value: stats?.pages ?? project.page_count, icon: FileText, color: "text-violet-600", tone: "bg-violet-50" },
     { label: "源资料", value: stats?.sources ?? project.source_count, icon: Layers, color: "text-blue-600", tone: "bg-blue-50" },
-    { label: "待审核", value: stats?.pending_reviews ?? "-", icon: AlertTriangle, color: "text-amber-600", tone: "bg-amber-50" },
     { label: "页面类型", value: "-", icon: Layers, color: "text-emerald-600", tone: "bg-emerald-50" },
   ];
 
@@ -4162,57 +4158,6 @@ function WikiGraphTab({ project }: { project: WikiProject }) {
           })}
         </div>
       </div>
-    </div>
-  );
-}
-
-function WikiReviewsTab({ project }: { project: WikiProject }) {
-  const [reviews, setReviews] = useState<WikiReview[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  const fetchReviews = useCallback(async () => {
-    setLoading(true);
-    try { const data = await wikiApi.getReviews(project.id, false); setReviews(data); }
-    catch { /* ignore */ } finally { setLoading(false); }
-  }, [project.id]);
-
-  useEffect(() => { fetchReviews(); }, [fetchReviews]);
-
-  if (loading) {
-    return <div className="surface empty-state"><Loader2 className="h-8 w-8 animate-spin text-slate-400" /></div>;
-  }
-
-  if (reviews.length === 0) {
-    return (
-      <div className="surface empty-state">
-        <CheckCircle2 className="h-10 w-10 text-emerald-300" />
-        <p className="text-sm text-slate-500">没有待审核项</p>
-        <p className="text-xs text-slate-400">摄入文档后 LLM 会自动检测矛盾、缺失和孤儿页面</p>
-      </div>
-    );
-  }
-
-  const typeIcons: Record<string, string> = {
-    contradiction: "⚠️", orphan: "🔗", missing_page: "📄", duplicate: "📋", stale: "⏰", suggestion: "💡",
-  };
-
-  return (
-    <div className="space-y-3">
-      {reviews.map(r => (
-        <div key={r.id} className="surface rounded-2xl p-4">
-          <div className="flex items-start gap-3">
-            <span className="text-lg">{typeIcons[r.review_type] || "❓"}</span>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <h4 className="text-sm font-semibold text-slate-900">{r.title}</h4>
-                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">{r.review_type}</span>
-              </div>
-              {r.description && <p className="mt-1 text-xs text-slate-500">{r.description}</p>}
-              {r.source_path && <code className="mt-1 block text-[11px] text-slate-400">{r.source_path}</code>}
-            </div>
-          </div>
-        </div>
-      ))}
     </div>
   );
 }

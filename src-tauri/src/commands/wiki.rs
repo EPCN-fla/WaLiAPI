@@ -237,19 +237,6 @@ pub async fn get_wiki_graph(
     repo.get_graph(&projectId).await
 }
 
-// ── Wiki Reviews ──
-
-#[tauri::command]
-pub async fn get_wiki_reviews(
-    state: State<'_, Arc<AppState>>,
-    projectId: String,
-    resolved: Option<bool>,
-) -> Result<Vec<WikiReview>, String> {
-    let pool = state.db.pool.clone();
-    let repo = crate::services::wiki::repository::WikiRepository::new(pool);
-    repo.list_reviews(&projectId, resolved).await
-}
-
 // ── Wiki Tags ──
 
 #[tauri::command]
