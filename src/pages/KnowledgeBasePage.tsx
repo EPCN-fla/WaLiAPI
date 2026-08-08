@@ -4428,7 +4428,7 @@ function WikiGraphTab({ project }: { project: WikiProject }) {
           ref={svgRef}
           viewBox="0 0 800 450"
           className="w-full select-none"
-          style={{ aspectRatio: "16 / 9", width: "100%", margin: "0 auto", cursor: "default" }}
+          style={{ width: "100%", height: "420px", margin: "0 auto", cursor: "default" }}
         >
           <defs>
             {Object.entries(NODE_COLORS).map(([type, color]) => (
