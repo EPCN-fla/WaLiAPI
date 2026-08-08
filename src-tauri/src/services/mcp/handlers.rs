@@ -1646,7 +1646,7 @@ async fn handle_tool_call(
             Ok(serde_json::json!({
                 "content": [{
                     "type": "text",
-                    "text": format!("# {}\n\n{}", path, content)
+                    "text": content
                 }],
                 "isError": false
             }))
@@ -1865,7 +1865,7 @@ async fn handle_tool_call(
             let wiki_dir = dir.to_string_lossy().to_string();
 
             let wiki_repo = WikiRepository::new(pool.clone());
-            let project = wiki_repo.create_project(&input, &wiki_dir).await
+            let project = wiki_repo.create_project_with_id(&project_id, &input, &wiki_dir).await
                 .map_err(|e| e.to_string())?;
 
             Ok(serde_json::json!({
@@ -1922,6 +1922,9 @@ async fn handle_tool_call(
 
             // Delete file from disk
             let _ = wiki_project::delete_page_file(project_id, path).await;
+
+            // Rebuild graph edges after page deletion
+            let _ = crate::services::wiki::ingest::rebuild_graph_edges(&pool, project_id).await;
 
             Ok(serde_json::json!({
                 "content": [{

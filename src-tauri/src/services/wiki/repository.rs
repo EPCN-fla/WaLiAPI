@@ -41,6 +41,10 @@ impl WikiRepository {
 
     pub async fn create_project(&self, input: &CreateProjectInput, wiki_dir: &str) -> Result<WikiProject, String> {
         let id = Self::uuid();
+        self.create_project_with_id(&id, input, wiki_dir).await
+    }
+
+    pub async fn create_project_with_id(&self, id: &str, input: &CreateProjectInput, wiki_dir: &str) -> Result<WikiProject, String> {
         let now = Self::now();
         let schema = input.schema_text.clone().unwrap_or_else(|| DEFAULT_SCHEMA.to_string());
 
@@ -238,6 +242,9 @@ impl WikiRepository {
                         let pos = content_lower.find(&query_lower).unwrap_or(0);
                         let start = if pos > 60 { pos - 60 } else { 0 };
                         let end = std::cmp::min(start + 200, content.len());
+                        // Align to char boundaries to avoid splitting multi-byte UTF-8 chars
+                        let start = content.floor_char_boundary(start);
+                        let end = content.ceil_char_boundary(end);
                         let snippet = format!("...{}...", &content[start..end].replace('\n', " "));
 
                         results.push(WikiSearchResult {

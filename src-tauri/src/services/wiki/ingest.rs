@@ -626,7 +626,7 @@ fn build_page_from_content(content: &str, source_filename: &str) -> Option<Gener
     })
 }
 
-fn extract_title_from_content(content: &str, fallback_path: &str) -> String {
+pub fn extract_title_from_content(content: &str, fallback_path: &str) -> String {
     // Try frontmatter title
     if content.starts_with("---") {
         let end = content[3..].find("---");
@@ -701,6 +701,55 @@ fn extract_wikilinks(content: &str) -> Vec<String> {
     links
 }
 
+/// Rebuild graph edges for a project based on current page wikilinks.
+/// Called after page save/delete to keep the knowledge graph up-to-date.
+pub async fn rebuild_graph_edges(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+) -> Result<(), String> {
+    // Load all pages from DB
+    let existing_pages: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT path, wikilinks, title FROM wiki_pages WHERE project_id = ? AND status = 'active'"
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
+
+    let mut all_links: Vec<(String, String)> = Vec::new();
+
+    for (path, wikilinks_json, _title) in &existing_pages {
+        let links: Vec<String> = serde_json::from_str(wikilinks_json).unwrap_or_default();
+        for link in links {
+            let target = resolve_wikilink_to_path(pool, project_id, &link).await;
+            // Check if target exists
+            if existing_pages.iter().any(|(p, _, _)| p == &target) {
+                all_links.push((path.clone(), target));
+            }
+        }
+    }
+
+    // Clear old edges and insert new ones
+    sqlx::query("DELETE FROM wiki_graph_edges WHERE project_id = ?")
+        .bind(project_id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("DB error: {}", e))?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    for (source, target) in all_links {
+        let id = uuid::Uuid::new_v4().to_string();
+        let _ = sqlx::query(
+            "INSERT OR IGNORE INTO wiki_graph_edges (id, project_id, source_page, target_page, edge_type, weight, created_at)
+             VALUES (?, ?, ?, ?, 'wikilink', 1.0, ?)"
+        )
+        .bind(&id).bind(project_id).bind(&source).bind(&target).bind(&now)
+        .execute(pool).await;
+    }
+
+    Ok(())
+}
+
 /// Update graph_edges table based on wikilinks in pages.
 async fn update_graph_edges(
     pool: &sqlx::SqlitePool,
@@ -724,8 +773,8 @@ async fn update_graph_edges(
     // From new pages
     for page in pages {
         for link in &page.wikilinks {
-            // Normalize link to path
-            let target = normalize_wikilink(link);
+            // Resolve wikilink to actual page path via title matching
+            let target = resolve_wikilink_to_path(pool, project_id, link).await;
             if valid_paths.contains(&target) || existing_pages.iter().any(|(p, _)| p == &target) {
                 all_links.push((page.path.clone(), target));
             }
@@ -736,7 +785,7 @@ async fn update_graph_edges(
     for (path, wikilinks_json) in &existing_pages {
         let links: Vec<String> = serde_json::from_str(wikilinks_json).unwrap_or_default();
         for link in links {
-            let target = normalize_wikilink(&link);
+            let target = resolve_wikilink_to_path(pool, project_id, &link).await;
             // Check if target exists (in new pages or existing)
             if valid_paths.contains(&target) || existing_pages.iter().any(|(p, _)| p == &target) {
                 all_links.push((path.clone(), target));
@@ -810,4 +859,34 @@ fn normalize_wikilink(link: &str) -> String {
         .collect();
     let slug = slug.trim_matches('-');
     format!("entities/{}.md", slug)
+}
+
+/// Resolve a wikilink to an actual page path by matching against known page titles.
+/// Falls back to `normalize_wikilink` if no title match is found.
+async fn resolve_wikilink_to_path(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    link: &str,
+) -> String {
+    let link = link.trim();
+    // If it already looks like a path, use as-is
+    if link.contains('/') && link.ends_with(".md") {
+        return link.to_string();
+    }
+    // Try exact title match (case-insensitive)
+    let pattern = format!("%{}%", link);
+    let title_match: Option<(String,)> = sqlx::query_as(
+        "SELECT path FROM wiki_pages WHERE project_id = ? AND status = 'active' AND LOWER(title) = LOWER(?) LIMIT 1"
+    )
+    .bind(project_id)
+    .bind(link)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    if let Some((path,)) = title_match {
+        return path;
+    }
+    // Fallback to slug-based normalization
+    normalize_wikilink(link)
 }

@@ -323,8 +323,7 @@ pub async fn update_page_inner(
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     let hash = format!("{:x}", hasher.finalize());
-    let title = path.split('/').last().unwrap_or(path)
-        .trim_end_matches(".md").to_string();
+    let title = ingest::extract_title_from_content(content, path);
     let page_type = if path.contains("entities/") { "entity" }
         else if path.contains("concepts/") { "concept" }
         else if path.contains("summaries/") { "summary" }
@@ -344,6 +343,9 @@ pub async fn update_page_inner(
 
     repo.upsert_page(id, path, &title, page_type, &hash, token_count, &wikilinks_json, "{}", &tags_json).await?;
 
+    // Rebuild knowledge graph edges based on updated wikilinks
+    let _ = ingest::rebuild_graph_edges(pool, id).await;
+
     // Append log
     let _ = project::append_log(id, &format!("update | {}", path)).await;
 
@@ -359,6 +361,8 @@ pub async fn delete_page(
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
     let _ = project::delete_page_file(&id, &path).await;
+    // Rebuild graph edges after page deletion
+    let _ = ingest::rebuild_graph_edges(&shared.state.db.pool, &id).await;
     (StatusCode::NO_CONTENT, "").into_response()
 }
 

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { useLocation } from "react-router-dom";
 import {
   KnowledgeBase,
@@ -24,6 +24,11 @@ import {
   type ServiceStatus,
 } from "../lib/api";
 import type { Channel } from "../types";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeRaw from "rehype-raw";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import {
   BookOpen,
   Plus,
@@ -3035,6 +3040,88 @@ function fileToBase64(file: File): Promise<string> {
 
 // ─── Wiki Section ─────────────────────────────────────────────────────
 
+// Strip YAML frontmatter from markdown content before rendering
+function stripFrontmatter(content: string): string {
+  if (content.startsWith("---\n")) {
+    const end = content.indexOf("\n---\n", 4);
+    if (end !== -1) return content.slice(end + 5);
+  }
+  return content;
+}
+
+// Reusable Markdown renderer for Wiki pages
+function WikiMarkdown({ content }: { content: string }) {
+  const body = stripFrontmatter(content);
+  return (
+    <div className="wiki-markdown">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeRaw]}
+        components={{
+          code({ className, children, ...props }) {
+            const match = /language-(\w+)/.exec(className || "");
+            const codeStr = String(children).replace(/\n$/, "");
+            if (match) {
+              return (
+                <SyntaxHighlighter
+                  language={match[1]}
+                  style={oneDark}
+                  customStyle={{ margin: 0, borderRadius: "0.75rem", fontSize: "0.75rem", lineHeight: "1.6rem" }}
+                  wrapLongLines={false}
+                >
+                  {codeStr}
+                </SyntaxHighlighter>
+              );
+            }
+            return <code className="rounded bg-slate-100 px-1.5 py-0.5 text-[0.85em] text-pink-600" {...props}>{children}</code>;
+          },
+          img({ src, alt, ...props }) {
+            return <img src={src as string} alt={alt || ""} loading="lazy" className="my-3 max-w-full rounded-xl border border-slate-100" {...props} />;
+          },
+          a({ href, children, ...props }) {
+            return <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline decoration-blue-200 underline-offset-2 hover:decoration-blue-500" {...props}>{children}</a>;
+          },
+          table({ children, ...props }) {
+            return <div className="my-3 overflow-x-auto rounded-xl border border-slate-100"><table className="w-full text-sm" {...props}>{children}</table></div>;
+          },
+          th({ children, ...props }) {
+            return <th className="border-b border-slate-100 bg-slate-50 px-3 py-2 text-left font-semibold text-slate-700" {...props}>{children}</th>;
+          },
+          td({ children, ...props }) {
+            return <td className="border-b border-slate-50 px-3 py-2 text-slate-600" {...props}>{children}</td>;
+          },
+          blockquote({ children, ...props }) {
+            return <blockquote className="my-3 border-l-3 border-blue-200 bg-blue-50/40 py-2 pl-4 text-slate-600" {...props}>{children}</blockquote>;
+          },
+          h1({ children, ...props }) {
+            return <h1 className="mb-3 mt-5 text-xl font-bold text-slate-900" {...props}>{children}</h1>;
+          },
+          h2({ children, ...props }) {
+            return <h2 className="mb-2 mt-4 text-lg font-bold text-slate-900" {...props}>{children}</h2>;
+          },
+          h3({ children, ...props }) {
+            return <h3 className="mb-2 mt-3 text-base font-semibold text-slate-800" {...props}>{children}</h3>;
+          },
+          p({ children, ...props }) {
+            return <p className="my-2 text-sm leading-6 text-slate-700" {...props}>{children}</p>;
+          },
+          ul({ children, ...props }) {
+            return <ul className="my-2 ml-5 list-disc space-y-1 text-sm text-slate-700" {...props}>{children}</ul>;
+          },
+          ol({ children, ...props }) {
+            return <ol className="my-2 ml-5 list-decimal space-y-1 text-sm text-slate-700" {...props}>{children}</ol>;
+          },
+          hr({ ...props }) {
+            return <hr className="my-4 border-slate-100" {...props} />;
+          },
+        }}
+      >
+        {body}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function WikiSection() {
   const [projects, setProjects] = useState<WikiProject[]>([]);
   const [selectedProject, setSelectedProject] = useState<WikiProject | null>(null);
@@ -3626,7 +3713,7 @@ function WikiPagesTab({ project }: { project: WikiProject }) {
           />
         ) : (
           <div className="surface rounded-2xl p-6">
-            <pre className="whitespace-pre-wrap text-sm text-slate-800 leading-6">{pageContent}</pre>
+            <WikiMarkdown content={pageContent} />
           </div>
         )}
       </div>
@@ -4061,13 +4148,229 @@ function WikiSearchTab({ project, initialQuery, onInitialQueryConsumed }: { proj
   );
 }
 
+const NODE_COLORS: Record<string, string> = {
+  entity: "#3b82f6",
+  concept: "#8b5cf6",
+  summary: "#10b981",
+  index: "#f59e0b",
+  log: "#94a3b8",
+};
+
+const NODE_COLOR_BG: Record<string, string> = {
+  entity: "bg-blue-500",
+  concept: "bg-violet-500",
+  summary: "bg-emerald-500",
+  index: "bg-amber-500",
+  log: "bg-slate-400",
+};
+
+interface SimNode {
+  id: string;
+  label: string;
+  node_type: string;
+  link_count: number;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  fx?: number | null;
+  fy?: number | null;
+}
+
+function useForceSimulation(graph: WikiGraphData | null) {
+  const [tick, setTick] = useState(0);
+  const dragRef = useRef<SimNode | null>(null);
+  const hoverRef = useRef<string | null>(null);
+  const animRef = useRef<number>(0);
+  const nodesRef = useRef<SimNode[]>([]);
+
+  // Initialize nodes when graph changes
+  useEffect(() => {
+    if (!graph || graph.nodes.length === 0) { nodesRef.current = []; return; }
+    const cx = 250, cy = 250;
+    nodesRef.current = graph.nodes.map((n, i) => {
+      const angle = (i / graph.nodes.length) * Math.PI * 2;
+      return {
+        id: n.id,
+        label: n.label,
+        node_type: n.node_type,
+        link_count: n.link_count,
+        x: cx + Math.cos(angle) * 120 + (Math.random() - 0.5) * 20,
+        y: cy + Math.sin(angle) * 120 + (Math.random() - 0.5) * 20,
+        vx: 0, vy: 0,
+        fx: null, fy: null,
+      };
+    });
+    setTick(t => t + 1);
+  }, [graph]);
+
+  // Build adjacency list
+  const adjacency = useMemo(() => {
+    const adj = new Map<string, Set<string>>();
+    if (!graph) return adj;
+    graph.nodes.forEach(n => adj.set(n.id, new Set()));
+    graph.edges.forEach(e => {
+      adj.get(e.source)?.add(e.target);
+      adj.get(e.target)?.add(e.source);
+    });
+    return adj;
+  }, [graph]);
+
+  // Animation loop
+  useEffect(() => {
+    if (!graph || graph.nodes.length === 0) return;
+    const W = 500, H = 500;
+    const repulsion = 600; // Charge strength
+    const linkDistance = 80;
+    const linkStrength = 0.08;
+    const centerForce = 0.015;
+    const damping = 0.82;
+    const maxSpeed = 8;
+
+    const edges = graph.edges;
+    const nodeMap = new Map<string, SimNode>();
+    nodesRef.current.forEach(n => nodeMap.set(n.id, n));
+
+    let running = true;
+    let alpha = 1.0;
+    const alphaDecay = 0.008;
+    const alphaMin = 0.02;
+
+    const step = () => {
+      if (!running) return;
+      const ns = nodesRef.current;
+
+      // Repulsion (Coulomb's law approximation)
+      for (let i = 0; i < ns.length; i++) {
+        for (let j = i + 1; j < ns.length; j++) {
+          const a = ns[i], b = ns[j];
+          let dx = a.x - b.x;
+          let dy = a.y - b.y;
+          let dist2 = dx * dx + dy * dy;
+          if (dist2 < 0.01) { dist2 = 0.01; dx = Math.random() - 0.5; dy = Math.random() - 0.5; }
+          const dist = Math.sqrt(dist2);
+          const force = repulsion / dist2;
+          const fx = (dx / dist) * force;
+          const fy = (dy / dist) * force;
+          a.vx += fx; a.vy += fy;
+          b.vx -= fx; b.vy -= fy;
+        }
+      }
+
+      // Link attraction (spring)
+      for (const edge of edges) {
+        const s = nodeMap.get(edge.source);
+        const t = nodeMap.get(edge.target);
+        if (!s || !t) continue;
+        const dx = t.x - s.x;
+        const dy = t.y - s.y;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        const diff = dist - linkDistance;
+        const force = diff * linkStrength * alpha;
+        const fx = (dx / dist) * force;
+        const fy = (dy / dist) * force;
+        s.vx += fx; s.vy += fy;
+        t.vx -= fx; t.vy -= fy;
+      }
+
+      // Center gravity
+      for (const n of ns) {
+        n.vx += (250 - n.x) * centerForce * alpha;
+        n.vy += (250 - n.y) * centerForce * alpha;
+      }
+
+      // Apply velocity with damping and boundary
+      for (const n of ns) {
+        if (n.fx != null) { n.x = n.fx; n.vx = 0; }
+        else {
+          n.vx *= damping;
+          n.vy *= damping;
+          const speed = Math.sqrt(n.vx * n.vx + n.vy * n.vy);
+          if (speed > maxSpeed) { n.vx = (n.vx / speed) * maxSpeed; n.vy = (n.vy / speed) * maxSpeed; }
+          n.x += n.vx;
+          n.y += n.vy;
+          n.x = Math.max(20, Math.min(W - 20, n.x));
+          n.y = Math.max(20, Math.min(H - 20, n.y));
+        }
+        if (n.fy != null) { n.y = n.fy; n.vy = 0; }
+      }
+
+      alpha = Math.max(alphaMin, alpha - alphaDecay);
+      setTick(t => t + 1);
+
+      if (alpha > alphaMin) {
+        animRef.current = requestAnimationFrame(step);
+      } else {
+        running = false;
+      }
+    };
+
+    animRef.current = requestAnimationFrame(step);
+    return () => { running = false; cancelAnimationFrame(animRef.current); };
+  }, [graph, adjacency]);
+
+  // Drag handlers
+  const handleDragStart = (node: SimNode) => {
+    dragRef.current = node;
+    node.fx = node.x;
+    node.fy = node.y;
+  };
+  const handleDragMove = (node: SimNode, x: number, y: number) => {
+    if (dragRef.current === node) {
+      node.fx = x;
+      node.fy = y;
+      setTick(t => t + 1);
+    }
+  };
+  const handleDragEnd = (node: SimNode) => {
+    dragRef.current = null;
+    node.fx = null;
+    node.fy = null;
+    // Reheat
+    const ns = nodesRef.current;
+    for (const n of ns) { n.vx += (Math.random() - 0.5) * 2; n.vy += (Math.random() - 0.5) * 2; }
+  };
+
+  const setHover = (id: string | null) => { hoverRef.current = id; setTick(t => t + 1); };
+
+  return { nodes: nodesRef.current, tick, handleDragStart, handleDragMove, handleDragEnd, setHover, hoverId: hoverRef.current, adjacency };
+}
+
 function WikiGraphTab({ project }: { project: WikiProject }) {
   const [graph, setGraph] = useState<WikiGraphData | null>(null);
   const [loading, setLoading] = useState(true);
+  const svgRef = useRef<SVGSVGElement>(null);
 
   useEffect(() => {
     wikiApi.getGraph(project.id).then(setGraph).catch(() => {}).finally(() => setLoading(false));
   }, [project.id]);
+
+  const sim = useForceSimulation(graph);
+  const [selectedNode, setSelectedNode] = useState<string | null>(null);
+
+  const maxLinks = graph ? Math.max(...graph.nodes.map(n => n.link_count), 1) : 1;
+
+  const handleNodeMouseDown = (node: SimNode) => (e: React.MouseEvent) => {
+    e.preventDefault();
+    sim.handleDragStart(node);
+    const moveHandler = (ev: MouseEvent) => {
+      const svg = svgRef.current;
+      if (!svg) return;
+      const pt = svg.createSVGPoint();
+      pt.x = ev.clientX; pt.y = ev.clientY;
+      const ctm = svg.getScreenCTM();
+      if (!ctm) return;
+      const transformed = pt.matrixTransform(ctm.inverse());
+      sim.handleDragMove(node, transformed.x, transformed.y);
+    };
+    const upHandler = () => {
+      sim.handleDragEnd(node);
+      document.removeEventListener("mousemove", moveHandler);
+      document.removeEventListener("mouseup", upHandler);
+    };
+    document.addEventListener("mousemove", moveHandler);
+    document.addEventListener("mouseup", upHandler);
+  };
 
   if (loading) {
     return <div className="surface empty-state"><Loader2 className="h-8 w-8 animate-spin text-slate-400" /></div>;
@@ -4083,16 +4386,21 @@ function WikiGraphTab({ project }: { project: WikiProject }) {
     );
   }
 
-  // Simple SVG visualization (Phase 3 will add Sigma.js)
-  const maxLinks = Math.max(...graph.nodes.map(n => n.link_count), 1);
+  const hoveredId = sim.hoverId;
 
-  // Circle layout
-  const cx = 250, cy = 250, r = 180;
-  const positions = new Map<string, { x: number; y: number }>();
-  graph.nodes.forEach((node, i) => {
-    const angle = (i / graph.nodes.length) * Math.PI * 2;
-    positions.set(node.id, { x: cx + Math.cos(angle) * r, y: cy + Math.sin(angle) * r });
-  });
+  // Highlight neighbors
+  const isHighlighted = (id: string): boolean => {
+    if (!hoveredId && !selectedNode) return false;
+    const active = hoveredId || selectedNode;
+    if (id === active) return true;
+    return sim.adjacency.get(active || "")?.has(id) ?? false;
+  };
+
+  const isEdgeHighlighted = (edge: { source: string; target: string }): boolean => {
+    if (!hoveredId && !selectedNode) return false;
+    const active = hoveredId || selectedNode;
+    return edge.source === active || edge.target === active;
+  };
 
   return (
     <div className="space-y-4">
@@ -4114,30 +4422,94 @@ function WikiGraphTab({ project }: { project: WikiProject }) {
         <div className="mb-3 flex items-center gap-2">
           <Network className="h-4 w-4 text-slate-700" />
           <h3 className="text-sm font-semibold text-slate-900">知识图谱</h3>
-          <span className="ml-auto text-[11px] text-slate-400">SVG 预览 · Sigma.js 将在 Phase 3 集成</span>
+          <span className="ml-auto text-[11px] text-slate-400">力导向布局 · 拖拽节点 · Hover 高亮关联</span>
         </div>
-        <svg viewBox="0 0 500 500" className="w-full" style={{ maxHeight: "500px" }}>
+        <svg
+          ref={svgRef}
+          viewBox="0 0 500 500"
+          className="w-full select-none"
+          style={{ maxHeight: "500px", cursor: "default" }}
+        >
+          <defs>
+            {Object.entries(NODE_COLORS).map(([type, color]) => (
+              <radialGradient key={type} id={`grad-${type}`} cx="35%" cy="35%">
+                <stop offset="0%" stopColor={color} stopOpacity="1" />
+                <stop offset="100%" stopColor={color} stopOpacity="0.6" />
+              </radialGradient>
+            ))}
+            <marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(99, 102, 241, 0.35)" />
+            </marker>
+            <marker id="arrow-active" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(59, 130, 246, 0.8)" />
+            </marker>
+          </defs>
           {/* Edges */}
           {graph.edges.map((edge, i) => {
-            const s = positions.get(edge.source);
-            const t = positions.get(edge.target);
+            const s = sim.nodes.find(n => n.id === edge.source);
+            const t = sim.nodes.find(n => n.id === edge.target);
             if (!s || !t) return null;
-            return <line key={i} x1={s.x} y1={s.y} x2={t.x} y2={t.y} stroke="rgba(47, 111, 237, 0.15)" strokeWidth={Math.max(1, edge.weight * 2)} />;
+            const highlighted = isEdgeHighlighted(edge);
+            const dimmed = (hoveredId || selectedNode) && !highlighted;
+            // Shorten edge to not overlap node circle
+            const dx = t.x - s.x;
+            const dy = t.y - s.y;
+            const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+            const sRadius = 6 + (s.link_count / maxLinks) * 10;
+            const tRadius = 6 + (t.link_count / maxLinks) * 10;
+            const x1 = s.x + (dx / dist) * sRadius;
+            const y1 = s.y + (dy / dist) * sRadius;
+            const x2 = t.x - (dx / dist) * (tRadius + 4);
+            const y2 = t.y - (dy / dist) * (tRadius + 4);
+            return (
+              <line
+                key={i}
+                x1={x1} y1={y1} x2={x2} y2={y2}
+                stroke={highlighted ? "rgba(59, 130, 246, 0.6)" : "rgba(99, 102, 241, 0.12)"}
+                strokeWidth={highlighted ? Math.max(1.5, edge.weight * 2.5) : Math.max(0.8, edge.weight * 1.5)}
+                markerEnd={highlighted ? "url(#arrow-active)" : "url(#arrow)"}
+                opacity={dimmed ? 0.15 : 1}
+                style={{ transition: "opacity 0.2s, stroke 0.2s, stroke-width 0.2s" }}
+              />
+            );
           })}
           {/* Nodes */}
-          {graph.nodes.map((node) => {
-            const pos = positions.get(node.id)!;
-            const radius = 6 + (node.link_count / maxLinks) * 12;
-            const colors: Record<string, string> = {
-              entity: "#3b82f6",
-              concept: "#8b5cf6",
-              summary: "#10b981",
-              index: "#f59e0b",
-              log: "#94a3b8",
-            };
+          {sim.nodes.map((node) => {
+            const radius = 6 + (node.link_count / maxLinks) * 10;
+            const color = NODE_COLORS[node.node_type] || "#64748b";
+            const highlighted = isHighlighted(node.id);
+            const dimmed = (hoveredId || selectedNode) && !highlighted;
+            const isSelected = selectedNode === node.id;
             return (
-              <g key={node.id}>
-                <circle cx={pos.x} cy={pos.y} r={radius} fill={colors[node.node_type] || "#64748b"} opacity={0.85} />
+              <g
+                key={node.id}
+                style={{ cursor: "grab" }}
+                onMouseDown={handleNodeMouseDown(node)}
+                onMouseEnter={() => sim.setHover(node.id)}
+                onMouseLeave={() => sim.setHover(null)}
+                onClick={(e) => { e.stopPropagation(); setSelectedNode(isSelected ? null : node.id); }}
+              >
+                {/* Highlight ring */}
+                {(highlighted || isSelected) && (
+                  <circle cx={node.x} cy={node.y} r={radius + 4} fill="none" stroke={color} strokeWidth="2" opacity="0.3" className="animate-pulse" />
+                )}
+                <circle
+                  cx={node.x} cy={node.y} r={radius}
+                  fill={`url(#grad-${node.node_type})`}
+                  opacity={dimmed ? 0.3 : 0.9}
+                  style={{ transition: "opacity 0.2s" }}
+                />
+                {/* Label on hover/selected */}
+                {(highlighted || isSelected) && (
+                  <text
+                    x={node.x} y={node.y - radius - 6}
+                    textAnchor="middle"
+                    className="fill-slate-700"
+                    style={{ fontSize: "10px", fontWeight: 600, pointerEvents: "none", paintOrder: "stroke", stroke: "white", strokeWidth: 3 }}
+                  >
+                    {node.label.length > 20 ? node.label.slice(0, 18) + "…" : node.label}
+                  </text>
+                )}
                 <title>{node.label} ({node.link_count} links)</title>
               </g>
             );
@@ -4145,17 +4517,13 @@ function WikiGraphTab({ project }: { project: WikiProject }) {
         </svg>
         {/* Legend */}
         <div className="mt-3 flex flex-wrap items-center gap-3">
-          {Object.entries({ entity: "实体", concept: "概念", summary: "摘要", index: "索引", log: "日志" }).map(([type, label]) => {
-            const colors: Record<string, string> = {
-              entity: "bg-blue-500", concept: "bg-violet-500", summary: "bg-emerald-500", index: "bg-amber-500", log: "bg-slate-400",
-            };
-            return (
-              <span key={type} className="flex items-center gap-1.5 text-[11px] text-slate-500">
-                <span className={`h-2.5 w-2.5 rounded-full ${colors[type]}`} />
-                {label}
-              </span>
-            );
-          })}
+          {Object.entries({ entity: "实体", concept: "概念", summary: "摘要", index: "索引", log: "日志" }).map(([type, label]) => (
+            <span key={type} className="flex items-center gap-1.5 text-[11px] text-slate-500">
+              <span className={`h-2.5 w-2.5 rounded-full ${NODE_COLOR_BG[type]}`} />
+              {label}
+            </span>
+          ))}
+          <span className="ml-auto text-[11px] text-slate-400">点击节点高亮 · 拖拽节点调整布局</span>
         </div>
       </div>
     </div>
