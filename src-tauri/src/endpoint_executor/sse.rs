@@ -152,6 +152,10 @@ pub struct StreamPumpCore {
     responses_state: Option<crate::protocol::responses::StreamState>,
     responses_id: String,
     accumulated_content: String,
+    /// Partial upstream bytes waiting for the rest of their SSE record.
+    /// ResponsesViaChat has no codec decoder, so the pump itself carries
+    /// records across `push()` calls (a frame split by TCP is not dropped).
+    responses_buffer: Vec<u8>,
     /// Last native usage observed.
     usage: Option<(i64, i64, i64)>,
 }
@@ -199,6 +203,7 @@ impl StreamPumpCore {
             },
             responses_id: format!("resp_{}", uuid::Uuid::new_v4().simple()),
             accumulated_content: String::new(),
+            responses_buffer: Vec::new(),
             usage: None,
         };
         match mode {
@@ -233,16 +238,13 @@ impl StreamPumpCore {
                 core.first_frame = out;
             }
             SseMode::ResponsesViaChat => {
-                let mut out = Vec::new();
-                if !first_frame.is_empty() {
-                    out.extend(
-                        core.encode_responses_chunk(&String::from_utf8_lossy(&first_frame))?,
-                    );
-                }
-                if !carry.is_empty() {
-                    out.extend(core.encode_responses_chunk(&String::from_utf8_lossy(&carry))?);
-                }
-                core.first_frame = out;
+                // Feed the first record AND the carry (records 2..N of the same
+                // upstream chunk) through the buffered encoder. A `carry` that
+                // ends mid-record must be held in `responses_buffer` and
+                // completed by a later `push()`, never dropped.
+                core.first_frame = core.encode_responses_buffered(&first_frame)?;
+                let carry_out = core.encode_responses_buffered(&carry)?;
+                core.first_frame.extend_from_slice(&carry_out);
             }
         }
         Ok(core)
@@ -344,6 +346,24 @@ impl StreamPumpCore {
         Ok(out)
     }
 
+    /// Buffer partial upstream bytes and feed any complete SSE records to
+    /// [`Self::encode_responses_chunk`] as discrete chunks. ResponsesViaChat has
+    /// no codec decoder, so a record split across TCP frames must be reassembled
+    /// here — otherwise both halves are dropped and the Responses stream loses
+    /// tool names / truncated arguments / text.
+    fn encode_responses_buffered(&mut self, bytes: &[u8]) -> Result<Vec<u8>, PumpError> {
+        self.responses_buffer.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        loop {
+            let Some(end) = record_end(&self.responses_buffer) else {
+                break;
+            };
+            let record: Vec<u8> = self.responses_buffer.drain(..end).collect();
+            out.extend(self.encode_responses_chunk(&String::from_utf8_lossy(&record))?);
+        }
+        Ok(out)
+    }
+
     /// Feed an upstream chunk.  Returns downstream bytes to emit.
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, PumpError> {
         let mut out = self.start()?;
@@ -355,9 +375,7 @@ impl StreamPumpCore {
                 out.extend_from_slice(&self.encode_conversion_chunk(bytes)?);
             }
             SseMode::ResponsesViaChat => {
-                out.extend_from_slice(
-                    &self.encode_responses_chunk(&String::from_utf8_lossy(bytes))?,
-                );
+                out.extend_from_slice(&self.encode_responses_buffered(bytes)?);
             }
         }
         Ok(out)
@@ -398,6 +416,12 @@ impl StreamPumpCore {
                 }
             }
             SseMode::ResponsesViaChat => {
+                // Flush any complete record still held in the carry buffer so a
+                // record that finished exactly at EOF is not lost.
+                if !self.responses_buffer.is_empty() {
+                    let tail = std::mem::take(&mut self.responses_buffer);
+                    out.extend(self.encode_responses_chunk(&String::from_utf8_lossy(&tail))?);
+                }
                 let synth = crate::protocol::responses::create_synthetic_completed_events(
                     &self.model,
                     &self.responses_id,
@@ -728,6 +752,295 @@ mod tests {
             text.contains("\"type\":\"thinking\"") &&
                 text.contains("\"thinking\":\"secret chain\""),
             "reasoning must surface as a Messages thinking block: {text}"
+        );
+    }
+
+    /// ResponsesViaChat has no codec decoder, so the pump must carry partial
+    /// SSE records across `push()` calls. A tool_call record split mid-JSON
+    /// (long frames are routinely fragmented by TCP) currently drops BOTH
+    /// halves — Codex then persists an empty tool name / truncated arguments.
+    #[test]
+    fn responses_via_chat_pump_buffers_split_tool_call_record() {
+        let mut core = StreamPumpCore::new(
+            native_supervisor(),
+            SseMode::ResponsesViaChat,
+            None,
+            Vec::new(),
+            Vec::new(),
+            "deepseek-v4-flash".to_string(),
+        )
+        .unwrap();
+        core.start().unwrap();
+
+        let record = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_A\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n";
+        let mid = record.len() / 2;
+        let mut out = core.push(&record[..mid]).unwrap();
+        out.extend(core.push(&record[mid..]).unwrap());
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("\"call_id\":\"call_A\""),
+            "tool call id must survive a record split mid-JSON: {text}"
+        );
+        assert!(
+            text.contains("\"name\":\"read\""),
+            "tool call name must survive a record split mid-JSON: {text}"
+        );
+    }
+
+    /// A UTF-8 codepoint split across TCP chunks must not corrupt the stream:
+    /// buffering by full SSE record (not by lossy chunk) keeps "hé" intact and
+    /// free of U+FFFD replacement characters.
+    #[test]
+    fn responses_via_chat_pump_buffers_split_multibyte_content() {
+        let mut core = StreamPumpCore::new(
+            native_supervisor(),
+            SseMode::ResponsesViaChat,
+            None,
+            Vec::new(),
+            Vec::new(),
+            "deepseek-v4-flash".to_string(),
+        )
+        .unwrap();
+        core.start().unwrap();
+
+        let record = "data: {\"choices\":[{\"delta\":{\"content\":\"hé\"}}]}\n\n";
+        let bytes = record.as_bytes();
+        let split = bytes.windows(2).position(|w| w == b"\xc3\xa9").unwrap() + 1;
+        let mut out = core.push(&bytes[..split]).unwrap();
+        out.extend(core.push(&bytes[split..]).unwrap());
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("hé"),
+            "split UTF-8 content must arrive intact: {text}"
+        );
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "no replacement characters: {text}"
+        );
+    }
+
+    /// C-1 seam for ResponsesViaChat: the first upstream chunk can deliver the
+    /// first complete record PLUS a partial SECOND record (`carry`). The
+    /// partial carry must be buffered in `new()` — not dropped — so it
+    /// completes when the rest arrives via `push()`.
+    #[test]
+    fn responses_via_chat_pump_buffers_partial_carry_record() {
+        let first_frame = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        // Record 2, truncated mid-JSON inside the FIRST upstream chunk.
+        let carry = b"data: {\"choices\":[{\"delta\":{\"content\":\"hel";
+        let mut core = StreamPumpCore::new(
+            native_supervisor(),
+            SseMode::ResponsesViaChat,
+            None,
+            first_frame.to_vec(),
+            carry.to_vec(),
+            "deepseek-v4-flash".to_string(),
+        )
+        .unwrap();
+        let out = core.start().unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("hi"),
+            "record 1 (the valid first frame) must be emitted: {text}"
+        );
+
+        // Complete record 2 in a later chunk.
+        let out2 = core.push(b"lo\"}}]}\n\n").unwrap();
+        let text2 = String::from_utf8_lossy(&out2);
+        assert!(
+            text2.contains("hello"),
+            "partial carry record must be completed, not dropped: {text2}"
+        );
+    }
+
+    /// Real OpenCode-GO stream (captured via `wa_upstream_raw.txt`): 16 reasoning
+    /// chunks, then a tool_call record carrying id+name+empty args (REC16), then
+    /// 11 arguments deltas, then a `finish_reason: "tool_calls"` record, then
+    /// [DONE].  This is the EXACT upstream byte stream the ResponsesViaChat
+    /// converter must survive.  Any loss/corruption here is the reported bug.
+    ///
+    /// The stream is driven the way `driver.rs` does it: the first record is
+    /// split off as `first_frame`, everything after it is `carry`, and the pump
+    /// is constructed in one shot — records 2..N MUST NOT be dropped.
+    #[test]
+    fn responses_via_chat_survives_real_tool_call_stream() {
+        let records: Vec<&str> = vec![
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"role":"assistant","content":null,"reasoning_content":""}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"The"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" user"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" wants"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" me"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" to"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" call"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" the"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" read"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" tool"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" with"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" path"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" /"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"tmp"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"/x"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"."}}],"usage":null}"#,
+            // REC16: the tool_call opener carrying id + name.
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"id":"call_00_B4Go5x1lk0lKp5y1fvPa3907","type":"function","function":{"name":"read","arguments":""}}]}}],"usage":null}"#,
+            // REC17-27: arguments deltas.
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"path"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":": "}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"/"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"tmp"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"/x"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}],"usage":null}"#,
+            // REC28: finish with tool_calls + usage.
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":"tool_calls","logprobs":null,"delta":{"content":"","reasoning_content":null}}],"usage":{"prompt_tokens":346,"completion_tokens":60,"total_tokens":406,"prompt_cache_hit_tokens":256,"prompt_cache_miss_tokens":90,"prompt_tokens_details":{"cached_tokens":256},"completion_tokens_details":{"reasoning_tokens":15}}}"#,
+            r#"data: [DONE]"#,
+        ];
+
+        // Concatenate all records into a single upstream byte stream.
+        let mut stream = String::new();
+        for rec in &records {
+            stream.push_str(rec);
+            stream.push_str("\n\n");
+        }
+        let bytes = stream.as_bytes();
+
+        // Replicate `buffer_first_record`: split off the first complete record
+        // (records here are `\n\n`-terminated) as first_frame, keep the rest as
+        // carry, exactly like driver.rs does on the live upstream chunk.
+        let mut first_end = 0;
+        for i in 0..bytes.len() - 1 {
+            if bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
+                first_end = i + 2;
+                break;
+            }
+        }
+        let first_frame = bytes[..first_end].to_vec();
+        let carry = bytes[first_end..].to_vec();
+        assert!(
+            !carry.is_empty(),
+            "carry must contain records 2..N (records 2..N must not be lost)"
+        );
+
+        let mut core = StreamPumpCore::new(
+            native_supervisor(),
+            SseMode::ResponsesViaChat,
+            None,
+            first_frame,
+            carry,
+            "deepseek-v4-flash".to_string(),
+        )
+        .unwrap();
+        let out = core.start().unwrap();
+        let text = String::from_utf8_lossy(&out);
+
+        // The tool call MUST carry the real id + name (not the fc_/call_ fallbacks).
+        assert!(
+            text.contains("call_00_B4Go5x1lk0lKp5y1fvPa3907"),
+            "tool call id from REC16 must survive: {text}"
+        );
+        assert!(
+            text.contains("\"name\":\"read\""),
+            "tool call name from REC16 must survive: {text}"
+        );
+        assert!(
+            !text.contains("\"name\":\"\"") && !text.contains("\"call_id\":\"call_1\""),
+            "fallback empty name / synthesized call_1 must NOT appear: {text}"
+        );
+
+        // The final completed item must contain the FULL arguments JSON.
+        let fin = core.finish().unwrap();
+        let full = format!("{text}{}", String::from_utf8_lossy(&fin));
+        assert!(
+            full.contains("{\\\"path\\\": \\\"/tmp/x\\\"}") || full.contains("\\\": \\\"/tmp/x\\\"}"),
+            "full arguments `{{\"path\": \"/tmp/x\"}}` must be accumulated: {full}"
+        );
+        assert!(
+            full.contains("\"status\":\"completed\"")
+                && full.contains("\"type\":\"function_call\""),
+            "the function_call must complete: {full}"
+        );
+    }
+
+    /// The SAME real stream fed ONE RECORD PER `push()`, as a live HTTP body
+    /// typically delivers it.  `buffer_first_record` only pre-loads the first
+    /// record + whatever was in the same TCP read; every later record arrives
+    /// as its own `push()`.  Any loss here is the production bug.
+    #[test]
+    fn responses_via_chat_survives_real_stream_record_by_record() {
+        // Build the full upstream byte stream exactly as in the single-shot test.
+        let records: Vec<&str> = vec![
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"role":"assistant","content":null,"reasoning_content":""}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"The"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" user"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" wants"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" me"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" to"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" call"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" the"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" read"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" tool"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" with"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" path"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" /"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"tmp"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"/x"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"."}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"id":"call_00_B4Go5x1lk0lKp5y1fvPa3907","type":"function","function":{"name":"read","arguments":""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"path"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":": "}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"/"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"tmp"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"/x"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":"tool_calls","logprobs":null,"delta":{"content":"","reasoning_content":null}}],"usage":{"prompt_tokens":346,"completion_tokens":60,"total_tokens":406,"prompt_cache_hit_tokens":256,"prompt_cache_miss_tokens":90,"prompt_tokens_details":{"cached_tokens":256},"completion_tokens_details":{"reasoning_tokens":15}}}"#,
+            r#"data: [DONE]"#,
+        ];
+
+        // First record becomes first_frame (as buffer_first_record does); the
+        // rest are delivered one record per push().
+        let rec0 = format!("{}\n\n", records[0]);
+        let mut core = StreamPumpCore::new(
+            native_supervisor(),
+            SseMode::ResponsesViaChat,
+            None,
+            rec0.as_bytes().to_vec(),
+            Vec::new(),
+            "deepseek-v4-flash".to_string(),
+        )
+        .unwrap();
+        let mut text = String::from_utf8_lossy(&core.start().unwrap()).to_string();
+        for rec in &records[1..] {
+            let chunk = format!("{}\n\n", rec);
+            let out = core.push(chunk.as_bytes()).unwrap();
+            text.push_str(&String::from_utf8_lossy(&out));
+        }
+        let fin = core.finish().unwrap();
+        text.push_str(&String::from_utf8_lossy(&fin));
+
+        assert!(
+            text.contains("call_00_B4Go5x1lk0lKp5y1fvPa3907"),
+            "tool call id must survive per-record push: {text}"
+        );
+        assert!(
+            text.contains("\"name\":\"read\""),
+            "tool call name must survive per-record push: {text}"
+        );
+        assert!(
+            !text.contains("\"name\":\"\"") && !text.contains("\"call_id\":\"call_1\""),
+            "fallback empty name / synthesized call_1 must NOT appear: {text}"
+        );
+        assert!(
+            text.contains("\\\": \\\"/tmp/x\\\"}"),
+            "full arguments `{{\"path\": \"/tmp/x\"}}` must be accumulated: {text}"
         );
     }
 }
