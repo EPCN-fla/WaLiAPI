@@ -152,6 +152,10 @@ pub struct StreamPumpCore {
     responses_state: Option<crate::protocol::responses::StreamState>,
     responses_id: String,
     accumulated_content: String,
+    /// Partial upstream bytes waiting for the rest of their SSE record.
+    /// ResponsesViaChat has no codec decoder, so the pump itself carries
+    /// records across `push()` calls (a frame split by TCP is not dropped).
+    responses_buffer: Vec<u8>,
     /// Last native usage observed.
     usage: Option<(i64, i64, i64)>,
 }
@@ -199,6 +203,7 @@ impl StreamPumpCore {
             },
             responses_id: format!("resp_{}", uuid::Uuid::new_v4().simple()),
             accumulated_content: String::new(),
+            responses_buffer: Vec::new(),
             usage: None,
         };
         match mode {
@@ -233,16 +238,13 @@ impl StreamPumpCore {
                 core.first_frame = out;
             }
             SseMode::ResponsesViaChat => {
-                let mut out = Vec::new();
-                if !first_frame.is_empty() {
-                    out.extend(
-                        core.encode_responses_chunk(&String::from_utf8_lossy(&first_frame))?,
-                    );
-                }
-                if !carry.is_empty() {
-                    out.extend(core.encode_responses_chunk(&String::from_utf8_lossy(&carry))?);
-                }
-                core.first_frame = out;
+                // Feed the first record AND the carry (records 2..N of the same
+                // upstream chunk) through the buffered encoder. A `carry` that
+                // ends mid-record must be held in `responses_buffer` and
+                // completed by a later `push()`, never dropped.
+                core.first_frame = core.encode_responses_buffered(&first_frame)?;
+                let carry_out = core.encode_responses_buffered(&carry)?;
+                core.first_frame.extend_from_slice(&carry_out);
             }
         }
         Ok(core)
@@ -344,6 +346,24 @@ impl StreamPumpCore {
         Ok(out)
     }
 
+    /// Buffer partial upstream bytes and feed any complete SSE records to
+    /// [`Self::encode_responses_chunk`] as discrete chunks. ResponsesViaChat has
+    /// no codec decoder, so a record split across TCP frames must be reassembled
+    /// here — otherwise both halves are dropped and the Responses stream loses
+    /// tool names / truncated arguments / text.
+    fn encode_responses_buffered(&mut self, bytes: &[u8]) -> Result<Vec<u8>, PumpError> {
+        self.responses_buffer.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        loop {
+            let Some(end) = record_end(&self.responses_buffer) else {
+                break;
+            };
+            let record: Vec<u8> = self.responses_buffer.drain(..end).collect();
+            out.extend(self.encode_responses_chunk(&String::from_utf8_lossy(&record))?);
+        }
+        Ok(out)
+    }
+
     /// Feed an upstream chunk.  Returns downstream bytes to emit.
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<u8>, PumpError> {
         let mut out = self.start()?;
@@ -355,9 +375,7 @@ impl StreamPumpCore {
                 out.extend_from_slice(&self.encode_conversion_chunk(bytes)?);
             }
             SseMode::ResponsesViaChat => {
-                out.extend_from_slice(
-                    &self.encode_responses_chunk(&String::from_utf8_lossy(bytes))?,
-                );
+                out.extend_from_slice(&self.encode_responses_buffered(bytes)?);
             }
         }
         Ok(out)
@@ -398,6 +416,12 @@ impl StreamPumpCore {
                 }
             }
             SseMode::ResponsesViaChat => {
+                // Flush any complete record still held in the carry buffer so a
+                // record that finished exactly at EOF is not lost.
+                if !self.responses_buffer.is_empty() {
+                    let tail = std::mem::take(&mut self.responses_buffer);
+                    out.extend(self.encode_responses_chunk(&String::from_utf8_lossy(&tail))?);
+                }
                 let synth = crate::protocol::responses::create_synthetic_completed_events(
                     &self.model,
                     &self.responses_id,
@@ -728,6 +752,104 @@ mod tests {
             text.contains("\"type\":\"thinking\"") &&
                 text.contains("\"thinking\":\"secret chain\""),
             "reasoning must surface as a Messages thinking block: {text}"
+        );
+    }
+
+    /// ResponsesViaChat has no codec decoder, so the pump must carry partial
+    /// SSE records across `push()` calls. A tool_call record split mid-JSON
+    /// (long frames are routinely fragmented by TCP) currently drops BOTH
+    /// halves — Codex then persists an empty tool name / truncated arguments.
+    #[test]
+    fn responses_via_chat_pump_buffers_split_tool_call_record() {
+        let mut core = StreamPumpCore::new(
+            native_supervisor(),
+            SseMode::ResponsesViaChat,
+            None,
+            Vec::new(),
+            Vec::new(),
+            "deepseek-v4-flash".to_string(),
+        )
+        .unwrap();
+        core.start().unwrap();
+
+        let record = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_A\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]}}]}\n\n";
+        let mid = record.len() / 2;
+        let mut out = core.push(&record[..mid]).unwrap();
+        out.extend(core.push(&record[mid..]).unwrap());
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("\"call_id\":\"call_A\""),
+            "tool call id must survive a record split mid-JSON: {text}"
+        );
+        assert!(
+            text.contains("\"name\":\"read\""),
+            "tool call name must survive a record split mid-JSON: {text}"
+        );
+    }
+
+    /// A UTF-8 codepoint split across TCP chunks must not corrupt the stream:
+    /// buffering by full SSE record (not by lossy chunk) keeps "hé" intact and
+    /// free of U+FFFD replacement characters.
+    #[test]
+    fn responses_via_chat_pump_buffers_split_multibyte_content() {
+        let mut core = StreamPumpCore::new(
+            native_supervisor(),
+            SseMode::ResponsesViaChat,
+            None,
+            Vec::new(),
+            Vec::new(),
+            "deepseek-v4-flash".to_string(),
+        )
+        .unwrap();
+        core.start().unwrap();
+
+        let record = "data: {\"choices\":[{\"delta\":{\"content\":\"hé\"}}]}\n\n";
+        let bytes = record.as_bytes();
+        let split = bytes.windows(2).position(|w| w == b"\xc3\xa9").unwrap() + 1;
+        let mut out = core.push(&bytes[..split]).unwrap();
+        out.extend(core.push(&bytes[split..]).unwrap());
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("hé"),
+            "split UTF-8 content must arrive intact: {text}"
+        );
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "no replacement characters: {text}"
+        );
+    }
+
+    /// C-1 seam for ResponsesViaChat: the first upstream chunk can deliver the
+    /// first complete record PLUS a partial SECOND record (`carry`). The
+    /// partial carry must be buffered in `new()` — not dropped — so it
+    /// completes when the rest arrives via `push()`.
+    #[test]
+    fn responses_via_chat_pump_buffers_partial_carry_record() {
+        let first_frame = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        // Record 2, truncated mid-JSON inside the FIRST upstream chunk.
+        let carry = b"data: {\"choices\":[{\"delta\":{\"content\":\"hel";
+        let mut core = StreamPumpCore::new(
+            native_supervisor(),
+            SseMode::ResponsesViaChat,
+            None,
+            first_frame.to_vec(),
+            carry.to_vec(),
+            "deepseek-v4-flash".to_string(),
+        )
+        .unwrap();
+        let out = core.start().unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("hi"),
+            "record 1 (the valid first frame) must be emitted: {text}"
+        );
+
+        // Complete record 2 in a later chunk.
+        let out2 = core.push(b"lo\"}}]}\n\n").unwrap();
+        let text2 = String::from_utf8_lossy(&out2);
+        assert!(
+            text2.contains("hello"),
+            "partial carry record must be completed, not dropped: {text2}"
         );
     }
 }

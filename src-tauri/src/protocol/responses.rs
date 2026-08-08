@@ -17,6 +17,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///   response.function_call_arguments.delta →
 ///   response.function_call_arguments.done →
 ///   response.output_item.done
+///
+/// For reasoning (DeepSeek R1, OpenAI o1/o3, etc.):
+///   response.output_item.added(type=reasoning) →
+///   response.reasoning_summary_part.added →
+///   response.reasoning_summary_text.delta (per chunk) →
+///   response.reasoning_summary_part.done →
+///   response.output_item.done
 #[derive(Default)]
 pub struct StreamState {
     /// Whether the text message output_item.added has been sent.
@@ -29,6 +36,18 @@ pub struct StreamState {
     pub text_output_index: u32,
     /// Next output_index to use for a new output item.
     pub next_output_index: u32,
+    /// Whether the reasoning output_item.added has been sent.
+    pub reasoning_item_added: bool,
+    /// Whether the reasoning summary_part.added has been sent.
+    pub reasoning_part_added: bool,
+    /// Whether the reasoning summary_part.done has been sent.
+    pub reasoning_part_done: bool,
+    /// Whether the reasoning output_item.done has been sent.
+    pub reasoning_item_done: bool,
+    /// The output_index assigned to the reasoning item.
+    pub reasoning_output_index: u32,
+    /// Full concatenated reasoning text accumulated so far.
+    pub accumulated_reasoning: String,
     /// Map from tool_call index → (output_index, call_id, name, accumulated_arguments, item_added_sent, arguments_done_sent)
     pub tool_calls: HashMap<u64, ToolCallState>,
     /// Whether any tool calls were seen in this stream.
@@ -123,11 +142,63 @@ pub fn convert_openai_sse_to_responses(
                     if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str())
                     {
                         if !reasoning.is_empty() {
+                            // Announce the reasoning item (output_item.added) and its
+                            // summary part BEFORE the first delta. Clients only persist
+                            // items they saw "added" — without this the reasoning never
+                            // enters the conversation and thinking-mode providers reject
+                            // the next turn.
+                            if !state.reasoning_item_added {
+                                let reasoning_output_index = state.next_output_index;
+                                state.reasoning_output_index = reasoning_output_index;
+                                let seq = next_seq(state);
+                                let item = serde_json::json!({
+                                    "id": reasoning_id,
+                                    "type": "reasoning",
+                                    "status": "in_progress",
+                                    "summary": [],
+                                    "content": []
+                                });
+                                let item_event = serde_json::json!({
+                                    "type": "response.output_item.added",
+                                    "output_index": reasoning_output_index,
+                                    "item": item,
+                                    "sequence_number": seq
+                                });
+                                events.push(format!(
+                                    "event: response.output_item.added\ndata: {}\n\n",
+                                    item_event
+                                ));
+
+                                let seq = next_seq(state);
+                                let part = serde_json::json!({
+                                    "type": "reasoning_summary_text",
+                                    "text": ""
+                                });
+                                let part_event = serde_json::json!({
+                                    "type": "response.reasoning_summary_part.added",
+                                    "item_id": reasoning_id,
+                                    "output_index": reasoning_output_index,
+                                    "summary_index": 0,
+                                    "part": part,
+                                    "sequence_number": seq
+                                });
+                                events.push(format!(
+                                    "event: response.reasoning_summary_part.added\ndata: {}\n\n",
+                                    part_event
+                                ));
+
+                                state.reasoning_item_added = true;
+                                state.reasoning_part_added = true;
+                                state.next_output_index += 1;
+                            }
+
+                            state.accumulated_reasoning.push_str(reasoning);
+                            let reasoning_output_index = state.reasoning_output_index;
                             let seq = next_seq(state);
                             let event = serde_json::json!({
                                 "type": "response.reasoning_summary_text.delta",
                                 "item_id": reasoning_id,
-                                "output_index": 0,
+                                "output_index": reasoning_output_index,
                                 "summary_index": 0,
                                 "delta": reasoning,
                                 "sequence_number": seq
@@ -331,6 +402,53 @@ pub fn convert_openai_sse_to_responses(
                 // Check for finish_reason
                 if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str()) {
                     if !finish.is_empty() && finish != "null" {
+                        // Close reasoning item if it was opened and not yet closed
+                        if state.reasoning_item_added && !state.reasoning_item_done {
+                            let reasoning_output_index = state.reasoning_output_index;
+                            let seq = next_seq(state);
+                            let part = serde_json::json!({
+                                "type": "reasoning_summary_text",
+                                "text": state.accumulated_reasoning
+                            });
+                            let part_done = serde_json::json!({
+                                "type": "response.reasoning_summary_part.done",
+                                "item_id": reasoning_id,
+                                "output_index": reasoning_output_index,
+                                "summary_index": 0,
+                                "part": part,
+                                "sequence_number": seq
+                            });
+                            events.push(format!(
+                                "event: response.reasoning_summary_part.done\ndata: {}\n\n",
+                                part_done
+                            ));
+
+                            let seq = next_seq(state);
+                            let completed_item = serde_json::json!({
+                                "id": reasoning_id,
+                                "type": "reasoning",
+                                "status": "completed",
+                                "summary": [{
+                                    "type": "summary_text",
+                                    "text": state.accumulated_reasoning
+                                }],
+                                "content": []
+                            });
+                            let item_done = serde_json::json!({
+                                "type": "response.output_item.done",
+                                "output_index": reasoning_output_index,
+                                "item": completed_item,
+                                "sequence_number": seq
+                            });
+                            events.push(format!(
+                                "event: response.output_item.done\ndata: {}\n\n",
+                                item_done
+                            ));
+
+                            state.reasoning_part_done = true;
+                            state.reasoning_item_done = true;
+                        }
+
                         // Close text item if it was opened and not yet closed
                         if state.text_item_added && !state.text_item_done {
                             let text_output_index = state.text_output_index;
@@ -573,6 +691,56 @@ pub fn create_synthetic_completed_events(
         }};
     }
 
+    // Close reasoning item if it was opened and not yet closed
+    if state.reasoning_item_added && !state.reasoning_item_done {
+        let reasoning_output_index = state.reasoning_output_index;
+        let reasoning_id = if response_id.starts_with("resp_") {
+            format!("rs_{}", &response_id[5..])
+        } else {
+            format!("rs_{}", response_id)
+        };
+
+        let s = next_seq!();
+        let part = serde_json::json!({
+            "type": "reasoning_summary_text",
+            "text": state.accumulated_reasoning
+        });
+        let part_done = serde_json::json!({
+            "type": "response.reasoning_summary_part.done",
+            "item_id": reasoning_id,
+            "output_index": reasoning_output_index,
+            "summary_index": 0,
+            "part": part,
+            "sequence_number": s
+        });
+        events.push(format!(
+            "event: response.reasoning_summary_part.done\ndata: {}\n\n",
+            part_done
+        ));
+
+        let s = next_seq!();
+        let completed_item = serde_json::json!({
+            "id": reasoning_id,
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [{
+                "type": "summary_text",
+                "text": state.accumulated_reasoning
+            }],
+            "content": []
+        });
+        let item_done = serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": reasoning_output_index,
+            "item": completed_item,
+            "sequence_number": s
+        });
+        events.push(format!(
+            "event: response.output_item.done\ndata: {}\n\n",
+            item_done
+        ));
+    }
+
     // Close text item if it was opened and not yet closed
     if state.text_item_added && !state.text_item_done {
         let text_output_index = state.text_output_index;
@@ -682,6 +850,25 @@ pub fn create_synthetic_completed_events(
 
     // Build the output array for response.completed
     let mut output_items: Vec<Value> = Vec::new();
+
+    // Add reasoning item to output if it was added
+    if state.reasoning_item_added {
+        let reasoning_id = if response_id.starts_with("resp_") {
+            format!("rs_{}", &response_id[5..])
+        } else {
+            format!("rs_{}", response_id)
+        };
+        output_items.push(serde_json::json!({
+            "id": reasoning_id,
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [{
+                "type": "summary_text",
+                "text": state.accumulated_reasoning
+            }],
+            "content": []
+        }));
+    }
 
     // Add text item to output if it was added
     if state.text_item_added {
@@ -1016,6 +1203,109 @@ mod tests {
         let fc_item_done = extract_event_data(&events4[4]);
         assert_eq!(fc_item_done["output_index"], 1);
         assert_eq!(fc_item_done["item"]["type"], "function_call");
+    }
+
+    #[test]
+    fn test_reasoning_item_full_lifecycle() {
+        // A reasoning_content delta must announce a `reasoning` item with
+        // output_item.added BEFORE any delta, and close it with
+        // output_item.done. Without the item lifecycle, Codex never persists a
+        // reasoning item, so the next turn omits reasoning_content and
+        // DeepSeek rejects it ("must be passed back to the API").
+        let mut state = StreamState::default();
+        let response_id = "resp_rs123";
+
+        // Chunk 1: reasoning delta
+        let chunk1 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"Let me"},"finish_reason":null}]}"#;
+        let events1 = convert_openai_sse_to_responses(chunk1, "deepseek-v4-flash", response_id, "", &mut state);
+        let types1 = extract_event_types(&events1);
+        assert_eq!(
+            types1,
+            vec![
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+            ]
+        );
+
+        // reasoning item announced with type=reasoning
+        let added = extract_event_data(&events1[0]);
+        assert_eq!(added["item"]["type"], "reasoning");
+        assert_eq!(added["item"]["id"], "rs_rs123");
+        assert_eq!(added["output_index"], 0);
+
+        // summary part added before deltas
+        let part_added = extract_event_data(&events1[1]);
+        assert_eq!(part_added["part"]["type"], "reasoning_summary_text");
+
+        // delta carries the reasoning text on item rs_
+        let delta = extract_event_data(&events1[2]);
+        assert_eq!(delta["delta"], "Let me");
+        assert_eq!(delta["item_id"], "rs_rs123");
+
+        // Chunk 2: more reasoning
+        let chunk2 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":" think."},"finish_reason":null}]}"#;
+        let events2 = convert_openai_sse_to_responses(chunk2, "deepseek-v4-flash", response_id, "", &mut state);
+        let types2 = extract_event_types(&events2);
+        assert_eq!(types2, vec!["response.reasoning_summary_text.delta"]);
+
+        // Chunk 3: content text
+        let chunk3 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Answer"},"finish_reason":null}]}"#;
+        let events3 = convert_openai_sse_to_responses(chunk3, "deepseek-v4-flash", response_id, "Answer", &mut state);
+        let types3 = extract_event_types(&events3);
+        assert_eq!(
+            types3,
+            vec![
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+            ]
+        );
+        // text item gets output_index 1 (reasoning took 0)
+        let text_added = extract_event_data(&events3[0]);
+        assert_eq!(text_added["output_index"], 1);
+        assert_eq!(text_added["item"]["type"], "message");
+
+        // Chunk 4: finish
+        let chunk4 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+        let events4 = convert_openai_sse_to_responses(chunk4, "deepseek-v4-flash", response_id, "Answer", &mut state);
+        let types4 = extract_event_types(&events4);
+        assert_eq!(
+            types4,
+            vec![
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+            ]
+        );
+
+        // reasoning item closed with the full text in the summary
+        let rs_done = extract_event_data(&events4[1]);
+        assert_eq!(rs_done["item"]["type"], "reasoning");
+        assert_eq!(rs_done["item"]["status"], "completed");
+        assert_eq!(rs_done["item"]["summary"][0]["text"], "Let me think.");
+        assert_eq!(rs_done["output_index"], 0);
+
+        // response.completed output array must contain the reasoning item too
+        let synthetic = create_synthetic_completed_events(
+            "deepseek-v4-flash",
+            response_id,
+            "Answer",
+            &state,
+            10,
+            5,
+        );
+        let completed_event = synthetic.iter().find(|e| {
+            e.lines().next().map(|l| l == "event: response.completed").unwrap_or(false)
+        }).unwrap();
+        let completed = extract_event_data(completed_event);
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "Let me think.");
+        assert_eq!(output[1]["type"], "message");
     }
 
     #[test]
