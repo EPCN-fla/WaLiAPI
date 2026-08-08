@@ -852,4 +852,195 @@ mod tests {
             "partial carry record must be completed, not dropped: {text2}"
         );
     }
+
+    /// Real OpenCode-GO stream (captured via `wa_upstream_raw.txt`): 16 reasoning
+    /// chunks, then a tool_call record carrying id+name+empty args (REC16), then
+    /// 11 arguments deltas, then a `finish_reason: "tool_calls"` record, then
+    /// [DONE].  This is the EXACT upstream byte stream the ResponsesViaChat
+    /// converter must survive.  Any loss/corruption here is the reported bug.
+    ///
+    /// The stream is driven the way `driver.rs` does it: the first record is
+    /// split off as `first_frame`, everything after it is `carry`, and the pump
+    /// is constructed in one shot — records 2..N MUST NOT be dropped.
+    #[test]
+    fn responses_via_chat_survives_real_tool_call_stream() {
+        let records: Vec<&str> = vec![
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"role":"assistant","content":null,"reasoning_content":""}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"The"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" user"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" wants"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" me"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" to"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" call"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" the"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" read"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" tool"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" with"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" path"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" /"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"tmp"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"/x"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"."}}],"usage":null}"#,
+            // REC16: the tool_call opener carrying id + name.
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"id":"call_00_B4Go5x1lk0lKp5y1fvPa3907","type":"function","function":{"name":"read","arguments":""}}]}}],"usage":null}"#,
+            // REC17-27: arguments deltas.
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"path"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":": "}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"/"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"tmp"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"/x"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}],"usage":null}"#,
+            // REC28: finish with tool_calls + usage.
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":"tool_calls","logprobs":null,"delta":{"content":"","reasoning_content":null}}],"usage":{"prompt_tokens":346,"completion_tokens":60,"total_tokens":406,"prompt_cache_hit_tokens":256,"prompt_cache_miss_tokens":90,"prompt_tokens_details":{"cached_tokens":256},"completion_tokens_details":{"reasoning_tokens":15}}}"#,
+            r#"data: [DONE]"#,
+        ];
+
+        // Concatenate all records into a single upstream byte stream.
+        let mut stream = String::new();
+        for rec in &records {
+            stream.push_str(rec);
+            stream.push_str("\n\n");
+        }
+        let bytes = stream.as_bytes();
+
+        // Replicate `buffer_first_record`: split off the first complete record
+        // (records here are `\n\n`-terminated) as first_frame, keep the rest as
+        // carry, exactly like driver.rs does on the live upstream chunk.
+        let mut first_end = 0;
+        for i in 0..bytes.len() - 1 {
+            if bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
+                first_end = i + 2;
+                break;
+            }
+        }
+        let first_frame = bytes[..first_end].to_vec();
+        let carry = bytes[first_end..].to_vec();
+        assert!(
+            !carry.is_empty(),
+            "carry must contain records 2..N (records 2..N must not be lost)"
+        );
+
+        let mut core = StreamPumpCore::new(
+            native_supervisor(),
+            SseMode::ResponsesViaChat,
+            None,
+            first_frame,
+            carry,
+            "deepseek-v4-flash".to_string(),
+        )
+        .unwrap();
+        let out = core.start().unwrap();
+        let text = String::from_utf8_lossy(&out);
+
+        // The tool call MUST carry the real id + name (not the fc_/call_ fallbacks).
+        assert!(
+            text.contains("call_00_B4Go5x1lk0lKp5y1fvPa3907"),
+            "tool call id from REC16 must survive: {text}"
+        );
+        assert!(
+            text.contains("\"name\":\"read\""),
+            "tool call name from REC16 must survive: {text}"
+        );
+        assert!(
+            !text.contains("\"name\":\"\"") && !text.contains("\"call_id\":\"call_1\""),
+            "fallback empty name / synthesized call_1 must NOT appear: {text}"
+        );
+
+        // The final completed item must contain the FULL arguments JSON.
+        let fin = core.finish().unwrap();
+        let full = format!("{text}{}", String::from_utf8_lossy(&fin));
+        assert!(
+            full.contains("{\\\"path\\\": \\\"/tmp/x\\\"}") || full.contains("\\\": \\\"/tmp/x\\\"}"),
+            "full arguments `{{\"path\": \"/tmp/x\"}}` must be accumulated: {full}"
+        );
+        assert!(
+            full.contains("\"status\":\"completed\"")
+                && full.contains("\"type\":\"function_call\""),
+            "the function_call must complete: {full}"
+        );
+    }
+
+    /// The SAME real stream fed ONE RECORD PER `push()`, as a live HTTP body
+    /// typically delivers it.  `buffer_first_record` only pre-loads the first
+    /// record + whatever was in the same TCP read; every later record arrives
+    /// as its own `push()`.  Any loss here is the production bug.
+    #[test]
+    fn responses_via_chat_survives_real_stream_record_by_record() {
+        // Build the full upstream byte stream exactly as in the single-shot test.
+        let records: Vec<&str> = vec![
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"role":"assistant","content":null,"reasoning_content":""}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"The"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" user"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" wants"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" me"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" to"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" call"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" the"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" read"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" tool"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" with"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" path"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":" /"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"tmp"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"/x"}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"content":null,"reasoning_content":"."}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"id":"call_00_B4Go5x1lk0lKp5y1fvPa3907","type":"function","function":{"name":"read","arguments":""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"path"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":": "}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"/"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"tmp"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"/x"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":null,"logprobs":null,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}],"usage":null}"#,
+            r#"data: {"id":"bfdd2576-6ce0-41a3-a1e4-ddca7acbf7b2","object":"chat.completion.chunk","created":1786164640,"model":"deepseek-v4-flash","choices":[{"index":0,"finish_reason":"tool_calls","logprobs":null,"delta":{"content":"","reasoning_content":null}}],"usage":{"prompt_tokens":346,"completion_tokens":60,"total_tokens":406,"prompt_cache_hit_tokens":256,"prompt_cache_miss_tokens":90,"prompt_tokens_details":{"cached_tokens":256},"completion_tokens_details":{"reasoning_tokens":15}}}"#,
+            r#"data: [DONE]"#,
+        ];
+
+        // First record becomes first_frame (as buffer_first_record does); the
+        // rest are delivered one record per push().
+        let rec0 = format!("{}\n\n", records[0]);
+        let mut core = StreamPumpCore::new(
+            native_supervisor(),
+            SseMode::ResponsesViaChat,
+            None,
+            rec0.as_bytes().to_vec(),
+            Vec::new(),
+            "deepseek-v4-flash".to_string(),
+        )
+        .unwrap();
+        let mut text = String::from_utf8_lossy(&core.start().unwrap()).to_string();
+        for rec in &records[1..] {
+            let chunk = format!("{}\n\n", rec);
+            let out = core.push(chunk.as_bytes()).unwrap();
+            text.push_str(&String::from_utf8_lossy(&out));
+        }
+        let fin = core.finish().unwrap();
+        text.push_str(&String::from_utf8_lossy(&fin));
+
+        assert!(
+            text.contains("call_00_B4Go5x1lk0lKp5y1fvPa3907"),
+            "tool call id must survive per-record push: {text}"
+        );
+        assert!(
+            text.contains("\"name\":\"read\""),
+            "tool call name must survive per-record push: {text}"
+        );
+        assert!(
+            !text.contains("\"name\":\"\"") && !text.contains("\"call_id\":\"call_1\""),
+            "fallback empty name / synthesized call_1 must NOT appear: {text}"
+        );
+        assert!(
+            text.contains("\\\": \\\"/tmp/x\\\"}"),
+            "full arguments `{{\"path\": \"/tmp/x\"}}` must be accumulated: {text}"
+        );
+    }
 }

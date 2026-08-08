@@ -2,6 +2,52 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Reassembles upstream SSE records that arrive fragmented across TCP chunks.
+///
+/// ResponsesViaChat has no codec decoder, so a record split across TCP frames
+/// would otherwise be fed to [`convert_openai_sse_to_responses`] as several
+/// half-records and silently dropped (mid-JSON fragments never parse). Only
+/// complete records are returned here. This mirrors the `encode_responses_buffered`
+/// reassembly in the StreamPumpCore path — tool names / call ids / argument
+/// fragments are lost without it.
+#[derive(Default)]
+pub struct ResponsesSseAssembler {
+    pending: Vec<u8>,
+}
+
+impl ResponsesSseAssembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one upstream chunk; returns every COMPLETE SSE record it contains.
+    /// A record whose terminator hasn't arrived yet is buffered for the next call.
+    pub fn push(&mut self, chunk: &str) -> Vec<String> {
+        self.pending.extend_from_slice(chunk.as_bytes());
+        let mut records = Vec::new();
+        while let Some(end) = crate::protocol::codec::sse::record_end(&self.pending) {
+            let record: Vec<u8> = self.pending.drain(..end).collect();
+            records.push(String::from_utf8_lossy(&record).into_owned());
+        }
+        records
+    }
+
+    /// Whether bytes are still buffered awaiting a record terminator.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Flush any trailing bytes at EOF as a final record (a record that
+    /// terminated exactly at EOF must not be lost).
+    pub fn flush(&mut self) -> Vec<String> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        let tail = std::mem::take(&mut self.pending);
+        vec![String::from_utf8_lossy(&tail).into_owned()]
+    }
+}
+
 /// State for tracking streaming output items during OpenAI SSE → Responses SSE conversion.
 ///
 /// Tracks both text message items and function_call items so we can emit
@@ -1015,6 +1061,166 @@ mod tests {
             .trim_start_matches("data: ")
             .trim();
         serde_json::from_str(data_line).unwrap()
+    }
+
+    /// 63 raw upstream fragments captured from `handle_responses_stream` via
+    /// `WALIAPI_DEBUG_SSE` instrumentation (deepseek-v4-flash / OpenCode-GO
+    /// channel, 2026-08-08). Every SSE record is split across multiple TCP
+    /// chunks — often mid-JSON, with the `\n\n` terminator landing in a fragment
+    /// that starts mid-record. This is the real-world fragmentation that used to
+    /// drop tool names / call ids / argument fragments.
+    const REAL_FRAGMENTS: &[&str] = &[
+        "data: {\"id\":\"adba4265-1f45-4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"\"}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk",
+        "\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\"I\",\"reasoning_content\":null}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk",
+        "\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\"'ll\",\"reasoning_content\":null}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f4",
+        "5-4b6f-a564-ef2ca7a6e353\",",
+        "\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\" read\",\"reasoning_content\":null}}],\"usage\":null}\n\ndata: {\"id\":\"adba4265-1f45-4b6f-a564-ef2ca7a6e353\",\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\" the\",\"reasoning_content\":null}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f4",
+        "5-4b6f-a564-ef2ca7a6e353\",\"",
+        "object\":\"chat.completion.chu",
+        "nk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\" file\",\"reasoning_content\":null}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk",
+        "\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\" at\",\"reasoning_content\":null}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f4",
+        "5-4b6f-a564-ef2ca7a6e353\",",
+        "\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\" that\",\"reasoning_content\":null}}],\"usage\":null}\n\ndata: {\"id\":\"adba4265-1f45-4b6f-a564-ef2ca7a6e353\",\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\" path\",\"reasoning_content\":null}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f4",
+        "5-4b6f-a564-ef2ca7a6e353\",\"",
+        "object\":\"chat.completion.chu",
+        "nk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\".\",\"reasoning_content\":null}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"o",
+        "bject\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_00_ET_qpwrSuOGqdNVOyDYESq94260\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f4",
+        "5-4b6f-a564-ef2ca7a6e353\",",
+        "\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"\"}}]}}],\"usage\":null}\n\ndata: {\"id\":\"adba4265-1f45-4b6f-a564-ef2ca7a6e353\",\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"path\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45",
+        "-",
+        "4b6f-a564-ef2ca7a6e353\",\"",
+        "object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\": \"}}]}}],\"usage\":null}\n\ndata: {\"id\":\"adba4265-1f45-4b6f-a564-ef2ca7a6e353\",\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f4",
+        "5-4b6f-a564-ef2ca7a6e353\",\"",
+        "object\":\"chat.completion.chu",
+        "nk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"/\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"tmp\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45",
+        "-",
+        "4b6f-a564-ef2ca7a6e353\",\"",
+        "object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"/x\"}}]}}],\"usage\":null}\n\ndata: {\"id\":\"adba4265-1f45-4b6f-a564-ef2ca7a6e353\",\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"o",
+        "bject\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"logprobs\":null,\"delta\":{\"content\":\"\",\"reasoning_content\":null}}],\"usage\":{\"prompt_tokens\":348,\"completion_tokens\":53,\"total_tokens\":401,\"prompt_cache_hit_tokens\":256,\"prompt_cache_miss_tokens\":92,\"prompt_tokens_details\":{\"cached_tokens\":256},\"completion_tokens_details\":{\"reasoning_tokens\":0}}}\n\n",
+        "data: [DONE]\n\n",
+        "data: {\"choices\":[],\"cost\":\"0\"}\n\n",
+    ];
+
+    /// Feed each raw fragment through the record-reassembly seam (the same logic
+    /// the handler uses), then convert each complete record. This reproduces the
+    /// real upstream fragmentation; without reassembly the tool-call announcement
+    /// record (carrying name + id) and most argument-delta records are dropped.
+    fn run_reassembled(fragments: &[&str]) -> Vec<String> {
+        let mut state = StreamState::default();
+        let mut events = Vec::new();
+        let mut asm = ResponsesSseAssembler::new();
+        for frag in fragments {
+            for record in asm.push(frag) {
+                events.extend(convert_openai_sse_to_responses(
+                    &record,
+                    "deepseek-v4-flash",
+                    "resp_test",
+                    "",
+                    &mut state,
+                ));
+            }
+        }
+        for record in asm.flush() {
+            events.extend(convert_openai_sse_to_responses(
+                &record,
+                "deepseek-v4-flash",
+                "resp_test",
+                "",
+                &mut state,
+            ));
+        }
+        events
+    }
+
+    #[test]
+    fn reassembled_tool_call_survives_real_fragmentation() {
+        let events = run_reassembled(REAL_FRAGMENTS);
+        let types = extract_event_types(&events);
+
+        // The text message must come through intact.
+        assert!(
+            types.contains(&"response.output_item.added".to_string()),
+            "expected a tool call item to be added"
+        );
+
+        // The function_call output_item.added must carry the real name + call_id.
+        let added = events
+            .iter()
+            .filter(|e| {
+                extract_event_types(&[(*e).clone()])
+                    == vec!["response.output_item.added".to_string()]
+            })
+            .map(|e| extract_event_data(e))
+            .find(|d| d["item"]["type"] == "function_call")
+            .expect("a function_call output_item.added must be emitted");
+
+        assert_eq!(
+            added["item"]["name"], "read",
+            "tool call name lost by fragmentation: got {}",
+            added["item"]["name"]
+        );
+        assert_eq!(
+            added["item"]["call_id"], "call_00_ET_qpwrSuOGqdNVOyDYESq94260",
+            "tool call id lost by fragmentation: got {}",
+            added["item"]["call_id"]
+        );
+        assert_eq!(
+            added["item"]["id"], "call_00_ET_qpwrSuOGqdNVOyDYESq94260",
+            "tool call item id must not fall back to fc_0"
+        );
+
+        // The final function_call output_item.done must carry full arguments.
+        let done = events
+            .iter()
+            .filter(|e| extract_event_types(&[(*e).clone()]) == vec!["response.output_item.done".to_string()])
+            .map(|e| extract_event_data(e))
+            .find(|d| d["item"]["type"] == "function_call")
+            .expect("a function_call output_item.done must be emitted");
+
+        assert_eq!(
+            done["item"]["arguments"], "{\"path\": \"/tmp/x\"}",
+            "tool call arguments truncated by fragmentation: got {}",
+            done["item"]["arguments"]
+        );
+        assert_eq!(done["item"]["name"], "read");
+        assert_eq!(
+            done["item"]["call_id"], "call_00_ET_qpwrSuOGqdNVOyDYESq94260",
+            "tool call id must not fall back to call_1"
+        );
     }
 
     #[test]

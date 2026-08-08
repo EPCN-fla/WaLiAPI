@@ -2340,44 +2340,52 @@ async fn handle_responses_stream(
                     let mut stream_state = crate::protocol::responses::StreamState::default();
                     let mut accumulated_content = String::new();
                     let mut accumulated_reasoning = String::new();
+                    let mut sse_assembler = crate::protocol::responses::ResponsesSseAssembler::new();
 
                     while let Some(chunk_result) = upstream_stream.next().await {
                         match chunk_result {
                             Ok(bytes) => {
                                 if let Ok(text) = std::str::from_utf8(&bytes) {
-                                    if let Some((p, c, t)) = crate::protocol::responses::parse_usage_from_sse_chunk(text) {
-                                        usage_prompt = p;
-                                        usage_completion = c;
-                                        usage_total = t;
-                                    }
-                                    // Accumulate content for logging
-                                    for line in text.lines() {
-                                        let trimmed = line.trim();
-                                        if !trimmed.starts_with("data:") { continue; }
-                                        let data_str = trimmed.trim_start_matches("data:").trim();
-                                        if data_str == "[DONE]" || data_str.is_empty() { continue; }
-                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
-                                            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
-                                                if let Some(choice) = choices.first() {
-                                                    if let Some(delta) = choice.get("delta") {
-                                                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                                                            accumulated_content.push_str(content);
-                                                        }
-                                                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
-                                                            accumulated_reasoning.push_str(reasoning);
+                                    // Reassemble fragmented SSE records before conversion.
+                                    // The upstream channel splits every record across TCP
+                                    // chunks (often mid-JSON); feeding raw fragments to
+                                    // the converter silently drops tool names / call ids /
+                                    // argument fragments. Only complete records are processed.
+                                    for record in sse_assembler.push(text) {
+                                        if let Some((p, c, t)) = crate::protocol::responses::parse_usage_from_sse_chunk(&record) {
+                                            usage_prompt = p;
+                                            usage_completion = c;
+                                            usage_total = t;
+                                        }
+                                        // Accumulate content for logging
+                                        for line in record.lines() {
+                                            let trimmed = line.trim();
+                                            if !trimmed.starts_with("data:") { continue; }
+                                            let data_str = trimmed.trim_start_matches("data:").trim();
+                                            if data_str == "[DONE]" || data_str.is_empty() { continue; }
+                                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+                                                if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                                                    if let Some(choice) = choices.first() {
+                                                        if let Some(delta) = choice.get("delta") {
+                                                            if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                                                accumulated_content.push_str(content);
+                                                            }
+                                                            if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                                                                accumulated_reasoning.push_str(reasoning);
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
                                         }
-                                    }
-                                    // Convert OpenAI SSE → Responses SSE events
-                                    let events = crate::protocol::responses::convert_openai_sse_to_responses(
-                                        text, &model_clone, &response_id, &accumulated_content,
-                                        &mut stream_state,
-                                    );
-                                    for event in events {
-                                        yield Ok::<_, std::io::Error>(event.into_bytes().into());
+                                        // Convert OpenAI SSE → Responses SSE events
+                                        let events = crate::protocol::responses::convert_openai_sse_to_responses(
+                                            &record, &model_clone, &response_id, &accumulated_content,
+                                            &mut stream_state,
+                                        );
+                                        for event in events {
+                                            yield Ok::<_, std::io::Error>(event.into_bytes().into());
+                                        }
                                     }
                                 } else {
                                     yield Ok::<_, std::io::Error>(bytes);
@@ -2395,9 +2403,45 @@ async fn handle_responses_stream(
                         }
                     }
 
-                    // Stream ended. Emit final response.completed with usage.
+                    // Stream ended. Flush any record whose terminator arrived exactly
+                    // at EOF so its deltas are not lost, then emit final response.completed
+                    // with usage.
                     // (convert_openai_sse_to_responses sends everything up to output_item.done,
                     // but NOT response.completed — that's sent here with usage from the final chunk)
+                    for record in sse_assembler.flush() {
+                        if let Some((p, c, t)) = crate::protocol::responses::parse_usage_from_sse_chunk(&record) {
+                            usage_prompt = p;
+                            usage_completion = c;
+                            usage_total = t;
+                        }
+                        for line in record.lines() {
+                            let trimmed = line.trim();
+                            if !trimmed.starts_with("data:") { continue; }
+                            let data_str = trimmed.trim_start_matches("data:").trim();
+                            if data_str == "[DONE]" || data_str.is_empty() { continue; }
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+                                if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                                    if let Some(choice) = choices.first() {
+                                        if let Some(delta) = choice.get("delta") {
+                                            if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                                accumulated_content.push_str(content);
+                                            }
+                                            if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                                                accumulated_reasoning.push_str(reasoning);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let events = crate::protocol::responses::convert_openai_sse_to_responses(
+                            &record, &model_clone, &response_id, &accumulated_content,
+                            &mut stream_state,
+                        );
+                        for event in events {
+                            yield Ok::<_, std::io::Error>(event.into_bytes().into());
+                        }
+                    }
                     if !had_error {
                         let synth_events = crate::protocol::responses::create_synthetic_completed_events(
                             &model_clone,

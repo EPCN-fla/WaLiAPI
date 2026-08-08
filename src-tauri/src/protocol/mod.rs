@@ -281,6 +281,25 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
         let mut call_id_fallback: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         let mut fallback_counter = 0u32;
+        // Whether a `function_call` item appears anywhere AFTER index `i`.
+        // A `reasoning` item followed (possibly through an intermediate
+        // assistant text message) by function_calls belongs to that
+        // tool-calling turn: its text must ride on the assistant(tool_calls)
+        // message emitted at flush time, NOT on the intermediate text message.
+        // DeepSeek thinking mode rejects the follow-up otherwise with
+        // "The reasoning_content in the thinking mode must be passed back."
+        let function_call_after: Vec<bool> = {
+            let mut v = vec![false; arr.len()];
+            let mut seen = false;
+            for (i, item) in arr.iter().enumerate().rev() {
+                v[i] = seen;
+                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                    seen = true;
+                }
+            }
+            v
+        };
+
         for item in arr {
             let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match item_type {
@@ -386,7 +405,7 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
             pending_tool_calls.clear();
         };
 
-        for item in arr {
+        for (idx, item) in arr.iter().enumerate() {
             let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
             match item_type {
@@ -518,7 +537,18 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
                             .get("reasoning_content")
                             .and_then(|r| r.as_str())
                             .map(|s| s.to_string())
-                            .or_else(|| pending_reasoning.take());
+                            .or_else(|| {
+                                // If this assistant text message is part of a
+                                // tool-calling turn (function_calls follow it),
+                                // keep the reasoning for the assistant(tool_calls)
+                                // message emitted at flush — that is the message
+                                // DeepSeek's thinking mode requires it on.
+                                if function_call_after[idx] {
+                                    None
+                                } else {
+                                    pending_reasoning.take()
+                                }
+                            });
                         if let Some(rc) = rc {
                             if !rc.is_empty() {
                                 msg["reasoning_content"] = Value::String(rc);
@@ -526,8 +556,11 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
                         }
                     } else {
                         // A reasoning item belongs to the assistant message that
-                        // immediately follows it; drop it before any other role.
-                        pending_reasoning = None;
+                        // immediately follows it; drop it before any other role —
+                        // unless a buffered tool call still needs to flush with it.
+                        if pending_tool_calls.is_empty() && awaiting.is_empty() {
+                            pending_reasoning = None;
+                        }
                     }
                     // Defer regular messages while tool responses are pending so
                     // they never interrupt an assistant(tool_calls)→tool(...) run.
@@ -1560,6 +1593,75 @@ mod anthropic_tests {
     }
 
     #[test]
+    fn responses_input_reasoning_stays_on_tool_calls_message() {
+        // Real Codex echo order (captured from the local gateway log):
+        // reasoning → assistant text → function_call → function_call_output.
+        // DeepSeek thinking mode requires `reasoning_content` on the
+        // assistant(tool_calls) message; consuming it on the intermediate
+        // text message makes the follow-up fail with
+        // "The reasoning_content in the thinking mode must be passed back
+        // to the API."
+        let input = serde_json::json!([
+            {"type": "reasoning", "id": "rs_a", "summary": [{"type": "summary_text", "text": "Let me check the file."}]},
+            {"type": "message", "id": "msg_a", "role": "assistant", "content": [{"type": "output_text", "text": "Let me look at that."}]},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_A", "name": "read", "arguments": "{\"path\":\"/tmp/x\"}"},
+            {"type": "function_call_output", "call_id": "call_A", "output": "file contents"},
+            {"type": "message", "id": "msg_u", "role": "user", "content": [{"type": "input_text", "text": "continue"}]}
+        ]);
+        let messages = convert_responses_input_to_messages(&input);
+        let msgs = messages.as_array().unwrap();
+
+        // The tool-calling assistant message MUST carry the reasoning.
+        let tool_call_msg = msgs
+            .iter()
+            .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .unwrap();
+        assert_eq!(tool_call_msg["reasoning_content"], "Let me check the file.");
+        assert_eq!(tool_call_msg["tool_calls"][0]["id"], "call_A");
+        assert_eq!(msgs[0]["role"], "assistant");
+
+        // The intermediate assistant text message must NOT have consumed it.
+        let text_msg = msgs
+            .iter()
+            .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_none())
+            .unwrap();
+        assert_eq!(text_msg["content"], "Let me look at that.");
+        assert!(
+            text_msg.get("reasoning_content").is_none()
+                || text_msg["reasoning_content"].as_str().unwrap_or("").is_empty(),
+            "reasoning must not be consumed by the intermediate text message"
+        );
+
+        // Tool output still follows the tool_calls assistant message.
+        assert_eq!(
+            msgs[2],
+            serde_json::json!({"role": "tool", "tool_call_id": "call_A", "content": "file contents"})
+        );
+    }
+
+    #[test]
+    fn responses_input_reasoning_with_user_interleaved_before_output() {
+        // Codex can interleave a user text message between function_call and
+        // function_call_output. The reasoning must survive until the
+        // assistant(tool_calls) flush even across that user message.
+        let input = serde_json::json!([
+            {"type": "reasoning", "id": "rs_a", "summary": [{"type": "summary_text", "text": "thinking"}]},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_A", "name": "shell", "arguments": "{}"},
+            {"type": "message", "id": "msg_ok", "role": "user", "content": [{"type": "input_text", "text": "Approved command prefix saved"}]},
+            {"type": "function_call_output", "call_id": "call_A", "output": "done"},
+            {"type": "message", "id": "msg_next", "role": "user", "content": [{"type": "input_text", "text": "next"}]}
+        ]);
+        let messages = convert_responses_input_to_messages(&input);
+        let msgs = messages.as_array().unwrap();
+        let tool_call_msg = msgs
+            .iter()
+            .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .unwrap();
+        assert_eq!(tool_call_msg["reasoning_content"], "thinking");
+        assert_eq!(msgs[1]["role"], "tool");
+    }
+
+    #[test]
     fn responses_input_parallel_function_calls_merge_into_one_assistant() {
         // Parallel function_calls must be merged into ONE assistant message with a
         // multi-element tool_calls array, immediately followed by their tool
@@ -1674,3 +1776,4 @@ mod anthropic_tests {
         assert_eq!(msgs[4], serde_json::json!({"role": "tool", "tool_call_id": "call_B", "content": "file contents"}));
     }
 }
+
