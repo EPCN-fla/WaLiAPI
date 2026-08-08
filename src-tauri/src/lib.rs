@@ -219,6 +219,7 @@ pub fn run() {
             commands::wiki::get_wiki_stats,
             commands::wiki::ingest_wiki_source,
             commands::wiki::rescan_wiki_sources,
+            commands::wiki::get_wiki_tags,
             // App Config (应用配置)
             commands::app_config::get_app_configs,
             commands::app_config::apply_app_config,

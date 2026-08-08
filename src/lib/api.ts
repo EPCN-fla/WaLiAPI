@@ -366,6 +366,7 @@ export interface WikiPage {
     token_count: number;
     wikilinks: string;
     frontmatter: string;
+    tags: string;
     status: string;
     content?: string;
     created_at: string;
@@ -428,6 +429,11 @@ export interface WikiGraphData {
     }>;
 }
 
+export interface WikiTag {
+  word: string;
+  count: number;
+}
+
 export interface AddWikiSourceInput {
     source_type: string;
     filename: string;
@@ -455,6 +461,7 @@ export const wikiApi = {
     getStats: (projectId: string) => invoke<Record<string, unknown>>("get_wiki_stats", { projectId }),
     ingestSource: (projectId: string, sourceId: string) => invoke<{ status: string; pages_created: number; page_paths: string[] }>("ingest_wiki_source", { projectId, sourceId }),
     rescanSources: (projectId: string) => invoke<{ status: string; processed: number; results: unknown[] }>("rescan_wiki_sources", { projectId }),
+    getTags: (projectId: string, limit?: number) => invoke<WikiTag[]>("get_wiki_tags", { projectId, limit }),
 };
 
 // Service status

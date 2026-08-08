@@ -143,16 +143,17 @@ impl WikiRepository {
         token_count: i64,
         wikilinks: &str,
         frontmatter: &str,
+        tags: &str,
     ) -> Result<(), String> {
         let now = Self::now();
         sqlx::query(
-            "INSERT INTO wiki_pages (id, project_id, path, title, page_type, content_hash, token_count, wikilinks, frontmatter, status, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            "INSERT INTO wiki_pages (id, project_id, path, title, page_type, content_hash, token_count, wikilinks, frontmatter, tags, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
              ON CONFLICT(project_id, path) DO UPDATE SET
                title=excluded.title, page_type=excluded.page_type,
                content_hash=excluded.content_hash, token_count=excluded.token_count,
                wikilinks=excluded.wikilinks, frontmatter=excluded.frontmatter,
-               status='active', updated_at=excluded.updated_at"
+               tags=excluded.tags, status='active', updated_at=excluded.updated_at"
         )
         .bind(Self::uuid())
         .bind(project_id)
@@ -163,6 +164,7 @@ impl WikiRepository {
         .bind(token_count)
         .bind(wikilinks)
         .bind(frontmatter)
+        .bind(tags)
         .bind(&now)
         .bind(&now)
         .execute(&self.pool)
@@ -455,6 +457,39 @@ impl WikiRepository {
             .await
             .map_err(|e| format!("DB error: {}", e))?;
         Ok(())
+    }
+
+    // ── Tags ──
+
+    pub async fn get_tags(&self, project_id: &str, limit: usize) -> Result<Vec<crate::services::wiki::models::WikiTag>, String> {
+        // Collect tags from all active pages in the project
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT tags FROM wiki_pages WHERE project_id = ? AND status = 'active'"
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("DB error: {}", e))?;
+
+        let mut freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (tags_json,) in &rows {
+            let tags: Vec<String> = serde_json::from_str(tags_json).unwrap_or_default();
+            for tag in tags {
+                let tag = tag.trim().to_lowercase();
+                if !tag.is_empty() {
+                    *freq.entry(tag).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut freq_vec: Vec<(String, usize)> = freq.into_iter().collect();
+        freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+        Ok(freq_vec
+            .into_iter()
+            .take(limit)
+            .map(|(word, count)| crate::services::wiki::models::WikiTag { word, count })
+            .collect())
     }
 
     // ── Graph ──

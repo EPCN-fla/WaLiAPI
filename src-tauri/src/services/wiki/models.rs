@@ -56,6 +56,7 @@ pub struct WikiPage {
     pub token_count: i64,
     pub wikilinks: String,
     pub frontmatter: String,
+    pub tags: String,
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
@@ -206,4 +207,10 @@ pub struct GraphEdge {
 pub struct GraphData {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WikiTag {
+    pub word: String,
+    pub count: usize,
 }

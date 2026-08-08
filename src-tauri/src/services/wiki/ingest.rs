@@ -6,7 +6,7 @@ use crate::db::repository::Repository;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 /// Ingest a source file: read → parse → generate wiki pages via LLM → write to disk+DB.
 pub async fn ingest_source(
@@ -26,6 +26,7 @@ pub async fn ingest_source(
     // 2. Update task status
     let task_id = repo.create_task(project_id, Some(source_id), "ingest").await?;
     repo.update_task_status(&task_id, "running", 0, 0, 3, None, None).await?;
+    emit_wiki_progress(app, source_id, project_id, &source.filename, "processing", 0, "准备摄入");
 
     // 3. Read source file content
     let content = if let Some(ref file_path) = source.file_path {
@@ -44,6 +45,7 @@ pub async fn ingest_source(
 
     // 4. Parse content into sections/chunks
     repo.update_task_status(&task_id, "running", 10, 0, 3, None, None).await?;
+    emit_wiki_progress(app, source_id, project_id, &source.filename, "parsing", 10, "解析文档");
     let sections = parse_content(&content, &file_ext);
 
     // 5. Get project config for LLM
@@ -63,6 +65,7 @@ pub async fn ingest_source(
 
     // 6. Generate wiki pages via LLM
     repo.update_task_status(&task_id, "running", 30, 1, 3, None, None).await?;
+    emit_wiki_progress(app, source_id, project_id, &source.filename, "generating", 30, "LLM 生成页面");
     let pages = generate_wiki_pages(
         app,
         &db_repo,
@@ -76,6 +79,7 @@ pub async fn ingest_source(
 
     // 7. Write pages to disk + DB
     repo.update_task_status(&task_id, "running", 60, 2, 3, None, None).await?;
+    emit_wiki_progress(app, source_id, project_id, &source.filename, "writing", 60, "写入页面");
     let mut written_pages = Vec::new();
     for page in &pages {
         let page_path = &page.path;
@@ -93,6 +97,10 @@ pub async fn ingest_source(
         let wikilinks = extract_wikilinks(&page.content);
         let wikilinks_json = serde_json::to_string(&wikilinks).unwrap_or_else(|_| "[]".to_string());
 
+        // Extract tags from frontmatter
+        let tags = extract_tags_from_frontmatter(&page.content);
+        let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
+
         // Upsert into DB
         repo.upsert_page(
             project_id,
@@ -103,6 +111,7 @@ pub async fn ingest_source(
             token_count,
             &wikilinks_json,
             "{}",
+            &tags_json,
         ).await?;
 
         written_pages.push(WrittenPage {
@@ -115,6 +124,7 @@ pub async fn ingest_source(
 
     // 8. Update graph edges from wikilinks
     repo.update_task_status(&task_id, "running", 80, 2, 3, None, None).await?;
+    emit_wiki_progress(app, source_id, project_id, &source.filename, "linking", 80, "更新知识图谱");
     update_graph_edges(pool, project_id, &written_pages).await?;
 
     // 9. Update source status
@@ -145,6 +155,7 @@ pub async fn ingest_source(
         "source": source_filename,
     }).to_string();
     repo.update_task_status(&task_id, "done", 100, 3, 3, Some(&result_json), None).await?;
+    emit_wiki_progress(app, source_id, project_id, &source.filename, "done", 100, &format!("完成，生成 {} 个页面", written_pages.len()));
 
     Ok(IngestResult {
         pages_created: written_pages.len(),
@@ -163,6 +174,29 @@ struct GeneratedPage {
     title: String,
     page_type: String,
     content: String,
+}
+
+/// Emit wiki source ingest progress event to frontend.
+fn emit_wiki_progress(
+    app: &AppHandle,
+    source_id: &str,
+    project_id: &str,
+    filename: &str,
+    stage: &str,
+    progress: u8,
+    detail: &str,
+) {
+    let _ = app.emit(
+        "wiki-source-progress",
+        serde_json::json!({
+            "source_id": source_id,
+            "project_id": project_id,
+            "filename": filename,
+            "stage": stage,
+            "progress": progress,
+            "detail": detail,
+        }),
+    );
 }
 
 struct WrittenPage {
@@ -729,6 +763,39 @@ async fn update_graph_edges(
     }
 
     Ok(())
+}
+
+/// Extract tags from YAML frontmatter of a wiki page.
+pub fn extract_tags_from_frontmatter(content: &str) -> Vec<String> {
+    if !content.starts_with("---") {
+        return vec![];
+    }
+    let rest = &content[3..];
+    let end = match rest.find("---") {
+        Some(e) => e,
+        None => return vec![],
+    };
+    let frontmatter = &rest[..end];
+    for line in frontmatter.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("tags:") {
+            let tags_part = trimmed[5..].trim();
+            // Parse array format: [tag1, tag2] or ["tag1", "tag2"]
+            let cleaned = tags_part
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim();
+            if cleaned.is_empty() {
+                return vec![];
+            }
+            return cleaned
+                .split(',')
+                .map(|t| t.trim().trim_matches('"').trim_matches('\'').trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+        }
+    }
+    vec![]
 }
 
 fn normalize_wikilink(link: &str) -> String {

@@ -21,6 +21,7 @@ import {
   type WikiSearchResult,
   type WikiGraphData,
   type WikiReview,
+  type WikiTag,
   type ServiceStatus,
 } from "../lib/api";
 import type { Channel } from "../types";
@@ -3256,9 +3257,6 @@ function CreateWikiProjectModal({ onClose, onCreated }: { onClose: () => void; o
     }
   };
 
-  const selectedChannelData = channels.find(c => c.id === selectedChannel);
-  const chatChannelData = channels.find(c => c.id === chatChannel);
-
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-sm" onClick={onClose}>
       <div className="relative w-full max-w-lg rounded-3xl bg-white p-7 shadow-2xl" onClick={e => e.stopPropagation()}>
@@ -3296,43 +3294,26 @@ function CreateWikiProjectModal({ onClose, onCreated }: { onClose: () => void; o
           <div className="rounded-2xl border border-slate-100 p-4">
             <label className="mb-1.5 block text-xs font-medium text-slate-700">摄入渠道 & 模型 *</label>
             <p className="mb-2 text-[11px] text-slate-400">用于 LLM 解析文档并生成 Wiki 页面</p>
-            <div className="flex gap-2">
-              <select
-                value={selectedChannel}
-                onChange={e => { setSelectedChannel(e.target.value); const c = channels.find(c => c.id === e.target.value); setSelectedModel(c?.models[0] || ""); }}
-                className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
-              >
-                {channels.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
-              <select
-                value={selectedModel}
-                onChange={e => setSelectedModel(e.target.value)}
-                className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
-              >
-                {selectedChannelData?.models.map(m => <option key={m} value={m}>{m}</option>)}
-              </select>
-            </div>
+            <ChannelModelPicker
+              channels={channels}
+              channelId={selectedChannel}
+              onChannelChange={setSelectedChannel}
+              model={selectedModel}
+              onModelChange={setSelectedModel}
+            />
           </div>
           <div className="rounded-2xl border border-slate-100 p-4">
             <label className="mb-1.5 block text-xs font-medium text-slate-700">对话渠道 & 模型</label>
             <p className="mb-2 text-[11px] text-slate-400">用于 Wiki 问答，默认同摄入渠道</p>
-            <div className="flex gap-2">
-              <select
-                value={chatChannel}
-                onChange={e => { setChatChannel(e.target.value); const c = channels.find(c => c.id === e.target.value); setChatModel(c?.models[0] || ""); }}
-                className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
-              >
-                <option value="">同摄入渠道</option>
-                {channels.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
-              <select
-                value={chatModel}
-                onChange={e => setChatModel(e.target.value)}
-                className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
-              >
-                {chatChannelData?.models.map(m => <option key={m} value={m}>{m}</option>)}
-              </select>
-            </div>
+            <ChannelModelPicker
+              channels={channels}
+              channelId={chatChannel}
+              onChannelChange={setChatChannel}
+              model={chatModel}
+              onModelChange={setChatModel}
+              allowAuto
+              autoLabel="同摄入渠道"
+            />
           </div>
           <div>
             <label className="mb-1.5 block text-xs font-medium text-slate-700">Wiki Schema (CLAUDE.md)</label>
@@ -3372,6 +3353,7 @@ function WikiProjectDetail({
   onBack: () => void;
   onRefresh: () => void;
 }) {
+  const [initialSearchQuery, setInitialSearchQuery] = useState<string | null>(null);
   const tabs = [
     { key: "overview" as const, label: "概览", icon: Layers },
     { key: "pages" as const, label: "页面", icon: FileText },
@@ -3411,10 +3393,10 @@ function WikiProjectDetail({
       </div>
 
       {/* Tab Content */}
-      {tab === "overview" && <WikiOverview project={project} />}
+      {tab === "overview" && <WikiOverview project={project} onTagClick={(tag) => { setInitialSearchQuery(tag); setTab("search"); }} />}
       {tab === "pages" && <WikiPagesTab project={project} />}
       {tab === "sources" && <WikiSourcesTab project={project} onRefresh={onRefresh} onNavigateSettings={() => setTab("settings")} />}
-      {tab === "search" && <WikiSearchTab project={project} />}
+      {tab === "search" && <WikiSearchTab project={project} initialQuery={initialSearchQuery} onInitialQueryConsumed={() => setInitialSearchQuery(null)} />}
       {tab === "graph" && <WikiGraphTab project={project} />}
       {tab === "reviews" && <WikiReviewsTab project={project} />}
       {tab === "settings" && <WikiSettingsTab project={project} onRefresh={onRefresh} />}
@@ -3422,7 +3404,75 @@ function WikiProjectDetail({
   );
 }
 
-function WikiOverview({ project }: { project: WikiProject }) {
+function WikiTagsBar({ projectId, onTagClick }: { projectId: string; onTagClick?: (tag: string) => void }) {
+  const [tags, setTags] = useState<WikiTag[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    wikiApi.getTags(projectId, 16)
+      .then((data) => { if (active) setTags(data); })
+      .catch(() => {})
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [projectId]);
+
+  if (loading && tags.length === 0) {
+    return (
+      <div className="surface data-card rounded-2xl animate-pulse">
+        <div className="h-4 w-24 rounded bg-slate-100" />
+        <div className="mt-3 flex flex-wrap gap-1.5">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <div key={i} className="h-5 w-16 rounded-full bg-slate-100" />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  if (tags.length === 0) return null;
+
+  const tagColors = [
+    "border-violet-200 bg-violet-50 text-violet-700 hover:bg-violet-100",
+    "border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100",
+    "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100",
+    "border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100",
+    "border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100",
+    "border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100",
+    "border-cyan-200 bg-cyan-50 text-cyan-700 hover:bg-cyan-100",
+    "border-fuchsia-200 bg-fuchsia-50 text-fuchsia-700 hover:bg-fuchsia-100",
+  ];
+
+  return (
+    <div className="surface data-card rounded-2xl">
+      <div className="mb-2 flex items-center gap-1.5">
+        <Tag size={13} className="text-slate-400" />
+        <span className="text-xs font-medium text-slate-500">标签</span>
+        <span className="text-[10px] text-slate-400">·</span>
+        <span className="text-[10px] text-slate-400">从页面 frontmatter 自动提取</span>
+        {onTagClick && (
+          <span className="ml-auto text-[10px] text-slate-400">点击标签快速搜索</span>
+        )}
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {tags.map((tag, i) => (
+          <button
+            key={tag.word}
+            onClick={() => onTagClick?.(tag.word)}
+            className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium transition-all ${onTagClick ? "cursor-pointer hover:shadow-sm" : "cursor-default"} ${tagColors[i % tagColors.length]}`}
+            title={`${tag.count} 个页面`}
+          >
+            {tag.word}
+            <span className="ml-1 text-[9px] opacity-60">{tag.count}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function WikiOverview({ project, onTagClick }: { project: WikiProject; onTagClick?: (tag: string) => void }) {
   const [stats, setStats] = useState<Record<string, unknown> | null>(null);
 
   useEffect(() => {
@@ -3449,6 +3499,8 @@ function WikiOverview({ project }: { project: WikiProject }) {
           </div>
         ))}
       </div>
+
+      <WikiTagsBar projectId={project.id} onTagClick={onTagClick} />
 
       <div className="surface data-card rounded-2xl">
         <div className="mb-3 flex items-center gap-2">
@@ -3613,9 +3665,11 @@ function WikiPagesTab({ project }: { project: WikiProject }) {
 function WikiSourcesTab({ project, onRefresh, onNavigateSettings }: { project: WikiProject; onRefresh: () => void; onNavigateSettings: () => void }) {
   const [sources, setSources] = useState<WikiSource[]>([]);
   const [loading, setLoading] = useState(true);
-  const [showAdd, setShowAdd] = useState(false);
   const [ingesting, setIngesting] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [uploadTotal, setUploadTotal] = useState(0);
+  const [uploadingCount, setUploadingCount] = useState(0);
+  const [progressMap, setProgressMap] = useState<Record<string, { stage: string; progress: number; detail: string; filename: string }>>({});
 
   const fetchSources = useCallback(async () => {
     setLoading(true);
@@ -3625,6 +3679,51 @@ function WikiSourcesTab({ project, onRefresh, onNavigateSettings }: { project: W
 
   useEffect(() => { fetchSources(); }, [fetchSources]);
 
+  // Listen for wiki source ingest progress events
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let active = true;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      unlisten = await listen<{ source_id: string; project_id: string; filename: string; stage: string; progress: number; detail: string }>(
+        "wiki-source-progress",
+        (event) => {
+          if (!active) return;
+          const p = event.payload;
+          if (p.project_id !== project.id) return;
+          if (p.stage === "done") {
+            setProgressMap((prev) => {
+              const next = { ...prev };
+              delete next[p.source_id];
+              return next;
+            });
+            setIngesting(null);
+            fetchSources();
+            onRefresh();
+          } else if (p.stage === "error") {
+            setProgressMap((prev) => {
+              const next = { ...prev };
+              delete next[p.source_id];
+              return next;
+            });
+            setIngesting(null);
+            setError(p.detail);
+            fetchSources();
+          } else {
+            setProgressMap((prev) => ({
+              ...prev,
+              [p.source_id]: { stage: p.stage, progress: p.progress, detail: p.detail, filename: p.filename || prev[p.source_id]?.filename || "" },
+            }));
+          }
+        }
+      );
+    })();
+    return () => {
+      active = false;
+      if (unlisten) unlisten();
+    };
+  }, [project.id, fetchSources, onRefresh]);
+
   const handleDelete = async (id: string) => {
     if (!confirm("确定删除此源文件？")) return;
     await wikiApi.deleteSource(id);
@@ -3632,26 +3731,33 @@ function WikiSourcesTab({ project, onRefresh, onNavigateSettings }: { project: W
     onRefresh();
   };
 
-  const handleFileUpload = async (file: File) => {
-    setIngesting('upload');
-    try {
-      const content = await file.text();
-      const source = await wikiApi.addSource(project.id, {
-        source_type: file.name.split('.').pop() || 'txt',
-        filename: file.name,
-        content,
-      });
-      await fetchSources();
-      // Auto-ingest after upload
-      await wikiApi.ingestSource(project.id, source.id);
-      await fetchSources();
-      onRefresh();
-    } catch (e) {
-      const msg = String(e);
-      setError(msg);
-    } finally {
-      setIngesting(null);
+  const handleUploadBatch = async (files: File[]) => {
+    if (files.length === 0) return;
+    setUploadTotal(files.length);
+    setUploadingCount(0);
+    for (const file of files) {
+      try {
+        const content = await file.text();
+        const source = await wikiApi.addSource(project.id, {
+          source_type: file.name.split('.').pop() || 'txt',
+          filename: file.name,
+          content,
+        });
+        setUploadingCount(prev => prev + 1);
+        // Auto-ingest after upload
+        setIngesting(source.id);
+        wikiApi.ingestSource(project.id, source.id).catch(e => {
+          setError(`摄入失败: ${e}`);
+          setIngesting(null);
+        });
+      } catch (e) {
+        setError(`上传失败 ${file.name}: ${e}`);
+      }
     }
+    setUploadTotal(0);
+    setUploadingCount(0);
+    await fetchSources();
+    onRefresh();
   };
 
   const handleIngest = async (sourceId: string) => {
@@ -3692,8 +3798,40 @@ function WikiSourcesTab({ project, onRefresh, onNavigateSettings }: { project: W
     failed: "bg-red-50 text-red-500",
   };
 
+  // Collect active progress entries (not done, not error)
+  const activeProgresses = Object.entries(progressMap);
+
   return (
-    <div className="space-y-3">
+    <div className="space-y-4">
+      {/* Upload zone — matches RAG style */}
+      <label className="flex cursor-pointer items-center justify-center rounded-2xl border-2 border-dashed border-slate-300 bg-white px-6 py-8 transition-colors hover:border-violet-400 hover:bg-violet-50/30">
+        <input
+          type="file"
+          className="hidden"
+          multiple
+          accept=".md,.txt,.json,.yaml,.yml,.rs,.ts,.tsx,.js,.py,.go,.java,.c,.cpp,.h,.sh,.toml,.xml,.html,.css,.pdf"
+          onChange={(e) => {
+            const files = Array.from(e.target.files || []);
+            if (files.length > 0) handleUploadBatch(files);
+            e.target.value = "";
+          }}
+          disabled={uploadTotal > 0}
+        />
+        {uploadTotal > 0 ? (
+          <div className="flex items-center gap-2 text-sm text-violet-600">
+            <Loader2 className="h-5 w-5 animate-spin" />
+            上传中 {uploadingCount}/{uploadTotal}...
+          </div>
+        ) : (
+          <div className="flex flex-col items-center gap-2 text-sm text-slate-500">
+            <Upload className="h-6 w-6" />
+            <span>点击或拖拽上传文件（支持多选）</span>
+            <span className="text-xs text-slate-400">支持 md/txt/code/json/yaml/pdf，上传后自动摄入</span>
+          </div>
+        )}
+      </label>
+
+      {/* Error notice */}
       {error && (
         <div className={`rounded-2xl border p-4 ${isChannelError ? 'border-amber-200 bg-amber-50' : 'border-red-200 bg-red-50'}`}>
           <div className="flex items-start gap-3">
@@ -3713,6 +3851,39 @@ function WikiSourcesTab({ project, onRefresh, onNavigateSettings }: { project: W
           </div>
         </div>
       )}
+
+      {/* Active ingest progress bars */}
+      {activeProgresses.length > 0 && (
+        <div className="space-y-2">
+          {activeProgresses.map(([sid, prog]) => (
+            <div key={sid} className="surface flex items-center gap-3 rounded-xl px-4 py-3">
+              <Loader2 className="h-5 w-5 shrink-0 animate-spin text-violet-500" />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="truncate text-sm font-medium text-slate-900">
+                    {prog.filename || sources.find(s => s.id === sid)?.filename || "摄入中..."}
+                  </span>
+                </div>
+                <div className="mt-1.5">
+                  <div className="flex items-center gap-2">
+                    <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-200">
+                      <div
+                        className="h-full rounded-full bg-violet-500 transition-all duration-300"
+                        style={{ width: `${prog.progress}%` }}
+                      />
+                    </div>
+                    <span className="shrink-0 text-[11px] text-violet-600">
+                      {prog.detail} · {prog.progress}%
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Toolbar */}
       <div className="flex justify-end gap-2">
         <button onClick={() => fetchSources()} disabled={loading} className="action-secondary">
           {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
@@ -3724,22 +3895,9 @@ function WikiSourcesTab({ project, onRefresh, onNavigateSettings }: { project: W
             全部处理
           </button>
         )}
-        <button onClick={() => setShowAdd(!showAdd)} className="action-primary">
-          <Plus size={16} /> 添加源文件
-        </button>
       </div>
-      {showAdd && (
-        <div className="surface rounded-2xl p-5 border-2 border-dashed border-slate-200">
-          <input
-            type="file"
-            onChange={e => {
-              if (e.target.files?.[0]) { handleFileUpload(e.target.files[0]); setShowAdd(false); }
-            }}
-            className="text-xs text-slate-500 file:mr-3 file:rounded-lg file:border-0 file:bg-slate-100 file:px-3 file:py-1.5 file:text-xs file:font-medium"
-          />
-          <p className="mt-2 text-[11px] text-slate-400">支持 .md / .txt / .json 等文本文件</p>
-        </div>
-      )}
+
+      {/* Sources list */}
       {sources.length === 0 ? (
         <div className="surface empty-state">
           <FolderOpen className="h-10 w-10 text-slate-300" />
@@ -3758,6 +3916,9 @@ function WikiSourcesTab({ project, onRefresh, onNavigateSettings }: { project: W
                     <span>{(s.file_size / 1024).toFixed(1)} KB</span>
                     {s.page_count > 0 && <span>{s.page_count} 页面</span>}
                     {s.ingested_at && <span>{s.ingested_at.slice(0, 10)}</span>}
+                    {s.status === 'failed' && s.error_message && (
+                      <span className="text-red-500" title={s.error_message}>{s.error_message.slice(0, 50)}</span>
+                    )}
                   </div>
                 </div>
                 <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${statusColors[s.status] || "bg-slate-50 text-slate-500"}`}>{s.status}</span>
@@ -3778,15 +3939,42 @@ function WikiSourcesTab({ project, onRefresh, onNavigateSettings }: { project: W
   );
 }
 
-function WikiSearchTab({ project }: { project: WikiProject }) {
-  const [query, setQuery] = useState("");
+function WikiSearchTab({ project, initialQuery, onInitialQueryConsumed }: { project: WikiProject; initialQuery?: string | null; onInitialQueryConsumed?: () => void }) {
+  const [query, setQueryDirect] = useState(initialQuery ?? "");
   const [results, setResults] = useState<WikiSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
+  const [searched, setSearched] = useState(false);
+  const [tags, setTags] = useState<WikiTag[]>([]);
+  const [tagsLoading, setTagsLoading] = useState(false);
 
-  const handleSearch = async () => {
-    if (!query.trim()) return;
+  // Load tags for preset search terms
+  useEffect(() => {
+    let active = true;
+    setTagsLoading(true);
+    wikiApi.getTags(project.id, 12)
+      .then((data) => { if (active) setTags(data); })
+      .catch(() => {})
+      .finally(() => { if (active) setTagsLoading(false); });
+    return () => { active = false; };
+  }, [project.id]);
+
+  // Auto-trigger search when initialQuery arrives from tag click in overview
+  useEffect(() => {
+    if (initialQuery) {
+      setQueryDirect(initialQuery);
+      handleSearch(initialQuery);
+      onInitialQueryConsumed?.();
+    }
+   // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialQuery]);
+
+  const handleSearch = async (searchQuery?: string) => {
+    const q = (searchQuery ?? query).trim();
+    if (!q) return;
+    if (searchQuery) setQueryDirect(searchQuery);
     setSearching(true);
-    try { const data = await wikiApi.search(project.id, query, 10); setResults(data); }
+    setSearched(true);
+    try { const data = await wikiApi.search(project.id, q, 10); setResults(data); }
     catch { /* ignore */ } finally { setSearching(false); }
   };
 
@@ -3802,17 +3990,47 @@ function WikiSearchTab({ project }: { project: WikiProject }) {
         <div className="flex gap-2">
           <input
             value={query}
-            onChange={e => setQuery(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && handleSearch()}
+            onChange={e => setQueryDirect(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && !e.nativeEvent.isComposing && e.keyCode !== 229 && handleSearch()}
             placeholder="搜索 Wiki 页面..."
             className="flex-1 rounded-xl border border-slate-200 px-4 py-2.5 text-sm"
           />
-          <button onClick={handleSearch} disabled={searching} className="action-primary">
+          <button onClick={() => handleSearch()} disabled={searching} className="action-primary">
             {searching ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
             搜索
           </button>
         </div>
+
+        {/* Preset search terms from tags */}
+        {(tagsLoading || tags.length > 0) && (
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <span className="flex items-center gap-1 text-[11px] font-medium text-slate-400">
+              <Sparkles size={12} />
+              快速搜索
+            </span>
+            {tagsLoading ? (
+              <>
+                {[...Array(5)].map((_, i) => (
+                  <div key={i} className="h-6 w-16 animate-pulse rounded-full bg-slate-100" />
+                ))}
+              </>
+            ) : (
+              tags.map((tag) => (
+                <button
+                  key={tag.word}
+                  onClick={() => handleSearch(tag.word)}
+                  className="inline-flex items-center rounded-full border border-slate-200 bg-gradient-to-br from-slate-50 to-white px-3 py-1 text-xs font-medium text-slate-600 transition-all hover:border-blue-200 hover:bg-blue-50 hover:text-blue-600 hover:shadow-sm"
+                  title={`${tag.count} 个页面`}
+                >
+                  {tag.word}
+                  <span className="ml-1 text-[9px] opacity-50">{tag.count}</span>
+                </button>
+              ))
+            )}
+          </div>
+        )}
       </div>
+
       {results.length > 0 && (
         <div className="surface rounded-2xl overflow-hidden">
           <div className="divide-y divide-slate-50">
@@ -3821,17 +4039,24 @@ function WikiSearchTab({ project }: { project: WikiProject }) {
                 <div className="flex items-center gap-2">
                   <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${typeColors[r.page_type] || "bg-slate-50 text-slate-500"}`}>{r.page_type}</span>
                   <p className="text-sm font-medium text-slate-900">{r.title}</p>
+                  {r.score > 0 && (
+                    <span className="ml-auto text-[10px] text-slate-400">{r.score.toFixed(2)}</span>
+                  )}
                 </div>
                 <code className="text-[11px] text-slate-400">{r.path}</code>
+                {r.snippet && (
+                  <p className="mt-1.5 text-xs leading-relaxed text-slate-500 line-clamp-2">{r.snippet}</p>
+                )}
               </div>
             ))}
           </div>
         </div>
       )}
-      {!searching && results.length === 0 && query && (
+      {searched && !searching && results.length === 0 && (
         <div className="surface empty-state">
           <Inbox className="h-10 w-10 text-slate-300" />
           <p className="text-sm text-slate-500">未找到匹配的页面</p>
+          <p className="text-xs text-slate-400">试试点击下方标签快速搜索</p>
         </div>
       )}
     </div>
@@ -3990,6 +4215,132 @@ function WikiReviewsTab({ project }: { project: WikiProject }) {
   );
 }
 
+function ChannelModelPicker({
+  channels,
+  channelId,
+  onChannelChange,
+  model,
+  onModelChange,
+  allowAuto = false,
+  autoLabel = "同摄入渠道",
+}: {
+  channels: Channel[];
+  channelId: string;
+  onChannelChange: (id: string) => void;
+  model: string;
+  onModelChange: (m: string) => void;
+  allowAuto?: boolean;
+  autoLabel?: string;
+}) {
+  const [showChannelPicker, setShowChannelPicker] = useState(false);
+  const [showModelPicker, setShowModelPicker] = useState(false);
+  const selectedChannel = channels.find(c => c.id === channelId);
+  const channelModels = selectedChannel?.models ?? [];
+
+  const handleChannel = (id: string) => {
+    onChannelChange(id);
+    const ch = channels.find(c => c.id === id);
+    onModelChange(ch?.models[0] || "");
+    setShowChannelPicker(false);
+  };
+
+  return (
+    <div className="flex gap-2">
+      {/* Channel picker */}
+      <div className="relative flex-1">
+        <button
+          type="button"
+          onClick={() => { setShowChannelPicker(!showChannelPicker); setShowModelPicker(false); }}
+          className="flex w-full items-center justify-between rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none transition-all hover:border-blue-400 hover:shadow-sm"
+        >
+          <span className={selectedChannel ? "text-slate-900 truncate" : "text-slate-400"}>
+            {selectedChannel ? selectedChannel.name : (allowAuto ? autoLabel : "选择渠道")}
+          </span>
+          <ChevronDown size={14} className={`shrink-0 text-slate-400 transition-transform ${showChannelPicker ? "rotate-180" : ""}`} />
+        </button>
+        {showChannelPicker && (
+          <>
+            <div className="fixed inset-0 z-40" onClick={() => setShowChannelPicker(false)} />
+            <div className="absolute left-0 top-full z-50 mt-1.5 w-full rounded-2xl border border-slate-200 bg-white p-2 shadow-xl max-h-[280px] overflow-auto">
+              {allowAuto && (
+                <button
+                  type="button"
+                  onClick={() => { onChannelChange(""); onModelChange(""); setShowChannelPicker(false); }}
+                  className={`flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-sm transition-all ${
+                    channelId === "" ? "bg-blue-50 text-blue-600 font-semibold" : "text-slate-700 hover:bg-slate-50"
+                  }`
+                  }
+                >
+                  <span>{autoLabel}</span>
+                  {channelId === "" && <Check size={14} className="shrink-0" />}
+                </button>
+              )}
+              {channels.length === 0 ? (
+                <div className="px-3 py-2 text-xs text-slate-400">暂无可用渠道</div>
+              ) : channels.map(c => (
+                <button
+                  key={c.id}
+                  type="button"
+                  onClick={() => handleChannel(c.id)}
+                  className={`flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-sm transition-all ${
+                    channelId === c.id ? "bg-blue-50 text-blue-600 font-semibold" : "text-slate-700 hover:bg-slate-50"
+                  }`}
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="truncate">{c.name}</span>
+                    <span className="rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500 shrink-0">{c.type}</span>
+                  </div>
+                  {channelId === c.id && <Check size={14} className="shrink-0" />}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Model picker */}
+      <div className="relative flex-1">
+        <button
+          type="button"
+          onClick={() => { setShowModelPicker(!showModelPicker); setShowChannelPicker(false); }}
+          disabled={!channelId}
+          className="flex w-full items-center justify-between rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none transition-all hover:border-blue-400 hover:shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <span className={model ? "text-slate-900 truncate font-mono" : "text-slate-400"}>
+            {model || "选择模型"}
+          </span>
+          <ChevronDown size={14} className={`shrink-0 text-slate-400 transition-transform ${showModelPicker ? "rotate-180" : ""}`} />
+        </button>
+        {showModelPicker && channelId && (
+          <>
+            <div className="fixed inset-0 z-40" onClick={() => setShowModelPicker(false)} />
+            <div className="absolute left-0 top-full z-50 mt-1.5 w-full rounded-2xl border border-slate-200 bg-white p-2 shadow-xl max-h-[280px] overflow-auto">
+              <div className="px-2 py-1.5 text-[11px] font-semibold text-slate-400/70 uppercase tracking-wide">
+                {selectedChannel?.name} 模型
+              </div>
+              {channelModels.length === 0 ? (
+                <div className="px-3 py-2 text-xs text-slate-400">该渠道未配置模型</div>
+              ) : channelModels.map(m => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => { onModelChange(m); setShowModelPicker(false); }}
+                  className={`flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-sm font-mono transition-all ${
+                    model === m ? "bg-blue-50 text-blue-600 font-semibold" : "text-slate-700 hover:bg-slate-50"
+                  }`}
+                >
+                  <span className="truncate">{m}</span>
+                  {model === m && <Check size={14} className="shrink-0" />}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function WikiSettingsTab({ project, onRefresh }: { project: WikiProject; onRefresh: () => void }) {
   const [name, setName] = useState(project.name);
   const [description, setDescription] = useState(project.description || "");
@@ -4021,9 +4372,6 @@ function WikiSettingsTab({ project, onRefresh }: { project: WikiProject; onRefre
     } catch { /* ignore */ } finally { setSaving(false); }
   };
 
-  const ingestChannelData = channels.find(c => c.id === ingestChannelId);
-  const chatChannelData = channels.find(c => c.id === chatChannelId);
-
   return (
     <div className="surface rounded-2xl p-6 space-y-5">
       <div className="flex items-center justify-between">
@@ -4044,44 +4392,28 @@ function WikiSettingsTab({ project, onRefresh }: { project: WikiProject; onRefre
       <div className="rounded-2xl border border-slate-100 p-4">
         <label className="mb-1.5 block text-xs font-medium text-slate-700">摄入渠道 & 模型</label>
         <p className="mb-2 text-[11px] text-slate-400">用于 LLM 解析文档并生成 Wiki 页面</p>
-        <div className="flex gap-2">
-          <select
-            value={ingestChannelId}
-            onChange={e => { setIngestChannelId(e.target.value); const c = channels.find(c => c.id === e.target.value); setIngestModel(c?.models[0] || ""); }}
-            className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
-          >
-            <option value="">自动选择</option>
-            {channels.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-          </select>
-          <select
-            value={ingestModel}
-            onChange={e => setIngestModel(e.target.value)}
-            className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
-          >
-            {ingestChannelData?.models.map(m => <option key={m} value={m}>{m}</option>)}
-          </select>
-        </div>
+        <ChannelModelPicker
+          channels={channels}
+          channelId={ingestChannelId}
+          onChannelChange={setIngestChannelId}
+          model={ingestModel}
+          onModelChange={setIngestModel}
+          allowAuto
+          autoLabel="自动选择"
+        />
       </div>
       <div className="rounded-2xl border border-slate-100 p-4">
         <label className="mb-1.5 block text-xs font-medium text-slate-700">对话渠道 & 模型</label>
         <p className="mb-2 text-[11px] text-slate-400">用于 Wiki 问答</p>
-        <div className="flex gap-2">
-          <select
-            value={chatChannelId}
-            onChange={e => { setChatChannelId(e.target.value); const c = channels.find(c => c.id === e.target.value); setChatModel(c?.models[0] || ""); }}
-            className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
-          >
-            <option value="">同摄入渠道</option>
-            {channels.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-          </select>
-          <select
-            value={chatModel}
-            onChange={e => setChatModel(e.target.value)}
-            className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
-          >
-            {chatChannelData?.models.map(m => <option key={m} value={m}>{m}</option>)}
-          </select>
-        </div>
+        <ChannelModelPicker
+          channels={channels}
+          channelId={chatChannelId}
+          onChannelChange={setChatChannelId}
+          model={chatModel}
+          onModelChange={setChatModel}
+          allowAuto
+          autoLabel="同摄入渠道"
+        />
       </div>
       <div>
         <label className="mb-1.5 block text-xs font-medium text-slate-700">Wiki Schema (CLAUDE.md)</label>

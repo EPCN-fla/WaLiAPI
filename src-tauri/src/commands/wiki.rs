@@ -2,7 +2,7 @@ use crate::AppState;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
 
 // Re-export models for convenience
 pub use crate::services::wiki::models::*;
@@ -161,7 +161,7 @@ pub async fn save_wiki_page(
         else if path.ends_with("log.md") { "log" }
         else { "entity" };
     let token_count = (content.len() / 4) as i64;
-    let _ = repo.upsert_page(&projectId, &path, &title, page_type, &hash, token_count, "[]", "{}").await;
+    let _ = repo.upsert_page(&projectId, &path, &title, page_type, &hash, token_count, "[]", "{}", "[]").await;
     let _ = crate::services::wiki::project::append_log(&projectId, &format!("update | {}", path)).await;
     Ok(())
 }
@@ -250,6 +250,19 @@ pub async fn get_wiki_reviews(
     repo.list_reviews(&projectId, resolved).await
 }
 
+// ── Wiki Tags ──
+
+#[tauri::command]
+pub async fn get_wiki_tags(
+    state: State<'_, Arc<AppState>>,
+    projectId: String,
+    limit: Option<usize>,
+) -> Result<Vec<WikiTag>, String> {
+    let pool = state.db.pool.clone();
+    let repo = crate::services::wiki::repository::WikiRepository::new(pool);
+    repo.get_tags(&projectId, limit.unwrap_or(15)).await
+}
+
 // ── Wiki Stats ──
 
 #[tauri::command]
@@ -281,10 +294,23 @@ pub async fn ingest_wiki_source(
         .map_err(|e| {
             let pool_clone = pool.clone();
             let sid = sourceId.clone();
+            let pid = projectId.clone();
             let err = e.clone();
+            let app_clone = app.clone();
             tokio::spawn(async move {
                 let repo = crate::services::wiki::repository::WikiRepository::new(pool_clone);
                 let _ = repo.update_source_status(&sid, "failed", 0, Some(&err)).await;
+                let _ = app_clone.emit(
+                    "wiki-source-progress",
+                    serde_json::json!({
+                        "source_id": sid,
+                        "project_id": pid,
+                        "filename": "",
+                        "stage": "error",
+                        "progress": 0,
+                        "detail": &err,
+                    }),
+                );
             });
             e
         })

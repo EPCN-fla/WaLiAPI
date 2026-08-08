@@ -322,7 +322,11 @@ pub async fn update_page(
     let wikilinks: Vec<String> = extract_wikilinks(content);
     let wikilinks_json = serde_json::to_string(&wikilinks).unwrap_or("[]".to_string());
 
-    if let Err(e) = repo.upsert_page(&id, &path, &title, page_type, &hash, token_count, &wikilinks_json, "{}").await {
+    // Extract tags from frontmatter
+    let tags = crate::services::wiki::ingest::extract_tags_from_frontmatter(content);
+    let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
+
+    if let Err(e) = repo.upsert_page(&id, &path, &title, page_type, &hash, token_count, &wikilinks_json, "{}", &tags_json).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
 
