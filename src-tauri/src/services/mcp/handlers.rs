@@ -1,6 +1,7 @@
 use crate::db::repository::Repository;
 use crate::server::router::SharedState;
 use crate::services::knowledge::{embedder, rag, repository::KbRepository, retriever};
+use crate::services::wiki::{handlers as wiki_handlers, project as wiki_project, repository::WikiRepository, ingest as wiki_ingest};
 use axum::{
     body::Body,
     extract::{Query, State},
@@ -327,6 +328,139 @@ fn get_tools() -> Vec<serde_json::Value> {
                     "max_file_size": { "type": "integer", "description": "Max file size in bytes (default: 1MB)" }
                 },
                 "required": ["kb_id", "source_type"]
+            }
+        }),
+        // ── Wiki tools: Project management ──────────────────────────
+        serde_json::json!({
+            "name": "list_wiki_projects",
+            "description": "列出所有 Wiki 项目。返回项目 ID、名称、页面数、源数、描述。Wiki 是结构化知识库，页面按 frontmatter 组织，支持标签、图谱、问答。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        serde_json::json!({
+            "name": "get_wiki_project",
+            "description": "获取 Wiki 项目详情：统计信息、标签、页面概览。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        // ── Wiki tools: Pages ───────────────────────────────────────
+        serde_json::json!({
+            "name": "list_wiki_pages",
+            "description": "列出 Wiki 项目的所有页面，返回路径、标题、类型、标签。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "get_wiki_page",
+            "description": "读取 Wiki 页面的完整 Markdown 内容。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "path": { "type": "string", "description": "页面路径（如 'index.md' 或 'guides/setup.md'）" }
+                },
+                "required": ["project_id", "path"]
+            }
+        }),
+        serde_json::json!({
+            "name": "save_wiki_page",
+            "description": "创建或更新 Wiki 页面。传入 Markdown 内容，自动提取 frontmatter 标签和 wikilinks。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "path": { "type": "string", "description": "页面路径（如 'guides/api.md'）" },
+                    "content": { "type": "string", "description": "页面 Markdown 内容" }
+                },
+                "required": ["project_id", "path", "content"]
+            }
+        }),
+        // ── Wiki tools: Search & Ask ───────────────────────────────
+        serde_json::json!({
+            "name": "search_wiki",
+            "description": "搜索 Wiki 页面。按标题、路径模糊匹配，并搜索页面内容。返回匹配页面的标题、路径、摘要片段。适合结构化知识检索，比 RAG chunk 更精确。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "query": { "type": "string", "description": "搜索关键词" },
+                    "top_k": { "type": "integer", "description": "最大返回结果数（默认 10）", "default": 10 }
+                },
+                "required": ["project_id", "query"]
+            }
+        }),
+        serde_json::json!({
+            "name": "ask_wiki",
+            "description": "向 Wiki 提问，获取基于 Wiki 页面的 AI 回答。检索相关页面 → LLM 生成回答 → 返回回答 + 来源引用。与 RAG ask 类似，但基于完整 Wiki 页面而非 chunk。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "question": { "type": "string", "description": "问题" },
+                    "top_k": { "type": "integer", "description": "检索页面数（默认 5）", "default": 5 },
+                    "model": { "type": "string", "description": "LLM 模型（默认用项目配置）" }
+                },
+                "required": ["project_id", "question"]
+            }
+        }),
+        // ── Wiki tools: Tags & Graph ───────────────────────────────
+        serde_json::json!({
+            "name": "get_wiki_tags",
+            "description": "获取 Wiki 项目的标签列表（从页面 frontmatter 自动提取），按频率排序。可用于快速了解 Wiki 覆盖的主题。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "limit": { "type": "integer", "description": "返回标签数（默认 15）", "default": 15 }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "get_wiki_graph",
+            "description": "获取 Wiki 知识图谱：页面（节点）和 wikilinks（边）。用于可视化知识关联。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        // ── Wiki tools: Sources ─────────────────────────────────────
+        serde_json::json!({
+            "name": "list_wiki_sources",
+            "description": "列出 Wiki 项目的源资料及其摄入状态。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        serde_json::json!({
+            "name": "ingest_wiki_source",
+            "description": "触发 Wiki 源资料的摄入：自动解析文档 → 生成结构化 Wiki 页面 → 提取标签和 wikilinks。异步执行，可用 list_wiki_pages 检查进度。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "source_id": { "type": "string", "description": "源资料 ID" }
+                },
+                "required": ["project_id", "source_id"]
             }
         }),
     ]
@@ -1360,6 +1494,273 @@ async fn handle_tool_call(
                         "Import started.\nSource ID: {}\nType: {}\nKnowledge base: {}\nThe import runs asynchronously. Use list_documents or get_knowledge_base_stats to check progress.",
                         source.id, source_type, kb_id
                     )
+                }],
+                "isError": false
+            }))
+        }
+
+        // ── Wiki tools ─────────────────────────────────────────────
+        "list_wiki_projects" => {
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let projects = wiki_repo.list_projects().await.map_err(|e| e.to_string())?;
+
+            let content: Vec<serde_json::Value> = projects.iter().map(|p| {
+                serde_json::json!({
+                    "type": "text",
+                    "text": format!("ID: {}\nName: {}\nPages: {} | Sources: {}\nDescription: {}",
+                        p.id, p.name, p.page_count, p.source_count, p.description.as_deref().unwrap_or("N/A"))
+                })
+            }).collect();
+
+            Ok(serde_json::json!({ "content": content, "isError": false }))
+        }
+
+        "get_wiki_project" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let proj = wiki_repo.get_project(project_id).await.map_err(|e| e.to_string())?;
+            let stats = wiki_repo.get_stats(project_id).await.unwrap_or(serde_json::json!({}));
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "ID: {}\nName: {}\nPages: {} | Sources: {}\nDescription: {}\nStats: {}",
+                        proj.id, proj.name, proj.page_count, proj.source_count,
+                        proj.description.as_deref().unwrap_or("N/A"),
+                        serde_json::to_string_pretty(&stats).unwrap_or_default()
+                    )
+                }],
+                "isError": false
+            }))
+        }
+
+        "list_wiki_pages" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let pages = wiki_repo.list_pages(project_id).await.map_err(|e| e.to_string())?;
+
+            if pages.is_empty() {
+                return Ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": "No wiki pages yet." }],
+                    "isError": false
+                }));
+            }
+
+            let lines: Vec<String> = pages.iter().map(|p| {
+                format!("- {} ({}) | {}", p.title, p.path, p.page_type)
+            }).collect();
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Wiki pages ({} total):\n{}", pages.len(), lines.join("\n"))
+                }],
+                "isError": false
+            }))
+        }
+
+        "get_wiki_page" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let path = args.get("path").and_then(|s| s.as_str())
+                .ok_or("Missing path")?;
+
+            let content = wiki_project::read_page(project_id, path)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("# {}\n\n{}", path, content)
+                }],
+                "isError": false
+            }))
+        }
+
+        "save_wiki_page" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let path = args.get("path").and_then(|s| s.as_str())
+                .ok_or("Missing path")?;
+            let content = args.get("content").and_then(|s| s.as_str())
+                .ok_or("Missing content")?;
+
+            // Call the wiki update_page handler logic
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let result = wiki_handlers::update_page_inner(
+                &shared.app, pool, &wiki_repo, project_id, path, content,
+            ).await;
+
+            match result {
+                Ok(()) => Ok(serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!("Wiki page '{}' saved successfully.", path)
+                    }],
+                    "isError": false
+                })),
+                Err(e) => Err(e),
+            }
+        }
+
+        "search_wiki" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let query = args.get("query").and_then(|s| s.as_str())
+                .ok_or("Missing query")?;
+            let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(10) as usize;
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let results = wiki_repo.search_pages(project_id, query, top_k)
+                .await.map_err(|e| e.to_string())?;
+
+            if results.is_empty() {
+                return Ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": "No matching wiki pages found." }],
+                    "isError": false
+                }));
+            }
+
+            let lines: Vec<String> = results.iter().map(|r| {
+                let mut line = format!("- {} ({})", r.title, r.path);
+                if !r.snippet.is_empty() {
+                    line.push_str(&format!("\n  {}", r.snippet));
+                }
+                line
+            }).collect();
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Wiki search results ({} found):\n{}", results.len(), lines.join("\n"))
+                }],
+                "isError": false
+            }))
+        }
+
+        "ask_wiki" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let question = args.get("question").and_then(|s| s.as_str())
+                .ok_or("Missing question")?;
+            let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(5) as usize;
+            let model = args.get("model").and_then(|m| m.as_str());
+
+            let result = wiki_handlers::ask_inner(
+                shared, project_id, question, top_k, model,
+            ).await;
+
+            match result {
+                Ok(json) => Ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&json).unwrap_or_default() }],
+                    "isError": false
+                })),
+                Err(e) => Err(e),
+            }
+        }
+
+        "get_wiki_tags" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(15) as usize;
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let tags = wiki_repo.get_tags(project_id, limit).await.map_err(|e| e.to_string())?;
+
+            if tags.is_empty() {
+                return Ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": "No tags found. Tags are auto-extracted from page frontmatter." }],
+                    "isError": false
+                }));
+            }
+
+            let lines: Vec<String> = tags.iter().map(|t| {
+                format!("- {} ({})", t.word, t.count)
+            }).collect();
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Wiki tags:\n{}", lines.join("\n"))
+                }],
+                "isError": false
+            }))
+        }
+
+        "get_wiki_graph" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let graph = wiki_repo.get_graph(project_id).await.map_err(|e| e.to_string())?;
+
+            let lines: Vec<String> = graph.nodes.iter().map(|n| {
+                format!("- {} ({}){}", n.label, n.node_type,
+                    n.path.as_deref().map(|p| format!(" [{}]", p)).unwrap_or_default())
+            }).collect();
+
+            let edge_lines: Vec<String> = graph.edges.iter().map(|e| {
+                format!("  {} --{}--> {}", e.source, e.edge_type, e.target)
+            }).collect();
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Graph: {} nodes, {} edges\n\nNodes:\n{}\n\nEdges:\n{}",
+                        graph.nodes.len(), graph.edges.len(),
+                        lines.join("\n"), edge_lines.join("\n"))
+                }],
+                "isError": false
+            }))
+        }
+
+        "list_wiki_sources" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let sources = wiki_repo.list_sources(project_id).await.map_err(|e| e.to_string())?;
+
+            if sources.is_empty() {
+                return Ok(serde_json::json!({
+                    "content": [{ "type": "text", "text": "No wiki sources yet." }],
+                    "isError": false
+                }));
+            }
+
+            let lines: Vec<String> = sources.iter().map(|s| {
+                format!("- {} | ID: {} | Type: {} | Status: {} | Pages: {}",
+                    s.filename, s.id, s.source_type, s.status, s.page_count)
+            }).collect();
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Wiki sources ({} total):\n{}", sources.len(), lines.join("\n"))
+                }],
+                "isError": false
+            }))
+        }
+
+        "ingest_wiki_source" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let source_id = args.get("source_id").and_then(|s| s.as_str())
+                .ok_or("Missing source_id")?;
+
+            let result = wiki_ingest::ingest_source(
+                &shared.app, pool, project_id, source_id,
+            ).await.map_err(|e| e.to_string())?;
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Ingest complete. Pages created: {}",
+                        result.pages_created)
                 }],
                 "isError": false
             }))
