@@ -109,6 +109,14 @@ impl Adaptor for ClaudeAdaptor {
             "messages": claude_messages,
             "stream": stream,
         });
+        let claude_tools = convert_openai_tools_to_claude(
+            openai_body.get("tools").unwrap_or(&serde_json::Value::Null),
+        );
+        if let Some(arr) = claude_tools.as_array() {
+            if !arr.is_empty() {
+                claude_body["tools"] = claude_tools;
+            }
+        }
         if let Some(sys) = system {
             claude_body["system"] = serde_json::Value::String(sys);
         }
@@ -172,6 +180,14 @@ impl Adaptor for ClaudeAdaptor {
             "messages": claude_messages,
             "stream": true,
         });
+        let claude_tools = convert_openai_tools_to_claude(
+            openai_body.get("tools").unwrap_or(&serde_json::Value::Null),
+        );
+        if let Some(arr) = claude_tools.as_array() {
+            if !arr.is_empty() {
+                claude_body["tools"] = claude_tools;
+            }
+        }
         if let Some(sys) = system {
             claude_body["system"] = serde_json::Value::String(sys);
         }
@@ -193,6 +209,16 @@ impl Adaptor for ClaudeAdaptor {
     }
 }
 
+/// Convert OpenAI Chat messages to Anthropic Messages format.
+///
+/// Handles the three shapes that tool-using sessions produce:
+/// - `system` → extracted `system` string (deduplicated, last one wins);
+/// - `assistant` with `tool_calls` → a content ARRAY of `text` + `tool_use`
+///   blocks (Anthropic requires this shape for tool calls — a bare string
+///   content cannot carry `tool_use`);
+/// - `tool` role → `user` + `tool_result` block (Anthropic has no `tool`
+///   role; the result is a `tool_result` content block on a `user` message,
+///   paired to the originating call via `tool_use_id`).
 fn convert_openai_messages_to_claude(
     messages: &serde_json::Value,
 ) -> (Option<String>, serde_json::Value) {
@@ -206,54 +232,204 @@ fn convert_openai_messages_to_claude(
 
     for msg in msgs {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+
+        if role == "system" {
+            if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
+                system = Some(s.to_string());
+            }
+            continue;
+        }
+
+        // assistant: text content (optional) + tool_calls (optional) →
+        // content array of text + tool_use blocks.
+        if role == "assistant" {
+            let tool_calls = msg
+                .get("tool_calls")
+                .and_then(|t| t.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let content = msg.get("content").cloned().unwrap_or(serde_json::Value::Null);
+
+            let mut blocks: Vec<serde_json::Value> = Vec::new();
+
+            // Collapse text content (string, or array of {type:"text"}) to one
+            // text block so it can sit beside tool_use blocks.
+            let text = match &content {
+                serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+                serde_json::Value::Null => None,
+                serde_json::Value::Array(arr) => {
+                    let mut t = String::new();
+                    for block in arr {
+                        if block.get("type").and_then(|x| x.as_str()) == Some("text") {
+                            if let Some(s) = block.get("text").and_then(|x| x.as_str()) {
+                                t.push_str(s);
+                            }
+                        }
+                    }
+                    if t.is_empty() { None } else { Some(t) }
+                }
+                _ => None,
+            };
+            if let Some(t) = text {
+                blocks.push(serde_json::json!({"type": "text", "text": t}));
+            }
+
+            for tc in &tool_calls {
+                let id = tc.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // Skip malformed tool calls rather than sending an invalid block.
+                if id.is_empty() || name.is_empty() {
+                    continue;
+                }
+                let raw_args = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("{}");
+                let input: serde_json::Value =
+                    serde_json::from_str(raw_args).unwrap_or(serde_json::json!({}));
+                blocks.push(serde_json::json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": input,
+                }));
+            }
+
+            // Skip assistant messages with neither text nor tool calls.
+            if blocks.is_empty() {
+                continue;
+            }
+            claude_msgs.push(serde_json::json!({
+                "role": "assistant",
+                "content": blocks,
+            }));
+            continue;
+        }
+
+        // tool result → user + tool_result block.
+        if role == "tool" {
+            let tool_use_id = msg
+                .get("tool_call_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if tool_use_id.is_empty() {
+                continue;
+            }
+            let tool_content = match msg.get("content").cloned().unwrap_or(serde_json::Value::Null) {
+                serde_json::Value::String(s) => s,
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::Array(arr) => arr
+                    .iter()
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(""),
+                other => other.to_string(),
+            };
+            claude_msgs.push(serde_json::json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": tool_content,
+                }],
+            }));
+            continue;
+        }
+
+        // plain user message.
         let content = msg
             .get("content")
             .cloned()
             .unwrap_or(serde_json::Value::String(String::new()));
-
-        if role == "system" {
-            if let Some(s) = content.as_str() {
-                system = Some(s.to_string());
-            }
-        } else {
-            // Skip empty assistant messages without tool_calls
-            if role == "assistant" {
-                let is_empty = match &content {
-                    serde_json::Value::Null => true,
-                    serde_json::Value::String(s) => s.is_empty(),
-                    serde_json::Value::Array(a) => a.is_empty(),
-                    _ => false,
-                };
-                let has_tool_calls = msg
-                    .get("tool_calls")
-                    .and_then(|t| t.as_array())
-                    .map(|a| !a.is_empty())
-                    .unwrap_or(false);
-                if is_empty && !has_tool_calls {
-                    continue;
-                }
-            }
-            claude_msgs.push(serde_json::json!({
-                "role": if role == "assistant" { "assistant" } else { "user" },
-                "content": content,
-            }));
-        }
+        claude_msgs.push(serde_json::json!({
+            "role": "user",
+            "content": content,
+        }));
     }
 
     (system, serde_json::Value::Array(claude_msgs))
 }
 
+/// Convert Chat Completions `tools` (nested `{type:"function",function:{...}}`)
+/// to Anthropic Messages `tools` (flat `{name, description, input_schema}`).
+/// Non-function tools (namespace / web_search / built-in) are dropped —
+/// Anthropic only supports function tools.
+fn convert_openai_tools_to_claude(tools: &serde_json::Value) -> serde_json::Value {
+    let arr = match tools.as_array() {
+        Some(a) => a,
+        None => return serde_json::Value::Array(vec![]),
+    };
+    let claude_tools: Vec<serde_json::Value> = arr
+        .iter()
+        .filter_map(|t| {
+            if t.get("type").and_then(|x| x.as_str()) != Some("function") {
+                return None;
+            }
+            let f = t.get("function").unwrap_or(&serde_json::Value::Null);
+            let name = f.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            if name.is_empty() {
+                return None;
+            }
+            let mut tool = serde_json::json!({
+                "name": name,
+                "input_schema": f.get("parameters").cloned().unwrap_or_else(|| {
+                    serde_json::json!({"type": "object", "properties": {}})
+                }),
+            });
+            if let Some(desc) = f.get("description").and_then(|d| d.as_str()) {
+                if !desc.is_empty() {
+                    tool["description"] = serde_json::Value::String(desc.to_string());
+                }
+            }
+            Some(tool)
+        })
+        .collect();
+    serde_json::Value::Array(claude_tools)
+}
+
 fn convert_claude_to_openai(claude_json: &serde_json::Value, model: &str) -> serde_json::Value {
-    let content = claude_json
+    let content_blocks = claude_json
         .get("content")
         .and_then(|c| c.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("")
-        })
+        .cloned()
         .unwrap_or_default();
+
+    let content = content_blocks
+        .iter()
+        .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+        .collect::<Vec<_>>()
+        .join("");
+
+    // Anthropic `tool_use` blocks → OpenAI `tool_calls` on the assistant
+    // message, so tool-using responses survive the non-streaming conversion.
+    let tool_calls: Vec<serde_json::Value> = content_blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+        .enumerate()
+        .map(|(i, block)| {
+            serde_json::json!({
+                "id": block.get("id").cloned().unwrap_or_else(|| {
+                    serde_json::Value::String(format!("call_{}", i))
+                }),
+                "type": "function",
+                "function": {
+                    "name": block.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                    "arguments": block
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}))
+                        .to_string(),
+                }
+            })
+        })
+        .collect();
 
     let prompt_tokens = claude_json
         .get("usage")
@@ -266,6 +442,24 @@ fn convert_claude_to_openai(claude_json: &serde_json::Value, model: &str) -> ser
         .and_then(|t| t.as_u64())
         .unwrap_or(0);
 
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": content,
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = serde_json::Value::Array(tool_calls);
+    }
+    // stop_reason tool_use → finish_reason tool_calls
+    let finish_reason = if claude_json
+        .get("stop_reason")
+        .and_then(|s| s.as_str())
+        == Some("tool_use")
+    {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+
     serde_json::json!({
         "id": claude_json.get("id").cloned().unwrap_or(serde_json::Value::String("chatcmpl-converted".to_string())),
         "object": "chat.completion",
@@ -273,11 +467,8 @@ fn convert_claude_to_openai(claude_json: &serde_json::Value, model: &str) -> ser
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content,
-            },
-            "finish_reason": "stop",
+            "message": message,
+            "finish_reason": finish_reason,
         }],
         "usage": {
             "prompt_tokens": prompt_tokens,
@@ -285,4 +476,93 @@ fn convert_claude_to_openai(claude_json: &serde_json::Value, model: &str) -> ser
             "total_tokens": prompt_tokens + completion_tokens,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_assistant_tool_calls_become_tool_use_blocks() {
+        let messages = serde_json::json!([
+            {"role": "system", "content": "You are Codex."},
+            {"role": "user", "content": "git status"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "call_A", "type": "function", "function": {"name": "exec_command", "arguments": "{\"cmd\":\"git status\"}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_A", "content": " M src-tauri/src/adaptor/claude.rs"}
+        ]);
+        let (system, claude_msgs) = convert_openai_messages_to_claude(&messages);
+        assert_eq!(system.as_deref(), Some("You are Codex."));
+        let msgs = claude_msgs.as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "user");
+        // assistant: content ARRAY with tool_use block
+        assert_eq!(msgs[1]["role"], "assistant");
+        let assistant_content = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(assistant_content[0]["type"], "tool_use");
+        assert_eq!(assistant_content[0]["id"], "call_A");
+        assert_eq!(assistant_content[0]["name"], "exec_command");
+        assert_eq!(assistant_content[0]["input"]["cmd"], "git status");
+        // tool result: user + tool_result block paired by tool_use_id
+        assert_eq!(msgs[2]["role"], "user");
+        let tool_result = msgs[2]["content"][0].clone();
+        assert_eq!(tool_result["type"], "tool_result");
+        assert_eq!(tool_result["tool_use_id"], "call_A");
+        assert_eq!(tool_result["content"], " M src-tauri/src/adaptor/claude.rs");
+    }
+
+    #[test]
+    fn messages_text_tool_call_mixed_content() {
+        let messages = serde_json::json!([
+            {"role": "assistant", "content": "Let me look.", "tool_calls": [
+                {"id": "call_A", "type": "function", "function": {"name": "read", "arguments": "{\"path\":\"/tmp/x\"}"}}
+            ]}
+        ]);
+        let (_, claude_msgs) = convert_openai_messages_to_claude(&messages);
+        let msgs = claude_msgs.as_array().unwrap();
+        let content = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Let me look.");
+        assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn tools_nested_to_claude_flat_and_drops_non_function() {
+        let tools = serde_json::json!([
+            {"type": "function", "function": {"name": "exec_command", "description": "Run a shell command", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}}},
+            {"type": "namespace", "name": "multi_agent_v1", "namespace": "multi_agent_v1"},
+            {"type": "web_search", "name": "web_search", "external_web_access": {}}
+        ]);
+        let claude_tools = convert_openai_tools_to_claude(&tools);
+        let arr = claude_tools.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "namespace/web_search must be dropped for Anthropic");
+        assert_eq!(arr[0]["name"], "exec_command");
+        assert_eq!(arr[0]["description"], "Run a shell command");
+        assert_eq!(arr[0]["input_schema"]["properties"]["cmd"]["type"], "string");
+    }
+
+    #[test]
+    fn claude_response_tool_use_becomes_openai_tool_calls() {
+        let claude_json = serde_json::json!({
+            "id": "msg_1",
+            "content": [
+                {"type": "text", "text": "Running now."},
+                {"type": "tool_use", "id": "toolu_1", "name": "exec_command", "input": {"cmd": "git status"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 20}
+        });
+        let openai = convert_claude_to_openai(&claude_json, "claude-3-5");
+        let choice = &openai["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls");
+        let message = &choice["message"];
+        assert_eq!(message["content"], "Running now.");
+        let tc = &message["tool_calls"][0];
+        assert_eq!(tc["id"], "toolu_1");
+        assert_eq!(tc["function"]["name"], "exec_command");
+        let args: serde_json::Value = serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["cmd"], "git status");
+    }
 }

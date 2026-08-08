@@ -1000,6 +1000,24 @@ fn messages_response_maps_stop_reasons() {
             .unwrap()["choices"][0]["finish_reason"],
         "length"
     );
+    // Stop-like reasons collapse to `stop` (refusal text rides in content).
+    for stop in ["refusal", "stop_sequence", "pause_turn"] {
+        assert_eq!(
+            messages::decode_messages_response_to_chat(&base(stop), &Default::default())
+                .unwrap()["choices"][0]["finish_reason"],
+            "stop",
+            "stop_reason {stop:?} should map to stop, not error"
+        );
+    }
+    // Context-window exhaustion behaves like max_tokens (truncation).
+    assert_eq!(
+        messages::decode_messages_response_to_chat(
+            &base("model_context_window_exceeded"),
+            &Default::default()
+        )
+        .unwrap()["choices"][0]["finish_reason"],
+        "length"
+    );
     // Unknown stop reason is rejected, never mapped to stop.
     let e = messages::decode_messages_response_to_chat(&base("budget_forced"), &Default::default())
         .unwrap_err();
@@ -1061,6 +1079,54 @@ fn messages_stream_text_and_tool_deltas() {
     assert!(joined.contains("\"prompt_tokens\":5"));
     assert!(joined.contains("\"completion_tokens\":2"));
     assert_eq!(events.iter().filter(|e| e.contains("[DONE]")).count(), 1);
+}
+
+#[test]
+fn messages_stream_stop_like_reasons_normalize_not_error() {
+    // Streaming path must treat stop-like / context-window stop reasons as a
+    // normal completion, never a hard codec error (retry instead of interrupt).
+    let stream = |stop_reason: &str| {
+        let mut state = messages::MessagesSseState::default();
+        let mut events = Vec::new();
+        events.extend(
+            state
+                .feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":5}}}\n\n")
+                .unwrap(),
+        );
+        events.extend(
+            state
+                .feed(b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
+                .unwrap(),
+        );
+        events.extend(
+            state
+                .feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n")
+                .unwrap(),
+        );
+        events.extend(
+            state
+                .feed(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n")
+                .unwrap(),
+        );
+        let delta = format!(
+            "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop_reason}\"}},\"usage\":{{\"output_tokens\":2}}}}\n\n"
+        );
+        events.extend(state.feed(delta.as_bytes()).unwrap());
+        events.extend(
+            state
+                .feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+                .unwrap(),
+        );
+        events.extend(state.finish().unwrap());
+        events.join("")
+    };
+
+    assert!(stream("refusal").contains("\"finish_reason\":\"stop\""));
+    assert!(stream("pause_turn").contains("\"finish_reason\":\"stop\""));
+    assert!(stream("stop_sequence").contains("\"finish_reason\":\"stop\""));
+    assert!(
+        stream("model_context_window_exceeded").contains("\"finish_reason\":\"length\"")
+    );
 }
 
 #[test]

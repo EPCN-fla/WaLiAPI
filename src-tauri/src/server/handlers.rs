@@ -437,6 +437,113 @@ fn parse_usage_from_chunk(text: &str) -> Option<(i64, i64, i64)> {
     None
 }
 
+/// Accumulate token usage and response content from one complete OpenAI Chat
+/// SSE record (`data: {json}\n\n`).  Shared by every upstream protocol: the
+/// Anthropic bridge converts its records into this exact shape first.
+fn accumulate_openai_chat_record(
+    record: &str,
+    usage_prompt: &mut i64,
+    usage_completion: &mut i64,
+    usage_total: &mut i64,
+    accumulated_content: &mut String,
+    accumulated_reasoning: &mut String,
+    response_role: &mut Option<String>,
+    finish_reason: &mut Option<String>,
+    tool_calls_map: &mut std::collections::BTreeMap<i64, serde_json::Value>,
+) {
+    if let Some((p, c, t)) = parse_usage_from_chunk(record) {
+        *usage_prompt = p;
+        *usage_completion = c;
+        *usage_total = t;
+    }
+    // Accumulate delta content from SSE records
+    for line in record.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("data:") {
+            continue;
+        }
+        let data_str = trimmed.trim_start_matches("data:").trim();
+        if data_str == "[DONE]" || data_str.is_empty() {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                if let Some(choice) = choices.first() {
+                    if let Some(delta) = choice.get("delta") {
+                        // Accumulate regular content
+                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                            accumulated_content.push_str(content);
+                        }
+                        // Accumulate reasoning/thinking content (DeepSeek R1, OpenAI o1/o3, etc.)
+                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str())
+                        {
+                            accumulated_reasoning.push_str(reasoning);
+                        }
+                        if response_role.is_none() {
+                            if let Some(role) = delta.get("role").and_then(|r| r.as_str()) {
+                                *response_role = Some(role.to_string());
+                            }
+                        }
+                        // Accumulate tool_calls by index
+                        if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                            for tc in tcs {
+                                let idx = tc.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
+                                let entry = tool_calls_map
+                                    .entry(idx)
+                                    .or_insert_with(|| {
+                                        serde_json::json!({
+                                            "id": "",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "",
+                                                "arguments": ""
+                                            }
+                                        })
+                                    });
+                                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                    if !id.is_empty() {
+                                        entry["id"] = serde_json::json!(id);
+                                    }
+                                }
+                                if let Some(t) = tc.get("type").and_then(|v| v.as_str()) {
+                                    if !t.is_empty() {
+                                        entry["type"] = serde_json::json!(t);
+                                    }
+                                }
+                                if let Some(func) = tc.get("function") {
+                                    if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                        if !name.is_empty() {
+                                            entry["function"]["name"] = serde_json::json!(name);
+                                        }
+                                    }
+                                    if let Some(args) = func.get("arguments").and_then(|v| v.as_str())
+                                    {
+                                        let existing = entry["function"]["arguments"]
+                                            .as_str()
+                                            .unwrap_or("");
+                                        entry["function"]["arguments"] =
+                                            serde_json::json!(format!("{}{}", existing, args));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if finish_reason.is_none() {
+                        if let Some(reason) = choice
+                            .get("finish_reason")
+                            .and_then(|r| r.as_str())
+                        {
+                            if !reason.is_empty() && reason != "null" {
+                                *finish_reason = Some(reason.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn handle_stream(
     shared: SharedState,
     json: serde_json::Value,
@@ -569,6 +676,12 @@ async fn handle_stream(
                 let security_result_clone = security_result.clone();
                 let trace_id_clone = trace_id.clone();
                 let is_retry = if attempt > 0 { 1 } else { 0 };
+                // Claude/Anthropic channels return Anthropic SSE from
+                // forward_stream; bridge it to OpenAI SSE before relaying.
+                let upstream_is_anthropic = crate::protocol::sse_bridge::is_anthropic_upstream(
+                    &channel.channel_type,
+                    channel.protocol.as_deref(),
+                );
 
                 // ── Raw byte passthrough with usage parsing ───────────────
                 // Forward upstream SSE bytes directly as the response body.
@@ -590,95 +703,57 @@ async fn handle_stream(
                     let mut finish_reason: Option<String> = None;
                     // Accumulate tool_calls by index (streaming chunks may contain partial tool_calls)
                     let mut tool_calls_map: std::collections::BTreeMap<i64, serde_json::Value> = std::collections::BTreeMap::new();
+                    // Normalize fragmented / Anthropic upstream records into
+                    // complete OpenAI SSE records before accumulation + relay.
+                    let mut sse_bridge = crate::protocol::sse_bridge::UpstreamSseBridge::for_upstream(
+                        upstream_is_anthropic,
+                        &upstream_model_clone,
+                    );
 
                     while let Some(chunk_result) = upstream_stream.next().await {
                         match chunk_result {
                             Ok(bytes) => {
-                                // Try to parse usage and content from this chunk
-                                if let Ok(text) = std::str::from_utf8(&bytes) {
-                                    if let Some((p, c, t)) = parse_usage_from_chunk(text) {
-                                        usage_prompt = p;
-                                        usage_completion = c;
-                                        usage_total = t;
+                                // Normalize the chunk through the bridge, then
+                                // accumulate usage/content and relay the records.
+                                //
+                                // Feed RAW bytes, never `str::from_utf8`-gated:
+                                // a chunk boundary can split a multibyte UTF-8
+                                // codepoint (CJK text is 3 bytes/char), and such
+                                // a chunk previously fell into an else-branch
+                                // that yielded the raw Anthropic frame straight
+                                // to the OpenAI client (Opencode "Type validation
+                                // failed ... expected array for `choices`").  The
+                                // bridge buffers bytes and decodes only COMPLETE
+                                // records, so a mid-codepoint split is held and
+                                // reassembled across calls — never escaped raw.
+                                match sse_bridge.push(&bytes) {
+                                    Ok(records) => {
+                                        for record in records {
+                                            accumulate_openai_chat_record(
+                                                &record,
+                                                &mut usage_prompt,
+                                                &mut usage_completion,
+                                                &mut usage_total,
+                                                &mut accumulated_content,
+                                                &mut accumulated_reasoning,
+                                                &mut response_role,
+                                                &mut finish_reason,
+                                                &mut tool_calls_map,
+                                            );
+                                            yield Ok::<_, std::io::Error>(bytes::Bytes::from(record.into_bytes()));
+                                        }
                                     }
-                                    // Accumulate delta content from SSE chunks
-                                    for line in text.lines() {
-                                        let trimmed = line.trim();
-                                        if !trimmed.starts_with("data:") {
-                                            continue;
-                                        }
-                                        let data_str = trimmed.trim_start_matches("data:").trim();
-                                        if data_str == "[DONE]" || data_str.is_empty() {
-                                            continue;
-                                        }
-                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
-                                            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
-                                                if let Some(choice) = choices.first() {
-                                                    if let Some(delta) = choice.get("delta") {
-                                                        // Accumulate regular content
-                                                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                                                            accumulated_content.push_str(content);
-                                                        }
-                                                        // Accumulate reasoning/thinking content (DeepSeek R1, OpenAI o1/o3, etc.)
-                                                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
-                                                            accumulated_reasoning.push_str(reasoning);
-                                                        }
-                                                        if response_role.is_none() {
-                                                            if let Some(role) = delta.get("role").and_then(|r| r.as_str()) {
-                                                                response_role = Some(role.to_string());
-                                                            }
-                                                        }
-                                                        // Accumulate tool_calls by index
-                                                        if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                                                            for tc in tcs {
-                                                                let idx = tc.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
-                                                                let entry = tool_calls_map.entry(idx).or_insert_with(|| {
-                                                                    serde_json::json!({
-                                                                        "id": "",
-                                                                        "type": "function",
-                                                                        "function": {
-                                                                            "name": "",
-                                                                            "arguments": ""
-                                                                        }
-                                                                    })
-                                                                });
-                                                                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                                                                    if !id.is_empty() {
-                                                                        entry["id"] = serde_json::json!(id);
-                                                                    }
-                                                                }
-                                                                if let Some(t) = tc.get("type").and_then(|v| v.as_str()) {
-                                                                    if !t.is_empty() {
-                                                                        entry["type"] = serde_json::json!(t);
-                                                                    }
-                                                                }
-                                                                if let Some(func) = tc.get("function") {
-                                                                    if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                                                                        if !name.is_empty() {
-                                                                            entry["function"]["name"] = serde_json::json!(name);
-                                                                        }
-                                                                    }
-                                                                    if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
-                                                                        let existing = entry["function"]["arguments"].as_str().unwrap_or("");
-                                                                        entry["function"]["arguments"] = serde_json::json!(format!("{}{}", existing, args));
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    if finish_reason.is_none() {
-                                                        if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
-                                                            if !reason.is_empty() && reason != "null" {
-                                                                finish_reason = Some(reason.to_string());
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
+                                    Err(e) => {
+                                        had_error = true;
+                                        let err_chunk = format!(
+                                            "data: {{\"error\":{{\"message\":\"Upstream conversion failed: {}\",\"type\":\"server_error\"}}}}\n\n",
+                                            e
+                                        );
+                                        yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_chunk.into_bytes()));
+                                        yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
+                                        break;
                                     }
                                 }
-                                yield Ok::<_, std::io::Error>(bytes);
                             }
                             Err(e) => {
                                 had_error = true;
@@ -686,9 +761,42 @@ async fn handle_stream(
                                     "data: {{\"error\":{{\"message\":\"Stream connection interrupted: {}\",\"type\":\"server_error\"}}}}\n\n",
                                     e
                                 );
-                                yield Ok::<_, std::io::Error>(err_chunk.into_bytes().into());
-                                yield Ok::<_, std::io::Error>(b"data: [DONE]\n\n".to_vec().into());
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_chunk.into_bytes()));
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
                                 break;
+                            }
+                        }
+                    }
+
+                    // Stream ended. Flush any trailing record that terminated at
+                    // EOF, and on Anthropic channels emit the exactly-once final
+                    // sequence (finish_reason + usage frame, then [DONE]).
+                    if !had_error {
+                        match sse_bridge.finish() {
+                            Ok(records) => {
+                                for record in records {
+                                    accumulate_openai_chat_record(
+                                        &record,
+                                        &mut usage_prompt,
+                                        &mut usage_completion,
+                                        &mut usage_total,
+                                        &mut accumulated_content,
+                                        &mut accumulated_reasoning,
+                                        &mut response_role,
+                                        &mut finish_reason,
+                                        &mut tool_calls_map,
+                                    );
+                                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(record.into_bytes()));
+                                }
+                            }
+                            Err(e) => {
+                                had_error = true;
+                                let err_chunk = format!(
+                                    "data: {{\"error\":{{\"message\":\"Upstream conversion failed: {}\",\"type\":\"server_error\"}}}}\n\n",
+                                    e
+                                );
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_chunk.into_bytes()));
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
                             }
                         }
                     }
@@ -2188,6 +2296,64 @@ pub async fn handle_responses(
     }
 }
 
+/// Process one complete OpenAI SSE record through the Responses streaming
+/// pipeline: record token usage, accumulate content/reasoning for logging, and
+/// convert the record into Responses SSE events.
+///
+/// Both the Anthropic bridge (converted frames) and OpenAI-compatible
+/// upstreams feed records here, so a single pipeline serves every protocol.
+#[allow(clippy::too_many_arguments)]
+fn process_openai_record_for_responses(
+    record: &str,
+    model: &str,
+    response_id: &str,
+    stream_state: &mut crate::protocol::responses::StreamState,
+    accumulated_content: &mut String,
+    accumulated_reasoning: &mut String,
+    usage_prompt: &mut i64,
+    usage_completion: &mut i64,
+    usage_total: &mut i64,
+) -> Vec<String> {
+    if let Some((p, c, t)) = crate::protocol::responses::parse_usage_from_sse_chunk(record) {
+        *usage_prompt = p;
+        *usage_completion = c;
+        *usage_total = t;
+    }
+    // Accumulate content for logging
+    for line in record.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("data:") {
+            continue;
+        }
+        let data_str = trimmed.trim_start_matches("data:").trim();
+        if data_str == "[DONE]" || data_str.is_empty() {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                if let Some(choice) = choices.first() {
+                    if let Some(delta) = choice.get("delta") {
+                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                            accumulated_content.push_str(content);
+                        }
+                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str())
+                        {
+                            accumulated_reasoning.push_str(reasoning);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    crate::protocol::responses::convert_openai_sse_to_responses(
+        record,
+        model,
+        response_id,
+        accumulated_content,
+        stream_state,
+    )
+}
+
 /// Stream handler for Responses API.
 /// Converts OpenAI SSE stream to Responses API SSE events.
 ///
@@ -2323,6 +2489,13 @@ async fn handle_responses_stream(
                 let trace_id_clone = trace_id.clone();
                 let is_retry = if attempt > 0 { 1 } else { 0 };
 
+                // Claude/Anthropic channels return Anthropic SSE from
+                // forward_stream; bridge it to OpenAI SSE before conversion.
+                let upstream_is_anthropic = crate::protocol::sse_bridge::is_anthropic_upstream(
+                    &channel.channel_type,
+                    channel.protocol.as_deref(),
+                );
+
                 let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
                 let upstream_stream = resp.bytes_stream();
 
@@ -2331,7 +2504,7 @@ async fn handle_responses_stream(
 
                     // Emit response.created event
                     let created = crate::protocol::responses::create_response_created_event(&model_clone, &response_id);
-                    yield Ok::<_, std::io::Error>(created.into_bytes().into());
+                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(created.into_bytes()));
 
                     let mut usage_prompt: i64 = 0;
                     let mut usage_completion: i64 = 0;
@@ -2340,55 +2513,53 @@ async fn handle_responses_stream(
                     let mut stream_state = crate::protocol::responses::StreamState::default();
                     let mut accumulated_content = String::new();
                     let mut accumulated_reasoning = String::new();
-                    let mut sse_assembler = crate::protocol::responses::ResponsesSseAssembler::new();
+                    let mut sse_bridge = crate::protocol::sse_bridge::UpstreamSseBridge::for_upstream(
+                        upstream_is_anthropic,
+                        &upstream_model_clone,
+                    );
 
                     while let Some(chunk_result) = upstream_stream.next().await {
                         match chunk_result {
                             Ok(bytes) => {
-                                if let Ok(text) = std::str::from_utf8(&bytes) {
-                                    // Reassemble fragmented SSE records before conversion.
-                                    // The upstream channel splits every record across TCP
-                                    // chunks (often mid-JSON); feeding raw fragments to
-                                    // the converter silently drops tool names / call ids /
-                                    // argument fragments. Only complete records are processed.
-                                    for record in sse_assembler.push(text) {
-                                        if let Some((p, c, t)) = crate::protocol::responses::parse_usage_from_sse_chunk(&record) {
-                                            usage_prompt = p;
-                                            usage_completion = c;
-                                            usage_total = t;
-                                        }
-                                        // Accumulate content for logging
-                                        for line in record.lines() {
-                                            let trimmed = line.trim();
-                                            if !trimmed.starts_with("data:") { continue; }
-                                            let data_str = trimmed.trim_start_matches("data:").trim();
-                                            if data_str == "[DONE]" || data_str.is_empty() { continue; }
-                                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
-                                                if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
-                                                    if let Some(choice) = choices.first() {
-                                                        if let Some(delta) = choice.get("delta") {
-                                                            if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                                                                accumulated_content.push_str(content);
-                                                            }
-                                                            if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
-                                                                accumulated_reasoning.push_str(reasoning);
-                                                            }
-                                                        }
-                                                    }
+                                // The bridge reassembles fragmented records AND, on
+                                // Anthropic channels, converts Anthropic SSE → OpenAI
+                                // SSE. The downstream pipeline below only ever sees
+                                // complete OpenAI `data:` records.
+                                //
+                                // Feed RAW bytes, never `str::from_utf8`-gated: a
+                                // chunk boundary can split a multibyte UTF-8 codepoint,
+                                // and the old else-branch leaked the raw Anthropic
+                                // frame to the OpenAI client.  The bridge buffers bytes
+                                // and decodes only complete records, so a mid-codepoint
+                                // split is held and reassembled across calls.
+                                match sse_bridge.push(&bytes) {
+                                        Ok(records) => {
+                                            for record in records {
+                                                let events = process_openai_record_for_responses(
+                                                    &record,
+                                                    &model_clone,
+                                                    &response_id,
+                                                    &mut stream_state,
+                                                    &mut accumulated_content,
+                                                    &mut accumulated_reasoning,
+                                                    &mut usage_prompt,
+                                                    &mut usage_completion,
+                                                    &mut usage_total,
+                                                );
+                                                for event in events {
+                                                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(event.into_bytes()));
                                                 }
                                             }
                                         }
-                                        // Convert OpenAI SSE → Responses SSE events
-                                        let events = crate::protocol::responses::convert_openai_sse_to_responses(
-                                            &record, &model_clone, &response_id, &accumulated_content,
-                                            &mut stream_state,
-                                        );
-                                        for event in events {
-                                            yield Ok::<_, std::io::Error>(event.into_bytes().into());
+                                        Err(e) => {
+                                            had_error = true;
+                                            let err_event = format!(
+                                                "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response_id\":\"{}\",\"error\":{{\"message\":\"Upstream conversion failed: {}\"}}}}\n\n",
+                                                response_id, e
+                                            );
+                                            yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_event.into_bytes()));
+                                            break;
                                         }
-                                    }
-                                } else {
-                                    yield Ok::<_, std::io::Error>(bytes);
                                 }
                             }
                             Err(e) => {
@@ -2397,7 +2568,7 @@ async fn handle_responses_stream(
                                     "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response_id\":\"{}\",\"error\":{{\"message\":\"Stream interrupted: {}\"}}}}\n\n",
                                     response_id, e
                                 );
-                                yield Ok::<_, std::io::Error>(err_event.into_bytes().into());
+                                yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_event.into_bytes()));
                                 break;
                             }
                         }
@@ -2408,38 +2579,34 @@ async fn handle_responses_stream(
                     // with usage.
                     // (convert_openai_sse_to_responses sends everything up to output_item.done,
                     // but NOT response.completed — that's sent here with usage from the final chunk)
-                    for record in sse_assembler.flush() {
-                        if let Some((p, c, t)) = crate::protocol::responses::parse_usage_from_sse_chunk(&record) {
-                            usage_prompt = p;
-                            usage_completion = c;
-                            usage_total = t;
-                        }
-                        for line in record.lines() {
-                            let trimmed = line.trim();
-                            if !trimmed.starts_with("data:") { continue; }
-                            let data_str = trimmed.trim_start_matches("data:").trim();
-                            if data_str == "[DONE]" || data_str.is_empty() { continue; }
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
-                                if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
-                                    if let Some(choice) = choices.first() {
-                                        if let Some(delta) = choice.get("delta") {
-                                            if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                                                accumulated_content.push_str(content);
-                                            }
-                                            if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
-                                                accumulated_reasoning.push_str(reasoning);
-                                            }
-                                        }
-                                    }
+                    // The Anthropic bridge emits its exactly-once final sequence here too
+                    // (finish_reason + usage frame, then [DONE]).
+                    match sse_bridge.finish() {
+                        Ok(records) => {
+                            for record in records {
+                                let events = process_openai_record_for_responses(
+                                    &record,
+                                    &model_clone,
+                                    &response_id,
+                                    &mut stream_state,
+                                    &mut accumulated_content,
+                                    &mut accumulated_reasoning,
+                                    &mut usage_prompt,
+                                    &mut usage_completion,
+                                    &mut usage_total,
+                                );
+                                for event in events {
+                                    yield Ok::<_, std::io::Error>(bytes::Bytes::from(event.into_bytes()));
                                 }
                             }
                         }
-                        let events = crate::protocol::responses::convert_openai_sse_to_responses(
-                            &record, &model_clone, &response_id, &accumulated_content,
-                            &mut stream_state,
-                        );
-                        for event in events {
-                            yield Ok::<_, std::io::Error>(event.into_bytes().into());
+                        Err(e) => {
+                            had_error = true;
+                            let err_event = format!(
+                                "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response_id\":\"{}\",\"error\":{{\"message\":\"Upstream conversion failed: {}\"}}}}\n\n",
+                                response_id, e
+                            );
+                            yield Ok::<_, std::io::Error>(bytes::Bytes::from(err_event.into_bytes()));
                         }
                     }
                     if !had_error {
@@ -2452,10 +2619,10 @@ async fn handle_responses_stream(
                             usage_completion,
                         );
                         for ev in synth_events {
-                            yield Ok::<_, std::io::Error>(ev.into_bytes().into());
+                            yield Ok::<_, std::io::Error>(bytes::Bytes::from(ev.into_bytes()));
                         }
                         // Emit [DONE] after response.completed
-                        yield Ok::<_, std::io::Error>(b"data: [DONE]\n\n".to_vec().into());
+                        yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
                     }
 
                     // Build response_choices for logging

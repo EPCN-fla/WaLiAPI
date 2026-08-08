@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod codec;
 pub mod responses;
+pub mod sse_bridge;
 pub mod thinking;
 
 use serde_json::Value;
