@@ -22,8 +22,13 @@ impl ResponsesSseAssembler {
 
     /// Feed one upstream chunk; returns every COMPLETE SSE record it contains.
     /// A record whose terminator hasn't arrived yet is buffered for the next call.
-    pub fn push(&mut self, chunk: &str) -> Vec<String> {
-        self.pending.extend_from_slice(chunk.as_bytes());
+    ///
+    /// Takes raw bytes, not `&str`: a TCP/HTTP chunk boundary may fall inside a
+    /// UTF-8 codepoint (common with 3-byte CJK text), so callers must not gate
+    /// on `str::from_utf8`.  Bytes are buffered and only COMPLETE records are
+    /// decoded, so a mid-codepoint split is reassembled across calls.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.pending.extend_from_slice(chunk);
         let mut records = Vec::new();
         while let Some(end) = crate::protocol::codec::sse::record_end(&self.pending) {
             let record: Vec<u8> = self.pending.drain(..end).collect();
@@ -68,6 +73,7 @@ impl ResponsesSseAssembler {
 ///   response.output_item.added(type=reasoning) →
 ///   response.reasoning_summary_part.added →
 ///   response.reasoning_summary_text.delta (per chunk) →
+///   response.reasoning_summary_text.done →
 ///   response.reasoning_summary_part.done →
 ///   response.output_item.done
 #[derive(Default)]
@@ -423,8 +429,10 @@ pub fn convert_openai_sse_to_responses(
                                 tc_state.item_added_sent = true;
                             }
 
-                            // Emit arguments delta if we have arguments content
-                            if !arguments.is_empty() {
+                            // Emit arguments delta if we have arguments content — but never
+                            // after the .done has already been sent (some upstreams re-send
+                            // or deliver a trailing chunk after finish_reason).
+                            if !arguments.is_empty() && !tc_state.arguments_done_sent {
                                 tc_state.accumulated_arguments.push_str(arguments);
 
                                 state.sequence_number += 1;
@@ -451,6 +459,20 @@ pub fn convert_openai_sse_to_responses(
                         // Close reasoning item if it was opened and not yet closed
                         if state.reasoning_item_added && !state.reasoning_item_done {
                             let reasoning_output_index = state.reasoning_output_index;
+                            let seq = next_seq(state);
+                            let text_done = serde_json::json!({
+                                "type": "response.reasoning_summary_text.done",
+                                "item_id": reasoning_id,
+                                "output_index": reasoning_output_index,
+                                "summary_index": 0,
+                                "text": state.accumulated_reasoning,
+                                "sequence_number": seq
+                            });
+                            events.push(format!(
+                                "event: response.reasoning_summary_text.done\ndata: {}\n\n",
+                                text_done
+                            ));
+
                             let seq = next_seq(state);
                             let part = serde_json::json!({
                                 "type": "reasoning_summary_text",
@@ -610,6 +632,7 @@ pub fn convert_openai_sse_to_responses(
                                     "type": "response.function_call_arguments.done",
                                     "item_id": item_id,
                                     "output_index": output_index,
+                                    "name": name,
                                     "arguments": accumulated_args,
                                     "sequence_number": seq
                                 });
@@ -747,6 +770,20 @@ pub fn create_synthetic_completed_events(
         };
 
         let s = next_seq!();
+        let text_done = serde_json::json!({
+            "type": "response.reasoning_summary_text.done",
+            "item_id": reasoning_id,
+            "output_index": reasoning_output_index,
+            "summary_index": 0,
+            "text": state.accumulated_reasoning,
+            "sequence_number": s
+        });
+        events.push(format!(
+            "event: response.reasoning_summary_text.done\ndata: {}\n\n",
+            text_done
+        ));
+
+        let s = next_seq!();
         let part = serde_json::json!({
             "type": "reasoning_summary_text",
             "text": state.accumulated_reasoning
@@ -862,6 +899,7 @@ pub fn create_synthetic_completed_events(
                 "type": "response.function_call_arguments.done",
                 "item_id": tc_state.item_id,
                 "output_index": tc_state.output_index,
+                "name": tc_state.name,
                 "arguments": tc_state.accumulated_arguments,
                 "sequence_number": s
             });
@@ -973,7 +1011,14 @@ pub fn create_synthetic_completed_events(
             "completed_at": now_ts(),
             "usage": {
                 "input_tokens": usage_prompt,
+                "input_tokens_details": {
+                    "cached_tokens": 0,
+                    "cache_write_tokens": 0
+                },
                 "output_tokens": usage_completion,
+                "output_tokens_details": {
+                    "reasoning_tokens": 0
+                },
                 "total_tokens": usage_prompt + usage_completion
             }
         },
@@ -1144,7 +1189,7 @@ mod tests {
         let mut events = Vec::new();
         let mut asm = ResponsesSseAssembler::new();
         for frag in fragments {
-            for record in asm.push(frag) {
+            for record in asm.push(frag.as_bytes()) {
                 events.extend(convert_openai_sse_to_responses(
                     &record,
                     "deepseek-v4-flash",
@@ -1331,6 +1376,17 @@ mod tests {
         let item_done_data = extract_event_data(&events3[1]);
         assert_eq!(item_done_data["item"]["type"], "function_call");
         assert_eq!(item_done_data["item"]["arguments"], "{\"city\":\"SF\"}");
+
+        // Chunk 4: stray trailing arguments delta AFTER .done — must be suppressed.
+        let chunk4 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"EXTRA"}}]},"finish_reason":null}]}"#;
+        let events4 = convert_openai_sse_to_responses(chunk4, "gpt-4", response_id, "", &mut state);
+        assert!(
+            extract_event_types(&events4).is_empty(),
+            "no delta may be re-emitted after function_call_arguments.done: {:?}",
+            events4
+        );
+        // The stray arguments must not leak into the accumulated result either.
+        assert_eq!(state.tool_calls[&0].accumulated_arguments, "{\"city\":\"SF\"}");
     }
 
     #[test]
@@ -1404,6 +1460,11 @@ mod tests {
         // Verify text done uses index 0
         let text_done = extract_event_data(&events4[0]);
         assert_eq!(text_done["output_index"], 0);
+
+        // function_call_arguments.done carries the required `name`
+        let fc_args_done = extract_event_data(&events4[3]);
+        assert_eq!(fc_args_done["type"], "response.function_call_arguments.done");
+        assert_eq!(fc_args_done["name"], "search");
 
         // Verify function_call done uses index 1
         let fc_item_done = extract_event_data(&events4[4]);
@@ -1479,6 +1540,7 @@ mod tests {
         assert_eq!(
             types4,
             vec![
+                "response.reasoning_summary_text.done",
                 "response.reasoning_summary_part.done",
                 "response.output_item.done",
                 "response.output_text.done",
@@ -1487,8 +1549,15 @@ mod tests {
             ]
         );
 
+        // reasoning_summary_text.done carries the full accumulated text
+        let rs_text_done = extract_event_data(&events4[0]);
+        assert_eq!(rs_text_done["type"], "response.reasoning_summary_text.done");
+        assert_eq!(rs_text_done["text"], "Let me think.");
+        assert_eq!(rs_text_done["summary_index"], 0);
+        assert_eq!(rs_text_done["item_id"], "rs_rs123");
+
         // reasoning item closed with the full text in the summary
-        let rs_done = extract_event_data(&events4[1]);
+        let rs_done = extract_event_data(&events4[2]);
         assert_eq!(rs_done["item"]["type"], "reasoning");
         assert_eq!(rs_done["item"]["status"], "completed");
         assert_eq!(rs_done["item"]["summary"][0]["text"], "Let me think.");
@@ -1535,6 +1604,11 @@ mod tests {
             ]
         );
 
+        // function_call_arguments.done now carries the required `name`
+        let args_done = extract_event_data(&synth[0]);
+        assert_eq!(args_done["type"], "response.function_call_arguments.done");
+        assert_eq!(args_done["name"], "test");
+
         // Verify response.completed has function_call in output
         let completed_data = extract_event_data(&synth[2]);
         assert_eq!(
@@ -1543,5 +1617,18 @@ mod tests {
         );
         assert_eq!(completed_data["response"]["usage"]["input_tokens"], 10);
         assert_eq!(completed_data["response"]["usage"]["output_tokens"], 20);
+        // usage now carries the official details sub-objects
+        assert_eq!(
+            completed_data["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
+            0
+        );
+        assert_eq!(
+            completed_data["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            0
+        );
+        assert_eq!(
+            completed_data["response"]["usage"]["total_tokens"],
+            30
+        );
     }
 }

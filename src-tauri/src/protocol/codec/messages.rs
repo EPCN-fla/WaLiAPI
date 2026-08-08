@@ -840,10 +840,13 @@ pub fn decode_messages_response_to_chat(
 
     let stop_reason = body.get("stop_reason").and_then(Value::as_str);
     let finish_reason = match stop_reason {
-        Some("end_turn") => "stop",
-        Some("max_tokens") => "length",
+        // `refusal`, `stop_sequence`, `pause_turn` all mean the model simply
+        // stopped producing output (refusal text is carried in the content),
+        // so map them to the OpenAI-canonical `stop` instead of erroring.
+        Some("end_turn") | Some("refusal") | Some("stop_sequence") | Some("pause_turn") => "stop",
+        // Context-window exhaustion is a truncation, exactly like `max_tokens`.
+        Some("max_tokens") | Some("model_context_window_exceeded") => "length",
         Some("tool_use") => "tool_calls",
-        Some("refusal") | Some("refusal_message") => "content_filter",
         Some(other) => {
             return Err(UnsupportedFeatures::single(
                 FeatureKind::UnknownFinishReason,
@@ -1285,10 +1288,12 @@ impl MessagesSseState {
             }
         }
         let finish_reason = match self.stop_reason.as_deref() {
-            Some("end_turn") => "stop",
-            Some("max_tokens") => "length",
+            // Same normalization as the non-streaming path: stop-like reasons
+            // (refusal / stop_sequence / pause_turn) collapse to `stop`, and a
+            // context-window overrun behaves like `length` — never a hard error.
+            Some("end_turn") | Some("refusal") | Some("stop_sequence") | Some("pause_turn") => "stop",
+            Some("max_tokens") | Some("model_context_window_exceeded") => "length",
             Some("tool_use") => "tool_calls",
-            Some("refusal") | Some("refusal_message") => "content_filter",
             Some(other) => {
                 return Err(UnsupportedFeatures::single(
                     FeatureKind::UnknownFinishReason,
