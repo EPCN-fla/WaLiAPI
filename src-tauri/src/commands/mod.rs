@@ -9,3 +9,4 @@ pub mod server;
 pub mod services;
 pub mod settings;
 pub mod stats;
+pub mod wiki;

@@ -51,7 +51,7 @@ export function DashboardPage() {
 
   const availability = stats.total_channels > 0 ? Math.round((stats.active_channels / stats.total_channels) * 100) : 0;
 
-  // 统一 8 卡片网格：今日请求 / 今日Token / 累计请求 / 累计Token / 活跃渠道 / 平均延迟 / 知识库 / 文档数
+  // 统一 8 卡片网格：今日请求 / 今日Token / 累计请求 / 累计Token / 活跃渠道 / 平均延迟 / RAG / 文档数
   const metrics = [
     { label: "今日请求", value: formatNumber(stats.today_requests), icon: Activity, color: "text-blue-600", tone: "bg-blue-50" },
     { label: "今日 Token", value: formatNumber(stats.today_total_tokens), icon: Zap, color: "text-amber-600", tone: "bg-amber-50" },
@@ -59,19 +59,19 @@ export function DashboardPage() {
     { label: "累计 Token", value: formatNumber(stats.total_tokens), icon: Zap, color: "text-orange-600", tone: "bg-orange-50" },
     { label: "活跃渠道", value: `${stats.active_channels}/${stats.total_channels}`, icon: Radio, color: "text-emerald-600", tone: "bg-emerald-50" },
     { label: "平均延迟", value: formatDuration(Math.round(stats.avg_latency_ms)), icon: Workflow, color: "text-violet-600", tone: "bg-violet-50" },
-    { label: "知识库", value: formatNumber(stats.total_knowledge_bases), icon: Database, color: "text-cyan-600", tone: "bg-cyan-50" },
-    { label: "知识库文档", value: formatNumber(stats.total_kb_documents), icon: Layers, color: "text-teal-600", tone: "bg-teal-50" },
+    { label: "RAG", value: formatNumber(stats.total_knowledge_bases), icon: Database, color: "text-cyan-600", tone: "bg-cyan-50" },
+    { label: "RAG 文档", value: formatNumber(stats.total_kb_documents), icon: Layers, color: "text-teal-600", tone: "bg-teal-50" },
   ];
 
   const quickActions = [
     { title: "新建渠道", icon: Plus, action: () => navigate("/channels") },
     { title: "管理密钥", icon: Key, action: () => navigate("/api-keys") },
-    { title: "创建知识库", icon: Database, action: () => navigate("/services/knowledge-base") },
+    { title: "创建 RAG", icon: Database, action: () => navigate("/services/knowledge-base") },
     { title: "接入示例", icon: BookOpen, action: () => navigate("/usage") },
     { title: "审计日志", icon: FileText, action: () => navigate("/logs") },
     { title: "安全设置", icon: ShieldCheck, action: () => navigate("/settings") },
     { title: "渠道管理", icon: Globe, action: () => navigate("/channels") },
-    { title: "MCP 服务", icon: Terminal, action: () => navigate("/services/mcp") },
+    { title: "MCP", icon: Terminal, action: () => navigate("/services/mcp") },
   ];
 
   return (
@@ -188,12 +188,12 @@ export function DashboardPage() {
           <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
             <div className="flex items-center gap-2">
               <Database className="h-4 w-4 text-cyan-600" />
-              <span className="text-sm font-medium text-slate-900">知识库</span>
+              <span className="text-sm font-medium text-slate-900">RAG</span>
             </div>
             <p className="mt-1.5 text-sm text-slate-500">
               {stats.total_knowledge_bases > 0
-                ? `${stats.total_knowledge_bases} 个知识库 · ${stats.total_kb_documents} 篇文档 · ${stats.total_kb_chunks} 个切片`
-                : "尚未创建知识库，点击上方「创建知识库」开始。"}
+                ? `${stats.total_knowledge_bases} 个 RAG · ${stats.total_kb_documents} 篇文档 · ${stats.total_kb_chunks} 个切片`
+                : "尚未创建 RAG，点击上方「创建 RAG」开始。"}
             </p>
           </div>
         </div>

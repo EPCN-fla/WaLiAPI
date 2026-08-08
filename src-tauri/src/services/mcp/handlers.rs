@@ -14,9 +14,9 @@ use tauri::{Emitter, Manager};
 use tokio::sync::{mpsc, RwLock};
 
 /// MCP server instructions — agent 首次连接时注入 system prompt
-const MCP_INSTRUCTIONS: &str = r#"# WaLiAPI 知识库 — 本地 RAG + 向量检索
+const MCP_INSTRUCTIONS: &str = r#"# WaLiAPI RAG — 本地向量检索
 
-知识库已预建索引：文档已解析、分块、向量化并存入本地 SQLite + HNSW 索引。
+RAG 已预建索引：文档已解析、分块、向量化并存入本地 SQLite + HNSW 索引。
 所有检索都是本地操作，亚秒级响应。
 
 ## 工具使用优先级
@@ -27,7 +27,7 @@ const MCP_INSTRUCTIONS: &str = r#"# WaLiAPI 知识库 — 本地 RAG + 向量检
 2. **search_knowledge_base** — 当需要看原始文本片段，或 ask_knowledge_base 回答不够时使用。
    返回匹配的 chunk 原文 + 相似度分数。
 
-3. **list_knowledge_bases** — 首次使用时调用一次，获取可用知识库 ID。
+3. **list_knowledge_bases** — 首次使用时调用一次，获取可用 RAG ID。
    之后无需重复调用。
 
 4. **其他工具** — 按需使用（上传文档、管理索引等）。
@@ -40,7 +40,7 @@ const MCP_INSTRUCTIONS: &str = r#"# WaLiAPI 知识库 — 本地 RAG + 向量检
 
 ## 代码文件
 
-知识库中的代码文件按符号边界分块（函数/类/方法），每个 chunk 是完整符号。
+RAG 中的代码文件按符号边界分块（函数/类/方法），每个 chunk 是完整符号。
 chunk metadata 包含 symbol_name、symbol_kind、signature，可用于精确过滤。"#;
 
 // ── Session management for SSE transport ──────────────────────────
@@ -218,12 +218,12 @@ fn get_tools() -> Vec<serde_json::Value> {
         // ── Write tools: Knowledge Base lifecycle ──────────────────
         serde_json::json!({
             "name": "create_knowledge_base",
-            "description": "创建新知识库。⚠️ 使用前请先调用 list_knowledge_bases 查看已有知识库，避免重复创建。仅当用户明确要求创建新库，或现有库都不适用时才创建。创建后可通过 upload_document 或 import_source 添加内容。",
+            "description": "创建新 RAG 知识库。⚠️ 使用前请先调用 list_knowledge_bases 查看已有知识库，避免重复创建。仅当用户明确要求创建新库，或现有库都不适用时才创建。创建后可通过 upload_document 或 import_source 添加内容。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "知识库名称（1-100字符）" },
-                    "description": { "type": "string", "description": "知识库用途描述（可选）" },
+                    "name": { "type": "string", "description": "RAG 名称（1-100字符）" },
+                    "description": { "type": "string", "description": "RAG 用途描述（可选）" },
                     "embedding_model": { "type": "string", "description": "嵌入模型（默认: text-embedding-3-small）" },
                     "embedding_channel_id": { "type": "string", "description": "自定义嵌入渠道 ID（可选）" }
                 },
@@ -262,11 +262,11 @@ fn get_tools() -> Vec<serde_json::Value> {
         // ── Write tools: Document management ───────────────────────
         serde_json::json!({
             "name": "upload_document",
-            "description": "上传文档到知识库。⚠️ 如果未指定 kb_id，将返回已有知识库列表供选择——请先调用 list_knowledge_bases 让用户选择目标库，或确认创建新库。文档上传后会自动解析、分块、向量化并建立索引。支持格式: .txt .md .pdf .docx .doc .pptx .xlsx .csv .json .html .rs .py .js .ts .go .java .c .cpp .h .sh .yaml .yml .toml",
+            "description": "上传文档到 RAG。⚠️ 如果未指定 kb_id，将返回已有知识库列表供选择——请先调用 list_knowledge_bases 让用户选择目标库，或确认创建新库。文档上传后会自动解析、分块、向量化并建立索引。支持格式: .txt .md .pdf .docx .doc .pptx .xlsx .csv .json .html .rs .py .js .ts .go .java .c .cpp .h .sh .yaml .yml .toml",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "kb_id": { "type": "string", "description": "目标知识库 ID。如果未提供，将返回已有知识库列表供用户选择" },
+                    "kb_id": { "type": "string", "description": "目标 RAG ID。如果未提供，将返回已有知识库列表供用户选择" },
                     "filename": { "type": "string", "description": "文档文件名（含扩展名，如 'report.pdf'）" },
                     "content": { "type": "string", "description": "Base64 编码的文件内容" }
                 },
@@ -955,13 +955,13 @@ async fn handle_tool_call(
                         return Ok(serde_json::json!({
                             "content": [{
                                 "type": "text",
-                                "text": "⚠️ 未指定知识库，且当前没有任何可用的知识库。\n\n请先调用 create_knowledge_base 创建一个知识库，然后再上传文档。"
+                                "text": "⚠️ 未指定 RAG，且当前没有任何可用的知识库。\n\n请先调用 create_knowledge_base 创建一个 RAG，然后再上传文档。"
                             }],
                             "isError": false
                         }));
                     }
 
-                    let mut lines = vec!["⚠️ 未指定目标知识库。请选择一个已有知识库，或确认创建新库。\n\n已有知识库列表:".to_string()];
+                    let mut lines = vec!["⚠️ 未指定目标 RAG。请选择一个已有知识库，或确认创建新库。\n\n已有知识库列表:".to_string()];
                     for (i, kb) in exposed.iter().enumerate() {
                         lines.push(format!(
                             "\n[{}] ID: {}\n    名称: {}\n    文档数: {} | 切片数: {} | Tokens: {}\n    描述: {}",
@@ -974,7 +974,7 @@ async fn handle_tool_call(
                             kb.description.as_deref().unwrap_or("无")
                         ));
                     }
-                    lines.push("\n\n请告诉 AI 你要上传到哪个知识库（提供 ID 或名称），或者要求创建新知识库。".to_string());
+                    lines.push("\n\n请告诉 AI 你要上传到哪个 RAG（提供 ID 或名称），或者要求创建新 RAG。".to_string());
 
                     return Ok(serde_json::json!({
                         "content": [{

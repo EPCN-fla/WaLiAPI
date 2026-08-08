@@ -163,7 +163,7 @@ pub async fn ask_with_config(
     if results.is_empty() {
         // Save to conversation history
         if !kb_id.is_empty() {
-            let answer = "知识库中没有找到相关内容。".to_string();
+            let answer = "RAG 中没有找到相关内容。".to_string();
             kb_repo
                 .add_conversation(kb_id, "user", query, None, Some(chat_model), 0)
                 .await
@@ -180,7 +180,7 @@ pub async fn ask_with_config(
             });
         }
         return Ok(RagAnswer {
-            answer: "知识库中没有找到相关内容。".to_string(),
+            answer: "RAG 中没有找到相关内容。".to_string(),
             sources: vec![],
             usage: None,
             retrieval_details: Some(vec![]),
@@ -208,7 +208,7 @@ pub async fn ask_with_config(
             if retriever::estimate_tokens(&no_history) > context_limit {
                 // Stage 3: Remove context entirely
                 let bare = format!(
-                    "注意：由于 token 限制，无法附上知识库上下文。\n\n问题: {}",
+                    "注意：由于 token 限制，无法附上 RAG 上下文。\n\n问题: {}",
                     query
                 );
                 (bare, false)
@@ -233,7 +233,7 @@ pub async fn ask_with_config(
     let chat_request = serde_json::json!({
         "model": chat_model,
         "messages": [
-            {"role": "system", "content": "你是知识库助手。基于检索到的知识库内容回答问题。回答要准确、简洁，并标注信息来源。如果知识库中没有相关信息，请明确说明。"},
+            {"role": "system", "content": "你是 RAG 助手。基于检索到的内容回答问题。回答要准确、简洁，并标注信息来源。如果没有相关信息，请明确说明。"},
             {"role": "user", "content": final_prompt}
         ],
         "stream": false
@@ -243,7 +243,7 @@ pub async fn ask_with_config(
         &Arc::new(repo),
         app,
         "kb-internal",
-        "知识库RAG",
+        "RAG",
         chat_request,
         false,
         Some(chat_request_str),
@@ -397,10 +397,10 @@ fn build_rag_prompt(context: &str, query: &str, history: &[ConversationMessage])
     };
 
     format!(
-        r#"基于以下知识库内容回答问题。如果知识库中没有相关信息，请明确说明。
+        r#"基于以下 RAG 内容回答问题。如果没有相关信息，请明确说明。
 
 规则：
-1. 只基于知识库内容回答，不要编造信息
+1. 只基于 RAG 内容回答，不要编造信息
 2. 如果是多轮对话，注意上下文连贯性
 3. 回答要准确、简洁，标注信息来源
 
@@ -567,7 +567,7 @@ pub async fn deep_research(
 
         let round_prompt = if round == 0 {
             format!(
-                r#"你是一个深度研究助手。请分析以下知识库内容，并给出初步发现。
+                r#"你是一个深度研究助手。请分析以下 RAG 内容，并给出初步发现。
 
 原始问题: {query}
 
@@ -577,7 +577,7 @@ pub async fn deep_research(
 
 请完成：
 1. 理解问题的核心需求
-2. 从知识库中提取相关信息
+2. 从 RAG 中提取相关信息
 3. 给出初步发现
 4. 如果信息不足，指出还需要哪些方面"#,
                 query = query,
@@ -610,7 +610,7 @@ pub async fn deep_research(
         let chat_request = serde_json::json!({
             "model": chat_model,
             "messages": [
-                {"role": "system", "content": "你是深度研究助手。基于知识库内容进行多轮迭代研究，逐步深入分析。"},
+                {"role": "system", "content": "你是深度研究助手。基于 RAG 内容进行多轮迭代研究，逐步深入分析。"},
                 {"role": "user", "content": round_prompt}
             ],
             "stream": false

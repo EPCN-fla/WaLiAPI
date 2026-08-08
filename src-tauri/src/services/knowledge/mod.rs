@@ -27,10 +27,10 @@ impl Service for KnowledgeService {
         "knowledge"
     }
     fn name(&self) -> &'static str {
-        "知识库"
+        "RAG"
     }
     fn description(&self) -> &'static str {
-        "本地知识库：创建私有知识库，上传文档自动向量化并构建 HNSW 索引，通过 MCP 协议对外提供检索和 RAG 问答工具，支持任意 AI Agent 对接"
+        "本地 RAG 知识库：创建私有知识库，上传文档自动向量化并构建 HNSW 索引，通过 MCP 协议对外提供检索和 RAG 问答工具，支持任意 AI Agent 对接"
     }
 
     async fn status(&self, state: &Arc<AppState>) -> ServiceStatus {

@@ -14,6 +14,13 @@ import {
   channelApi,
   serviceApi,
   serverApi,
+  wikiApi,
+  type WikiProject,
+  type WikiPage,
+  type WikiSource,
+  type WikiSearchResult,
+  type WikiGraphData,
+  type WikiReview,
   type ServiceStatus,
 } from "../lib/api";
 import type { Channel } from "../types";
@@ -54,20 +61,26 @@ import {
   Package,
   Rocket,
   Puzzle,
+  Network,
+  Edit3,
+  AlertTriangle,
+  Save,
+  Inbox,
 } from "lucide-react";
 
-type ServiceTab = "knowledge" | "mcp" | "skills";
+type ServiceTab = "knowledge" | "wiki" | "mcp" | "skills";
 type KbTab = "documents" | "sources" | "search" | "ask" | "settings" | "index" | "mcp";
 
 export function KnowledgeBasePage() {
   const location = useLocation();
-  const initialTab: ServiceTab = location.pathname.includes("/mcp") ? "mcp" : location.pathname.includes("/skills") ? "skills" : "knowledge";
+  const initialTab: ServiceTab = location.pathname.includes("/mcp") ? "mcp" : location.pathname.includes("/skills") ? "skills" : location.pathname.includes("/wiki") ? "wiki" : "knowledge";
   const [serviceTab, setServiceTab] = useState<ServiceTab>(initialTab);
 
   const serviceTabs: { key: ServiceTab; label: string; icon: typeof BookOpen }[] = [
-    { key: "knowledge", label: "知识库", icon: BookOpen },
-    { key: "mcp", label: "MCP 服务", icon: Terminal },
-    { key: "skills", label: "Skills 技能", icon: Puzzle },
+    { key: "knowledge", label: "RAG", icon: BookOpen },
+    { key: "wiki", label: "Wiki", icon: Network },
+    { key: "mcp", label: "MCP", icon: Terminal },
+    { key: "skills", label: "Skills", icon: Puzzle },
   ];
 
   return (
@@ -76,7 +89,7 @@ export function KnowledgeBasePage() {
       <div className="page-header sticky top-0 z-30 -mx-7 -mt-7 mb-2 bg-white/90 px-7 py-5 backdrop-blur-md border-b border-slate-100">
         <div>
           <h1 className="page-title">服务</h1>
-          <p className="page-subtitle">本地知识库 · MCP Server · 文档向量化 + HNSW 索引 · RAG 问答 · 支持 AI Agent 对接</p>
+          <p className="page-subtitle">本地 RAG 知识库 · Wiki 知识图谱 · 文档向量化 + HNSW 索引 · RAG 问答 · 支持 AI Agent 对接</p>
         </div>
         <div className="flex items-center gap-2">
           {serviceTabs.map(({ key, label, icon: Icon }) => (
@@ -97,11 +110,12 @@ export function KnowledgeBasePage() {
       </div>
 
       <div>
-        {serviceTab === "knowledge" ? <KnowledgeBaseSection /> : serviceTab === "mcp" ? <McpSection /> : <SkillsSection />}
+        {serviceTab === "knowledge" ? <KnowledgeBaseSection /> : serviceTab === "wiki" ? <WikiSection /> : serviceTab === "mcp" ? <McpSection /> : <SkillsSection />}
       </div>
     </div>
   );
 }
+
 
 // ─── MCP Service Section ─────────────────────────────────────────────────
 
@@ -174,26 +188,26 @@ function McpSection() {
           {kbService && (
             <div className="rounded-xl border border-slate-100 bg-slate-50 p-4">
               <div className="flex items-center justify-between">
-                <span className="text-sm font-medium text-slate-700">知识库服务</span>
+                <span className="text-sm font-medium text-slate-700">RAG 服务</span>
                 <span className={`flex items-center gap-1.5 text-xs ${kbService.running ? "text-emerald-600" : "text-red-500"}`}>
                   <Wifi size={12} /> {kbService.running ? "运行中" : "已停止"}
                 </span>
               </div>
               <div className="mt-2 text-xs text-slate-500">
-                知识库: {String(kbService.stats.knowledge_bases || 0)} · 文档: {String(kbService.stats.documents || 0)} · 切片: {String(kbService.stats.chunks || 0)}
+                RAG: {String(kbService.stats.knowledge_bases || 0)} · 文档: {String(kbService.stats.documents || 0)} · 切片: {String(kbService.stats.chunks || 0)}
               </div>
             </div>
           )}
           {mcpService && (
             <div className="rounded-xl border border-slate-100 bg-slate-50 p-4">
               <div className="flex items-center justify-between">
-                <span className="text-sm font-medium text-slate-700">MCP 服务</span>
+                <span className="text-sm font-medium text-slate-700">MCP</span>
                 <span className={`flex items-center gap-1.5 text-xs ${mcpService.running ? "text-emerald-600" : "text-red-500"}`}>
                   <Wifi size={12} /> {mcpService.running ? "运行中" : "已停止"}
                 </span>
               </div>
               <div className="mt-2 text-xs text-slate-500">
-                可用知识库: {String(mcpService.stats.available_knowledge_bases || 0)} · 工具: {tools.length}
+                可用 RAG: {String(mcpService.stats.available_knowledge_bases || 0)} · 工具: {tools.length}
               </div>
             </div>
           )}
@@ -311,7 +325,7 @@ function SkillsSection() {
               <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-600 border border-emerald-100">v1.0.0</span>
             </div>
             <p className="mt-1 text-sm leading-relaxed text-slate-600">
-              即装即用的 Agent Skill 技能包，通过 MCP 协议连接 WaLiAPI 本地知识库。安装后 AI Agent 可直接执行语义搜索、RAG 问答、文档管理等操作，无需手写提示词。
+              即装即用的 Agent Skill 技能包，通过 MCP 协议连接 WaLiAPI 本地 RAG。安装后 AI Agent 可直接执行语义搜索、RAG 问答、文档管理等操作，无需手写提示词。
             </p>
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <a
@@ -356,10 +370,10 @@ function SkillsSection() {
                 <pre className="mt-2 overflow-x-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-mono text-slate-800">git clone https://github.com/fuzhengwei/waliapi-rag-skills.git</pre>
                 <p className="mt-2 text-[11px] leading-relaxed text-slate-500">安装完成后，在 Agent 客户端（如 WaLiCode、Codex、Claude Code）中即可直接使用以下能力：</p>
                 <div className="mt-1.5 space-y-1">
-                  <p className="text-[11px] text-slate-600">🔍 <span className="font-medium text-slate-700">语义搜索</span> — 搜索知识库中的内容，支持 hybrid/vector/keyword 三种模式</p>
-                  <p className="text-[11px] text-slate-600">💬 <span className="font-medium text-slate-700">RAG 问答</span> — 基于知识库内容生成回答，附带来源引用</p>
-                  <p className="text-[11px] text-slate-600">📁 <span className="font-medium text-slate-700">文档管理</span> — 上传、删除、列举知识库中的文档</p>
-                  <p className="text-[11px] text-slate-600">📦 <span className="font-medium text-slate-700">批量导入</span> — 导入 Git 仓库、URL 或本地目录到知识库</p>
+                  <p className="text-[11px] text-slate-600">🔍 <span className="font-medium text-slate-700">语义搜索</span> — 搜索 RAG 中的内容，支持 hybrid/vector/keyword 三种模式</p>
+                  <p className="text-[11px] text-slate-600">💬 <span className="font-medium text-slate-700">RAG 问答</span> — 基于 RAG 内容生成回答，附带来源引用</p>
+                  <p className="text-[11px] text-slate-600">📁 <span className="font-medium text-slate-700">文档管理</span> — 上传、删除、列举 RAG 中的文档</p>
+                  <p className="text-[11px] text-slate-600">📦 <span className="font-medium text-slate-700">批量导入</span> — 导入 Git 仓库、URL 或本地目录到 RAG</p>
                 </div>
               </div>
             </div>
@@ -367,7 +381,7 @@ function SkillsSection() {
               <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">2</span>
               <div className="min-w-0 flex-1">
                 <p className="text-xs font-medium text-slate-700">重启 Agent 客户端</p>
-                <p className="mt-1 text-[11px] leading-relaxed text-slate-500">重启 WaLiCode / Codex / Claude Code 等 Agent 客户端，技能会在启动时自动加载。首次使用时 AI 会自动询问 MCP 服务地址（<code className="rounded bg-slate-200 px-1 py-0.5 text-[10px] font-mono text-slate-700">${mcpEndpoint}</code>），无需手动配置。</p>
+                <p className="mt-1 text-[11px] leading-relaxed text-slate-500">重启 WaLiCode / Codex / Claude Code 等 Agent 客户端，技能会在启动时自动加载。首次使用时 AI 会自动询问 MCP 地址（<code className="rounded bg-slate-200 px-1 py-0.5 text-[10px] font-mono text-slate-700">${mcpEndpoint}</code>），无需手动配置。</p>
               </div>
             </div>
           </div>
@@ -385,7 +399,7 @@ function SkillsSection() {
                 <Search size={14} className="text-blue-500" />
                 <p className="text-xs font-semibold text-slate-800">语义搜索</p>
               </div>
-              <p className="mt-1 text-[11px] text-slate-500">「搜索知识库中关于渠道配置的内容」</p>
+              <p className="mt-1 text-[11px] text-slate-500">「搜索 RAG 中关于渠道配置的内容」</p>
               <p className="mt-0.5 text-[11px] text-slate-400">调用 search_knowledge_base，支持 hybrid/vector/keyword 三种模式</p>
             </div>
             <div className="rounded-lg border border-slate-100 bg-gradient-to-br from-white to-slate-50 px-3 py-2.5">
@@ -393,7 +407,7 @@ function SkillsSection() {
                 <MessageCircle size={14} className="text-emerald-500" />
                 <p className="text-xs font-semibold text-slate-800">RAG 问答</p>
               </div>
-              <p className="mt-1 text-[11px] text-slate-500">「问一下知识库，WaLiAPI 支持哪些协议？」</p>
+              <p className="mt-1 text-[11px] text-slate-500">「问一下 RAG，WaLiAPI 支持哪些协议？」</p>
               <p className="mt-0.5 text-[11px] text-slate-400">调用 ask_knowledge_base，检索 + LLM 生成回答 + 来源引用</p>
             </div>
             <div className="rounded-lg border border-slate-100 bg-gradient-to-br from-white to-slate-50 px-3 py-2.5">
@@ -401,7 +415,7 @@ function SkillsSection() {
                 <Upload size={14} className="text-amber-500" />
                 <p className="text-xs font-semibold text-slate-800">文档管理</p>
               </div>
-              <p className="mt-1 text-[11px] text-slate-500">「把这份 PDF 上传到知识库」</p>
+              <p className="mt-1 text-[11px] text-slate-500">「把这份 PDF 上传到 RAG」</p>
               <p className="mt-0.5 text-[11px] text-slate-400">调用 upload_document，自动解析 → 分块 → 向量化 → 索引</p>
             </div>
             <div className="rounded-lg border border-slate-100 bg-gradient-to-br from-white to-slate-50 px-3 py-2.5">
@@ -409,7 +423,7 @@ function SkillsSection() {
                 <GitBranch size={14} className="text-purple-500" />
                 <p className="text-xs font-semibold text-slate-800">批量导入</p>
               </div>
-              <p className="mt-1 text-[11px] text-slate-500">「把这个 Git 仓库导入知识库」</p>
+              <p className="mt-1 text-[11px] text-slate-500">「把这个 Git 仓库导入 RAG」</p>
               <p className="mt-0.5 text-[11px] text-slate-400">调用 import_source，支持 Git 仓库 / URL / 本地目录</p>
             </div>
           </div>
@@ -458,12 +472,12 @@ function SkillsSection() {
             {[
               { name: "search_knowledge_base", label: "语义搜索", icon: Search, color: "text-blue-500" },
               { name: "ask_knowledge_base", label: "RAG 问答", icon: MessageCircle, color: "text-emerald-500" },
-              { name: "list_knowledge_bases", label: "列出知识库", icon: BookOpen, color: "text-slate-500" },
+              { name: "list_knowledge_bases", label: "列出 RAG", icon: BookOpen, color: "text-slate-500" },
               { name: "read_document", label: "读取文档", icon: FileText, color: "text-slate-500" },
-              { name: "get_knowledge_base_stats", label: "知识库统计", icon: Database, color: "text-slate-500" },
-              { name: "create_knowledge_base", label: "创建知识库", icon: Plus, color: "text-indigo-500" },
-              { name: "update_knowledge_base", label: "更新知识库", icon: SettingsIcon, color: "text-indigo-500" },
-              { name: "delete_knowledge_base", label: "删除知识库", icon: Trash2, color: "text-red-400" },
+              { name: "get_knowledge_base_stats", label: "RAG 统计", icon: Database, color: "text-slate-500" },
+              { name: "create_knowledge_base", label: "创建 RAG", icon: Plus, color: "text-indigo-500" },
+              { name: "update_knowledge_base", label: "更新 RAG", icon: SettingsIcon, color: "text-indigo-500" },
+              { name: "delete_knowledge_base", label: "删除 RAG", icon: Trash2, color: "text-red-400" },
               { name: "upload_document", label: "上传文档", icon: Upload, color: "text-amber-500" },
               { name: "delete_document", label: "删除文档", icon: Trash2, color: "text-red-400" },
               { name: "list_documents", label: "文档列表", icon: Layers, color: "text-slate-500" },
@@ -493,15 +507,15 @@ function SkillsSection() {
         <div className="space-y-2">
           <div className="rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
             <p className="text-[11px] font-medium text-slate-400">验证连接</p>
-            <code className="text-xs text-slate-700">列出所有知识库</code>
+            <code className="text-xs text-slate-700">列出所有 RAG</code>
           </div>
           <div className="rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
             <p className="text-[11px] font-medium text-slate-400">验证搜索</p>
-            <code className="text-xs text-slate-700">搜索知识库中关于配置的内容</code>
+            <code className="text-xs text-slate-700">搜索 RAG 中关于配置的内容</code>
           </div>
           <div className="rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
             <p className="text-[11px] font-medium text-slate-400">验证 RAG 问答</p>
-            <code className="text-xs text-slate-700">问一下知识库，WaLiAPI 支持哪些协议？</code>
+            <code className="text-xs text-slate-700">问一下 RAG，WaLiAPI 支持哪些协议？</code>
           </div>
         </div>
       </div>
@@ -551,7 +565,7 @@ function KnowledgeBaseSection() {
   }, [kbs, selectedKb]);
 
   const handleDelete = async (id: string) => {
-    if (!confirm("确定删除此知识库？所有文档和切片将一并删除。")) return;
+    if (!confirm("确定删除此 RAG 知识库？所有文档和切片将一并删除。")) return;
     try {
       await kbApi.delete(id);
       await fetchKbs();
@@ -710,10 +724,10 @@ function KbList({
     return (
       <div className="surface empty-state">
         <BookOpen className="h-12 w-12 text-slate-300" />
-        <p className="text-sm text-slate-500">还没有知识库</p>
+        <p className="text-sm text-slate-500">还没有 RAG</p>
         <button onClick={onCreate} className="action-primary mt-2">
           <Plus size={16} />
-          新建知识库
+          新建 RAG
         </button>
       </div>
     );
@@ -724,7 +738,7 @@ function KbList({
       <div className="flex justify-end mb-4">
         <button onClick={onCreate} className="action-primary">
           <Plus size={16} />
-          新建知识库
+          新建 RAG
         </button>
       </div>
       <div className="space-y-3">
@@ -801,7 +815,7 @@ function KbList({
                     className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
                       kb.status === 1 ? "bg-emerald-500" : "bg-slate-300"
                     }`}
-                    title="知识库开关"
+                    title="RAG 开关"
                   >
                     <span
                       className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
@@ -1683,7 +1697,7 @@ function DocumentsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => v
         ) : (
           <div className="flex flex-col items-center gap-2 text-sm text-slate-500">
             <Upload className="h-6 w-6" />
-            <span>点击或拖拽上传文件到知识库（支持多选）</span>
+            <span>点击或拖拽上传文件到 RAG（支持多选）</span>
             <span className="text-xs text-slate-400">支持 md/txt/code/json/yaml/pdf</span>
           </div>
         )}
@@ -2271,7 +2285,7 @@ function AskTab({ kb }: { kb: KnowledgeBase }) {
           {conversation.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
               <MessageCircle className="h-10 w-10 text-muted-foreground/30" />
-              <p className="mt-3 text-sm">向知识库提问，AI 将基于检索到的内容回答</p>
+              <p className="mt-3 text-sm">向 RAG 提问，AI 将基于检索到的内容回答</p>
               <p className="mt-1 text-xs text-muted-foreground/70">
                 {kb.doc_count} 文档 · {kb.chunk_count} 切片可供检索
               </p>
@@ -2349,7 +2363,7 @@ function AskTab({ kb }: { kb: KnowledgeBase }) {
               <div className="rounded-2xl bg-muted/50 border border-border px-4 py-3">
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
                   <Loader2 className="h-4 w-4 animate-spin" />
-                  正在检索知识库并生成回答...
+                  正在检索 RAG 并生成回答...
                 </div>
               </div>
             </div>
@@ -2483,7 +2497,7 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
                 onChange={(e) => setStatus(e.target.checked ? 1 : 0)}
                 className="rounded"
               />
-              <span className="text-sm text-slate-700">启用知识库</span>
+              <span className="text-sm text-slate-700">启用 RAG</span>
             </label>
             <label className="flex items-center gap-2 cursor-pointer ml-4">
               <input
@@ -2496,7 +2510,7 @@ function SettingsTab({ kb, onRefresh }: { kb: KnowledgeBase; onRefresh: () => vo
             </label>
           </div>
           <p className="text-xs text-slate-400">
-            关闭 MCP 暴露后，该知识库不会出现在 MCP 工具的列表中，也不会被全局搜索命中。仍可通过显式指定 kb_id 访问。
+            关闭 MCP 暴露后，该 RAG 不会出现在 MCP 工具的列表中，也不会被全局搜索命中。仍可通过显式指定 kb_id 访问。
           </p>
         </div>
       </div>
@@ -2732,11 +2746,11 @@ function McpTab({ kb }: { kb: KnowledgeBase }) {
   };
 
   const mcpTools = [
-    { name: "search_knowledge_base", desc: "语义检索知识库，返回匹配文本片段和相似度评分", required: ["query"] },
-    { name: "list_knowledge_bases", desc: "列出所有已暴露的知识库（ID/名称/文档数）", required: [] },
+    { name: "search_knowledge_base", desc: "语义检索 RAG，返回匹配文本片段和相似度评分", required: ["query"] },
+    { name: "list_knowledge_bases", desc: "列出所有已暴露的 RAG（ID/名称/文档数）", required: [] },
     { name: "ask_knowledge_base", desc: "RAG 问答，基于检索内容生成回答并返回来源引用", required: ["question"] },
     { name: "read_document", desc: "读取指定文档的完整内容", required: ["kb_id", "doc_id"] },
-    { name: "get_knowledge_base_stats", desc: "获取知识库统计信息（文档数/切片数/token数）", required: ["kb_id"] },
+    { name: "get_knowledge_base_stats", desc: "获取 RAG 统计信息（文档数/切片数/token数）", required: ["kb_id"] },
   ];
 
   return (
@@ -2769,14 +2783,14 @@ function McpTab({ kb }: { kb: KnowledgeBase }) {
           <div className="rounded-lg bg-blue-50 border border-blue-100 px-3 py-2.5 text-xs text-blue-700">
             <div className="font-medium mb-1">📡 MCP (Model Context Protocol) 对接</div>
             <div className="text-blue-600">
-              其他 AI Agent / 工具可通过 MCP 协议接入此知识库。将上方端点配置到支持 MCP 的客户端（如 Claude Desktop、Cursor、自定义 Agent），即可让 AI 自动检索和问答你的私有知识库。
+              其他 AI Agent / 工具可通过 MCP 协议接入此 RAG。将上方端点配置到支持 MCP 的客户端（如 Claude Desktop、Cursor、自定义 Agent），即可让 AI 自动检索和问答你的私有 RAG。
             </div>
           </div>
 
           {/* 未暴露提示 */}
           {kb.mcp_enabled !== 1 && (
             <div className="rounded-lg bg-amber-50 border border-amber-100 px-3 py-2 text-xs text-amber-700">
-              ⚠️ 该知识库未开启 MCP 暴露。外部 Agent 无法检索到此知识库。请在「设置」中开启「MCP 暴露」。
+              ⚠️ 该 RAG 未开启 MCP 暴露。外部 Agent 无法检索到此 RAG。请在「设置」中开启「MCP 暴露」。
             </div>
           )}
         </div>
@@ -2815,7 +2829,7 @@ function McpTab({ kb }: { kb: KnowledgeBase }) {
 
         <div className="space-y-3">
           <div>
-            <label className="mb-1 block text-xs font-medium text-slate-500">1. 列出可用知识库</label>
+            <label className="mb-1 block text-xs font-medium text-slate-500">1. 列出可用 RAG</label>
             <pre className="overflow-x-auto rounded-xl bg-slate-50 border border-slate-200 p-3 text-[11px]"><code className="text-slate-800">{`curl -X POST ${mcpEndpoint} \\
   -H "Content-Type: application/json" \\
   -d '{
@@ -2892,7 +2906,7 @@ function CreateKbModal({
 
   const handleCreate = async () => {
     if (!name.trim()) {
-      setError("请输入知识库名称");
+      setError("请输入 RAG 名称");
       return;
     }
     setCreating(true);
@@ -2917,7 +2931,7 @@ function CreateKbModal({
         className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <h3 className="text-lg font-semibold text-slate-900">新建知识库</h3>
+        <h3 className="text-lg font-semibold text-slate-900">新建 RAG</h3>
 
         <div className="mt-4 space-y-4">
           <div>
@@ -2936,7 +2950,7 @@ function CreateKbModal({
             <textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="知识库用途描述..."
+              placeholder="RAG 用途描述..."
               rows={2}
               className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
             />
@@ -3015,4 +3029,1065 @@ function fileToBase64(file: File): Promise<string> {
     reader.onerror = reject;
     reader.readAsDataURL(file);
   });
+}
+
+// ─── Wiki Section ─────────────────────────────────────────────────────
+
+function WikiSection() {
+  const [projects, setProjects] = useState<WikiProject[]>([]);
+  const [selectedProject, setSelectedProject] = useState<WikiProject | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [wikiTab, setWikiTab] = useState<"overview" | "pages" | "sources" | "search" | "graph" | "reviews" | "settings">("overview");
+
+  const fetchProjects = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await wikiApi.getProjects();
+      setProjects(data);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { fetchProjects(); }, [fetchProjects]);
+
+  useEffect(() => {
+    if (selectedProject) {
+      const updated = projects.find(p => p.id === selectedProject.id);
+      if (updated && (updated.page_count !== selectedProject.page_count || updated.source_count !== selectedProject.source_count)) {
+        setSelectedProject(updated);
+      }
+    }
+  }, [projects, selectedProject]);
+
+  const handleDelete = async (id: string) => {
+    if (!confirm("确定删除此 Wiki 项目？所有页面和源数据将一并删除。")) return;
+    try {
+      await wikiApi.deleteProject(id);
+      await fetchProjects();
+      if (selectedProject?.id === id) setSelectedProject(null);
+    } catch (e) { setError(String(e)); }
+  };
+
+  const handleToggleStatus = async (p: WikiProject, newStatus: number) => {
+    try {
+      await wikiApi.updateProject(p.id, { status: newStatus });
+      await fetchProjects();
+    } catch (e) { setError(String(e)); }
+  };
+
+  const handleToggleMcp = async (p: WikiProject, newMcp: number) => {
+    try {
+      await wikiApi.updateProject(p.id, { mcp_enabled: newMcp });
+      await fetchProjects();
+    } catch (e) { setError(String(e)); }
+  };
+
+  if (error) {
+    return (
+      <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-600">
+        {error}
+        <button onClick={() => setError(null)} className="ml-2 text-red-400 hover:text-red-600">✕</button>
+      </div>
+    );
+  }
+
+  if (selectedProject) {
+    return (
+      <WikiProjectDetail
+        project={selectedProject}
+        tab={wikiTab}
+        setTab={setWikiTab}
+        onBack={() => { setSelectedProject(null); setWikiTab("overview"); }}
+        onRefresh={fetchProjects}
+      />
+    );
+  }
+
+  if (loading && projects.length === 0) {
+    return (
+      <div className="surface empty-state">
+        <Loader2 className="h-8 w-8 animate-spin text-slate-400" />
+      </div>
+    );
+  }
+
+  if (projects.length === 0) {
+    return (
+      <div className="surface empty-state">
+        <Network className="h-12 w-12 text-slate-300" />
+        <p className="text-sm text-slate-500">还没有 Wiki 项目</p>
+        <p className="text-xs text-slate-400">LLM 增量 RAG：摄入文档 → 生成结构化页面 → 知识图谱</p>
+        <button onClick={() => setShowCreate(true)} className="action-primary mt-3">
+          <Plus size={16} />
+          新建 Wiki 项目
+        </button>
+        {showCreate && (
+          <CreateWikiProjectModal
+            onClose={() => setShowCreate(false)}
+            onCreated={async () => { setShowCreate(false); await fetchProjects(); }}
+          />
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="flex justify-end mb-4">
+        <button onClick={() => setShowCreate(true)} className="action-primary">
+          <Plus size={16} />
+          新建 Wiki 项目
+        </button>
+      </div>
+      <div className="space-y-3">
+        {projects.map((p) => (
+          <div key={p.id} className="surface group rounded-2xl p-5 transition-all hover:shadow-[0_8px_24px_rgba(15,23,42,0.06)] border border-slate-100">
+            <div className="flex items-start gap-4">
+              <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${p.status === 1 ? "bg-violet-50" : "bg-slate-100"}`}>
+                <Network className={`h-5 w-5 ${p.status === 1 ? "text-violet-600" : "text-slate-400"}`} />
+              </div>
+              <div className="min-w-0 flex-1 cursor-pointer" onClick={() => setSelectedProject(p)}>
+                <div className="flex items-center gap-2">
+                  <h3 className="text-base font-semibold text-slate-900">{p.name}</h3>
+                  {p.status === 1 ? (
+                    <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-600">活跃</span>
+                  ) : (
+                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">已禁用</span>
+                  )}
+                </div>
+                <p className="mt-0.5 text-xs text-slate-500 line-clamp-1">{p.description || "暂无描述"}</p>
+                <div className="mt-2 flex items-center gap-4 text-xs text-slate-500">
+                  <span className="flex items-center gap-1"><FileText size={12} /> {p.page_count} 页面</span>
+                  <span className="flex items-center gap-1"><Layers size={12} /> {p.source_count} 源</span>
+                  {p.ingest_model && <span className="truncate" title={p.ingest_model}>{p.ingest_model}</span>}
+                </div>
+              </div>
+              <div className="flex flex-col items-end gap-2 shrink-0">
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={(e) => { e.stopPropagation(); handleToggleMcp(p, p.mcp_enabled === 1 ? 0 : 1); }}
+                    className={`flex items-center gap-1.5 rounded-lg px-2 py-1 text-[10px] font-medium transition-colors ${
+                      p.mcp_enabled === 1 ? "bg-violet-50 text-violet-600 hover:bg-violet-100" : "bg-slate-100 text-slate-400 hover:bg-slate-200"
+                    }`}
+                    title="MCP 暴露开关"
+                  >
+                    <Terminal size={11} />
+                    MCP {p.mcp_enabled === 1 ? "已暴露" : "未暴露"}
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); handleToggleStatus(p, p.status === 1 ? 0 : 1); }}
+                    className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${p.status === 1 ? "bg-emerald-500" : "bg-slate-300"}`}
+                    title="项目开关"
+                  >
+                    <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${p.status === 1 ? "translate-x-4" : "translate-x-1"}`} />
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); handleDelete(p.id); }}
+                    className="rounded-lg p-1.5 text-slate-400 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-red-50 hover:text-red-500"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+      {showCreate && (
+        <CreateWikiProjectModal
+          onClose={() => setShowCreate(false)}
+          onCreated={async () => { setShowCreate(false); await fetchProjects(); }}
+        />
+      )}
+    </>
+  );
+}
+
+function CreateWikiProjectModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [schemaText, setSchemaText] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [channels, setChannels] = useState<Channel[]>([]);
+  const [selectedChannel, setSelectedChannel] = useState("");
+  const [selectedModel, setSelectedModel] = useState("");
+  const [chatChannel, setChatChannel] = useState("");
+  const [chatModel, setChatModel] = useState("");
+
+  useEffect(() => {
+    channelApi.getAll().then(list => {
+      const active = list.filter(c => c.status === 1);
+      setChannels(active);
+      if (active.length > 0) {
+        setSelectedChannel(active[0].id);
+        setChatChannel(active[0].id);
+        const firstModel = active[0].models[0];
+        if (firstModel) { setSelectedModel(firstModel); setChatModel(firstModel); }
+      }
+    }).catch(() => {});
+  }, []);
+
+  const handleCreate = async () => {
+    if (!name.trim()) { setError("请输入项目名称"); return; }
+    if (!selectedChannel || !selectedModel) { setError("请选择摄入渠道和模型"); return; }
+    setCreating(true);
+    setError(null);
+    try {
+      await wikiApi.createProject({
+        name: name.trim(),
+        description: description.trim() || undefined,
+        schema_text: schemaText.trim() || undefined,
+        ingest_channel_id: selectedChannel,
+        ingest_model: selectedModel,
+        chat_channel_id: chatChannel || selectedChannel,
+        chat_model: chatModel || selectedModel,
+      });
+      onCreated();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const selectedChannelData = channels.find(c => c.id === selectedChannel);
+  const chatChannelData = channels.find(c => c.id === chatChannel);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="relative w-full max-w-lg rounded-3xl bg-white p-7 shadow-2xl" onClick={e => e.stopPropagation()}>
+        <button onClick={onClose} className="absolute right-5 top-5 rounded-full p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600">
+          <XCircle className="h-5 w-5" />
+        </button>
+        <div className="flex items-center gap-2">
+          <div className="rounded-2xl border border-violet-100 bg-violet-50 p-2.5">
+            <Network className="h-5 w-5 text-violet-600" />
+          </div>
+          <div>
+            <h2 className="text-lg font-semibold text-slate-900">新建 Wiki 项目</h2>
+            <p className="text-xs text-slate-500">LLM 增量 RAG</p>
+          </div>
+        </div>
+        <div className="mt-5 space-y-4">
+          <div>
+            <label className="mb-1.5 block text-xs font-medium text-slate-700">项目名称 *</label>
+            <input
+              value={name}
+              onChange={e => setName(e.target.value)}
+              placeholder="例如：项目文档 Wiki"
+              className="w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm"
+            />
+          </div>
+          <div>
+            <label className="mb-1.5 block text-xs font-medium text-slate-700">描述</label>
+            <input
+              value={description}
+              onChange={e => setDescription(e.target.value)}
+              placeholder="简单描述这个 Wiki 的用途"
+              className="w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm"
+            />
+          </div>
+          <div className="rounded-2xl border border-slate-100 p-4">
+            <label className="mb-1.5 block text-xs font-medium text-slate-700">摄入渠道 & 模型 *</label>
+            <p className="mb-2 text-[11px] text-slate-400">用于 LLM 解析文档并生成 Wiki 页面</p>
+            <div className="flex gap-2">
+              <select
+                value={selectedChannel}
+                onChange={e => { setSelectedChannel(e.target.value); const c = channels.find(c => c.id === e.target.value); setSelectedModel(c?.models[0] || ""); }}
+                className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
+              >
+                {channels.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+              <select
+                value={selectedModel}
+                onChange={e => setSelectedModel(e.target.value)}
+                className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
+              >
+                {selectedChannelData?.models.map(m => <option key={m} value={m}>{m}</option>)}
+              </select>
+            </div>
+          </div>
+          <div className="rounded-2xl border border-slate-100 p-4">
+            <label className="mb-1.5 block text-xs font-medium text-slate-700">对话渠道 & 模型</label>
+            <p className="mb-2 text-[11px] text-slate-400">用于 Wiki 问答，默认同摄入渠道</p>
+            <div className="flex gap-2">
+              <select
+                value={chatChannel}
+                onChange={e => { setChatChannel(e.target.value); const c = channels.find(c => c.id === e.target.value); setChatModel(c?.models[0] || ""); }}
+                className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
+              >
+                <option value="">同摄入渠道</option>
+                {channels.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+              <select
+                value={chatModel}
+                onChange={e => setChatModel(e.target.value)}
+                className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
+              >
+                {chatChannelData?.models.map(m => <option key={m} value={m}>{m}</option>)}
+              </select>
+            </div>
+          </div>
+          <div>
+            <label className="mb-1.5 block text-xs font-medium text-slate-700">Wiki Schema (CLAUDE.md)</label>
+            <p className="mb-1.5 text-[11px] text-slate-400">定义 LLM 维护 Wiki 的规则。留空使用默认模板。</p>
+            <textarea
+              value={schemaText}
+              onChange={e => setSchemaText(e.target.value)}
+              placeholder="留空使用默认 Schema..."
+              rows={4}
+              className="w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-xs font-mono"
+            />
+          </div>
+          {error && <p className="text-xs text-red-500">{error}</p>}
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button onClick={onClose} className="action-secondary">取消</button>
+          <button onClick={handleCreate} disabled={creating} className="action-primary">
+            {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+            创建
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function WikiProjectDetail({
+  project,
+  tab,
+  setTab,
+  onBack,
+  onRefresh,
+}: {
+  project: WikiProject;
+  tab: "overview" | "pages" | "sources" | "search" | "graph" | "reviews" | "settings";
+  setTab: (t: "overview" | "pages" | "sources" | "search" | "graph" | "reviews" | "settings") => void;
+  onBack: () => void;
+  onRefresh: () => void;
+}) {
+  const tabs = [
+    { key: "overview" as const, label: "概览", icon: Layers },
+    { key: "pages" as const, label: "页面", icon: FileText },
+    { key: "sources" as const, label: "源", icon: FolderOpen },
+    { key: "search" as const, label: "搜索", icon: Search },
+    { key: "graph" as const, label: "图谱", icon: Network },
+    { key: "reviews" as const, label: "审核", icon: AlertTriangle },
+    { key: "settings" as const, label: "设置", icon: SettingsIcon },
+  ];
+
+  return (
+    <div className="space-y-4">
+      {/* Breadcrumb + Tabs */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <button onClick={onBack} className="flex items-center gap-1 text-xs text-slate-500 hover:text-slate-900">
+            <ChevronRight className="h-3 w-3 rotate-180" /> 返回
+          </button>
+          <span className="text-slate-300">/</span>
+          <Network className="h-4 w-4 text-violet-600" />
+          <h2 className="text-lg font-semibold text-slate-900">{project.name}</h2>
+        </div>
+        <div className="flex items-center gap-1">
+          {tabs.map(({ key, label, icon: Icon }) => (
+            <button
+              key={key}
+              onClick={() => setTab(key)}
+              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-all ${
+                tab === key ? "bg-slate-900 text-white" : "text-slate-500 hover:bg-slate-100 hover:text-slate-900"
+              }`}
+            >
+              <Icon size={13} />
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Tab Content */}
+      {tab === "overview" && <WikiOverview project={project} />}
+      {tab === "pages" && <WikiPagesTab project={project} />}
+      {tab === "sources" && <WikiSourcesTab project={project} onRefresh={onRefresh} onNavigateSettings={() => setTab("settings")} />}
+      {tab === "search" && <WikiSearchTab project={project} />}
+      {tab === "graph" && <WikiGraphTab project={project} />}
+      {tab === "reviews" && <WikiReviewsTab project={project} />}
+      {tab === "settings" && <WikiSettingsTab project={project} onRefresh={onRefresh} />}
+    </div>
+  );
+}
+
+function WikiOverview({ project }: { project: WikiProject }) {
+  const [stats, setStats] = useState<Record<string, unknown> | null>(null);
+
+  useEffect(() => {
+    wikiApi.getStats(project.id).then(setStats).catch(() => {});
+  }, [project.id]);
+
+  const metrics = [
+    { label: "页面数", value: stats?.pages ?? project.page_count, icon: FileText, color: "text-violet-600", tone: "bg-violet-50" },
+    { label: "源资料", value: stats?.sources ?? project.source_count, icon: Layers, color: "text-blue-600", tone: "bg-blue-50" },
+    { label: "待审核", value: stats?.pending_reviews ?? "-", icon: AlertTriangle, color: "text-amber-600", tone: "bg-amber-50" },
+    { label: "页面类型", value: "-", icon: Layers, color: "text-emerald-600", tone: "bg-emerald-50" },
+  ];
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        {metrics.map(({ label, value, icon: Icon, color, tone }) => (
+          <div key={label} className="surface data-card">
+            <div className="flex items-center justify-between">
+              <div className={`rounded-xl ${tone} p-2`}><Icon className={`h-4 w-4 ${color}`} /></div>
+            </div>
+            <div className="mt-3 text-2xl font-semibold tracking-tight text-slate-900">{String(value)}</div>
+            <div className="text-xs text-slate-500">{label}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="surface data-card rounded-2xl">
+        <div className="mb-3 flex items-center gap-2">
+          <Network className="h-4 w-4 text-slate-700" />
+          <h3 className="text-sm font-semibold text-slate-900">项目信息</h3>
+        </div>
+        <div className="space-y-2">
+          <div className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
+            <span className="text-xs font-medium text-slate-500">项目 ID</span>
+            <code className="text-xs text-slate-700">{project.id.slice(0, 8)}...</code>
+          </div>
+          <div className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
+            <span className="text-xs font-medium text-slate-500">摄入模型</span>
+            <span className="text-xs text-slate-800">{project.ingest_model || "默认路由"}</span>
+          </div>
+          <div className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
+            <span className="text-xs font-medium text-slate-500">查询模型</span>
+            <span className="text-xs text-slate-800">{project.chat_model || "默认路由"}</span>
+          </div>
+          <div className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
+            <span className="text-xs font-medium text-slate-500">MCP 状态</span>
+            <span className={`text-xs font-medium ${project.mcp_enabled === 1 ? "text-violet-600" : "text-slate-400"}`}>
+              {project.mcp_enabled === 1 ? "已暴露" : "未暴露"}
+            </span>
+          </div>
+          <div className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
+            <span className="text-xs font-medium text-slate-500">创建时间</span>
+            <span className="text-xs text-slate-800">{project.created_at.slice(0, 19).replace("T", " ")}</span>
+          </div>
+          {project.last_ingest_at && (
+            <div className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
+              <span className="text-xs font-medium text-slate-500">最后摄入</span>
+              <span className="text-xs text-slate-800">{project.last_ingest_at.slice(0, 19).replace("T", " ")}</span>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function WikiPagesTab({ project }: { project: WikiProject }) {
+  const [pages, setPages] = useState<WikiPage[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedPage, setSelectedPage] = useState<string | null>(null);
+  const [pageContent, setPageContent] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [editContent, setEditContent] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const fetchPages = useCallback(async () => {
+    setLoading(true);
+    try { const data = await wikiApi.getPages(project.id); setPages(data); }
+    catch { /* ignore */ } finally { setLoading(false); }
+  }, [project.id]);
+
+  useEffect(() => { fetchPages(); }, [fetchPages]);
+
+  const openPage = async (path: string) => {
+    setSelectedPage(path);
+    setEditing(false);
+    try {
+      const page = await wikiApi.getPage(project.id, path);
+      setPageContent(page.content || "");
+    } catch { setPageContent("无法加载页面内容"); }
+  };
+
+  const handleSave = async () => {
+    if (!selectedPage) return;
+    setSaving(true);
+    try {
+      await wikiApi.savePage(project.id, selectedPage, editContent);
+      setPageContent(editContent);
+      setEditing(false);
+      await fetchPages();
+    } catch { /* ignore */ } finally { setSaving(false); }
+  };
+
+  if (loading) {
+    return <div className="surface empty-state"><Loader2 className="h-8 w-8 animate-spin text-slate-400" /></div>;
+  }
+
+  if (pages.length === 0 && !selectedPage) {
+    return (
+      <div className="surface empty-state">
+        <FileText className="h-10 w-10 text-slate-300" />
+        <p className="text-sm text-slate-500">还没有 Wiki 页面</p>
+        <p className="text-xs text-slate-400">摄入源文档后 LLM 会自动生成页面</p>
+      </div>
+    );
+  }
+
+  if (selectedPage) {
+    return (
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <button onClick={() => setSelectedPage(null)} className="text-xs text-slate-500 hover:text-slate-900">
+              <ChevronRight className="h-3 w-3 rotate-180" /> 返回列表
+            </button>
+            <span className="text-slate-300">/</span>
+            <code className="text-xs text-slate-700">{selectedPage}</code>
+          </div>
+          <div className="flex gap-2">
+            {editing ? (
+              <>
+                <button onClick={() => setEditing(false)} className="action-secondary">取消</button>
+                <button onClick={handleSave} disabled={saving} className="action-primary">
+                  {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                  保存
+                </button>
+              </>
+            ) : (
+              <button onClick={() => { setEditContent(pageContent); setEditing(true); }} className="action-secondary">
+                <Edit3 size={14} /> 编辑
+              </button>
+            )}
+          </div>
+        </div>
+        {editing ? (
+          <textarea
+            value={editContent}
+            onChange={e => setEditContent(e.target.value)}
+            className="w-full h-[60vh] rounded-xl border border-slate-200 bg-white p-4 text-xs font-mono"
+          />
+        ) : (
+          <div className="surface rounded-2xl p-6">
+            <pre className="whitespace-pre-wrap text-sm text-slate-800 leading-6">{pageContent}</pre>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  const typeColors: Record<string, string> = {
+    entity: "bg-blue-50 text-blue-600",
+    concept: "bg-violet-50 text-violet-600",
+    summary: "bg-emerald-50 text-emerald-600",
+    index: "bg-amber-50 text-amber-600",
+    log: "bg-slate-50 text-slate-500",
+  };
+
+  return (
+    <div className="surface rounded-2xl overflow-hidden">
+      <div className="divide-y divide-slate-50">
+        {pages.map(p => (
+          <div key={p.id} className="flex items-center gap-3 px-4 py-3 hover:bg-slate-50 cursor-pointer" onClick={() => openPage(p.path)}>
+            <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${typeColors[p.page_type] || "bg-slate-50 text-slate-500"}`}>{p.page_type}</span>
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-medium text-slate-900 truncate">{p.title}</p>
+              <code className="text-[11px] text-slate-400">{p.path}</code>
+            </div>
+            <span className="text-[10px] text-slate-400">{p.token_count} tokens</span>
+            <ChevronRight className="h-4 w-4 text-slate-300" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function WikiSourcesTab({ project, onRefresh, onNavigateSettings }: { project: WikiProject; onRefresh: () => void; onNavigateSettings: () => void }) {
+  const [sources, setSources] = useState<WikiSource[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [showAdd, setShowAdd] = useState(false);
+  const [ingesting, setIngesting] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchSources = useCallback(async () => {
+    setLoading(true);
+    try { const data = await wikiApi.getSources(project.id); setSources(data); }
+    catch { /* ignore */ } finally { setLoading(false); }
+  }, [project.id]);
+
+  useEffect(() => { fetchSources(); }, [fetchSources]);
+
+  const handleDelete = async (id: string) => {
+    if (!confirm("确定删除此源文件？")) return;
+    await wikiApi.deleteSource(id);
+    await fetchSources();
+    onRefresh();
+  };
+
+  const handleFileUpload = async (file: File) => {
+    setIngesting('upload');
+    try {
+      const content = await file.text();
+      const source = await wikiApi.addSource(project.id, {
+        source_type: file.name.split('.').pop() || 'txt',
+        filename: file.name,
+        content,
+      });
+      await fetchSources();
+      // Auto-ingest after upload
+      await wikiApi.ingestSource(project.id, source.id);
+      await fetchSources();
+      onRefresh();
+    } catch (e) {
+      const msg = String(e);
+      setError(msg);
+    } finally {
+      setIngesting(null);
+    }
+  };
+
+  const handleIngest = async (sourceId: string) => {
+    setIngesting(sourceId);
+    try {
+      await wikiApi.ingestSource(project.id, sourceId);
+      await fetchSources();
+      onRefresh();
+    } catch (e) {
+      setError(`摄入失败: ${e}`);
+    } finally {
+      setIngesting(null);
+    }
+  };
+
+  const handleRescanAll = async () => {
+    setIngesting('rescan');
+    try {
+      await wikiApi.rescanSources(project.id);
+      await fetchSources();
+      onRefresh();
+    } catch (e) {
+      setError(`重新扫描失败: ${e}`);
+    } finally {
+      setIngesting(null);
+    }
+  };
+
+  const isChannelError = error && (error.includes('No channel available') || error.includes('No active channel'));
+
+  if (loading) {
+    return <div className="surface empty-state"><Loader2 className="h-8 w-8 animate-spin text-slate-400" /></div>;
+  }
+
+  const statusColors: Record<string, string> = {
+    pending: "bg-amber-50 text-amber-600",
+    ingested: "bg-emerald-50 text-emerald-600",
+    failed: "bg-red-50 text-red-500",
+  };
+
+  return (
+    <div className="space-y-3">
+      {error && (
+        <div className={`rounded-2xl border p-4 ${isChannelError ? 'border-amber-200 bg-amber-50' : 'border-red-200 bg-red-50'}`}>
+          <div className="flex items-start gap-3">
+            <AlertTriangle className={`h-5 w-5 shrink-0 ${isChannelError ? 'text-amber-500' : 'text-red-500'}`} />
+            <div className="flex-1">
+              <p className="text-sm font-medium text-slate-900">{isChannelError ? '渠道未配置' : '操作失败'}</p>
+              <p className="mt-0.5 text-xs text-slate-500">{error}</p>
+              {isChannelError && (
+                <button onClick={() => { setError(null); onNavigateSettings(); }} className="mt-2 inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-800">
+                  <SettingsIcon size={13} /> 前往设置配置渠道
+                </button>
+              )}
+              {!isChannelError && (
+                <button onClick={() => setError(null)} className="mt-2 text-xs text-slate-500 hover:text-slate-900">关闭</button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      <div className="flex justify-end gap-2">
+        <button onClick={() => fetchSources()} disabled={loading} className="action-secondary">
+          {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+          刷新
+        </button>
+        {(sources.some(s => s.status === 'pending' || s.status === 'failed')) && (
+          <button onClick={handleRescanAll} disabled={!!ingesting} className="action-secondary">
+            {ingesting === 'rescan' ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            全部处理
+          </button>
+        )}
+        <button onClick={() => setShowAdd(!showAdd)} className="action-primary">
+          <Plus size={16} /> 添加源文件
+        </button>
+      </div>
+      {showAdd && (
+        <div className="surface rounded-2xl p-5 border-2 border-dashed border-slate-200">
+          <input
+            type="file"
+            onChange={e => {
+              if (e.target.files?.[0]) { handleFileUpload(e.target.files[0]); setShowAdd(false); }
+            }}
+            className="text-xs text-slate-500 file:mr-3 file:rounded-lg file:border-0 file:bg-slate-100 file:px-3 file:py-1.5 file:text-xs file:font-medium"
+          />
+          <p className="mt-2 text-[11px] text-slate-400">支持 .md / .txt / .json 等文本文件</p>
+        </div>
+      )}
+      {sources.length === 0 ? (
+        <div className="surface empty-state">
+          <FolderOpen className="h-10 w-10 text-slate-300" />
+          <p className="text-sm text-slate-500">还没有源文件</p>
+          <p className="text-xs text-slate-400">上传文档后 LLM 会自动摄入并生成 Wiki 页面</p>
+        </div>
+      ) : (
+        <div className="surface rounded-2xl overflow-hidden">
+          <div className="divide-y divide-slate-50">
+            {sources.map(s => (
+              <div key={s.id} className="flex items-center gap-3 px-4 py-3">
+                <FileText className="h-4 w-4 text-slate-400 shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-slate-900 truncate">{s.filename}</p>
+                  <div className="flex items-center gap-3 text-[11px] text-slate-400">
+                    <span>{(s.file_size / 1024).toFixed(1)} KB</span>
+                    {s.page_count > 0 && <span>{s.page_count} 页面</span>}
+                    {s.ingested_at && <span>{s.ingested_at.slice(0, 10)}</span>}
+                  </div>
+                </div>
+                <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${statusColors[s.status] || "bg-slate-50 text-slate-500"}`}>{s.status}</span>
+                {(s.status === 'pending' || s.status === 'failed') && (
+                  <button onClick={() => handleIngest(s.id)} disabled={!!ingesting} className="rounded-lg p-1.5 text-violet-500 hover:bg-violet-50 disabled:opacity-50" title={s.status === 'failed' ? '重新摄入' : '摄入'}>
+                    {ingesting === s.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                  </button>
+                )}
+                <button onClick={() => handleDelete(s.id)} className="rounded-lg p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-500">
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WikiSearchTab({ project }: { project: WikiProject }) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<WikiSearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+
+  const handleSearch = async () => {
+    if (!query.trim()) return;
+    setSearching(true);
+    try { const data = await wikiApi.search(project.id, query, 10); setResults(data); }
+    catch { /* ignore */ } finally { setSearching(false); }
+  };
+
+  const typeColors: Record<string, string> = {
+    entity: "bg-blue-50 text-blue-600",
+    concept: "bg-violet-50 text-violet-600",
+    summary: "bg-emerald-50 text-emerald-600",
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="surface rounded-2xl p-5">
+        <div className="flex gap-2">
+          <input
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && handleSearch()}
+            placeholder="搜索 Wiki 页面..."
+            className="flex-1 rounded-xl border border-slate-200 px-4 py-2.5 text-sm"
+          />
+          <button onClick={handleSearch} disabled={searching} className="action-primary">
+            {searching ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+            搜索
+          </button>
+        </div>
+      </div>
+      {results.length > 0 && (
+        <div className="surface rounded-2xl overflow-hidden">
+          <div className="divide-y divide-slate-50">
+            {results.map((r) => (
+              <div key={r.page_id} className="px-4 py-3 hover:bg-slate-50">
+                <div className="flex items-center gap-2">
+                  <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${typeColors[r.page_type] || "bg-slate-50 text-slate-500"}`}>{r.page_type}</span>
+                  <p className="text-sm font-medium text-slate-900">{r.title}</p>
+                </div>
+                <code className="text-[11px] text-slate-400">{r.path}</code>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {!searching && results.length === 0 && query && (
+        <div className="surface empty-state">
+          <Inbox className="h-10 w-10 text-slate-300" />
+          <p className="text-sm text-slate-500">未找到匹配的页面</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WikiGraphTab({ project }: { project: WikiProject }) {
+  const [graph, setGraph] = useState<WikiGraphData | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    wikiApi.getGraph(project.id).then(setGraph).catch(() => {}).finally(() => setLoading(false));
+  }, [project.id]);
+
+  if (loading) {
+    return <div className="surface empty-state"><Loader2 className="h-8 w-8 animate-spin text-slate-400" /></div>;
+  }
+
+  if (!graph || graph.nodes.length === 0) {
+    return (
+      <div className="surface empty-state">
+        <Network className="h-10 w-10 text-slate-300" />
+        <p className="text-sm text-slate-500">还没有知识图谱</p>
+        <p className="text-xs text-slate-400">摄入文档并生成页面后，图谱会自动构建</p>
+      </div>
+    );
+  }
+
+  // Simple SVG visualization (Phase 3 will add Sigma.js)
+  const maxLinks = Math.max(...graph.nodes.map(n => n.link_count), 1);
+
+  // Circle layout
+  const cx = 250, cy = 250, r = 180;
+  const positions = new Map<string, { x: number; y: number }>();
+  graph.nodes.forEach((node, i) => {
+    const angle = (i / graph.nodes.length) * Math.PI * 2;
+    positions.set(node.id, { x: cx + Math.cos(angle) * r, y: cy + Math.sin(angle) * r });
+  });
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-3 gap-3">
+        <div className="surface data-card">
+          <div className="text-2xl font-semibold text-slate-900">{graph.nodes.length}</div>
+          <div className="text-xs text-slate-500">节点</div>
+        </div>
+        <div className="surface data-card">
+          <div className="text-2xl font-semibold text-slate-900">{graph.edges.length}</div>
+          <div className="text-xs text-slate-500">边</div>
+        </div>
+        <div className="surface data-card">
+          <div className="text-2xl font-semibold text-slate-900">{new Set(graph.edges.map(e => e.edge_type)).size}</div>
+          <div className="text-xs text-slate-500">边类型</div>
+        </div>
+      </div>
+      <div className="surface rounded-2xl p-6">
+        <div className="mb-3 flex items-center gap-2">
+          <Network className="h-4 w-4 text-slate-700" />
+          <h3 className="text-sm font-semibold text-slate-900">知识图谱</h3>
+          <span className="ml-auto text-[11px] text-slate-400">SVG 预览 · Sigma.js 将在 Phase 3 集成</span>
+        </div>
+        <svg viewBox="0 0 500 500" className="w-full" style={{ maxHeight: "500px" }}>
+          {/* Edges */}
+          {graph.edges.map((edge, i) => {
+            const s = positions.get(edge.source);
+            const t = positions.get(edge.target);
+            if (!s || !t) return null;
+            return <line key={i} x1={s.x} y1={s.y} x2={t.x} y2={t.y} stroke="rgba(47, 111, 237, 0.15)" strokeWidth={Math.max(1, edge.weight * 2)} />;
+          })}
+          {/* Nodes */}
+          {graph.nodes.map((node) => {
+            const pos = positions.get(node.id)!;
+            const radius = 6 + (node.link_count / maxLinks) * 12;
+            const colors: Record<string, string> = {
+              entity: "#3b82f6",
+              concept: "#8b5cf6",
+              summary: "#10b981",
+              index: "#f59e0b",
+              log: "#94a3b8",
+            };
+            return (
+              <g key={node.id}>
+                <circle cx={pos.x} cy={pos.y} r={radius} fill={colors[node.node_type] || "#64748b"} opacity={0.85} />
+                <title>{node.label} ({node.link_count} links)</title>
+              </g>
+            );
+          })}
+        </svg>
+        {/* Legend */}
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          {Object.entries({ entity: "实体", concept: "概念", summary: "摘要", index: "索引", log: "日志" }).map(([type, label]) => {
+            const colors: Record<string, string> = {
+              entity: "bg-blue-500", concept: "bg-violet-500", summary: "bg-emerald-500", index: "bg-amber-500", log: "bg-slate-400",
+            };
+            return (
+              <span key={type} className="flex items-center gap-1.5 text-[11px] text-slate-500">
+                <span className={`h-2.5 w-2.5 rounded-full ${colors[type]}`} />
+                {label}
+              </span>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function WikiReviewsTab({ project }: { project: WikiProject }) {
+  const [reviews, setReviews] = useState<WikiReview[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const fetchReviews = useCallback(async () => {
+    setLoading(true);
+    try { const data = await wikiApi.getReviews(project.id, false); setReviews(data); }
+    catch { /* ignore */ } finally { setLoading(false); }
+  }, [project.id]);
+
+  useEffect(() => { fetchReviews(); }, [fetchReviews]);
+
+  if (loading) {
+    return <div className="surface empty-state"><Loader2 className="h-8 w-8 animate-spin text-slate-400" /></div>;
+  }
+
+  if (reviews.length === 0) {
+    return (
+      <div className="surface empty-state">
+        <CheckCircle2 className="h-10 w-10 text-emerald-300" />
+        <p className="text-sm text-slate-500">没有待审核项</p>
+        <p className="text-xs text-slate-400">摄入文档后 LLM 会自动检测矛盾、缺失和孤儿页面</p>
+      </div>
+    );
+  }
+
+  const typeIcons: Record<string, string> = {
+    contradiction: "⚠️", orphan: "🔗", missing_page: "📄", duplicate: "📋", stale: "⏰", suggestion: "💡",
+  };
+
+  return (
+    <div className="space-y-3">
+      {reviews.map(r => (
+        <div key={r.id} className="surface rounded-2xl p-4">
+          <div className="flex items-start gap-3">
+            <span className="text-lg">{typeIcons[r.review_type] || "❓"}</span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <h4 className="text-sm font-semibold text-slate-900">{r.title}</h4>
+                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">{r.review_type}</span>
+              </div>
+              {r.description && <p className="mt-1 text-xs text-slate-500">{r.description}</p>}
+              {r.source_path && <code className="mt-1 block text-[11px] text-slate-400">{r.source_path}</code>}
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function WikiSettingsTab({ project, onRefresh }: { project: WikiProject; onRefresh: () => void }) {
+  const [name, setName] = useState(project.name);
+  const [description, setDescription] = useState(project.description || "");
+  const [ingestModel, setIngestModel] = useState(project.ingest_model || "");
+  const [chatModel, setChatModel] = useState(project.chat_model || "");
+  const [ingestChannelId, setIngestChannelId] = useState(project.ingest_channel_id || "");
+  const [chatChannelId, setChatChannelId] = useState(project.chat_channel_id || "");
+  const [schemaText, setSchemaText] = useState(project.schema_text || "");
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [channels, setChannels] = useState<Channel[]>([]);
+
+  useEffect(() => {
+    channelApi.getAll().then(list => setChannels(list.filter(c => c.status === 1))).catch(() => {});
+  }, []);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await wikiApi.updateProject(project.id, {
+        name, description, ingest_model: ingestModel || undefined,
+        chat_model: chatModel || undefined, schema_text: schemaText || undefined,
+        ingest_channel_id: ingestChannelId || undefined,
+        chat_channel_id: chatChannelId || undefined,
+      });
+      setSaved(true);
+      onRefresh();
+      setTimeout(() => setSaved(false), 2000);
+    } catch { /* ignore */ } finally { setSaving(false); }
+  };
+
+  const ingestChannelData = channels.find(c => c.id === ingestChannelId);
+  const chatChannelData = channels.find(c => c.id === chatChannelId);
+
+  return (
+    <div className="surface rounded-2xl p-6 space-y-5">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-slate-900">项目设置</h3>
+        <button onClick={handleSave} disabled={saving} className="action-primary">
+          {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : saved ? <Check className="h-4 w-4" /> : <Save className="h-4 w-4" />}
+          {saved ? "已保存" : "保存"}
+        </button>
+      </div>
+      <div>
+        <label className="mb-1.5 block text-xs font-medium text-slate-700">项目名称</label>
+        <input value={name} onChange={e => setName(e.target.value)} className="w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm" />
+      </div>
+      <div>
+        <label className="mb-1.5 block text-xs font-medium text-slate-700">描述</label>
+        <input value={description} onChange={e => setDescription(e.target.value)} className="w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm" />
+      </div>
+      <div className="rounded-2xl border border-slate-100 p-4">
+        <label className="mb-1.5 block text-xs font-medium text-slate-700">摄入渠道 & 模型</label>
+        <p className="mb-2 text-[11px] text-slate-400">用于 LLM 解析文档并生成 Wiki 页面</p>
+        <div className="flex gap-2">
+          <select
+            value={ingestChannelId}
+            onChange={e => { setIngestChannelId(e.target.value); const c = channels.find(c => c.id === e.target.value); setIngestModel(c?.models[0] || ""); }}
+            className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
+          >
+            <option value="">自动选择</option>
+            {channels.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+          <select
+            value={ingestModel}
+            onChange={e => setIngestModel(e.target.value)}
+            className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
+          >
+            {ingestChannelData?.models.map(m => <option key={m} value={m}>{m}</option>)}
+          </select>
+        </div>
+      </div>
+      <div className="rounded-2xl border border-slate-100 p-4">
+        <label className="mb-1.5 block text-xs font-medium text-slate-700">对话渠道 & 模型</label>
+        <p className="mb-2 text-[11px] text-slate-400">用于 Wiki 问答</p>
+        <div className="flex gap-2">
+          <select
+            value={chatChannelId}
+            onChange={e => { setChatChannelId(e.target.value); const c = channels.find(c => c.id === e.target.value); setChatModel(c?.models[0] || ""); }}
+            className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
+          >
+            <option value="">同摄入渠道</option>
+            {channels.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+          <select
+            value={chatModel}
+            onChange={e => setChatModel(e.target.value)}
+            className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
+          >
+            {chatChannelData?.models.map(m => <option key={m} value={m}>{m}</option>)}
+          </select>
+        </div>
+      </div>
+      <div>
+        <label className="mb-1.5 block text-xs font-medium text-slate-700">Wiki Schema (CLAUDE.md)</label>
+        <p className="mb-1.5 text-[11px] text-slate-400">定义 LLM 维护 Wiki 的规则</p>
+        <textarea value={schemaText} onChange={e => setSchemaText(e.target.value)} rows={10} className="w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-xs font-mono" />
+      </div>
+    </div>
+  );
 }

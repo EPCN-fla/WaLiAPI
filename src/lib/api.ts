@@ -313,6 +313,150 @@ export const kbApi = {
   getTags: (kbId: string, limit?: number) => invoke<KbTag[]>("get_kb_tags", { kbId, limit }),
 };
 
+// ── Wiki types ──
+export interface WikiProject {
+    id: string;
+    name: string;
+    description: string | null;
+    status: number;
+    schema_text: string | null;
+    wiki_dir: string;
+    ingest_model: string | null;
+    chat_model: string | null;
+    ingest_channel_id: string | null;
+    chat_channel_id: string | null;
+    mcp_enabled: number;
+    source_count: number;
+    page_count: number;
+    last_ingest_at: string | null;
+    last_lint_at: string | null;
+    created_at: string;
+    updated_at: string;
+}
+
+export interface CreateWikiProjectInput {
+    name: string;
+    description?: string;
+    ingest_model?: string;
+    chat_model?: string;
+    ingest_channel_id?: string;
+    chat_channel_id?: string;
+    schema_text?: string;
+}
+
+export interface UpdateWikiProjectInput {
+    name?: string;
+    description?: string;
+    status?: number;
+    schema_text?: string;
+    ingest_model?: string;
+    chat_model?: string;
+    ingest_channel_id?: string;
+    chat_channel_id?: string;
+    mcp_enabled?: number;
+}
+
+export interface WikiPage {
+    id: string;
+    project_id: string;
+    path: string;
+    title: string;
+    page_type: string;
+    content_hash: string;
+    token_count: number;
+    wikilinks: string;
+    frontmatter: string;
+    status: string;
+    content?: string;
+    created_at: string;
+    updated_at: string;
+}
+
+export interface WikiSource {
+    id: string;
+    project_id: string;
+    source_type: string;
+    filename: string;
+    file_path: string | null;
+    source_url: string | null;
+    content_hash: string | null;
+    file_size: number;
+    status: string;
+    page_count: number;
+    error_message: string | null;
+    created_at: string;
+    ingested_at: string | null;
+}
+
+export interface WikiSearchResult {
+    page_id: string;
+    path: string;
+    title: string;
+    score: number;
+    snippet: string;
+    page_type: string;
+}
+
+export interface WikiReview {
+    id: string;
+    project_id: string;
+    review_type: string;
+    title: string;
+    description: string | null;
+    source_path: string | null;
+    affected_pages: string;
+    search_queries: string;
+    options_json: string;
+    resolved: number;
+    created_at: string;
+    resolved_at: string | null;
+}
+
+export interface WikiGraphData {
+    nodes: Array<{
+        id: string;
+        label: string;
+        path: string | null;
+        node_type: string;
+        link_count: number;
+    }>;
+    edges: Array<{
+        source: string;
+        target: string;
+        edge_type: string;
+        weight: number;
+    }>;
+}
+
+export interface AddWikiSourceInput {
+    source_type: string;
+    filename: string;
+    file_path?: string;
+    source_url?: string;
+    content?: string;
+}
+
+// Wiki commands
+export const wikiApi = {
+    getProjects: () => invoke<WikiProject[]>("get_wiki_projects"),
+    createProject: (input: CreateWikiProjectInput) => invoke<WikiProject>("create_wiki_project", { input }),
+    getProject: (id: string) => invoke<WikiProject>("get_wiki_project", { id }),
+    updateProject: (id: string, input: UpdateWikiProjectInput) => invoke<WikiProject>("update_wiki_project", { id, input }),
+    deleteProject: (id: string) => invoke<void>("delete_wiki_project", { id }),
+    getPages: (projectId: string) => invoke<WikiPage[]>("get_wiki_pages", { projectId }),
+    getPage: (projectId: string, path: string) => invoke<WikiPage & { content: string }>("get_wiki_page", { projectId, path }),
+    savePage: (projectId: string, path: string, content: string) => invoke<void>("save_wiki_page", { projectId, path, content }),
+    getSources: (projectId: string) => invoke<WikiSource[]>("get_wiki_sources", { projectId }),
+    addSource: (projectId: string, input: AddWikiSourceInput) => invoke<WikiSource>("add_wiki_source", { projectId, input }),
+    deleteSource: (sourceId: string) => invoke<void>("delete_wiki_source", { sourceId }),
+    search: (projectId: string, query: string, topK?: number) => invoke<WikiSearchResult[]>("search_wiki", { projectId, query, topK }),
+    getGraph: (projectId: string) => invoke<WikiGraphData>("get_wiki_graph", { projectId }),
+    getReviews: (projectId: string, resolved?: boolean) => invoke<WikiReview[]>("get_wiki_reviews", { projectId, resolved }),
+    getStats: (projectId: string) => invoke<Record<string, unknown>>("get_wiki_stats", { projectId }),
+    ingestSource: (projectId: string, sourceId: string) => invoke<{ status: string; pages_created: number; page_paths: string[] }>("ingest_wiki_source", { projectId, sourceId }),
+    rescanSources: (projectId: string) => invoke<{ status: string; processed: number; results: unknown[] }>("rescan_wiki_sources", { projectId }),
+};
+
 // Service status
 export interface ServiceStatus {
   id: string;
