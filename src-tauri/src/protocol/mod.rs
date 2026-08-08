@@ -281,6 +281,25 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
         let mut call_id_fallback: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         let mut fallback_counter = 0u32;
+        // Whether a `function_call` item appears anywhere AFTER index `i`.
+        // A `reasoning` item followed (possibly through an intermediate
+        // assistant text message) by function_calls belongs to that
+        // tool-calling turn: its text must ride on the assistant(tool_calls)
+        // message emitted at flush time, NOT on the intermediate text message.
+        // DeepSeek thinking mode rejects the follow-up otherwise with
+        // "The reasoning_content in the thinking mode must be passed back."
+        let function_call_after: Vec<bool> = {
+            let mut v = vec![false; arr.len()];
+            let mut seen = false;
+            for (i, item) in arr.iter().enumerate().rev() {
+                v[i] = seen;
+                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                    seen = true;
+                }
+            }
+            v
+        };
+
         for item in arr {
             let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match item_type {
@@ -314,11 +333,110 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
         }
 
         let mut msgs = Vec::new();
-        for item in arr {
+        // Reasoning from a preceding `reasoning` item is attached to the next
+        // assistant message as `reasoning_content`. Without this, thinking-mode
+        // providers (e.g. DeepSeek) reject multi-turn requests with
+        // "The `reasoning_content` in the thinking mode must be passed back."
+        let mut pending_reasoning: Option<String> = None;
+        // Function_call items are buffered and flushed together as ONE assistant
+        // message with a multi-element `tool_calls` array. Emitting a separate
+        // assistant message per call breaks parallel tool use: DeepSeek rejects any
+        // assistant message carrying tool_calls that isn't immediately followed by
+        // tool messages for each of its call_ids.
+        let mut pending_tool_calls: Vec<(String, String, String)> = Vec::new();
+        // call_ids whose tool response is still awaited (their real output exists
+        // later in the input). Regular messages are deferred until this empties so
+        // they never sit between an assistant(tool_calls) and its tool messages.
+        let mut awaiting: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Regular messages deferred while tool responses are pending.
+        let mut deferred: Vec<Value> = Vec::new();
+
+        // Flush buffered function_calls as one assistant message. For each call:
+        // if a real output exists later in the input, mark it awaiting; otherwise
+        // synthesize an empty tool response so upstream never sees an unanswered
+        // tool_call_id.
+        let flush_tool_calls = |msgs: &mut Vec<Value>,
+                                pending_tool_calls: &mut Vec<(String, String, String)>,
+                                awaiting: &mut std::collections::HashSet<String>,
+                                output_ids: &std::collections::HashSet<String>,
+                                pending_reasoning: &mut Option<String>| {
+            if pending_tool_calls.is_empty() {
+                return;
+            }
+            // Never flush a new tool batch while an earlier assistant(tool_calls)
+            // is still awaiting its tool replies. Doing so would emit a SECOND
+            // assistant message between the first one and its tool messages,
+            // which DeepSeek rejects ("assistant with tool_calls must be
+            // followed by tool messages responding to each tool_call_id"). The
+            // new calls stay buffered and flush together once awaiting drains.
+            if !awaiting.is_empty() {
+                return;
+            }
+            let tool_calls: Vec<Value> = pending_tool_calls
+                .iter()
+                .map(|(cid, name, arguments)| {
+                    serde_json::json!({
+                        "id": cid,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments}
+                    })
+                })
+                .collect();
+            let mut msg = serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": tool_calls,
+            });
+            if let Some(rc) = pending_reasoning.take() {
+                msg["reasoning_content"] = Value::String(rc);
+            }
+            msgs.push(msg);
+            for (cid, _, _) in pending_tool_calls.iter() {
+                if output_ids.contains(cid) {
+                    awaiting.insert(cid.clone());
+                } else {
+                    msgs.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": cid,
+                        "content": ""
+                    }));
+                }
+            }
+            pending_tool_calls.clear();
+        };
+
+        for (idx, item) in arr.iter().enumerate() {
             let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
             match item_type {
-                // function_call: assistant's tool call → OpenAI assistant message with tool_calls
+                // reasoning: thinking chain → attach as reasoning_content on the following assistant message
+                "reasoning" => {
+                    let mut text = String::new();
+                    if let Some(summary) = item.get("summary").and_then(|s| s.as_array()) {
+                        for block in summary {
+                            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                                text.push_str(t);
+                            }
+                        }
+                    }
+                    if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+                        for block in content {
+                            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                                text.push_str(t);
+                            }
+                        }
+                    }
+                    if text.is_empty() {
+                        if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                            text = t.to_string();
+                        }
+                    }
+                    if !text.is_empty() {
+                        pending_reasoning = Some(text);
+                    }
+                }
+
+                // function_call: assistant's tool call → buffer for the next merged assistant message
                 "function_call" => {
                     let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     let arguments = item.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
@@ -332,31 +450,19 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
                         .get(&original_call_id)
                         .cloned()
                         .unwrap_or(original_call_id);
-                    msgs.push(serde_json::json!({
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": arguments
-                            }
-                        }]
-                    }));
-                    // If this function_call has no matching output, synthesize an empty tool response
-                    // to prevent upstream "tool_call_ids did not have response messages" errors
-                    if !output_ids.contains(&call_id) {
-                        msgs.push(serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": ""
-                        }));
-                    }
+                    pending_tool_calls.push((call_id, name.to_string(), arguments.to_string()));
                 }
 
-                // function_call_output: tool result → OpenAI tool message
+                // function_call_output: tool result → OpenAI tool message, then
+                // release any deferred messages once every awaited output has landed
                 "function_call_output" => {
+                    flush_tool_calls(
+                        &mut msgs,
+                        &mut pending_tool_calls,
+                        &mut awaiting,
+                        &output_ids,
+                        &mut pending_reasoning,
+                    );
                     let original_call_id = item
                         .get("call_id")
                         .and_then(|c| c.as_str())
@@ -368,15 +474,27 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
                         .cloned()
                         .unwrap_or(original_call_id);
                     let output = item.get("output").and_then(|o| o.as_str()).unwrap_or("");
+                    awaiting.remove(&call_id);
                     msgs.push(serde_json::json!({
                         "role": "tool",
                         "tool_call_id": call_id,
                         "content": output
                     }));
+                    // Tool responses are in; regular messages can be emitted again.
+                    if awaiting.is_empty() {
+                        msgs.append(&mut deferred);
+                    }
                 }
 
                 // message: standard chat message
                 "message" | _ if item.get("role").is_some() => {
+                    flush_tool_calls(
+                        &mut msgs,
+                        &mut pending_tool_calls,
+                        &mut awaiting,
+                        &output_ids,
+                        &mut pending_reasoning,
+                    );
                     let role = item
                         .get("role")
                         .and_then(|r| r.as_str())
@@ -407,31 +525,106 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
                         } else {
                             Value::String(String::new())
                         };
-                    msgs.push(serde_json::json!({
+                    let mut msg = serde_json::json!({
                         "role": role,
                         "content": content,
-                    }));
+                    });
+                    // Attach reasoning_content (from a preceding `reasoning` item,
+                    // or carried directly on this message) for assistant turns so
+                    // thinking-mode providers accept the request.
+                    if role == "assistant" {
+                        let rc = item
+                            .get("reasoning_content")
+                            .and_then(|r| r.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| {
+                                // If this assistant text message is part of a
+                                // tool-calling turn (function_calls follow it),
+                                // keep the reasoning for the assistant(tool_calls)
+                                // message emitted at flush — that is the message
+                                // DeepSeek's thinking mode requires it on.
+                                if function_call_after[idx] {
+                                    None
+                                } else {
+                                    pending_reasoning.take()
+                                }
+                            });
+                        if let Some(rc) = rc {
+                            if !rc.is_empty() {
+                                msg["reasoning_content"] = Value::String(rc);
+                            }
+                        }
+                    } else {
+                        // A reasoning item belongs to the assistant message that
+                        // immediately follows it; drop it before any other role —
+                        // unless a buffered tool call still needs to flush with it.
+                        if pending_tool_calls.is_empty() && awaiting.is_empty() {
+                            pending_reasoning = None;
+                        }
+                    }
+                    // Defer regular messages while tool responses are pending so
+                    // they never interrupt an assistant(tool_calls)→tool(...) run.
+                    if awaiting.is_empty() {
+                        msgs.push(msg);
+                    } else {
+                        deferred.push(msg);
+                    }
                 }
 
                 // Simple text item
                 _ if item.get("text").is_some() => {
+                    flush_tool_calls(
+                        &mut msgs,
+                        &mut pending_tool_calls,
+                        &mut awaiting,
+                        &output_ids,
+                        &mut pending_reasoning,
+                    );
                     let text = item.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                    msgs.push(serde_json::json!({
+                    let msg = serde_json::json!({
                         "role": "user",
                         "content": text,
-                    }));
+                    });
+                    if awaiting.is_empty() {
+                        msgs.push(msg);
+                    } else {
+                        deferred.push(msg);
+                    }
                 }
 
                 // Raw string input
                 _ => {
                     if let Some(s) = item.as_str() {
-                        msgs.push(serde_json::json!({
+                        flush_tool_calls(
+                            &mut msgs,
+                            &mut pending_tool_calls,
+                            &mut awaiting,
+                            &output_ids,
+                            &mut pending_reasoning,
+                        );
+                        let msg = serde_json::json!({
                             "role": "user",
                             "content": s,
-                        }));
+                        });
+                        if awaiting.is_empty() {
+                            msgs.push(msg);
+                        } else {
+                            deferred.push(msg);
+                        }
                     }
                 }
             }
+        }
+        // End of input: flush any buffered tool calls and remaining deferred messages.
+        flush_tool_calls(
+            &mut msgs,
+            &mut pending_tool_calls,
+            &mut awaiting,
+            &output_ids,
+            &mut pending_reasoning,
+        );
+        if awaiting.is_empty() {
+            msgs.append(&mut deferred);
         }
         msgs
     } else if let Some(s) = input.as_str() {
@@ -634,32 +827,11 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
-    // Extract system message and prepend it
-    let system = body.get("system").map(|s| {
-        if let Some(str_val) = s.as_str() {
-            Ok(str_val.to_string())
-        } else if let Some(arr) = s.as_array() {
-            let mut texts = Vec::new();
-            for block in arr {
-                // Prompt caching changes Anthropic billing/cache behavior but
-                // not the text content of a Chat Completions request.  It is
-                // safe to drop this annotation on the OpenAI bridge; native
-                // channels still receive the original body unchanged.
-                match block.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => texts.push(block.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string()),
-                    Some("thinking") => {
-                        // Fail-open: reasoning instructions on the system prompt
-                        // are dropped (no Chat equivalent), not rejected.
-                    }
-                    Some("cache_control") => return Err("system cache_control blocks require a native Anthropic Messages channel".to_string()),
-                    _ => return Err("unsupported non-text system content requires a native Anthropic Messages channel".to_string()),
-                }
-            }
-            Ok(texts.join(""))
-        } else {
-            Err("system must be text or an array of text blocks".to_string())
-        }
-    }).transpose()?;
+    // Extract top-level system message and prepend it.
+    let system = body
+        .get("system")
+        .map(anthropic_system_content_to_openai_text)
+        .transpose()?;
 
     // Convert Anthropic message content (array format) to OpenAI string format
     let openai_messages = convert_anthropic_messages_to_openai(&messages, system)?;
@@ -767,7 +939,20 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
             };
             openai_body["tool_choice"] = openai_tc;
         } else if let Some(s) = tc.as_str() {
-            openai_body["tool_choice"] = Value::String(s.to_string());
+            let openai_tc = match s {
+                "auto" => Value::String("auto".to_string()),
+                "any" => Value::String("required".to_string()),
+                "tool" => return Err("Anthropic tool_choice 'tool' requires a name".to_string()),
+                _ => {
+                    return Err(
+                        "unsupported Anthropic tool_choice requires a native Anthropic Messages channel"
+                            .to_string(),
+                    )
+                }
+            };
+            openai_body["tool_choice"] = openai_tc;
+        } else {
+            return Err("unsupported Anthropic tool_choice requires a native Anthropic Messages channel".to_string());
         }
     }
 
@@ -860,6 +1045,48 @@ fn tool_result_to_openai_content(block: &Value) -> Result<String, String> {
     }
 }
 
+fn anthropic_system_content_to_openai_text(value: &Value) -> Result<String, String> {
+    if let Some(str_val) = value.as_str() {
+        Ok(str_val.to_string())
+    } else if let Some(arr) = value.as_array() {
+        let mut texts = Vec::new();
+        for block in arr {
+            // Prompt caching changes Anthropic billing/cache behavior but not
+            // the text content of a Chat Completions request.  It is safe to
+            // drop this annotation on the OpenAI bridge; native channels still
+            // receive the original body unchanged.
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("text") => texts.push(
+                    block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                Some("thinking") => {
+                    // Fail-open: reasoning instructions on the system prompt
+                    // are dropped (no Chat equivalent), not rejected.
+                }
+                Some("cache_control") => {
+                    return Err(
+                        "system cache_control blocks require a native Anthropic Messages channel"
+                            .to_string(),
+                    )
+                }
+                _ => {
+                    return Err(
+                        "unsupported non-text system content requires a native Anthropic Messages channel"
+                            .to_string(),
+                    )
+                }
+            }
+        }
+        Ok(texts.join(""))
+    } else {
+        Err("system must be text or an array of text blocks".to_string())
+    }
+}
+
 /// Convert Anthropic messages array to OpenAI messages array.
 /// Anthropic content can be string or array of content blocks.
 /// Handles: text, tool_use (assistant), tool_result (user)
@@ -881,8 +1108,19 @@ fn convert_anthropic_messages_to_openai(
                 .and_then(|r| r.as_str())
                 .ok_or_else(|| "Anthropic message is missing role".to_string())?
                 .to_string();
-            if role != "user" && role != "assistant" {
-                return Err("only user and assistant Anthropic messages can be sent to OpenAI Chat Completions".to_string());
+            if role != "user" && role != "assistant" && role != "system" {
+                return Err("only user, assistant, and system Anthropic messages can be sent to OpenAI Chat Completions".to_string());
+            }
+
+            if role == "system" {
+                let content = msg
+                    .get("content")
+                    .ok_or_else(|| "system message is missing content".to_string())?;
+                msgs.push(serde_json::json!({
+                    "role": "system",
+                    "content": anthropic_system_content_to_openai_text(content)?,
+                }));
+                continue;
             }
 
             if let Some(content_arr) = msg.get("content").and_then(|c| c.as_array()) {
@@ -916,7 +1154,11 @@ fn convert_anthropic_messages_to_openai(
                             if role != "assistant" { return Err("tool_use blocks must be in an assistant message".to_string()); }
                             let id = block.get("id").and_then(|i| i.as_str()).filter(|s| !s.is_empty()).ok_or_else(|| "tool_use is missing id".to_string())?;
                             let name = block.get("name").and_then(|n| n.as_str()).filter(|s| !s.is_empty()).ok_or_else(|| "tool_use is missing name".to_string())?;
-                            let input = block.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                            let input = block.get("input").ok_or_else(|| "tool_use is missing input".to_string())?;
+                            if !input.is_object() {
+                                return Err("tool_use input must be a JSON object".to_string());
+                            }
+                            let input = input.clone();
                             tool_calls.push(serde_json::json!({"id": id, "type": "function", "function": {"name": name, "arguments": serde_json::to_string(&input).map_err(|e| e.to_string())?}}));
                         }
                         "tool_result" => {
@@ -1047,6 +1289,75 @@ mod anthropic_tests {
     }
 
     #[test]
+    fn maps_mid_conversation_system_messages_to_chat_system_role() {
+        let request = serde_json::json!({
+            "model": "claude-compatible",
+            "messages": [
+                {"role":"user", "content":"use the strict profile"},
+                {"role":"system", "content":[{"type":"text", "text":"strict profile active", "cache_control":{"type":"ephemeral"}}]},
+                {"role":"assistant", "content":[{"type":"text", "text":"ack"}]}
+            ]
+        });
+        let converted = anthropic_to_openai(&request).unwrap();
+        assert_eq!(converted["messages"][0]["role"], "user");
+        assert_eq!(converted["messages"][1]["role"], "system");
+        assert_eq!(converted["messages"][1]["content"], "strict profile active");
+        assert_eq!(converted["messages"][2]["role"], "assistant");
+    }
+
+    #[test]
+    fn legacy_tool_choice_strings_map_or_reject() {
+        for (input, expected) in [("auto", "auto"), ("any", "required")] {
+            let request = serde_json::json!({
+                "model": "model",
+                "messages": [{"role":"user", "content":"hi"}],
+                "tool_choice": input
+            });
+            let converted = anthropic_to_openai(&request).unwrap();
+            assert_eq!(converted["tool_choice"], expected);
+        }
+
+        let request = serde_json::json!({
+            "model": "model",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tool_choice": "tool"
+        });
+        assert!(anthropic_to_openai(&request).is_err());
+
+        let request = serde_json::json!({
+            "model": "model",
+            "messages": [{"role":"user", "content":"hi"}],
+            "tool_choice": "bogus"
+        });
+        assert!(anthropic_to_openai(&request).is_err());
+    }
+
+    #[test]
+    fn legacy_tool_use_requires_input_not_fabricated() {
+        let request = serde_json::json!({
+            "model": "model",
+            "messages": [{"role":"assistant", "content":[{"type":"tool_use", "id":"call_1", "name":"run"}]}]
+        });
+        assert!(anthropic_to_openai(&request).is_err());
+
+        let request = serde_json::json!({
+            "model": "model",
+            "messages": [{"role":"assistant", "content":[{"type":"tool_use", "id":"call_1", "name":"run", "input":[]}]}]
+        });
+        assert!(anthropic_to_openai(&request).is_err());
+
+        let request = serde_json::json!({
+            "model": "model",
+            "messages": [{"role":"assistant", "content":[{"type":"tool_use", "id":"call_1", "name":"run", "input":{}}]}]
+        });
+        let converted = anthropic_to_openai(&request).unwrap();
+        assert_eq!(
+            converted["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            "{}"
+        );
+    }
+
+    #[test]
     fn rejects_invalid_openai_tool_arguments_without_inventing_input() {
         let response = serde_json::json!({"choices":[{"finish_reason":"tool_calls", "message":{"role":"assistant", "content":null, "tool_calls":[{"id":"call_1", "function":{"name":"run", "arguments":"{bad"}}]}}]});
         assert!(openai_to_anthropic(&response, "model").is_err());
@@ -1156,4 +1467,313 @@ mod anthropic_tests {
         assert_eq!(converted["content"][1]["type"], "text");
         assert_eq!(converted["content"][1]["text"], "answer");
     }
+
+    #[test]
+    fn responses_input_reasoning_item_becomes_assistant_reasoning_content() {
+        // A `reasoning` item must be forwarded to the upstream Chat request as
+        // `reasoning_content` on the assistant message it precedes. Without this,
+        // DeepSeek thinking models reject the 2nd+ turn with
+        // "The `reasoning_content` in the thinking mode must be passed back."
+        let input = serde_json::json!([
+            {
+                "type": "reasoning",
+                "id": "rs_abc",
+                "summary": [{"type": "summary_text", "text": "Let me think."}],
+                "content": [{"type": "reasoning_text", "text": "chain of thought"}]
+            },
+            {
+                "type": "message",
+                "id": "msg_xyz",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "The answer is 42."}]
+            }
+        ]);
+        let messages = convert_responses_input_to_messages(&input);
+        let msgs = messages.as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[0]["content"], "The answer is 42.");
+        assert_eq!(msgs[0]["reasoning_content"], "Let me think.chain of thought");
+    }
+
+    #[test]
+    fn responses_input_reasoning_item_without_content_still_preserved() {
+        // DeepSeek-compatible: even a reasoning item with only a summary must be
+        // forwarded as reasoning_content (no crash, no drop).
+        let input = serde_json::json!([
+            {"type": "reasoning", "id": "rs_abc", "summary": [{"type": "summary_text", "text": "Let me think."}]},
+            {"type": "message", "id": "msg_xyz", "role": "assistant", "content": [{"type": "output_text", "text": "Hi"}]}
+        ]);
+        let messages = convert_responses_input_to_messages(&input);
+        let msgs = messages.as_array().unwrap();
+        assert_eq!(msgs[0]["reasoning_content"], "Let me think.");
+    }
+
+    #[test]
+    fn responses_input_message_carries_reasoning_content_directly() {
+        // Some clients attach reasoning_content directly to the message item.
+        let input = serde_json::json!([
+            {"type": "message", "id": "msg_xyz", "role": "assistant",
+             "reasoning_content": "direct chain",
+             "content": [{"type": "output_text", "text": "Hi"}]}
+        ]);
+        let messages = convert_responses_input_to_messages(&input);
+        let msgs = messages.as_array().unwrap();
+        assert_eq!(msgs[0]["reasoning_content"], "direct chain");
+    }
+
+    #[test]
+    fn responses_reasoning_round_trip_to_chat() {
+        // Simulates the full Codex repro: upstream DeepSeek streams reasoning_content,
+        // WaLiAPI emits a `reasoning` item in Responses API format, then the next
+        // turn's input (echoing that reasoning item) converts back to Chat with
+        // `reasoning_content` so DeepSeek accepts the request.
+        use crate::protocol::responses::{
+            create_synthetic_completed_events, convert_openai_sse_to_responses, StreamState,
+        };
+
+        let response_id = "resp_repro";
+        let mut state = StreamState::default();
+
+        // Upstream turn output: reasoning_content then content, then stop.
+        let ev1 = convert_openai_sse_to_responses(
+            r#"data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"deepseek thought"},"finish_reason":null}]}"#,
+            "deepseek-v4-flash",
+            response_id,
+            "",
+            &mut state,
+        );
+        let ev2 = convert_openai_sse_to_responses(
+            r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":null}]}"#,
+            "deepseek-v4-flash",
+            response_id,
+            "answer",
+            &mut state,
+        );
+        let ev3 = convert_openai_sse_to_responses(
+            r#"data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            "deepseek-v4-flash",
+            response_id,
+            "answer",
+            &mut state,
+        );
+        let ev4 = create_synthetic_completed_events(
+            "deepseek-v4-flash",
+            response_id,
+            "answer",
+            &state,
+            10,
+            5,
+        );
+
+        // The stream Codex receives must announce + complete the reasoning item.
+        let stream: String = ev1
+            .into_iter()
+            .chain(ev2)
+            .chain(ev3)
+            .chain(ev4)
+            .collect();
+        assert!(stream.contains("\"type\":\"response.output_item.added\""));
+        assert!(stream.contains("\"type\":\"reasoning\""));
+        assert!(stream.contains("\"type\":\"reasoning_summary_text\""));
+        assert!(stream.contains("deepseek thought"));
+        assert!(stream.contains("\"type\":\"response.completed\""));
+
+        // Next turn: Codex echoes reasoning + message items back in input.
+        let next_input = serde_json::json!([
+            {"type": "reasoning", "id": "rs_repro", "summary": [{"type": "summary_text", "text": "deepseek thought"}]},
+            {"type": "message", "id": "msg_repro", "role": "assistant", "content": [{"type": "output_text", "text": "answer"}]},
+            {"type": "message", "id": "msg_u2", "role": "user", "content": [{"type": "input_text", "text": "continue"}]}
+        ]);
+        let messages = convert_responses_input_to_messages(&next_input);
+        let msgs = messages.as_array().unwrap();
+        let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+        assert_eq!(assistant["reasoning_content"], "deepseek thought");
+        assert_eq!(assistant["content"], "answer");
+    }
+
+    #[test]
+    fn responses_input_reasoning_stays_on_tool_calls_message() {
+        // Real Codex echo order (captured from the local gateway log):
+        // reasoning → assistant text → function_call → function_call_output.
+        // DeepSeek thinking mode requires `reasoning_content` on the
+        // assistant(tool_calls) message; consuming it on the intermediate
+        // text message makes the follow-up fail with
+        // "The reasoning_content in the thinking mode must be passed back
+        // to the API."
+        let input = serde_json::json!([
+            {"type": "reasoning", "id": "rs_a", "summary": [{"type": "summary_text", "text": "Let me check the file."}]},
+            {"type": "message", "id": "msg_a", "role": "assistant", "content": [{"type": "output_text", "text": "Let me look at that."}]},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_A", "name": "read", "arguments": "{\"path\":\"/tmp/x\"}"},
+            {"type": "function_call_output", "call_id": "call_A", "output": "file contents"},
+            {"type": "message", "id": "msg_u", "role": "user", "content": [{"type": "input_text", "text": "continue"}]}
+        ]);
+        let messages = convert_responses_input_to_messages(&input);
+        let msgs = messages.as_array().unwrap();
+
+        // The tool-calling assistant message MUST carry the reasoning.
+        let tool_call_msg = msgs
+            .iter()
+            .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .unwrap();
+        assert_eq!(tool_call_msg["reasoning_content"], "Let me check the file.");
+        assert_eq!(tool_call_msg["tool_calls"][0]["id"], "call_A");
+        assert_eq!(msgs[0]["role"], "assistant");
+
+        // The intermediate assistant text message must NOT have consumed it.
+        let text_msg = msgs
+            .iter()
+            .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_none())
+            .unwrap();
+        assert_eq!(text_msg["content"], "Let me look at that.");
+        assert!(
+            text_msg.get("reasoning_content").is_none()
+                || text_msg["reasoning_content"].as_str().unwrap_or("").is_empty(),
+            "reasoning must not be consumed by the intermediate text message"
+        );
+
+        // Tool output still follows the tool_calls assistant message.
+        assert_eq!(
+            msgs[2],
+            serde_json::json!({"role": "tool", "tool_call_id": "call_A", "content": "file contents"})
+        );
+    }
+
+    #[test]
+    fn responses_input_reasoning_with_user_interleaved_before_output() {
+        // Codex can interleave a user text message between function_call and
+        // function_call_output. The reasoning must survive until the
+        // assistant(tool_calls) flush even across that user message.
+        let input = serde_json::json!([
+            {"type": "reasoning", "id": "rs_a", "summary": [{"type": "summary_text", "text": "thinking"}]},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_A", "name": "shell", "arguments": "{}"},
+            {"type": "message", "id": "msg_ok", "role": "user", "content": [{"type": "input_text", "text": "Approved command prefix saved"}]},
+            {"type": "function_call_output", "call_id": "call_A", "output": "done"},
+            {"type": "message", "id": "msg_next", "role": "user", "content": [{"type": "input_text", "text": "next"}]}
+        ]);
+        let messages = convert_responses_input_to_messages(&input);
+        let msgs = messages.as_array().unwrap();
+        let tool_call_msg = msgs
+            .iter()
+            .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .unwrap();
+        assert_eq!(tool_call_msg["reasoning_content"], "thinking");
+        assert_eq!(msgs[1]["role"], "tool");
+    }
+
+    #[test]
+    fn responses_input_parallel_function_calls_merge_into_one_assistant() {
+        // Parallel function_calls must be merged into ONE assistant message with a
+        // multi-element tool_calls array, immediately followed by their tool
+        // messages. Splitting them into per-call assistant messages makes DeepSeek
+        // reject the request ("assistant with tool_calls must be followed by tool
+        // messages responding to each tool_call_id").
+        let input = serde_json::json!([
+            {"type": "function_call", "call_id": "call_A", "name": "read", "arguments": "{}"},
+            {"type": "function_call", "call_id": "call_B", "name": "grep", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_A", "output": "file contents"},
+            {"type": "function_call_output", "call_id": "call_B", "output": "matched lines"}
+        ]);
+        let messages = convert_responses_input_to_messages(&input);
+        let msgs = messages.as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[0]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_A");
+        assert_eq!(msgs[0]["tool_calls"][1]["id"], "call_B");
+        assert_eq!(msgs[1], serde_json::json!({"role": "tool", "tool_call_id": "call_A", "content": "file contents"}));
+        assert_eq!(msgs[2], serde_json::json!({"role": "tool", "tool_call_id": "call_B", "content": "matched lines"}));
+    }
+
+    #[test]
+    fn responses_input_defers_text_message_until_tool_output() {
+        // Codex interleaves a user text message ("Approved command prefix saved")
+        // between function_call and function_call_output. That text must be
+        // deferred until the tool output lands, so the assistant(tool_calls) is
+        // immediately followed by its tool message.
+        let input = serde_json::json!([
+            {"type": "function_call", "call_id": "call_A", "name": "shell", "arguments": "{}"},
+            {"type": "message", "id": "msg_ok", "role": "user", "content": [{"type": "input_text", "text": "Approved command prefix saved"}]},
+            {"type": "function_call_output", "call_id": "call_A", "output": "done"},
+            {"type": "message", "id": "msg_next", "role": "user", "content": [{"type": "input_text", "text": "next"}]}
+        ]);
+        let messages = convert_responses_input_to_messages(&input);
+        let msgs = messages.as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_A");
+        assert_eq!(msgs[1], serde_json::json!({"role": "tool", "tool_call_id": "call_A", "content": "done"}));
+        assert_eq!(msgs[2], serde_json::json!({"role": "user", "content": "Approved command prefix saved"}));
+        assert_eq!(msgs[3], serde_json::json!({"role": "user", "content": "next"}));
+    }
+
+    #[test]
+    fn responses_input_orphan_function_call_gets_empty_tool_response() {
+        // A function_call with no matching output must still get a synthesized
+        // empty tool message, otherwise the assistant(tool_calls) has no response.
+        let input = serde_json::json!([
+            {"type": "function_call", "call_id": "call_A", "name": "shell", "arguments": "{}"},
+            {"type": "message", "id": "msg_next", "role": "user", "content": [{"type": "input_text", "text": "next"}]}
+        ]);
+        let messages = convert_responses_input_to_messages(&input);
+        let msgs = messages.as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_A");
+        assert_eq!(msgs[1], serde_json::json!({"role": "tool", "tool_call_id": "call_A", "content": ""}));
+        assert_eq!(msgs[2], serde_json::json!({"role": "user", "content": "next"}));
+    }
+
+    #[test]
+    fn responses_input_reasoning_attaches_to_merged_tool_calls_message() {
+        // When reasoning directly precedes parallel function_calls, the reasoning
+        // content is attached to the merged assistant tool_calls message.
+        let input = serde_json::json!([
+            {"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "think"}]},
+            {"type": "function_call", "call_id": "call_A", "name": "read", "arguments": "{}"},
+            {"type": "function_call", "call_id": "call_B", "name": "grep", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_A", "output": "a"},
+            {"type": "function_call_output", "call_id": "call_B", "output": "b"}
+        ]);
+        let messages = convert_responses_input_to_messages(&input);
+        let msgs = messages.as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[0]["reasoning_content"], "think");
+        assert_eq!(msgs[0]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(msgs[1]["role"], "tool");
+        assert_eq!(msgs[2]["role"], "tool");
+    }
+
+    #[test]
+    fn responses_input_interleaved_call_never_leaves_orphan_assistant() {
+        // A second function_call that arrives AFTER a user confirmation message
+        // (still awaiting tool output for a prior call) must NOT be flushed as a
+        // separate assistant message while the first one is still awaiting its
+        // tool reply. Flushing it mid-await would emit
+        // `assistant(tool_calls=[A]), assistant(tool_calls=[B]), tool_A, ...`
+        // — the first assistant left without its tool message, which DeepSeek
+        // rejects exactly like the original 502. Each assistant(tool_calls)
+        // must be immediately followed by its own tool messages.
+        let input = serde_json::json!([
+            {"type": "function_call", "call_id": "call_A", "name": "shell", "arguments": "{}"},
+            {"type": "message", "id": "msg_ok", "role": "user", "content": [{"type": "input_text", "text": "Approved command prefix saved"}]},
+            {"type": "function_call", "call_id": "call_B", "name": "read", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_A", "output": "done"},
+            {"type": "function_call_output", "call_id": "call_B", "output": "file contents"}
+        ]);
+        let messages = convert_responses_input_to_messages(&input);
+        let msgs = messages.as_array().unwrap();
+        assert_eq!(msgs.len(), 5);
+        // assistant(A) is immediately followed by tool_A — never by assistant(B).
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_A");
+        assert_eq!(msgs[1], serde_json::json!({"role": "tool", "tool_call_id": "call_A", "content": "done"}));
+        assert_eq!(msgs[2], serde_json::json!({"role": "user", "content": "Approved command prefix saved"}));
+        // assistant(B) starts a fresh, valid turn: tool_B follows it directly.
+        assert_eq!(msgs[3]["role"], "assistant");
+        assert_eq!(msgs[3]["tool_calls"][0]["id"], "call_B");
+        assert_eq!(msgs[4], serde_json::json!({"role": "tool", "tool_call_id": "call_B", "content": "file contents"}));
+    }
 }
+

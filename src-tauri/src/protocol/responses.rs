@@ -2,6 +2,52 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Reassembles upstream SSE records that arrive fragmented across TCP chunks.
+///
+/// ResponsesViaChat has no codec decoder, so a record split across TCP frames
+/// would otherwise be fed to [`convert_openai_sse_to_responses`] as several
+/// half-records and silently dropped (mid-JSON fragments never parse). Only
+/// complete records are returned here. This mirrors the `encode_responses_buffered`
+/// reassembly in the StreamPumpCore path — tool names / call ids / argument
+/// fragments are lost without it.
+#[derive(Default)]
+pub struct ResponsesSseAssembler {
+    pending: Vec<u8>,
+}
+
+impl ResponsesSseAssembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one upstream chunk; returns every COMPLETE SSE record it contains.
+    /// A record whose terminator hasn't arrived yet is buffered for the next call.
+    pub fn push(&mut self, chunk: &str) -> Vec<String> {
+        self.pending.extend_from_slice(chunk.as_bytes());
+        let mut records = Vec::new();
+        while let Some(end) = crate::protocol::codec::sse::record_end(&self.pending) {
+            let record: Vec<u8> = self.pending.drain(..end).collect();
+            records.push(String::from_utf8_lossy(&record).into_owned());
+        }
+        records
+    }
+
+    /// Whether bytes are still buffered awaiting a record terminator.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Flush any trailing bytes at EOF as a final record (a record that
+    /// terminated exactly at EOF must not be lost).
+    pub fn flush(&mut self) -> Vec<String> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        let tail = std::mem::take(&mut self.pending);
+        vec![String::from_utf8_lossy(&tail).into_owned()]
+    }
+}
+
 /// State for tracking streaming output items during OpenAI SSE → Responses SSE conversion.
 ///
 /// Tracks both text message items and function_call items so we can emit
@@ -17,6 +63,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///   response.function_call_arguments.delta →
 ///   response.function_call_arguments.done →
 ///   response.output_item.done
+///
+/// For reasoning (DeepSeek R1, OpenAI o1/o3, etc.):
+///   response.output_item.added(type=reasoning) →
+///   response.reasoning_summary_part.added →
+///   response.reasoning_summary_text.delta (per chunk) →
+///   response.reasoning_summary_part.done →
+///   response.output_item.done
 #[derive(Default)]
 pub struct StreamState {
     /// Whether the text message output_item.added has been sent.
@@ -29,6 +82,18 @@ pub struct StreamState {
     pub text_output_index: u32,
     /// Next output_index to use for a new output item.
     pub next_output_index: u32,
+    /// Whether the reasoning output_item.added has been sent.
+    pub reasoning_item_added: bool,
+    /// Whether the reasoning summary_part.added has been sent.
+    pub reasoning_part_added: bool,
+    /// Whether the reasoning summary_part.done has been sent.
+    pub reasoning_part_done: bool,
+    /// Whether the reasoning output_item.done has been sent.
+    pub reasoning_item_done: bool,
+    /// The output_index assigned to the reasoning item.
+    pub reasoning_output_index: u32,
+    /// Full concatenated reasoning text accumulated so far.
+    pub accumulated_reasoning: String,
     /// Map from tool_call index → (output_index, call_id, name, accumulated_arguments, item_added_sent, arguments_done_sent)
     pub tool_calls: HashMap<u64, ToolCallState>,
     /// Whether any tool calls were seen in this stream.
@@ -123,11 +188,63 @@ pub fn convert_openai_sse_to_responses(
                     if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str())
                     {
                         if !reasoning.is_empty() {
+                            // Announce the reasoning item (output_item.added) and its
+                            // summary part BEFORE the first delta. Clients only persist
+                            // items they saw "added" — without this the reasoning never
+                            // enters the conversation and thinking-mode providers reject
+                            // the next turn.
+                            if !state.reasoning_item_added {
+                                let reasoning_output_index = state.next_output_index;
+                                state.reasoning_output_index = reasoning_output_index;
+                                let seq = next_seq(state);
+                                let item = serde_json::json!({
+                                    "id": reasoning_id,
+                                    "type": "reasoning",
+                                    "status": "in_progress",
+                                    "summary": [],
+                                    "content": []
+                                });
+                                let item_event = serde_json::json!({
+                                    "type": "response.output_item.added",
+                                    "output_index": reasoning_output_index,
+                                    "item": item,
+                                    "sequence_number": seq
+                                });
+                                events.push(format!(
+                                    "event: response.output_item.added\ndata: {}\n\n",
+                                    item_event
+                                ));
+
+                                let seq = next_seq(state);
+                                let part = serde_json::json!({
+                                    "type": "reasoning_summary_text",
+                                    "text": ""
+                                });
+                                let part_event = serde_json::json!({
+                                    "type": "response.reasoning_summary_part.added",
+                                    "item_id": reasoning_id,
+                                    "output_index": reasoning_output_index,
+                                    "summary_index": 0,
+                                    "part": part,
+                                    "sequence_number": seq
+                                });
+                                events.push(format!(
+                                    "event: response.reasoning_summary_part.added\ndata: {}\n\n",
+                                    part_event
+                                ));
+
+                                state.reasoning_item_added = true;
+                                state.reasoning_part_added = true;
+                                state.next_output_index += 1;
+                            }
+
+                            state.accumulated_reasoning.push_str(reasoning);
+                            let reasoning_output_index = state.reasoning_output_index;
                             let seq = next_seq(state);
                             let event = serde_json::json!({
                                 "type": "response.reasoning_summary_text.delta",
                                 "item_id": reasoning_id,
-                                "output_index": 0,
+                                "output_index": reasoning_output_index,
                                 "summary_index": 0,
                                 "delta": reasoning,
                                 "sequence_number": seq
@@ -331,6 +448,53 @@ pub fn convert_openai_sse_to_responses(
                 // Check for finish_reason
                 if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str()) {
                     if !finish.is_empty() && finish != "null" {
+                        // Close reasoning item if it was opened and not yet closed
+                        if state.reasoning_item_added && !state.reasoning_item_done {
+                            let reasoning_output_index = state.reasoning_output_index;
+                            let seq = next_seq(state);
+                            let part = serde_json::json!({
+                                "type": "reasoning_summary_text",
+                                "text": state.accumulated_reasoning
+                            });
+                            let part_done = serde_json::json!({
+                                "type": "response.reasoning_summary_part.done",
+                                "item_id": reasoning_id,
+                                "output_index": reasoning_output_index,
+                                "summary_index": 0,
+                                "part": part,
+                                "sequence_number": seq
+                            });
+                            events.push(format!(
+                                "event: response.reasoning_summary_part.done\ndata: {}\n\n",
+                                part_done
+                            ));
+
+                            let seq = next_seq(state);
+                            let completed_item = serde_json::json!({
+                                "id": reasoning_id,
+                                "type": "reasoning",
+                                "status": "completed",
+                                "summary": [{
+                                    "type": "summary_text",
+                                    "text": state.accumulated_reasoning
+                                }],
+                                "content": []
+                            });
+                            let item_done = serde_json::json!({
+                                "type": "response.output_item.done",
+                                "output_index": reasoning_output_index,
+                                "item": completed_item,
+                                "sequence_number": seq
+                            });
+                            events.push(format!(
+                                "event: response.output_item.done\ndata: {}\n\n",
+                                item_done
+                            ));
+
+                            state.reasoning_part_done = true;
+                            state.reasoning_item_done = true;
+                        }
+
                         // Close text item if it was opened and not yet closed
                         if state.text_item_added && !state.text_item_done {
                             let text_output_index = state.text_output_index;
@@ -573,6 +737,56 @@ pub fn create_synthetic_completed_events(
         }};
     }
 
+    // Close reasoning item if it was opened and not yet closed
+    if state.reasoning_item_added && !state.reasoning_item_done {
+        let reasoning_output_index = state.reasoning_output_index;
+        let reasoning_id = if response_id.starts_with("resp_") {
+            format!("rs_{}", &response_id[5..])
+        } else {
+            format!("rs_{}", response_id)
+        };
+
+        let s = next_seq!();
+        let part = serde_json::json!({
+            "type": "reasoning_summary_text",
+            "text": state.accumulated_reasoning
+        });
+        let part_done = serde_json::json!({
+            "type": "response.reasoning_summary_part.done",
+            "item_id": reasoning_id,
+            "output_index": reasoning_output_index,
+            "summary_index": 0,
+            "part": part,
+            "sequence_number": s
+        });
+        events.push(format!(
+            "event: response.reasoning_summary_part.done\ndata: {}\n\n",
+            part_done
+        ));
+
+        let s = next_seq!();
+        let completed_item = serde_json::json!({
+            "id": reasoning_id,
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [{
+                "type": "summary_text",
+                "text": state.accumulated_reasoning
+            }],
+            "content": []
+        });
+        let item_done = serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": reasoning_output_index,
+            "item": completed_item,
+            "sequence_number": s
+        });
+        events.push(format!(
+            "event: response.output_item.done\ndata: {}\n\n",
+            item_done
+        ));
+    }
+
     // Close text item if it was opened and not yet closed
     if state.text_item_added && !state.text_item_done {
         let text_output_index = state.text_output_index;
@@ -682,6 +896,25 @@ pub fn create_synthetic_completed_events(
 
     // Build the output array for response.completed
     let mut output_items: Vec<Value> = Vec::new();
+
+    // Add reasoning item to output if it was added
+    if state.reasoning_item_added {
+        let reasoning_id = if response_id.starts_with("resp_") {
+            format!("rs_{}", &response_id[5..])
+        } else {
+            format!("rs_{}", response_id)
+        };
+        output_items.push(serde_json::json!({
+            "id": reasoning_id,
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [{
+                "type": "summary_text",
+                "text": state.accumulated_reasoning
+            }],
+            "content": []
+        }));
+    }
 
     // Add text item to output if it was added
     if state.text_item_added {
@@ -828,6 +1061,166 @@ mod tests {
             .trim_start_matches("data: ")
             .trim();
         serde_json::from_str(data_line).unwrap()
+    }
+
+    /// 63 raw upstream fragments captured from `handle_responses_stream` via
+    /// `WALIAPI_DEBUG_SSE` instrumentation (deepseek-v4-flash / OpenCode-GO
+    /// channel, 2026-08-08). Every SSE record is split across multiple TCP
+    /// chunks — often mid-JSON, with the `\n\n` terminator landing in a fragment
+    /// that starts mid-record. This is the real-world fragmentation that used to
+    /// drop tool names / call ids / argument fragments.
+    const REAL_FRAGMENTS: &[&str] = &[
+        "data: {\"id\":\"adba4265-1f45-4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"\"}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk",
+        "\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\"I\",\"reasoning_content\":null}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk",
+        "\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\"'ll\",\"reasoning_content\":null}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f4",
+        "5-4b6f-a564-ef2ca7a6e353\",",
+        "\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\" read\",\"reasoning_content\":null}}],\"usage\":null}\n\ndata: {\"id\":\"adba4265-1f45-4b6f-a564-ef2ca7a6e353\",\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\" the\",\"reasoning_content\":null}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f4",
+        "5-4b6f-a564-ef2ca7a6e353\",\"",
+        "object\":\"chat.completion.chu",
+        "nk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\" file\",\"reasoning_content\":null}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk",
+        "\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\" at\",\"reasoning_content\":null}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f4",
+        "5-4b6f-a564-ef2ca7a6e353\",",
+        "\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\" that\",\"reasoning_content\":null}}],\"usage\":null}\n\ndata: {\"id\":\"adba4265-1f45-4b6f-a564-ef2ca7a6e353\",\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\" path\",\"reasoning_content\":null}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f4",
+        "5-4b6f-a564-ef2ca7a6e353\",\"",
+        "object\":\"chat.completion.chu",
+        "nk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"content\":\".\",\"reasoning_content\":null}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"o",
+        "bject\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_00_ET_qpwrSuOGqdNVOyDYESq94260\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f4",
+        "5-4b6f-a564-ef2ca7a6e353\",",
+        "\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"\"}}]}}],\"usage\":null}\n\ndata: {\"id\":\"adba4265-1f45-4b6f-a564-ef2ca7a6e353\",\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"path\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45",
+        "-",
+        "4b6f-a564-ef2ca7a6e353\",\"",
+        "object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\": \"}}]}}],\"usage\":null}\n\ndata: {\"id\":\"adba4265-1f45-4b6f-a564-ef2ca7a6e353\",\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f4",
+        "5-4b6f-a564-ef2ca7a6e353\",\"",
+        "object\":\"chat.completion.chu",
+        "nk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"/\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"tmp\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45",
+        "-",
+        "4b6f-a564-ef2ca7a6e353\",\"",
+        "object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"/x\"}}]}}],\"usage\":null}\n\ndata: {\"id\":\"adba4265-1f45-4b6f-a564-ef2ca7a6e353\",\"object\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"ob",
+        "ject\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"logprobs\":null,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}]}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"adba4265-1f45-",
+        "4b6f-a564-ef2ca7a6e353\",\"o",
+        "bject\":\"chat.completion.chunk\",\"created\":1786166337,\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"logprobs\":null,\"delta\":{\"content\":\"\",\"reasoning_content\":null}}],\"usage\":{\"prompt_tokens\":348,\"completion_tokens\":53,\"total_tokens\":401,\"prompt_cache_hit_tokens\":256,\"prompt_cache_miss_tokens\":92,\"prompt_tokens_details\":{\"cached_tokens\":256},\"completion_tokens_details\":{\"reasoning_tokens\":0}}}\n\n",
+        "data: [DONE]\n\n",
+        "data: {\"choices\":[],\"cost\":\"0\"}\n\n",
+    ];
+
+    /// Feed each raw fragment through the record-reassembly seam (the same logic
+    /// the handler uses), then convert each complete record. This reproduces the
+    /// real upstream fragmentation; without reassembly the tool-call announcement
+    /// record (carrying name + id) and most argument-delta records are dropped.
+    fn run_reassembled(fragments: &[&str]) -> Vec<String> {
+        let mut state = StreamState::default();
+        let mut events = Vec::new();
+        let mut asm = ResponsesSseAssembler::new();
+        for frag in fragments {
+            for record in asm.push(frag) {
+                events.extend(convert_openai_sse_to_responses(
+                    &record,
+                    "deepseek-v4-flash",
+                    "resp_test",
+                    "",
+                    &mut state,
+                ));
+            }
+        }
+        for record in asm.flush() {
+            events.extend(convert_openai_sse_to_responses(
+                &record,
+                "deepseek-v4-flash",
+                "resp_test",
+                "",
+                &mut state,
+            ));
+        }
+        events
+    }
+
+    #[test]
+    fn reassembled_tool_call_survives_real_fragmentation() {
+        let events = run_reassembled(REAL_FRAGMENTS);
+        let types = extract_event_types(&events);
+
+        // The text message must come through intact.
+        assert!(
+            types.contains(&"response.output_item.added".to_string()),
+            "expected a tool call item to be added"
+        );
+
+        // The function_call output_item.added must carry the real name + call_id.
+        let added = events
+            .iter()
+            .filter(|e| {
+                extract_event_types(&[(*e).clone()])
+                    == vec!["response.output_item.added".to_string()]
+            })
+            .map(|e| extract_event_data(e))
+            .find(|d| d["item"]["type"] == "function_call")
+            .expect("a function_call output_item.added must be emitted");
+
+        assert_eq!(
+            added["item"]["name"], "read",
+            "tool call name lost by fragmentation: got {}",
+            added["item"]["name"]
+        );
+        assert_eq!(
+            added["item"]["call_id"], "call_00_ET_qpwrSuOGqdNVOyDYESq94260",
+            "tool call id lost by fragmentation: got {}",
+            added["item"]["call_id"]
+        );
+        assert_eq!(
+            added["item"]["id"], "call_00_ET_qpwrSuOGqdNVOyDYESq94260",
+            "tool call item id must not fall back to fc_0"
+        );
+
+        // The final function_call output_item.done must carry full arguments.
+        let done = events
+            .iter()
+            .filter(|e| extract_event_types(&[(*e).clone()]) == vec!["response.output_item.done".to_string()])
+            .map(|e| extract_event_data(e))
+            .find(|d| d["item"]["type"] == "function_call")
+            .expect("a function_call output_item.done must be emitted");
+
+        assert_eq!(
+            done["item"]["arguments"], "{\"path\": \"/tmp/x\"}",
+            "tool call arguments truncated by fragmentation: got {}",
+            done["item"]["arguments"]
+        );
+        assert_eq!(done["item"]["name"], "read");
+        assert_eq!(
+            done["item"]["call_id"], "call_00_ET_qpwrSuOGqdNVOyDYESq94260",
+            "tool call id must not fall back to call_1"
+        );
     }
 
     #[test]
@@ -1016,6 +1409,109 @@ mod tests {
         let fc_item_done = extract_event_data(&events4[4]);
         assert_eq!(fc_item_done["output_index"], 1);
         assert_eq!(fc_item_done["item"]["type"], "function_call");
+    }
+
+    #[test]
+    fn test_reasoning_item_full_lifecycle() {
+        // A reasoning_content delta must announce a `reasoning` item with
+        // output_item.added BEFORE any delta, and close it with
+        // output_item.done. Without the item lifecycle, Codex never persists a
+        // reasoning item, so the next turn omits reasoning_content and
+        // DeepSeek rejects it ("must be passed back to the API").
+        let mut state = StreamState::default();
+        let response_id = "resp_rs123";
+
+        // Chunk 1: reasoning delta
+        let chunk1 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"Let me"},"finish_reason":null}]}"#;
+        let events1 = convert_openai_sse_to_responses(chunk1, "deepseek-v4-flash", response_id, "", &mut state);
+        let types1 = extract_event_types(&events1);
+        assert_eq!(
+            types1,
+            vec![
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+            ]
+        );
+
+        // reasoning item announced with type=reasoning
+        let added = extract_event_data(&events1[0]);
+        assert_eq!(added["item"]["type"], "reasoning");
+        assert_eq!(added["item"]["id"], "rs_rs123");
+        assert_eq!(added["output_index"], 0);
+
+        // summary part added before deltas
+        let part_added = extract_event_data(&events1[1]);
+        assert_eq!(part_added["part"]["type"], "reasoning_summary_text");
+
+        // delta carries the reasoning text on item rs_
+        let delta = extract_event_data(&events1[2]);
+        assert_eq!(delta["delta"], "Let me");
+        assert_eq!(delta["item_id"], "rs_rs123");
+
+        // Chunk 2: more reasoning
+        let chunk2 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":" think."},"finish_reason":null}]}"#;
+        let events2 = convert_openai_sse_to_responses(chunk2, "deepseek-v4-flash", response_id, "", &mut state);
+        let types2 = extract_event_types(&events2);
+        assert_eq!(types2, vec!["response.reasoning_summary_text.delta"]);
+
+        // Chunk 3: content text
+        let chunk3 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Answer"},"finish_reason":null}]}"#;
+        let events3 = convert_openai_sse_to_responses(chunk3, "deepseek-v4-flash", response_id, "Answer", &mut state);
+        let types3 = extract_event_types(&events3);
+        assert_eq!(
+            types3,
+            vec![
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+            ]
+        );
+        // text item gets output_index 1 (reasoning took 0)
+        let text_added = extract_event_data(&events3[0]);
+        assert_eq!(text_added["output_index"], 1);
+        assert_eq!(text_added["item"]["type"], "message");
+
+        // Chunk 4: finish
+        let chunk4 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+        let events4 = convert_openai_sse_to_responses(chunk4, "deepseek-v4-flash", response_id, "Answer", &mut state);
+        let types4 = extract_event_types(&events4);
+        assert_eq!(
+            types4,
+            vec![
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+            ]
+        );
+
+        // reasoning item closed with the full text in the summary
+        let rs_done = extract_event_data(&events4[1]);
+        assert_eq!(rs_done["item"]["type"], "reasoning");
+        assert_eq!(rs_done["item"]["status"], "completed");
+        assert_eq!(rs_done["item"]["summary"][0]["text"], "Let me think.");
+        assert_eq!(rs_done["output_index"], 0);
+
+        // response.completed output array must contain the reasoning item too
+        let synthetic = create_synthetic_completed_events(
+            "deepseek-v4-flash",
+            response_id,
+            "Answer",
+            &state,
+            10,
+            5,
+        );
+        let completed_event = synthetic.iter().find(|e| {
+            e.lines().next().map(|l| l == "event: response.completed").unwrap_or(false)
+        }).unwrap();
+        let completed = extract_event_data(completed_event);
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "Let me think.");
+        assert_eq!(output[1]["type"], "message");
     }
 
     #[test]
