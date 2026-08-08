@@ -6,6 +6,7 @@ use crate::core::proxy;
 use crate::core::route_plan::{self, EndpointKind};
 use crate::db::repository::Repository;
 use crate::protocol;
+use sqlx::sqlite::SqlitePool;
 use crate::security;
 use axum::{
     body::Body,
@@ -2899,46 +2900,142 @@ pub async fn handle_embeddings(
     (StatusCode::BAD_GATEWAY, Json(err_body)).into_response()
 }
 
-pub async fn handle_list_models(State(shared): State<SharedState>) -> Response {
-    let repo = Repository::new(shared.state.db.pool.clone());
-    match repo.get_enabled_channels().await {
-        Ok(channels) => {
-            let mut models: Vec<serde_json::Value> = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for ch in &channels {
-                let ch_models: Vec<String> = serde_json::from_str(&ch.models).unwrap_or_default();
-                for m in ch_models {
-                    if seen.insert(m.clone()) {
-                        models.push(serde_json::json!({
-                            "id": m, "object": "model",
-                            "created": chrono::Utc::now().timestamp(),
-                            "owned_by": ch.channel_type,
-                        }));
-                    }
-                }
-                // Also expose mapped model names (mapping keys)
-                let mapping: serde_json::Value = serde_json::from_str(&ch.model_mapping)
-                    .unwrap_or(serde_json::Value::Object(Default::default()));
-                if let Some(obj) = mapping.as_object() {
-                    for key in obj.keys() {
-                        if seen.insert(key.clone()) {
-                            models.push(serde_json::json!({
-                                "id": key, "object": "model",
-                                "created": chrono::Utc::now().timestamp(),
-                                "owned_by": ch.channel_type,
-                            }));
-                        }
-                    }
+/// True when the request came from an Anthropic client: it authenticates with
+/// `x-api-key` and sends no `Authorization: Bearer`. Matches the downstream
+/// protocol selection rule (both present → OpenAI, keeping existing behavior).
+fn request_is_anthropic(headers: &HeaderMap) -> bool {
+    headers.contains_key("x-api-key") && !headers.contains_key("authorization")
+}
+
+/// One model exposed to downstream clients: its public `id` plus the channel
+/// type of the first channel that listed it (kept for the OpenAI `owned_by`).
+#[derive(Debug, Clone, PartialEq)]
+struct ConfigModel {
+    id: String,
+    owned_by: String,
+}
+
+/// Aggregate configured models across enabled channels, deduped:
+/// each channel's `models` list, then the keys of its `model_mapping`
+/// (mapping values are upstream model names and are NOT exposed).
+fn collect_config_models(channels: &[crate::db::models::Channel]) -> Vec<ConfigModel> {
+    let mut out: Vec<ConfigModel> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for ch in channels {
+        let ch_models: Vec<String> = serde_json::from_str(&ch.models).unwrap_or_default();
+        for m in ch_models {
+            if seen.insert(m.clone()) {
+                out.push(ConfigModel { id: m, owned_by: ch.channel_type.clone() });
+            }
+        }
+        let mapping: serde_json::Value = serde_json::from_str(&ch.model_mapping)
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        if let Some(obj) = mapping.as_object() {
+            for key in obj.keys() {
+                if seen.insert(key.clone()) {
+                    out.push(ConfigModel { id: key.clone(), owned_by: ch.channel_type.clone() });
                 }
             }
-            Json(serde_json::json!({ "object": "list", "data": models })).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
-        )
-            .into_response(),
     }
+    out
+}
+
+/// OpenAI `/v1/models` response body: `{"object":"list","data":[...]}`.
+fn openai_models_response(models: &[ConfigModel]) -> serde_json::Value {
+    let data: Vec<serde_json::Value> = models
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "object": "model",
+                "created": chrono::Utc::now().timestamp(),
+                "owned_by": m.owned_by,
+            })
+        })
+        .collect();
+    serde_json::json!({ "object": "list", "data": data })
+}
+
+/// Anthropic `/v1/models` response body: `{"data":[{"type":"model","id",...}]}`.
+fn anthropic_models_response(models: &[ConfigModel]) -> serde_json::Value {
+    let data: Vec<serde_json::Value> = models
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "type": "model",
+                "id": m.id,
+                "display_name": m.id,
+                "created_at": crate::utils::time::now_iso(),
+            })
+        })
+        .collect();
+    serde_json::json!({ "data": data })
+}
+
+/// OpenAI-style error body: `{"error":{"message","type","code"}}`.
+fn openai_error(status: StatusCode, message: impl Into<String>, kind: &str) -> Response {
+    let message = message.into();
+    let code = status.as_u16().to_string();
+    (
+        status,
+        Json(serde_json::json!({
+            "error": { "message": message, "type": kind, "code": code }
+        })),
+    )
+        .into_response()
+}
+
+/// Build an error in the caller's protocol format (Anthropic vs OpenAI).
+fn models_error(anthropic: bool, status: StatusCode, kind: &str, message: impl Into<String>) -> Response {
+    if anthropic {
+        anthropic_error(status, kind, message)
+    } else {
+        openai_error(status, message, kind)
+    }
+}
+
+/// Core of `/v1/models`: auth, quota, configured-model aggregation, then a
+/// response in the caller's protocol format. Extractable because it never
+/// needs the Tauri `AppHandle` — only a SQLite pool.
+async fn list_models_impl(pool: SqlitePool, headers: &HeaderMap) -> Response {
+    let anthropic = request_is_anthropic(headers);
+    let api_key = match protocol::extract_api_key(headers) {
+        Some(key) => key,
+        None => {
+            return models_error(anthropic, StatusCode::UNAUTHORIZED, "authentication_error", "Missing API key")
+        }
+    };
+    let repo = Repository::new(pool);
+    let key = match repo.get_api_key_by_key(&api_key).await {
+        Ok(key) => key,
+        Err(_) => {
+            return models_error(anthropic, StatusCode::UNAUTHORIZED, "authentication_error", "Invalid API key")
+        }
+    };
+    if key.quota_limit > 0 && key.quota_used >= key.quota_limit {
+        return models_error(anthropic, StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", "Quota exceeded");
+    }
+    let channels = match repo.get_enabled_channels().await {
+        Ok(channels) => channels,
+        Err(_) => {
+            return models_error(anthropic, StatusCode::INTERNAL_SERVER_ERROR, "api_error", "Failed to load channels")
+        }
+    };
+    let models = collect_config_models(&channels);
+    let body = if anthropic {
+        anthropic_models_response(&models)
+    } else {
+        openai_models_response(&models)
+    };
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+pub async fn handle_list_models(
+    State(shared): State<SharedState>,
+    headers: HeaderMap,
+) -> Response {
+    list_models_impl(shared.state.db.pool.clone(), &headers).await
 }
 
 pub async fn handle_images(State(_shared): State<SharedState>) -> Response {
@@ -3153,5 +3250,263 @@ mod anthropic_handler_tests {
         let log_str = serde_json::to_string(&audited.sanitized_log_json).unwrap();
         assert!(raw_str.contains("sk-abcdefghijklmnopqrstuvwx123456"));
         assert!(!log_str.contains("sk-abcdefghijklmnopqrstuvwx123456"));
+    }
+}
+
+#[cfg(test)]
+mod list_models_tests {
+    use super::*;
+    use crate::db::models::{ApiKey, CreateApiKeyInput, CreateChannelInput};
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[test]
+    fn detects_anthropic_only_when_x_api_key_without_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "sk-test".parse().unwrap());
+        assert!(request_is_anthropic(&headers));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer sk-test".parse().unwrap());
+        assert!(!request_is_anthropic(&headers));
+
+        // 极端情况：两法都带 key → 保持现有行为，按 OpenAI
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "sk-test".parse().unwrap());
+        headers.insert("authorization", "Bearer sk-test".parse().unwrap());
+        assert!(!request_is_anthropic(&headers));
+
+        let headers = HeaderMap::new();
+        assert!(!request_is_anthropic(&headers));
+    }
+
+    fn channel(name: &str, ch_type: &str, models: &[&str], mapping: serde_json::Value) -> crate::db::models::Channel {
+        crate::db::models::Channel {
+            id: name.to_string(),
+            name: name.to_string(),
+            channel_type: ch_type.to_string(),
+            base_url: "http://example.com".to_string(),
+            api_key: "k".to_string(),
+            models: serde_json::to_string(models).unwrap(),
+            status: 1,
+            priority: 0,
+            weight: 1,
+            config: "{}".to_string(),
+            model_mapping: mapping.to_string(),
+            timeout_secs: 60,
+            protocol: None,
+            provider: None,
+            native_base_url: None,
+            native_endpoints: None,
+            preset_revision: None,
+            identity_revision: 0,
+            legacy_executor_override: None,
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+            updated_at: "2026-01-01T00:00:00.000Z".to_string(),
+            last_test_at: None,
+            last_test_ok: None,
+        }
+    }
+
+    #[test]
+    fn aggregates_models_and_mapping_keys_with_dedup() {
+        let channels = vec![
+            channel("a", "openai", &["gpt-4o", "gpt-4o-mini"], serde_json::json!({"gpt-4o": "upstream-x"})),
+            channel("b", "claude", &["claude-sonnet-4"], serde_json::json!({"gpt-4o": "claude-sonnet-5", "claude-35": "claude-3-5-sonnet"})),
+        ];
+        let models = collect_config_models(&channels);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        // a.models → gpt-4o, gpt-4o-mini；a.mapping keys → gpt-4o(重复跳过)；
+        // b.models → claude-sonnet-4；b.mapping keys → gpt-4o(重复跳过), claude-35
+        assert_eq!(ids, vec!["gpt-4o", "gpt-4o-mini", "claude-sonnet-4", "claude-35"]);
+        // 首个列出该模型的渠道胜出（owned_by 为 openai，而非 claude）
+        assert_eq!(models[0].owned_by, "openai");
+    }
+
+    #[test]
+    fn mapping_values_are_never_listed_as_models() {
+        // value（"upstream-y"）是上游实际模型，不参与列出
+        let channels = vec![channel("a", "openai", &["real-a"], serde_json::json!({"alias": "upstream-y"}))];
+        let models = collect_config_models(&channels);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["real-a", "alias"]);
+    }
+
+    #[test]
+    fn builds_openai_models_response() {
+        let models = vec![
+            ConfigModel { id: "gpt-4o".to_string(), owned_by: "openai".to_string() },
+            ConfigModel { id: "claude-35".to_string(), owned_by: "claude".to_string() },
+        ];
+        let value = openai_models_response(&models);
+        assert_eq!(value["object"], "list");
+        let data = value["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0]["id"], "gpt-4o");
+        assert_eq!(data[0]["object"], "model");
+        assert_eq!(data[0]["owned_by"], "openai");
+        assert!(data[0]["created"].is_number());
+    }
+
+    #[test]
+    fn builds_anthropic_models_response() {
+        let models = vec![ConfigModel { id: "claude-sonnet-4".to_string(), owned_by: "claude".to_string() }];
+        let value = anthropic_models_response(&models);
+        let data = value["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["type"], "model");
+        assert_eq!(data[0]["id"], "claude-sonnet-4");
+        assert_eq!(data[0]["display_name"], "claude-sonnet-4");
+        assert!(data[0]["created_at"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn builds_openai_style_errors() {
+        let resp = openai_error(StatusCode::UNAUTHORIZED, "Missing API key", "authentication_error");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "authentication_error");
+        assert_eq!(json["error"]["message"], "Missing API key");
+        assert_eq!(json["error"]["code"], "401");
+    }
+
+    #[tokio::test]
+    async fn models_error_dispatches_by_protocol() {
+        let resp = models_error(true, StatusCode::UNAUTHORIZED, "authentication_error", "nope");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["type"], "error"); // Anthropic wrapper
+
+        let resp = models_error(false, StatusCode::UNAUTHORIZED, "authentication_error", "nope");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "authentication_error");
+        assert_eq!(json["error"]["code"], "401");
+    }
+
+    async fn seed_test_db() -> (SqlitePool, ApiKey) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let repo = Repository::new(pool.clone());
+        repo.create_channel(&CreateChannelInput {
+            name: "ch-a".to_string(),
+            channel_type: "openai".to_string(),
+            base_url: "http://example.com".to_string(),
+            api_key: "upstream".to_string(),
+            models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
+            priority: Some(0),
+            weight: Some(1),
+            config: None,
+            model_mapping: Some(serde_json::json!({
+                "alias-1": "gpt-4o",
+                "alias-2": ["gpt-4o", "gpt-4o-mini"],
+            })),
+            timeout_secs: Some(60),
+            protocol: None,
+            provider: None,
+            native_base_url: None,
+            native_endpoints: None,
+            preset_revision: None,
+            legacy_executor_override: None,
+            test_run_id: None,
+            draft_fingerprint: None,
+            force_save: None,
+        }).await.unwrap();
+        let api_key = repo.create_api_key(&CreateApiKeyInput {
+            name: "test-key".to_string(),
+            allowed_models: None,
+            allowed_channels: None,
+            quota_limit: Some(1000),
+            expires_at: None,
+        }).await.unwrap();
+        (pool, api_key)
+    }
+
+    #[tokio::test]
+    async fn openai_bearer_returns_openai_format() {
+        let (pool, api_key) = seed_test_db().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {}", api_key.key).parse().unwrap());
+        let resp = list_models_impl(pool, &headers).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["object"], "list");
+        let ids: Vec<&str> = json["data"].as_array().unwrap()
+            .iter().map(|m| m["id"].as_str().unwrap()).collect();
+        // models: gpt-4o, gpt-4o-mini；mapping keys: alias-1, alias-2 → 4 个，去重后无重复
+        assert_eq!(ids.len(), 4);
+        assert!(ids.contains(&"gpt-4o"));
+        assert!(ids.contains(&"gpt-4o-mini"));
+        assert!(ids.contains(&"alias-1"));
+        assert!(ids.contains(&"alias-2"));
+        assert!(json["data"].as_array().unwrap().iter().all(|m| m["object"] == "model"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_x_api_key_returns_anthropic_format() {
+        let (pool, api_key) = seed_test_db().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", api_key.key.parse().unwrap());
+        let resp = list_models_impl(pool, &headers).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = json["data"].as_array().unwrap();
+        assert!(!data.is_empty());
+        assert!(data.iter().all(|m| m["type"] == "model"));
+        assert!(data.iter().all(|m| m["id"].as_str().is_some()));
+    }
+
+    #[tokio::test]
+    async fn missing_key_returns_401_openai_format() {
+        let (pool, _) = seed_test_db().await;
+        let resp = list_models_impl(pool, &HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "authentication_error");
+        assert_eq!(json["error"]["code"], "401");
+    }
+
+    #[tokio::test]
+    async fn invalid_key_returns_401() {
+        let (pool, _) = seed_test_db().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer sk-wrong".parse().unwrap());
+        let resp = list_models_impl(pool, &headers).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn invalid_key_anthropic_returns_anthropic_error_format() {
+        let (pool, _) = seed_test_db().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "sk-wrong".parse().unwrap());
+        let resp = list_models_impl(pool, &headers).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "authentication_error");
+    }
+
+    #[tokio::test]
+    async fn quota_exceeded_returns_429() {
+        let (pool, api_key) = seed_test_db().await;
+        Repository::new(pool.clone()).increment_quota(&api_key.id, 2000).await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {}", api_key.key).parse().unwrap());
+        let resp = list_models_impl(pool, &headers).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["type"], "rate_limit_error");
+        assert_eq!(json["error"]["code"], "429");
+
     }
 }
