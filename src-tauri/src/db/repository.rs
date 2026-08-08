@@ -798,6 +798,18 @@ impl Repository {
             .await
             .unwrap_or(0);
 
+        let total_wiki_projects: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM wiki_projects")
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
+
+        let total_wiki_pages: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM wiki_pages")
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
+
         Ok(DashboardStats {
             today_requests,
             today_total_tokens,
@@ -810,6 +822,8 @@ impl Repository {
             total_knowledge_bases,
             total_kb_documents,
             total_kb_chunks,
+            total_wiki_projects,
+            total_wiki_pages,
         })
     }
 

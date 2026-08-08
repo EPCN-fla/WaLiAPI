@@ -15,6 +15,8 @@ pub struct DashboardStatsDto {
     pub total_knowledge_bases: i64,
     pub total_kb_documents: i64,
     pub total_kb_chunks: i64,
+    pub total_wiki_projects: i64,
+    pub total_wiki_pages: i64,
 }
 
 #[tauri::command]
@@ -38,5 +40,7 @@ pub async fn get_dashboard_stats(
         total_knowledge_bases: s.total_knowledge_bases,
         total_kb_documents: s.total_kb_documents,
         total_kb_chunks: s.total_kb_chunks,
+        total_wiki_projects: s.total_wiki_projects,
+        total_wiki_pages: s.total_wiki_pages,
     })
 }

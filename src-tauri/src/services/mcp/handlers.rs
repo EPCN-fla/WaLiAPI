@@ -463,6 +463,77 @@ fn get_tools() -> Vec<serde_json::Value> {
                 "required": ["project_id", "source_id"]
             }
         }),
+        // ── Wiki tools: Project lifecycle ───────────────────────────
+        serde_json::json!({
+            "name": "create_wiki_project",
+            "description": "创建新 Wiki 项目。Wiki 是结构化知识库，页面按 frontmatter 组织，支持标签、图谱、问答。创建后可通过 save_wiki_page 添加页面或 add_wiki_source 添加源资料。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Wiki 项目名称（1-100字符）" },
+                    "description": { "type": "string", "description": "项目描述（可选）" },
+                    "ingest_model": { "type": "string", "description": "摄入模型（用于自动生成页面的 LLM，可选）" },
+                    "chat_model": { "type": "string", "description": "问答模型（用于 Wiki 问答的 LLM，可选）" },
+                    "ingest_channel_id": { "type": "string", "description": "摄入渠道 ID（可选，默认自动选择）" },
+                    "chat_channel_id": { "type": "string", "description": "问答渠道 ID（可选，默认自动选择）" },
+                    "schema_text": { "type": "string", "description": "自定义 Wiki schema（CLAUDE.md 内容，可选）。定义页面结构规范、标签约定等。" }
+                },
+                "required": ["name"]
+            }
+        }),
+        serde_json::json!({
+            "name": "delete_wiki_project",
+            "description": "永久删除 Wiki 项目及其所有页面、源资料和目录。此操作不可恢复。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" }
+                },
+                "required": ["project_id"]
+            }
+        }),
+        // ── Wiki tools: Page deletion ───────────────────────────────
+        serde_json::json!({
+            "name": "delete_wiki_page",
+            "description": "删除 Wiki 项目中的指定页面。同时删除数据库记录和磁盘文件。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "path": { "type": "string", "description": "页面路径（如 'guides/old-page.md'）" }
+                },
+                "required": ["project_id", "path"]
+            }
+        }),
+        // ── Wiki tools: Source management ──────────────────────────
+        serde_json::json!({
+            "name": "add_wiki_source",
+            "description": "添加源资料到 Wiki 项目。可传入文件内容，自动保存到磁盘。添加后可用 ingest_wiki_source 触发摄入，自动生成结构化 Wiki 页面。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "filename": { "type": "string", "description": "源资料文件名（如 'design.md' 或 'service.java'）" },
+                    "source_type": { "type": "string", "description": "源类型（如 'md', 'java', 'py', 'txt' 等）" },
+                    "content": { "type": "string", "description": "文件内容（纯文本，非 base64）。如果提供，会自动保存到磁盘。" },
+                    "file_path": { "type": "string", "description": "已有文件路径（可选，如果不提供 content 则用此路径）" },
+                    "source_url": { "type": "string", "description": "来源 URL（可选）" }
+                },
+                "required": ["project_id", "filename", "source_type"]
+            }
+        }),
+        serde_json::json!({
+            "name": "delete_wiki_source",
+            "description": "删除 Wiki 项目中的指定源资料。仅删除源记录，不影响已通过该源生成的 Wiki 页面。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "description": "Wiki 项目 ID" },
+                    "source_id": { "type": "string", "description": "源资料 ID" }
+                },
+                "required": ["project_id", "source_id"]
+            }
+        }),
     ]
 }
 
@@ -1761,6 +1832,183 @@ async fn handle_tool_call(
                     "type": "text",
                     "text": format!("Ingest complete. Pages created: {}",
                         result.pages_created)
+                }],
+                "isError": false
+            }))
+        }
+
+        // ── Wiki tools: Project lifecycle ───────────────────────────
+        "create_wiki_project" => {
+            let name = args.get("name").and_then(|s| s.as_str())
+                .ok_or("Missing name")?;
+
+            let input = crate::services::wiki::models::CreateProjectInput {
+                name: name.to_string(),
+                description: args.get("description").and_then(|d| d.as_str()).map(|s| s.to_string()),
+                ingest_model: args.get("ingest_model").and_then(|m| m.as_str()).map(|s| s.to_string()),
+                chat_model: args.get("chat_model").and_then(|m| m.as_str()).map(|s| s.to_string()),
+                ingest_channel_id: args.get("ingest_channel_id").and_then(|c| c.as_str()).map(|s| s.to_string()),
+                chat_channel_id: args.get("chat_channel_id").and_then(|c| c.as_str()).map(|s| s.to_string()),
+                schema_text: args.get("schema_text").and_then(|s| s.as_str()).map(|s| s.to_string()),
+            };
+
+            let project_id = wiki_project::new_uuid();
+            let schema = input.schema_text.clone().unwrap_or_else(|| {
+                crate::services::wiki::repository::DEFAULT_SCHEMA.to_string()
+            });
+
+            // Create directory structure
+            wiki_project::init_project_dir(&project_id, &schema).await
+                .map_err(|e| e.to_string())?;
+
+            let dir = wiki_project::project_wiki_dir(&project_id);
+            let wiki_dir = dir.to_string_lossy().to_string();
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let project = wiki_repo.create_project(&input, &wiki_dir).await
+                .map_err(|e| e.to_string())?;
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Wiki project created successfully.\nID: {}\nName: {}\nDescription: {}\nIngest model: {}\nChat model: {}",
+                        project.id,
+                        project.name,
+                        project.description.as_deref().unwrap_or("N/A"),
+                        project.ingest_model.as_deref().unwrap_or("default"),
+                        project.chat_model.as_deref().unwrap_or("default")
+                    )
+                }],
+                "isError": false
+            }))
+        }
+
+        "delete_wiki_project" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let project = wiki_repo.get_project(project_id).await
+                .map_err(|e| e.to_string())?;
+
+            wiki_repo.delete_project(project_id).await
+                .map_err(|e| e.to_string())?;
+
+            // Remove directory
+            if let Err(e) = wiki_project::remove_project_dir(project_id).await {
+                tracing::warn!("Failed to remove project dir: {}", e);
+            }
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Wiki project '{}' ({}) has been permanently deleted.", project.name, project_id)
+                }],
+                "isError": false
+            }))
+        }
+
+        // ── Wiki tools: Page deletion ───────────────────────────────
+        "delete_wiki_page" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let path = args.get("path").and_then(|s| s.as_str())
+                .ok_or("Missing path")?;
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            wiki_repo.delete_page(project_id, path).await
+                .map_err(|e| e.to_string())?;
+
+            // Delete file from disk
+            let _ = wiki_project::delete_page_file(project_id, path).await;
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Wiki page '{}' has been deleted.", path)
+                }],
+                "isError": false
+            }))
+        }
+
+        // ── Wiki tools: Source management ──────────────────────────
+        "add_wiki_source" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let filename = args.get("filename").and_then(|s| s.as_str())
+                .ok_or("Missing filename")?;
+            let source_type = args.get("source_type").and_then(|s| s.as_str())
+                .ok_or("Missing source_type")?;
+
+            let content = args.get("content").and_then(|c| c.as_str());
+            let file_path = args.get("file_path").and_then(|f| f.as_str()).map(|s| s.to_string());
+            let source_url = args.get("source_url").and_then(|u| u.as_str()).map(|s| s.to_string());
+
+            // Compute hash and size if content provided
+            let (content_hash, file_size) = if let Some(ref content) = content {
+                use sha2::Digest;
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(content.as_bytes());
+                let hash = format!("{:x}", hasher.finalize());
+                (Some(hash), content.len() as i64)
+            } else {
+                (None, 0i64)
+            };
+
+            // Write content to disk if provided
+            if let Some(ref content) = content {
+                wiki_project::write_source_file(project_id, filename, content.as_bytes()).await
+                    .map_err(|e| e.to_string())?;
+            }
+
+            let input = crate::services::wiki::models::AddSourceInput {
+                source_type: source_type.to_string(),
+                filename: filename.to_string(),
+                file_path,
+                source_url,
+                content: content.map(|s| s.to_string()),
+            };
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+            let source = wiki_repo.add_source(project_id, &input, content_hash.as_deref(), file_size).await
+                .map_err(|e| e.to_string())?;
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Wiki source added successfully.\nID: {}\nFilename: {}\nType: {}\nStatus: pending\n\nUse ingest_wiki_source to generate structured pages from this source.",
+                        source.id, source.filename, source.source_type
+                    )
+                }],
+                "isError": false
+            }))
+        }
+
+        "delete_wiki_source" => {
+            let project_id = args.get("project_id").and_then(|s| s.as_str())
+                .ok_or("Missing project_id")?;
+            let source_id = args.get("source_id").and_then(|s| s.as_str())
+                .ok_or("Missing source_id")?;
+
+            let wiki_repo = WikiRepository::new(pool.clone());
+
+            // Get source info before deletion for the response message
+            let sources = wiki_repo.list_sources(project_id).await
+                .map_err(|e| e.to_string())?;
+            let source = sources.iter().find(|s| s.id == source_id)
+                .ok_or_else(|| format!("Source {} not found in project {}", source_id, project_id))?;
+
+            let filename = source.filename.clone();
+
+            wiki_repo.delete_source(source_id).await
+                .map_err(|e| e.to_string())?;
+
+            Ok(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Wiki source '{}' ({}) has been deleted.", filename, source_id)
                 }],
                 "isError": false
             }))

@@ -21,6 +21,7 @@ import {
   Database,
   Layers,
   Terminal,
+  Network,
 } from "lucide-react";
 
 export function DashboardPage() {
@@ -61,12 +62,15 @@ export function DashboardPage() {
     { label: "平均延迟", value: formatDuration(Math.round(stats.avg_latency_ms)), icon: Workflow, color: "text-violet-600", tone: "bg-violet-50" },
     { label: "RAG", value: formatNumber(stats.total_knowledge_bases), icon: Database, color: "text-cyan-600", tone: "bg-cyan-50" },
     { label: "RAG 文档", value: formatNumber(stats.total_kb_documents), icon: Layers, color: "text-teal-600", tone: "bg-teal-50" },
+    { label: "Wiki", value: formatNumber(stats.total_wiki_projects), icon: Network, color: "text-fuchsia-600", tone: "bg-fuchsia-50" },
+    { label: "Wiki 页面", value: formatNumber(stats.total_wiki_pages), icon: FileText, color: "text-pink-600", tone: "bg-pink-50" },
   ];
 
   const quickActions = [
     { title: "新建渠道", icon: Plus, action: () => navigate("/channels") },
     { title: "管理密钥", icon: Key, action: () => navigate("/api-keys") },
     { title: "创建 RAG", icon: Database, action: () => navigate("/services/knowledge-base") },
+    { title: "Wiki 知识库", icon: Network, action: () => navigate("/services/knowledge-base") },
     { title: "接入示例", icon: BookOpen, action: () => navigate("/usage") },
     { title: "审计日志", icon: FileText, action: () => navigate("/logs") },
     { title: "安全设置", icon: ShieldCheck, action: () => navigate("/settings") },
@@ -126,7 +130,7 @@ export function DashboardPage() {
       </section>
 
       {/* 统一指标卡片 */}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-8">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5 xl:grid-cols-10">
         {metrics.map(({ label, value, icon: Icon, color, tone }) => (
           <div key={label} className="surface data-card">
             <div className="flex items-center justify-between">
@@ -194,6 +198,17 @@ export function DashboardPage() {
               {stats.total_knowledge_bases > 0
                 ? `${stats.total_knowledge_bases} 个 RAG · ${stats.total_kb_documents} 篇文档 · ${stats.total_kb_chunks} 个切片`
                 : "尚未创建 RAG，点击上方「创建 RAG」开始。"}
+            </p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+            <div className="flex items-center gap-2">
+              <Network className="h-4 w-4 text-fuchsia-600" />
+              <span className="text-sm font-medium text-slate-900">Wiki 知识库</span>
+            </div>
+            <p className="mt-1.5 text-sm text-slate-500">
+              {stats.total_wiki_projects > 0
+                ? `${stats.total_wiki_projects} 个 Wiki · ${stats.total_wiki_pages} 个页面`
+                : "尚未创建 Wiki，前往知识库页面创建。"}
             </p>
           </div>
         </div>

@@ -239,6 +239,8 @@ pub struct DashboardStats {
     pub total_knowledge_bases: i64,
     pub total_kb_documents: i64,
     pub total_kb_chunks: i64,
+    pub total_wiki_projects: i64,
+    pub total_wiki_pages: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
