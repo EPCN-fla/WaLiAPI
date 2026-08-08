@@ -4,7 +4,7 @@
 
 ### 本地 LLM API 网关 · 多协议接入 · 知识库 RAG · MCP 工具服务
 
-[![Version](https://img.shields.io/badge/version-0.1.5-blue.svg)](./src-tauri/tauri.conf.json)
+[![Version](https://img.shields.io/badge/version-0.1.6-blue.svg)](./src-tauri/tauri.conf.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)](#-安装使用)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app)
@@ -392,6 +392,42 @@ WaLiAPI/
 
 ## 📌 版本历史
 
+### v0.1.6 (2026-08-08)
+
+#### 渠道协议大重构（T01–T14）
+
+- **T01** — Provider preset registry + 领域类型定义，统一渠道身份模型
+- **T02** — 渠道身份迁移和 resolver，修复 review findings
+- **T03** — 零调用 fail-closed 测试、legacy 日志脱敏、安全审计门、dead-code 清理
+- **T04** — chat↔messages 严格 codec，canonical tool_result，strict n/empty-stream，thread model
+- **T07** — SSRF private-range 策略（按渠道）、stream:false 探测、SSE-always 网关容错、草稿测试跳过 count_tokens 探测
+- **T08** — Provider 下拉组件（分组、品牌 SVG 图标、键盘导航、a11y）、silent switch、free endpoint toggle、延迟显示两位小数、legacy 渠道显示推断协议标签
+- **T10** — Feature flags 暴露给 UI（Tauri Command）
+- **T11** — Codec 加固：image gate、field whitelist、tool validation；protocol rollout 集成测试；upstream model 采样写入 body
+- **T12** — CLIProxyAPI codec baseline 对比
+- **T13** — thinking/reasoning fail-open 转换（codec + legacy）
+- **T14** — 通过 modal 同步上游模型（后端 fetch + 前端 apply）
+
+#### 渠道表单 URL 预览
+
+- 端点→请求路径模板常量 `ENDPOINT_PATHS`
+- 端点下方实时展示实际请求 URL 预览，随输入更新
+- URL 预览改纯文本靠左，隐藏 count_tokens 端点
+- Anthropic base URL 统一自带 `/v1`，端点只补 `/messages`
+
+#### /v1/models 接口
+
+- 新增兼容 OpenAI + Anthropic 格式的 `/v1/models` 接口，聚合所有启用渠道的模型列表
+
+#### 数据库迁移备份
+
+- 迁移前自动备份数据库，保留最近 3 份
+
+#### Provider 图标和预设更新
+
+- 品牌 SVG 图标（Claude、Moonshot、Doubao 等）
+- 渠道预设更新（名称、图标、端点、描述）
+
 ### v0.1.5 (2026-08-03)
 
 - ✨ 模型映射一对多：`model_mapping` 支持单目标→多目标数组映射，同优先级渠道间随机负载均衡
@@ -441,10 +477,10 @@ WaLiAPI/
 
 | 贡献者 | GitHub | 提交 | 代码行数 | 主要贡献 |
 |:---|:---|:---|:---|:---|
-| 小傅哥 | [@fuzhengwei](https://github.com/fuzhengwei) | 181 | +55,951 / -13,859 | 项目创建者，核心架构、多渠道管理、协议网关、安全审计、知识库引擎、MCP Server |
-| xian | [@zsxink](https://github.com/zsxink) | 2 | +2,149 / -661 | Claude Code Anthropic Messages 协议兼容适配 |
-| mw | [@maowei0427](https://github.com/maowei0427) | 6 | +1,105 / -197 | 日志模块响应内容记录、Trace ID 追踪、详情页体验优化、知识库 embedding 批次大小配置 |
-| lianggq | [@GQingL](https://github.com/GQingL) | 1 | +91 / -9 | 日志结束日期筛选修复、macOS 渠道删除按钮无响应修复 |
+| 小傅哥 | [@fuzhengwei](https://github.com/fuzhengwei) | 874 | +71,627 / -14,466 | 项目创建者，核心架构、多渠道管理、协议网关、安全审计、知识库引擎、MCP Server、渠道协议重构 |
+| xian | [@zsxink](https://github.com/zsxink) | 241 | +41,373 / -5,119 | Anthropic Messages 协议兼容、渠道协议重构（T01-T14）、codec 加固、SSRF 防护、models 接口 |
+| mw | [@maowei0427](https://github.com/maowei0427) | 35 | +1,105 / -197 | 日志模块响应内容记录、Trace ID 追踪、详情页体验优化、知识库 embedding 批次大小配置 |
+| lianggq | [@GQingL](https://github.com/GQingL) | 2 | +91 / -9 | 日志结束日期筛选修复、macOS 渠道删除按钮无响应修复 |
 
 > 欢迎通过 PR / Issue 参与项目共建。
 
