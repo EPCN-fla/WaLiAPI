@@ -322,15 +322,15 @@ function SkillsSection() {
           </div>
           <div className="flex-1">
             <div className="flex items-center gap-3">
-              <h3 className="text-base font-semibold text-slate-900">WaLiAPI RAG Skills</h3>
-              <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-600 border border-emerald-100">v1.0.0</span>
+              <h3 className="text-base font-semibold text-slate-900">WaLiAPI Skills</h3>
+              <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-600 border border-emerald-100">v2.0.0</span>
             </div>
             <p className="mt-1 text-sm leading-relaxed text-slate-600">
-              即装即用的 Agent Skill 技能包，通过 MCP 协议连接 WaLiAPI 本地 RAG。安装后 AI Agent 可直接执行语义搜索、RAG 问答、文档管理等操作，无需手写提示词。
+              即装即用的 Agent Skill 技能包，通过 MCP 协议连接 WaLiAPI 本地知识服务。安装后 AI Agent 可直接执行 RAG 语义搜索、RAG 问答、文档管理、Wiki 搜索与问答、知识图谱等操作，无需手写提示词。
             </p>
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <a
-                href="https://github.com/fuzhengwei/waliapi-rag-skills"
+                href="https://github.com/fuzhengwei/waliapi-skills"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center gap-1.5 rounded-lg bg-slate-800 px-4 py-2 text-xs font-medium text-white transition-all hover:bg-slate-700"
@@ -340,7 +340,7 @@ function SkillsSection() {
                 <ExternalLink size={11} className="text-slate-300" />
               </a>
               <a
-                href="https://github.com/fuzhengwei/waliapi-rag-skills#readme"
+                href="https://github.com/fuzhengwei/waliapi-skills#readme"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center gap-1.5 rounded-lg border border-slate-200 px-4 py-2 text-xs font-medium text-slate-600 transition-all hover:border-slate-300 hover:bg-slate-50"
@@ -367,14 +367,16 @@ function SkillsSection() {
               <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-slate-800 text-[10px] font-bold text-white">1</span>
               <div className="min-w-0 flex-1">
                 <p className="text-xs font-medium text-slate-700">下载技能包</p>
-                <p className="mt-1 text-[11px] leading-relaxed text-slate-500">从 GitHub 仓库克隆技能包到本地。克隆完成后，技能包会自动安装到 <code className="rounded bg-slate-200 px-1 py-0.5 text-[10px] font-mono text-slate-700">waliapi-rag-skills</code> 目录。</p>
-                <pre className="mt-2 overflow-x-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-mono text-slate-800">git clone https://github.com/fuzhengwei/waliapi-rag-skills.git</pre>
+                <p className="mt-1 text-[11px] leading-relaxed text-slate-500">从 GitHub 仓库克隆技能包到本地。克隆完成后，技能包会自动安装到 <code className="rounded bg-slate-200 px-1 py-0.5 text-[10px] font-mono text-slate-700">waliapi-skills</code> 目录。</p>
+                <pre className="mt-2 overflow-x-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-mono text-slate-800">git clone https://github.com/fuzhengwei/waliapi-skills.git</pre>
                 <p className="mt-2 text-[11px] leading-relaxed text-slate-500">安装完成后，在 Agent 客户端（如 WaLiCode、Codex、Claude Code）中即可直接使用以下能力：</p>
                 <div className="mt-1.5 space-y-1">
-                  <p className="text-[11px] text-slate-600">🔍 <span className="font-medium text-slate-700">语义搜索</span> — 搜索 RAG 中的内容，支持 hybrid/vector/keyword 三种模式</p>
-                  <p className="text-[11px] text-slate-600">💬 <span className="font-medium text-slate-700">RAG 问答</span> — 基于 RAG 内容生成回答，附带来源引用</p>
-                  <p className="text-[11px] text-slate-600">📁 <span className="font-medium text-slate-700">文档管理</span> — 上传、删除、列举 RAG 中的文档</p>
-                  <p className="text-[11px] text-slate-600">📦 <span className="font-medium text-slate-700">批量导入</span> — 导入 Git 仓库、URL 或本地目录到 RAG</p>
+                  <p className="text-[11px] text-slate-600">🔍 <span className="font-medium text-slate-700">RAG 语义搜索</span> — 向量+关键词混合检索，支持 hybrid/vector/keyword 三种模式</p>
+                  <p className="text-[11px] text-slate-600">💬 <span className="font-medium text-slate-700">RAG 问答</span> — 基于知识库内容生成回答，附带来源引用</p>
+                  <p className="text-[11px] text-slate-600">📖 <span className="font-medium text-slate-700">Wiki 搜索与问答</span> — 结构化知识页面搜索、标签导航、Wiki Q&A</p>
+                  <p className="text-[11px] text-slate-600">🗺️ <span className="font-medium text-slate-700">知识图谱</span> — 页面关联可视化、wikilinks 网络</p>
+                  <p className="text-[11px] text-slate-600">📁 <span className="font-medium text-slate-700">文档管理</span> — 上传、删除、列举知识库中的文档</p>
+                  <p className="text-[11px] text-slate-600">📦 <span className="font-medium text-slate-700">批量导入</span> — 导入 Git 仓库、URL 或本地目录到知识库</p>
                 </div>
               </div>
             </div>
