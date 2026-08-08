@@ -144,6 +144,35 @@ pub fn openai_to_responses(openai_resp: &Value, model: &str) -> Value {
     })
 }
 
+/// Normalize a Responses API `tool_choice` to OpenAI Chat Completions shape.
+///
+/// Responses API accepts either a bare string ("auto" | "none" | "required") or
+/// an object — `{"type": "auto"|"none"|"required"}` or
+/// `{"type": "function", "name": "foo"}`. Chat Completions wants a bare string
+/// or `{"type": "function", "function": {"name": "foo"}}`. Returns `None` when
+/// the value cannot be represented (caller then drops tool_choice).
+fn responses_tool_choice_to_chat(tc: &Value) -> Option<Value> {
+    if let Some(s) = tc.as_str() {
+        return Some(Value::String(s.to_string()));
+    }
+    let obj = tc.as_object()?;
+    let ty = obj.get("type")?.as_str()?;
+    match ty {
+        "auto" | "none" | "required" => Some(Value::String(ty.to_string())),
+        "function" => {
+            let name = obj.get("name")?.as_str()?;
+            if name.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "type": "function",
+                "function": {"name": name}
+            }))
+        }
+        _ => None,
+    }
+}
+
 /// Convert Responses API request to OpenAI Chat Completions format.
 pub fn responses_to_openai(body: &Value) -> Value {
     let model = body
@@ -245,9 +274,19 @@ pub fn responses_to_openai(body: &Value) -> Value {
         }
     }
 
-    // Pass through tool_choice (format is the same between Responses and Chat Completions)
-    if let Some(tc) = body.get("tool_choice") {
-        openai_body["tool_choice"] = tc.clone();
+    // Normalize tool_choice to Chat Completions shape, but ONLY when the
+    // converted request actually carries function tools. `openai_body["tools"]`
+    // is only set when the conversion produced a non-empty array, so its
+    // presence is the exact gate. OpenAI Chat Completions rejects `tool_choice`
+    // without `tools` ("When using `tool_choice`, `tools` must be set."), and
+    // Codex sends `tool_choice: "auto"` even for plain no-tool requests —
+    // passing it through unconditionally turns those into an upstream 400/502.
+    if openai_body.get("tools").is_some() {
+        if let Some(tc) = body.get("tool_choice") {
+            if let Some(normalized) = responses_tool_choice_to_chat(tc) {
+                openai_body["tool_choice"] = normalized;
+            }
+        }
     }
 
     // Pass through instructions as a system message if present
@@ -385,7 +424,7 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
                 .collect();
             let mut msg = serde_json::json!({
                 "role": "assistant",
-                "content": null,
+                "content": "",
                 "tool_calls": tool_calls,
             });
             if let Some(rc) = pending_reasoning.take() {
@@ -1591,6 +1630,84 @@ mod anthropic_tests {
         let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
         assert_eq!(assistant["reasoning_content"], "deepseek thought");
         assert_eq!(assistant["content"], "answer");
+    }
+
+    #[test]
+    fn responses_to_openai_drops_tool_choice_when_no_function_tools() {
+        // GitHub issue #13: Codex sends `tool_choice: "auto"` even on plain
+        // no-tool requests. Chat Completions rejects `tool_choice` without
+        // `tools` ("When using `tool_choice`, `tools` must be set."), so the
+        // conversion must strip it whenever no convertible function tools exist.
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "tool_choice": "auto",
+            // Only non-function tools (e.g. web_search) — must NOT keep tool_choice.
+            "tools": [{"type": "web_search"}]
+        });
+        let converted = responses_to_openai(&body);
+        assert!(converted.get("tool_choice").is_none(), "tool_choice must be dropped when no function tools convert");
+        assert!(converted.get("tools").is_none(), "non-function tools must not be forwarded");
+    }
+
+    #[test]
+    fn responses_to_openai_keeps_tool_choice_only_with_function_tools() {
+        // When the request does carry convertible function tools, tool_choice
+        // passes through; the assistant tool-call message must use "" instead of
+        // null content (some strict OpenAI-compatible services reject content:null).
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "list files"}]},
+                {"type": "function_call", "call_id": "call_A", "name": "list", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_A", "output": "a.txt"}
+            ],
+            "tools": [{"type": "function", "name": "list", "parameters": {"type": "object", "properties": {}}}],
+            "tool_choice": {"type": "function", "name": "list"}
+        });
+        let converted = responses_to_openai(&body);
+        assert!(converted.get("tool_choice").is_some(), "tool_choice must be kept when function tools are present");
+        assert_eq!(converted["tool_choice"]["type"], "function");
+        assert_eq!(converted["tool_choice"]["function"]["name"], "list");
+        assert_eq!(converted["tools"].as_array().unwrap().len(), 1);
+
+        let msgs = converted["messages"].as_array().unwrap();
+        let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+        assert_eq!(assistant["tool_calls"][0]["id"], "call_A");
+        assert_eq!(assistant["content"], "", "assistant tool-call message must use empty string, not null");
+    }
+
+    #[test]
+    fn responses_to_openai_flattens_object_tool_choice_modes() {
+        // Responses object forms {"type": "auto"} / {"type": "none"} must flatten
+        // to the bare strings Chat Completions expects.
+        for (input, expected) in [
+            ("auto", "auto"),
+            ("none", "none"),
+            ("required", "required"),
+        ] {
+            let body = serde_json::json!({
+                "model": "gpt-4",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "tool_choice": {"type": input},
+                "tools": [{"type": "function", "name": "list", "parameters": {"type": "object", "properties": {}}}]
+            });
+            let converted = responses_to_openai(&body);
+            assert_eq!(converted["tool_choice"], expected, "object {{type:{input}}} must flatten to string");
+        }
+    }
+
+    #[test]
+    fn responses_to_drops_object_tool_choice_without_name() {
+        // {"type":"function"} without a name has no Chat equivalent — drop it.
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "tool_choice": {"type": "function"},
+            "tools": [{"type": "function", "name": "list", "parameters": {"type": "object", "properties": {}}}]
+        });
+        let converted = responses_to_openai(&body);
+        assert!(converted.get("tool_choice").is_none(), "function tool_choice without a name must be dropped");
     }
 
     #[test]
