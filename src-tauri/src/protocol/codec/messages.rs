@@ -1304,10 +1304,11 @@ impl MessagesSseState {
                 ))
             }
         };
+        // OpenAI streaming chunks must ALWAYS carry `choices` (Opencode etc.
+        // reject a bare `{"usage":...}` frame), so the usage is merged into the
+        // final finish_reason frame — the OpenAI-canonical shape.
         events.push(sse::data_frame(serde_json::json!({
-            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
-        })));
-        events.push(sse::data_frame(serde_json::json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
             "usage": {
                 "prompt_tokens": self.usage.input_tokens,
                 "completion_tokens": self.usage.output_tokens,
