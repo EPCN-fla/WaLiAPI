@@ -52,13 +52,15 @@ export function DashboardPage() {
 
   const availability = stats.total_channels > 0 ? Math.round((stats.active_channels / stats.total_channels) * 100) : 0;
 
-  // 统一 8 卡片网格：今日请求 / 今日Token / 累计请求 / 累计Token / 活跃渠道 / 平均延迟 / RAG / 文档数
-  const metrics = [
+  // 上 5：请求与渠道 | 下 5：知识服务
+  const topMetrics = [
     { label: "今日请求", value: formatNumber(stats.today_requests), icon: Activity, color: "text-blue-600", tone: "bg-blue-50" },
     { label: "今日 Token", value: formatNumber(stats.today_total_tokens), icon: Zap, color: "text-amber-600", tone: "bg-amber-50" },
     { label: "累计请求", value: formatNumber(stats.total_requests), icon: TrendingUp, color: "text-indigo-600", tone: "bg-indigo-50" },
     { label: "累计 Token", value: formatNumber(stats.total_tokens), icon: Zap, color: "text-orange-600", tone: "bg-orange-50" },
     { label: "活跃渠道", value: `${stats.active_channels}/${stats.total_channels}`, icon: Radio, color: "text-emerald-600", tone: "bg-emerald-50" },
+  ];
+  const bottomMetrics = [
     { label: "平均延迟", value: formatDuration(Math.round(stats.avg_latency_ms)), icon: Workflow, color: "text-violet-600", tone: "bg-violet-50" },
     { label: "RAG", value: formatNumber(stats.total_knowledge_bases), icon: Database, color: "text-cyan-600", tone: "bg-cyan-50" },
     { label: "RAG 文档", value: formatNumber(stats.total_kb_documents), icon: Layers, color: "text-teal-600", tone: "bg-teal-50" },
@@ -129,9 +131,24 @@ export function DashboardPage() {
         </div>
       </section>
 
-      {/* 统一指标卡片 */}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-5 xl:grid-cols-10">
-        {metrics.map(({ label, value, icon: Icon, color, tone }) => (
+      {/* 指标卡片 — 上排：请求与渠道 */}
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-5">
+        {topMetrics.map(({ label, value, icon: Icon, color, tone }) => (
+          <div key={label} className="surface data-card">
+            <div className="flex items-center justify-between">
+              <div className={`rounded-xl ${tone} p-2`}>
+                <Icon className={`h-4 w-4 ${color}`} />
+              </div>
+            </div>
+            <div className="mt-3 text-2xl font-semibold tracking-tight text-slate-900">{value}</div>
+            <div className="text-xs text-slate-500">{label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* 指标卡片 — 下排：知识服务 */}
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-5">
+        {bottomMetrics.map(({ label, value, icon: Icon, color, tone }) => (
           <div key={label} className="surface data-card">
             <div className="flex items-center justify-between">
               <div className={`rounded-xl ${tone} p-2`}>
