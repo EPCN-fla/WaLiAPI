@@ -4187,7 +4187,7 @@ function useForceSimulation(graph: WikiGraphData | null) {
   // Initialize nodes when graph changes
   useEffect(() => {
     if (!graph || graph.nodes.length === 0) { nodesRef.current = []; return; }
-    const cx = 250, cy = 250;
+    const cx = 400, cy = 400;
     nodesRef.current = graph.nodes.map((n, i) => {
       const angle = (i / graph.nodes.length) * Math.PI * 2;
       return {
@@ -4195,8 +4195,8 @@ function useForceSimulation(graph: WikiGraphData | null) {
         label: n.label,
         node_type: n.node_type,
         link_count: n.link_count,
-        x: cx + Math.cos(angle) * 120 + (Math.random() - 0.5) * 20,
-        y: cy + Math.sin(angle) * 120 + (Math.random() - 0.5) * 20,
+        x: cx + Math.cos(angle) * 200 + (Math.random() - 0.5) * 20,
+        y: cy + Math.sin(angle) * 200 + (Math.random() - 0.5) * 20,
         vx: 0, vy: 0,
         fx: null, fy: null,
       };
@@ -4219,9 +4219,9 @@ function useForceSimulation(graph: WikiGraphData | null) {
   // Animation loop
   useEffect(() => {
     if (!graph || graph.nodes.length === 0) return;
-    const W = 500, H = 500;
-    const repulsion = 600; // Charge strength
-    const linkDistance = 80;
+    const W = 800, H = 800;
+    const repulsion = 1500; // Charge strength
+    const linkDistance = 120;
     const linkStrength = 0.08;
     const centerForce = 0.015;
     const damping = 0.82;
@@ -4275,8 +4275,8 @@ function useForceSimulation(graph: WikiGraphData | null) {
 
       // Center gravity
       for (const n of ns) {
-        n.vx += (250 - n.x) * centerForce * alpha;
-        n.vy += (250 - n.y) * centerForce * alpha;
+        n.vx += (400 - n.x) * centerForce * alpha;
+        n.vy += (400 - n.y) * centerForce * alpha;
       }
 
       // Apply velocity with damping and boundary
@@ -4289,8 +4289,8 @@ function useForceSimulation(graph: WikiGraphData | null) {
           if (speed > maxSpeed) { n.vx = (n.vx / speed) * maxSpeed; n.vy = (n.vy / speed) * maxSpeed; }
           n.x += n.vx;
           n.y += n.vy;
-          n.x = Math.max(20, Math.min(W - 20, n.x));
-          n.y = Math.max(20, Math.min(H - 20, n.y));
+          n.x = Math.max(30, Math.min(W - 30, n.x));
+          n.y = Math.max(30, Math.min(H - 30, n.y));
         }
         if (n.fy != null) { n.y = n.fy; n.vy = 0; }
       }
@@ -4426,9 +4426,9 @@ function WikiGraphTab({ project }: { project: WikiProject }) {
         </div>
         <svg
           ref={svgRef}
-          viewBox="0 0 500 500"
+          viewBox="0 0 800 800"
           className="w-full select-none"
-          style={{ maxHeight: "500px", cursor: "default" }}
+          style={{ aspectRatio: "1 / 1", width: "70%", margin: "0 auto", cursor: "default" }}
         >
           <defs>
             {Object.entries(NODE_COLORS).map(([type, color]) => (
@@ -4437,11 +4437,11 @@ function WikiGraphTab({ project }: { project: WikiProject }) {
                 <stop offset="100%" stopColor={color} stopOpacity="0.6" />
               </radialGradient>
             ))}
-            <marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(99, 102, 241, 0.35)" />
+            <marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(99, 102, 241, 0.5)" />
             </marker>
-            <marker id="arrow-active" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(59, 130, 246, 0.8)" />
+            <marker id="arrow-active" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(59, 130, 246, 0.9)" />
             </marker>
           </defs>
           {/* Edges */}
@@ -4461,14 +4461,21 @@ function WikiGraphTab({ project }: { project: WikiProject }) {
             const y1 = s.y + (dy / dist) * sRadius;
             const x2 = t.x - (dx / dist) * (tRadius + 4);
             const y2 = t.y - (dy / dist) * (tRadius + 4);
+            // Curve control point — perpendicular offset for visual appeal
+            const mx = (x1 + x2) / 2;
+            const my = (y1 + y2) / 2;
+            const curveOffset = Math.min(dist * 0.12, 20);
+            const cx = mx + (-dy / dist) * curveOffset;
+            const cy = my + (dx / dist) * curveOffset;
             return (
-              <line
+              <path
                 key={i}
-                x1={x1} y1={y1} x2={x2} y2={y2}
-                stroke={highlighted ? "rgba(59, 130, 246, 0.6)" : "rgba(99, 102, 241, 0.12)"}
-                strokeWidth={highlighted ? Math.max(1.5, edge.weight * 2.5) : Math.max(0.8, edge.weight * 1.5)}
+                d={`M ${x1} ${y1} Q ${cx} ${cy} ${x2} ${y2}`}
+                fill="none"
+                stroke={highlighted ? "rgba(59, 130, 246, 0.7)" : "rgba(99, 102, 241, 0.35)"}
+                strokeWidth={highlighted ? Math.max(2, edge.weight * 2.5) : Math.max(1.2, edge.weight * 1.5)}
                 markerEnd={highlighted ? "url(#arrow-active)" : "url(#arrow)"}
-                opacity={dimmed ? 0.15 : 1}
+                opacity={dimmed ? 0.12 : 1}
                 style={{ transition: "opacity 0.2s, stroke 0.2s, stroke-width 0.2s" }}
               />
             );
@@ -4493,21 +4500,39 @@ function WikiGraphTab({ project }: { project: WikiProject }) {
                 {(highlighted || isSelected) && (
                   <circle cx={node.x} cy={node.y} r={radius + 4} fill="none" stroke={color} strokeWidth="2" opacity="0.3" className="animate-pulse" />
                 )}
+                {/* Node glow */}
+                <circle
+                  cx={node.x} cy={node.y} r={radius + 2}
+                  fill={color}
+                  opacity={dimmed ? 0.05 : 0.15}
+                  style={{ transition: "opacity 0.2s" }}
+                />
                 <circle
                   cx={node.x} cy={node.y} r={radius}
                   fill={`url(#grad-${node.node_type})`}
-                  opacity={dimmed ? 0.3 : 0.9}
+                  opacity={dimmed ? 0.3 : 0.92}
+                  stroke={dimmed ? "rgba(148, 163, 184, 0.2)" : "rgba(255, 255, 255, 0.8)"}
+                  strokeWidth="1.5"
                   style={{ transition: "opacity 0.2s" }}
                 />
-                {/* Label on hover/selected */}
-                {(highlighted || isSelected) && (
+                {/* Label: always show when few nodes, otherwise on hover/selected */}
+                {(highlighted || isSelected || graph.nodes.length <= 25) && (
                   <text
-                    x={node.x} y={node.y - radius - 6}
+                    x={node.x} y={node.y - radius - 5}
                     textAnchor="middle"
-                    className="fill-slate-700"
-                    style={{ fontSize: "10px", fontWeight: 600, pointerEvents: "none", paintOrder: "stroke", stroke: "white", strokeWidth: 3 }}
+                    className={highlighted || isSelected ? "fill-slate-900" : "fill-slate-600"}
+                    style={{
+                      fontSize: highlighted || isSelected ? "11px" : "9px",
+                      fontWeight: highlighted || isSelected ? 700 : 500,
+                      pointerEvents: "none",
+                      paintOrder: "stroke",
+                      stroke: "white",
+                      strokeWidth: 3,
+                      opacity: dimmed ? 0.3 : 1,
+                      transition: "opacity 0.2s",
+                    }}
                   >
-                    {node.label.length > 20 ? node.label.slice(0, 18) + "…" : node.label}
+                    {node.label.length > 16 ? node.label.slice(0, 14) + "…" : node.label}
                   </text>
                 )}
                 <title>{node.label} ({node.link_count} links)</title>
