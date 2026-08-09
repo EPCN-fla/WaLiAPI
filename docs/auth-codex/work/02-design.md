@@ -203,7 +203,11 @@ driver 闭包拿到 `RouteCandidate` 后：Channel 继续 `dispatch_executor/dis
 
 ### 5.3 quota
 
-在 `reqwest::Response` 被消费前解析并持久化安全响应头。parser 扫描 `x-<limit_id>-(primary|secondary)-(used-percent|window-minutes|reset-at)`，覆盖 codex 5h/周窗口；未知 limit id 原样作为结构化项保存。任一窗口 `used_percent >= 100` 时账号级 `exceeded=true`；多个耗尽窗口的恢复点取最后一个 reset（必须全部恢复才能重新入池）。429 优先用 `Retry-After`，无有效值时指数退避；非 429 且所有已知窗口恢复时清除 exceeded。没有任何限额头时不凭空创建 quota，视为无限额。
+在 `reqwest::Response` 被消费前解析并持久化安全响应头。parser 扫描 `x-<limit_id>-(primary|secondary)-(used-percent|window-minutes|reset-at)`，**不写死窗口类型**——primary/secondary 是平行可选项，实际由 `window-minutes` 决定（实测 free 号 `primary.window_minutes=43200` = 30 天月限额；非 free 常见周限额；`window_minutes` 单位是分钟）；未知 limit id 原样作为结构化项保存。前端只识别三种标签：**5H限额 / 周限额 / 月限额**，其它时长显示裸「限额」。
+
+**空窗口丢弃（镜像上游 `has_data`）**：窗口仅当 `used_percent != 0 || window_minutes != 0 || reset_at 存在` 才保留；只有 `used-percent: 0` 的窗口（如 free 号的 `secondary`）丢弃。限额项 `primary/secondary/credits` 全空时整个丢弃（如 `codex-credits-has`，其 `x-codex-credits-*` 头为布尔标志，非数值，无法解析为 credits）。
+
+任一窗口 `used_percent >= 100` 时账号级 `exceeded=true`；多个耗尽窗口的恢复点取最后一个 reset（必须全部恢复才能重新入池）。429 优先用 `Retry-After`，无有效值时指数退避；非 429 且所有已知窗口恢复时清除 exceeded。没有任何限额头时不凭空创建 quota，视为无限额。
 
 `AttemptSuccess.response_headers` 仍负责向下游转发安全头；quota 更新失败只记脱敏 warning，不破坏已成功响应。`codex.rate_limits` SSE 事件不归一化：Responses 原生流字节级直通；Chat/Messages 转换流将该完整 SSE record 作为未改写 side-band record 透传，并用固定夹具锁定字节一致性。
 
@@ -265,8 +269,9 @@ driver 闭包拿到 `RouteCandidate` 后：Channel 继续 `dispatch_executor/dis
 | --- | --- |
 | `auth_accounts_list` | 无输入；返回无 token 的 `Vec<AuthAccountDto>` |
 | `auth_login` | provider；单 invoke 完成 OAuth、upsert、首次模型同步，允许部分成功 |
-| `auth_login_import` | provider/path 可省略；读默认 auth.json，过期先 refresh |
-| `auth_logout` | account id + revoke；远端 revoke 失败不阻止本地删除，返回 warning |
+| `auth_login_import` | provider/path 可省略；前端先弹文件选择框(默认路径来自 `auth_default_import_path`)，读选中文件，过期先 refresh |
+| `auth_default_import_path` | 返回默认 auth.json 路径,供文件选择框 defaultPath |
+| `auth_logout` | account id；**纯本地删除**（删数据库行 + 模型快照），不调用 provider revoke（ADR-38） |
 | `auth_refresh_token` | account id；刷新并返回新摘要，失败按规则置 invalid |
 | `auth_sync_models` | account id；成功才替换快照，返回只读模型列表 |
 | `auth_write_back` | account id；原子覆盖+0600+备份，返回写入路径/备份路径 |
@@ -274,7 +279,7 @@ driver 闭包拿到 `RouteCandidate` 后：Channel 继续 `dispatch_executor/dis
 | `auth_quota_status` | account id；返回规范 QuotaState/null 与有效恢复状态 |
 | `auth_update` | account id + label/priority/weight；校验 label 非空、P>=0、W>=1 |
 
-命令延续 `Result<T,String>` 外观，但内部保留 `ProviderError` 分类；对前端错误文本做脱敏。revoke 的远端具体能力若 codex 无端点，返回“未执行远端 revoke”的 warning 后本地删除，不伪报成功撤销。
+命令延续 `Result<T,String>` 外观，但内部保留 `ProviderError` 分类；对前端错误文本做脱敏。`auth_logout` 为**纯本地删除**（删数据库行 + 模型快照，返回被删账号摘要），不调用 provider 的 revoke 端点；不触达 provider 服务端，故无「revoke 失败」路径，也不存在伪报成功撤销的问题。
 
 ## 9. 前端（路由、Auth 页、卡片、弹窗、状态变体）
 
@@ -292,14 +297,14 @@ driver 闭包拿到 `RouteCandidate` 后：Channel 继续 `dispatch_executor/dis
 
 颜色按实际 `App.css`：主色 `--color-primary:#2f6fed`、边框 `--color-border`、危险/成功/警告使用现有 `--color-destructive/#dc4c64`、`--color-success/#1f8f5f`、`--color-warning/#c48a21` 或对应 Tailwind palette，不引用不存在的 `--emerald/--amber/--red` 变量。
 
-卡片展示 provider、label、email、plan、P/W、模型数/只读 tags、同步/刷新时间。有 quota 才画 5h/周窗口；无 quota 不画限额块。三态：正常（绿）、quota 耗尽（琥珀+踢出路由+恢复时间）、invalid（灰/红警示+重新登录）。右上横排编辑/启停/删除；底部均分刷新 token/同步模型/写回 CLI。
+卡片展示 provider、label、email、plan、P/W、模型数/只读 tags、同步/刷新时间。有 quota 且含非空窗口才画限额块（标签按 `window-minutes` 推导，只识别 **5H限额 / 周限额 / 月限额** 三种，重置显示具体时间点）；无 quota 或窗口全空不画限额块。三态：正常（绿）、quota 耗尽（琥珀+踢出路由+恢复时间）、invalid（灰/红警示+重新登录）。右上横排编辑/启停/删除；底部均分刷新 token/同步模型/写回 CLI。
 
 ### 9.3 弹窗
 
 - 登录：五步视图；单 invoke 期间根据本地阶段展示监听、浏览器、等待、入库、同步，timeout/error 后可重试且不遗留 listener。
 - 编辑：label、priority、weight，客户端与后端同规则校验。
 - 同步模型：打开即调用，spinner 后只读列出模型，无 checkbox。
-- 删除/revoke 与写回 CLI 必须二次确认；分别显示 revoke warning、写回目标和备份结果。
+- 删除与写回 CLI 必须二次确认；删除弹窗只问「是否删除」（删除后此账号不再参与路由），确认后纯本地移除；写回 CLI 显示将覆盖的目标与备份结果。
 - 导入、刷新、同步、写回、重登按 UI spec 提示 toast；首次模型同步失败要明确“账号已保存但暂不参与路由”。
 
 ## 10. 错误处理与测试策略
@@ -317,7 +322,7 @@ driver 闭包拿到 `RouteCandidate` 后：Channel 继续 `dispatch_executor/dis
 
 - repository：SQLite 临时库跑全部 migrations，测唯一键 upsert 保留路由配置、模型同步失败保留、quota 到期懒恢复、request_logs 默认/账号类型。
 - Provider：注入 `LoginRuntime`、时钟、随机源和本地 axum mock；用假 JWT payload + opaque refresh fixture 测 PKCE state、timeout、导入、refresh rotation、401 仅一次、并发 single-flight、header/allowlist；不访问 auth.openai.com/chatgpt.com。
-- quota：纯 header map table tests，覆盖多 limit id、5h/周、百分比边界、无头、坏 reset、Retry-After、多个窗口取最晚恢复点。
+- quota：纯 header map table tests，覆盖多 limit id、动态窗口（月 43200 保留 / 周）、空窗口（仅 used-percent:0）丢弃、百分比边界、无头、坏 reset、Retry-After、多个窗口取最晚恢复点。
 - routing：固定 RNG，覆盖混合池顺序、账号豁免 allowed_channels、空模型拒绝、disabled/invalid/quota 过滤、到期恢复、三下游出组、纯 Channel flags 行为未变。
 - codec：静态 JSON/SSE fixtures，覆盖 §6.3 全事件链和任意分片；用计数 mock 断言请求编码拒绝时 upstream calls=0；Chat/Messages/Responses 的 stream/non-stream 都做 golden assertions。
 - executor：本地 mock 返回 401→200、429、SSE、rate_limits；断言 AttemptFlow attempt_no 不因 token refresh 增加、日志 upstream_type 正确、Native usage 非零。
@@ -339,7 +344,7 @@ driver 闭包拿到 `RouteCandidate` 后：Channel 继续 `dispatch_executor/dis
 | 30min 空闲 quota 探测 | 不实现；响应头+429更新，恢复点在路由加载时懒恢复 |
 | token 明文风险 | 与 channels.api_key 一致明文；DTO/日志全面隔离，后续单独设计加密迁移 |
 | OAuth 进度/取消 | 单 invoke、5min timeout、资源清理；不扩第 11 条命令 |
-| revoke 能力不明确 | 远端失败/不可用不阻止本地删除，结果显式 warning |
+| revoke 能力不明确 | **v1 删除不做 revoke**：删除=纯本地移除，不依赖远端能力（ADR-38；用户拍板 2026-08-09） |
 
 ### 11.2 ADR 覆盖矩阵
 
