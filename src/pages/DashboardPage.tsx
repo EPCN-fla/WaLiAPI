@@ -22,6 +22,7 @@ import {
   Layers,
   Terminal,
   Network,
+  Puzzle,
 } from "lucide-react";
 
 export function DashboardPage() {
@@ -72,7 +73,8 @@ export function DashboardPage() {
     { title: "新建渠道", icon: Plus, action: () => navigate("/channels") },
     { title: "管理密钥", icon: Key, action: () => navigate("/api-keys") },
     { title: "创建 RAG", icon: Database, action: () => navigate("/services/knowledge-base") },
-    { title: "Wiki 知识库", icon: Network, action: () => navigate("/services/knowledge-base") },
+    { title: "Wiki 知识库", icon: Network, action: () => navigate("/services/wiki") },
+    { title: "Skills", icon: Puzzle, action: () => navigate("/services/skills") },
     { title: "接入示例", icon: BookOpen, action: () => navigate("/usage") },
     { title: "审计日志", icon: FileText, action: () => navigate("/logs") },
     { title: "安全设置", icon: ShieldCheck, action: () => navigate("/settings") },

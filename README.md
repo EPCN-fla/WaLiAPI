@@ -4,7 +4,7 @@
 
 ### 本地 LLM API 网关 · 多协议接入 · 知识库 RAG · MCP 工具服务
 
-[![Version](https://img.shields.io/badge/version-0.1.6-blue.svg)](./src-tauri/tauri.conf.json)
+[![Version](https://img.shields.io/badge/version-0.1.7-blue.svg)](./src-tauri/tauri.conf.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)](#-安装使用)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app)
@@ -33,7 +33,7 @@
 
 ## 🧭 工作原理
 
-WaLiAPI 作为本地网关，在下游 AI 应用和上游模型供应商之间做协议翻译、负载均衡、安全审计和日志记录。同时内置知识库引擎和 MCP Server，让 AI Agent 能直接检索私有知识。
+WaLiAPI 作为本地网关，在下游 AI 应用和上游模型供应商之间做协议翻译、负载均衡、安全审计和日志记录。同时内置知识库引擎、Wiki 知识引擎和 MCP Server，让 AI Agent 能直接检索私有知识。
 
 ### 请求转发流程
 
@@ -60,17 +60,19 @@ graph TD
         B --> C --> D --> E
         C --> F
 
-        subgraph KBService[知识库 & MCP 服务]
+        subgraph KBService[知识库 & Wiki & MCP 服务]
             G1[文档解析<br/>Markdown / Code / PDF]
             G2[智能分块器<br/>滑动窗口 · 符号感知]
             G3[向量化<br/>复用渠道 Embedding]
             G4[HNSW 索引<br/>向量检索 + FTS5 混合]
             G5[RAG 引擎<br/>混合检索 → 重排 → 生成回答]
-            G6[MCP Server<br/>Streamable HTTP + SSE<br/>13 个工具]
+            G6[MCP Server<br/>Streamable HTTP + SSE<br/>29 个工具 (KB 13 + Wiki 16)]
+            G7[Wiki 引擎<br/>结构化知识库 · frontmatter 标签<br/>wikilinks 图谱 · 摄入管道]
 
             G1 --> G2 --> G3 --> G4
             G4 --> G5
             G4 -.-> G6
+            G7 -.-> G6
         end
     end
 
@@ -106,7 +108,7 @@ flowchart TD
 
 ### MCP 工具服务
 
-WaLiAPI 内置 MCP (Model Context Protocol) Server，通过 Streamable HTTP + SSE 端点对外暴露知识库工具，任何支持 MCP 的 AI Agent 均可接入：
+WaLiAPI 内置 MCP (Model Context Protocol) Server，通过 Streamable HTTP + SSE 端点对外暴露 **29 个工具**（知识库 13 个 + Wiki 16 个），任何支持 MCP 的 AI Agent 均可接入：
 
 ```mermaid
 flowchart LR
@@ -114,20 +116,31 @@ flowchart LR
     MCP -->|"SSE Stream"| Agent
 
     subgraph MCP[MCP Server — WaLiAPI]
-        T1[search_knowledge_base<br/>语义搜索]
-        T2[ask_knowledge_base<br/>RAG 问答]
-        T3[read_document<br/>读取文档]
-        T4[list_knowledge_bases<br/>列出知识库]
-        T5[get_knowledge_base_stats<br/>知识库统计]
-        T6[create / update / delete<br/>知识库 CRUD]
-        T7[upload_document<br/>上传文档]
-        T8[list_documents<br/>文档列表]
-        T9[build_index<br/>构建索引]
-        T10[import_source<br/>多源导入]
-        T11[delete_document<br/>删除文档]
+        subgraph KBTools[知识库工具 ×13]
+            T1[search_knowledge_base<br/>语义搜索]
+            T2[ask_knowledge_base<br/>RAG 问答]
+            T3[read_document<br/>读取文档]
+            T4[list_knowledge_bases<br/>列出知识库]
+            T5[get_knowledge_base_stats<br/>知识库统计]
+            T6[create / update / delete<br/>知识库 CRUD]
+            T7[upload_document<br/>上传文档]
+            T8[list_documents<br/>文档列表]
+            T9[build_index<br/>构建索引]
+            T10[import_source<br/>多源导入]
+            T11[delete_document<br/>删除文档]
+        end
+        subgraph WikiTools[Wiki 工具 ×16]
+            W1[list / get / create<br/>delete_wiki_project]
+            W2[list / get / save<br/>delete_wiki_page]
+            W3[search_wiki<br/>页面搜索]
+            W4[ask_wiki<br/>Wiki 问答]
+            W5[get_wiki_tags<br/>标签列表]
+            W6[get_wiki_graph<br/>知识图谱]
+            W7[list / add / delete<br/>ingest_wiki_source]
+        end
     end
 
-    MCP --> KB[(知识库<br/>SQLite + HNSW)]
+    MCP --> KB[(知识库 + Wiki<br/>SQLite + HNSW)]
 ```
 
 ---
@@ -181,12 +194,23 @@ flowchart LR
 - **多源导入**：Git 仓库克隆导入、URL 批量导入、本地目录扫描导入
 - **会话管理**：按知识库维度的对话历史记录与清除
 
+### 📓 Wiki 知识引擎
+
+- **结构化知识库**：以项目为单位组织 Wiki，页面按 Markdown + frontmatter 管理，支持目录层级
+- **文档摄入管道**：源文件解析 → 结构化页面生成 → 自动提取 frontmatter 标签和 `[[wikilinks]]` → 摄入状态机（pending / ingested / failed）
+- **页面管理**：CRUD 操作、按路径/标题/内容搜索、按标签筛选
+- **Wiki 问答**：检索相关页面 → LLM 生成回答 + 来源引用
+- **知识图谱**：页面（节点）+ wikilinks（边）构成图谱，可视化知识关联
+- **标签体系**：从 frontmatter 自动提取标签，按频率排序
+- **多源管理**：Wiki 源文件列表、添加、删除、摄入
+
 ### 🔗 MCP Server
 
-- 内置 Model Context Protocol Server，通过 `/mcp` 端点对外提供 13 个知识库工具
+- 内置 Model Context Protocol Server，通过 `/mcp` 端点对外提供 **29 个工具**（知识库 13 + Wiki 16）
 - 支持 Streamable HTTP（POST JSON-RPC）和 SSE（GET 升级）两种传输模式
 - 兼容 Claude Desktop、OpenClaw 等支持 MCP 协议的 AI Agent
-- 工具列表：搜索、RAG 问答、读取文档、知识库 CRUD、文档上传/删除、索引管理、多源导入
+- **知识库工具**（13 个）：搜索、RAG 问答、读取文档、知识库 CRUD、文档上传/删除、索引管理、多源导入
+- **Wiki 工具**（16 个）：项目 CRUD、页面 CRUD、搜索、问答、标签、图谱、源文件管理、摄入
 
 ### ⚙️ 设置中心
 
@@ -266,6 +290,7 @@ curl http://127.0.0.1:8777/v1/messages \
 | 后端 | Rust + Tauri 2 + Axum + SQLite (sqlx) + Reqwest | Edition 2021 |
 | UI | shadcn/ui 风格 + Lucide Icons + React Router 7 | — |
 | 知识库 | tree-sitter (7 语言) + HNSW + FTS5 + bincode | — |
+| Wiki | Markdown + frontmatter 解析 + wikilinks 图谱 + SQLite | — |
 | 打包 | Tauri bundler（.dmg / .msi / .deb / .AppImage） | 2.x |
 
 ---
@@ -316,7 +341,7 @@ WaLiAPI/
 │   │   ├── ChannelsPage.tsx          # 渠道管理
 │   │   ├── ApiKeysPage.tsx           # 密钥管理
 │   │   ├── LogsPage.tsx              # 审计日志
-│   │   ├── KnowledgeBasePage.tsx     # 知库 + MCP 服务
+│   │   ├── KnowledgeBasePage.tsx     # 知识库 + Wiki + MCP 服务
 │   │   ├── UsagePage.tsx             # 接入示例
 │   │   ├── SettingsPage.tsx          # 设置中心
 │   │   └── AppConfigPage.tsx        # 应用配置
@@ -337,7 +362,10 @@ WaLiAPI/
 │   │   │   └── custom.rs            # 自定义适配器
 │   │   ├── protocol/                 # 协议转换层
 │   │   │   ├── mod.rs                # 双向格式转换
-│   │   │   ├── anthropic.rs          # Anthropic SSE 流式
+│   │   │   ├── sse_bridge.rs         # SSE 流桥接 (字节级重组 · CJK 安全)
+│   │   │   ├── codec/                # 编解码器
+│   │   │   │   ├── chat_messages_codec.rs  # Chat↔Messages 严格 codec
+│   │   │   │   └── messages.rs       # Anthropic Messages 转换
 │   │   │   └── responses.rs          # Responses SSE 流式
 │   │   ├── core/                     # 核心逻辑
 │   │   │   ├── proxy.rs              # 代理转发 + 安全扫描 + 重试
@@ -361,9 +389,17 @@ WaLiAPI/
 │   │   │   │   ├── importer.rs       # 多源导入 (Git/URL/目录)
 │   │   │   │   ├── repository.rs     # 数据访问层
 │   │   │   │   └── routes.rs         # 知识库路由
+│   │   │   ├── wiki/                 # Wiki 知识引擎
+│   │   │   │   ├── mod.rs            # WikiService 定义
+│   │   │   │   ├── models.rs         # 数据模型 (Project/Page/Source)
+│   │   │   │   ├── repository.rs     # 数据访问层
+│   │   │   │   ├── project.rs        # 项目目录管理
+│   │   │   │   ├── ingest.rs         # 文档摄入管道 (frontmatter/wikilinks)
+│   │   │   │   ├── handlers.rs       # Wiki 请求处理器
+│   │   │   │   └── routes.rs         # Wiki 路由
 │   │   │   └── mcp/                  # MCP Server
 │   │   │       ├── mod.rs            # MCP Service 定义
-│   │   │       └── handlers.rs       # JSON-RPC 工具处理
+│   │   │       └── handlers.rs       # JSON-RPC 工具处理 (29 个工具)
 │   │   ├── commands/                 # Tauri Commands
 │   │   │   ├── channel.rs            # 渠道管理
 │   │   │   ├── api_key.rs            # 密钥管理
@@ -372,6 +408,7 @@ WaLiAPI/
 │   │   │   ├── settings.rs           # 设置管理
 │   │   │   ├── security.rs           # 安全规则
 │   │   │   ├── knowledge_base.rs     # 知识库命令
+│   │   │   ├── wiki.rs              # Wiki 命令
 │   │   │   ├── services.rs           # 服务状态
 │   │   │   ├── app_config.rs         # 应用配置 (8 款工具)
 │   │   │   ├── import_export.rs      # 导入导出
@@ -383,7 +420,7 @@ WaLiAPI/
 │   │   ├── utils/                    # 工具函数
 │   │   ├── lib.rs                    # 入口 + 系统托盘
 │   │   └── main.rs                   # main 函数
-│   ├── migrations/                   # 数据库迁移 (13 个)
+│   ├── migrations/                   # 数据库迁移 (15 个)
 │   └── tauri.conf.json               # Tauri 配置
 └── package.json
 ```
@@ -391,6 +428,33 @@ WaLiAPI/
 ---
 
 ## 📌 版本历史
+
+### v0.1.7 (2026-08-09)
+
+#### Wiki 知识引擎（大功能）
+
+- **数据模型**：Wiki 项目/页面/源文件三表结构（mig017 + mig018 标签表），项目目录隔离
+- **文档摄入管道**：源文件解析 → 结构化页面生成 → 自动提取 frontmatter 标签和 `[[wikilinks]]` → 摄入状态机（pending / ingested / failed）
+- **页面管理**：CRUD 操作、按路径/标题/内容搜索、按标签筛选
+- **Wiki 问答**：检索相关页面 → LLM 生成回答 + 来源引用
+- **知识图谱**：页面（节点）+ wikilinks（边）构成图谱，支持可视化
+- **标签体系**：从 frontmatter 自动提取标签，按频率排序
+- **前端面板**：KnowledgeBasePage Wiki 面板（项目/页面/搜索/问答/标签/图谱视图），Sidebar 导航，Dashboard 统计
+
+#### MCP Server 扩展
+
+- 新增 **16 个 Wiki MCP 工具**：项目 CRUD、页面 CRUD、搜索、问答、标签、图谱、源文件管理、摄入
+- MCP 工具总数从 13 → **29 个**（知识库 13 + Wiki 16）
+- Dashboard 新增 Wiki 统计卡片，指标分两行展示（5+5）
+
+#### SSE 协议修复
+
+- **SSE 字节级重组**：`sse_bridge.rs` 新模块，修复 CJK 多字节边界帧泄漏问题（push 改 `&[u8]`）
+- **Responses 流式修复**：handler 路径 SSE 帧重组 + reasoning 归属修复
+- **OpenAI Responses/Chat 协议对齐**：stop_reason 收敛 + done 补字段 + usage details
+- **Opencode/Codex 流式修复**：bridge 统一 Anthropic→OpenAI SSE + usage 合并 + tools 转发
+- **tool_choice 透传修复**：仅在转换出函数工具时透传并规范化到 Chat 格式
+- **Anthropic Messages 转换修复**：system 提取 + tool_choice 映射 + stream_options
 
 ### v0.1.6 (2026-08-08)
 
@@ -477,8 +541,8 @@ WaLiAPI/
 
 | 贡献者 | GitHub | 提交 | 代码行数 | 主要贡献 |
 |:---|:---|:---|:---|:---|
-| 小傅哥 | [@fuzhengwei](https://github.com/fuzhengwei) | 874 | +71,627 / -14,466 | 项目创建者，核心架构、多渠道管理、协议网关、安全审计、知识库引擎、MCP Server、渠道协议重构 |
-| xian | [@zsxink](https://github.com/zsxink) | 241 | +41,373 / -5,119 | Anthropic Messages 协议兼容、渠道协议重构（T01-T14）、codec 加固、SSRF 防护、models 接口 |
+| 小傅哥 | [@fuzhengwei](https://github.com/fuzhengwei) | 874 | +71,627 / -14,466 | 项目创建者，核心架构、多渠道管理、协议网关、安全审计、知识库引擎、Wiki 知识引擎、MCP Server、渠道协议重构 |
+| xian | [@zsxink](https://github.com/zsxink) | 241 | +41,373 / -5,119 | Anthropic Messages 协议兼容、渠道协议重构（T01-T14）、codec 加固、SSRF 防护、models 接口、SSE 帧重组、协议修复 |
 | mw | [@maowei0427](https://github.com/maowei0427) | 35 | +1,105 / -197 | 日志模块响应内容记录、Trace ID 追踪、详情页体验优化、知识库 embedding 批次大小配置 |
 | lianggq | [@GQingL](https://github.com/GQingL) | 2 | +91 / -9 | 日志结束日期筛选修复、macOS 渠道删除按钮无响应修复 |
 
