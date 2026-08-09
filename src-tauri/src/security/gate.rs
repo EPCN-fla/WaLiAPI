@@ -221,28 +221,42 @@ pub fn audit_request(input: SecurityGateInput) -> Result<SecurityGateOutput, Sec
     let body_hash = hex::encode(Sha256::digest(&body_bytes));
     let body_len = body_bytes.len();
 
-    // Full-tree scan with cumulative budgets over the ORIGINAL protocol JSON.
-    let mut result =
-        match scanner::scan_with_budget(&input.original_json, "request", settings, &budget) {
-            Ok(result) => result,
-            Err(scanner::BudgetError::Exceeded(reason)) => {
-                // Fail-closed: never reported as clean.  The caller short-circuits
-                // to `security_scan_budget_exceeded` and never contacts upstream.
-                return Err(SecurityGateError::BudgetExceeded { message: reason });
-            }
-        };
+    // When security audit is disabled, skip scanning entirely and return a
+    // clean result.  This prevents risk_level / risk_score / findings from
+    // being populated in the log when the user has turned audit off.
+    let (mut result, request_features) = if !settings.enabled {
+        let features = super::features::collect_features(
+            &input.original_json,
+            input.downstream_protocol,
+            &input.safe_forward_headers,
+            &budget,
+        );
+        (SecurityScanResult::default(), features)
+    } else {
+        // Full-tree scan with cumulative budgets over the ORIGINAL protocol JSON.
+        let mut result =
+            match scanner::scan_with_budget(&input.original_json, "request", settings, &budget) {
+                Ok(result) => result,
+                Err(scanner::BudgetError::Exceeded(reason)) => {
+                    // Fail-closed: never reported as clean.  The caller short-circuits
+                    // to `security_scan_budget_exceeded` and never contacts upstream.
+                    return Err(SecurityGateError::BudgetExceeded { message: reason });
+                }
+            };
 
-    super::decide_action(&mut result, settings);
+        super::decide_action(&mut result, settings);
 
-    // Base64 attachment metadata audit (never scanned as ordinary text).
-    // Feature collection runs under the SAME cumulative budget so a hostile
-    // tree cannot grow unbounded feature vectors or hash unbounded base64.
-    let request_features = super::features::collect_features(
-        &input.original_json,
-        input.downstream_protocol,
-        &input.safe_forward_headers,
-        &budget,
-    );
+        // Base64 attachment metadata audit (never scanned as ordinary text).
+        // Feature collection runs under the SAME cumulative budget so a hostile
+        // tree cannot grow unbounded feature vectors or hash unbounded base64.
+        let features = super::features::collect_features(
+            &input.original_json,
+            input.downstream_protocol,
+            &input.safe_forward_headers,
+            &budget,
+        );
+        (result, features)
+    };
 
     // Resolve the effective forward action.
     let action = if settings.enabled {
