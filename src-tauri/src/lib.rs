@@ -171,6 +171,7 @@ pub fn run() {
             commands::auth::auth_login_status,
             commands::auth::auth_login_cancel,
             commands::auth::auth_login_import,
+            commands::auth::auth_default_import_path,
             commands::auth::auth_logout,
             commands::auth::auth_refresh_token,
             commands::auth::auth_sync_models,

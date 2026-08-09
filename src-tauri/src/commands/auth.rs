@@ -104,7 +104,6 @@ pub struct AuthMutationResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthLogoutResult {
     pub deleted: bool,
-    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -439,34 +438,20 @@ async fn run_codex_login_session(
     sessions.finish(&session_id, result).await;
 }
 
-async fn logout_local(
-    repository: &Repository,
-    id: &str,
-    revoke: bool,
-    remote_revoke: Result<(), ProviderError>,
-) -> Result<AuthLogoutResult, String> {
+async fn logout_local(repository: &Repository, id: &str) -> Result<AuthLogoutResult, String> {
     validate_account_id(id)?;
     // Confirm the record exists before reporting a successful local deletion.
     repository
         .get_auth_account(id)
         .await
         .map_err(|_| storage_error())?;
-    let warning = if revoke {
-        remote_revoke
-            .err()
-            .map(|_| "Remote revoke was not completed; the local account was removed.".to_owned())
-    } else {
-        None
-    };
-    // Local removal is deliberately independent from remote revocation.
+    // ADR-38: deletion is local-only — remove the row (payload and model
+    // snapshot live in it), no provider revoke endpoint is called.
     repository
         .delete_auth_account(id)
         .await
         .map_err(|_| storage_error())?;
-    Ok(AuthLogoutResult {
-        deleted: true,
-        warning,
-    })
+    Ok(AuthLogoutResult { deleted: true })
 }
 
 fn quota_is_available(quota: Option<&QuotaState>, now: DateTime<Utc>) -> bool {
@@ -488,6 +473,15 @@ fn import_path(path: Option<String>) -> Result<PathBuf, String> {
         Some(path) if !path.trim().is_empty() => Ok(PathBuf::from(path)),
         _ => CodexLogin::default_auth_json_path().map_err(safe_error),
     }
+}
+
+/// Return the default Codex CLI auth file path for the native file picker.
+/// Reads no secrets; path logic stays in `CodexLogin::default_auth_json_path`.
+#[tauri::command]
+pub async fn auth_default_import_path() -> Result<String, String> {
+    CodexLogin::default_auth_json_path()
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(safe_error)
 }
 
 #[tauri::command]
@@ -579,13 +573,11 @@ pub async fn auth_login_import(
 #[tauri::command]
 pub async fn auth_logout(
     id: String,
-    revoke: bool,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<AuthLogoutResult, String> {
     let repository = Repository::new(state.db.pool.clone());
-    // Codex has no supported revocation endpoint in v1.  Treat this exactly
-    // like a failed remote revoke: tell the caller and still remove local data.
-    logout_local(&repository, &id, revoke, Err(ProviderError::Retryable)).await
+    // ADR-38: v1 deletion is local-only, no provider revoke endpoint.
+    logout_local(&repository, &id).await
 }
 
 #[tauri::command]
@@ -767,11 +759,7 @@ mod tests {
             notice: None,
         })
         .unwrap();
-        let logout = serde_json::to_string(&AuthLogoutResult {
-            deleted: true,
-            warning: Some("Remote revoke was not completed".into()),
-        })
-        .unwrap();
+        let logout = serde_json::to_string(&AuthLogoutResult { deleted: true }).unwrap();
         let write_back = serde_json::to_string(&AuthWriteBackResult {
             path: "/tmp/auth.json".into(),
             backup_path: "/tmp/auth.json.bak".into(),
@@ -806,7 +794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_revoke_still_deletes_local_account_and_returns_warning() {
+    async fn logout_deletes_local_account_only() {
         let repository = test_repository().await;
         let account = repository
             .upsert_by_provider_account_id(&AuthAccountUpsert {
@@ -821,19 +809,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let result = logout_local(
-            &repository,
-            &account.id,
-            true,
-            Err(ProviderError::Retryable),
-        )
-        .await
-        .unwrap();
+        let result = logout_local(&repository, &account.id).await.unwrap();
         assert!(result.deleted);
-        assert!(result
-            .warning
-            .as_deref()
-            .is_some_and(|warning| !warning.is_empty()));
+        // Local-only deletion: no provider call, no warning surfaced (ADR-38).
         assert!(repository.get_auth_account(&account.id).await.is_err());
     }
 
