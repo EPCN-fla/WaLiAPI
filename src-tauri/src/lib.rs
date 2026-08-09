@@ -1,4 +1,7 @@
 mod adaptor;
+#[cfg(test)]
+mod auth_integration_tests;
+pub mod auth_provider;
 mod channel_presets;
 pub mod commands;
 pub mod core;
@@ -23,6 +26,8 @@ use tokio::sync::RwLock;
 
 pub struct AppState {
     pub db: Arc<db::Database>,
+    pub auth_service: Arc<auth_provider::service::AuthService>,
+    pub login_sessions: Arc<commands::auth::LoginSessions>,
     pub server_port: Arc<RwLock<u16>>,
     pub server_running: Arc<std::sync::atomic::AtomicBool>,
     pub server_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
@@ -111,8 +116,15 @@ pub fn run() {
             let app_handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
                 let db = db::Database::new(&app_handle).await;
+                let db = Arc::new(db);
+                let auth_service = Arc::new(auth_provider::service::AuthService::new(
+                    Arc::new(db::repository::Repository::new(db.pool.clone())),
+                    auth_provider::ProviderRegistry::new(),
+                ));
                 let state = Arc::new(AppState {
-                    db: Arc::new(db),
+                    db,
+                    auth_service: auth_service.clone(),
+                    login_sessions: Arc::new(commands::auth::LoginSessions::new()),
                     server_port: Arc::new(RwLock::new(0)),
                     server_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     server_handle: Arc::new(RwLock::new(None)),
@@ -121,6 +133,10 @@ pub fn run() {
                     )),
                 });
                 app_handle.manage(state.clone());
+
+                tauri::async_runtime::spawn(async move {
+                    auth_provider::maintenance::run_maintenance_loop(auth_service).await;
+                });
 
                 let handle = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
@@ -149,6 +165,19 @@ pub fn run() {
             commands::api_key::update_api_key,
             commands::api_key::delete_api_key,
             commands::api_key::get_api_key_stats,
+            commands::auth::auth_accounts_list,
+            commands::auth::auth_login,
+            commands::auth::auth_login_start,
+            commands::auth::auth_login_status,
+            commands::auth::auth_login_cancel,
+            commands::auth::auth_login_import,
+            commands::auth::auth_logout,
+            commands::auth::auth_refresh_token,
+            commands::auth::auth_sync_models,
+            commands::auth::auth_write_back,
+            commands::auth::auth_toggle,
+            commands::auth::auth_quota_status,
+            commands::auth::auth_update,
             commands::log::get_logs,
             commands::log::get_log,
             commands::log::get_log_security_findings,

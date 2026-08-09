@@ -173,8 +173,9 @@ export function LogsPage() {
   const [filterDateFrom, setFilterDateFrom] = useState("");
   const [filterDateTo, setFilterDateTo] = useState("");
   const [filterTraceId, setFilterTraceId] = useState("");
+  const [filterUpstreamType, setFilterUpstreamType] = useState<"" | "channel" | "auth_account">("");
 
-  const hasActiveFilters = keyword || filterApiKey || filterChannel || filterModel || filterDateFrom || filterDateTo || filterTraceId;
+  const hasActiveFilters = keyword || filterApiKey || filterChannel || filterModel || filterDateFrom || filterDateTo || filterTraceId || filterUpstreamType;
 
   const load = useCallback((p: number = 0) => {
     setLoading(true);
@@ -190,12 +191,13 @@ export function LogsPage() {
       // "created_at <= 'YYYY-MM-DD'" 的字符串比较会漏掉结束日当天的全部日志
       date_from: filterDateFrom ? new Date(`${filterDateFrom}T00:00:00`).toISOString() : undefined,
       date_to: filterDateTo ? new Date(`${filterDateTo}T23:59:59.999`).toISOString() : undefined,
-        trace_id: filterTraceId || undefined,
+      trace_id: filterTraceId || undefined,
+      upstream_type: filterUpstreamType || undefined,
     })
       .then(setLogs)
       .catch(() => setLoadError(true))
       .finally(() => setLoading(false));
-  }, [keyword, filterApiKey, filterChannel, filterModel, filterDateFrom, filterDateTo, filterTraceId]);
+  }, [keyword, filterApiKey, filterChannel, filterModel, filterDateFrom, filterDateTo, filterTraceId, filterUpstreamType]);
 
   useEffect(() => { load(0); }, [load]);
 
@@ -207,6 +209,7 @@ export function LogsPage() {
     setFilterDateFrom("");
     setFilterDateTo("");
     setFilterTraceId("");
+    setFilterUpstreamType("");
     setPage(0);
   };
 
@@ -325,6 +328,19 @@ export function LogsPage() {
                 className="w-full pl-9 pr-3 py-2 text-sm rounded-lg border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
               />
             </div>
+            <div className="relative">
+              <Server size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+              <select
+                aria-label="来源类型"
+                value={filterUpstreamType}
+                onChange={(e) => { setFilterUpstreamType(e.target.value as "" | "channel" | "auth_account"); setPage(0); }}
+                className="w-full appearance-none bg-white pl-9 pr-3 py-2 text-sm rounded-lg border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+              >
+                <option value="">全部来源</option>
+                <option value="channel">API 渠道</option>
+                <option value="auth_account">Auth 账号</option>
+              </select>
+            </div>
             {/* Trace ID filter */}
             <div className="relative">
               <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
@@ -394,7 +410,7 @@ export function LogsPage() {
                       <th className="w-36 px-2 py-3 text-left font-medium">时间</th>
                       {showTraceColumn && <th className="w-28 px-2 py-3 text-left font-medium">Trace ID</th>}
                       <th className="w-24 px-2 py-3 text-left font-medium">密钥</th>
-                      <th className="w-20 px-2 py-3 text-left font-medium">渠道</th>
+                      <th className="w-24 px-2 py-3 text-left font-medium">上游</th>
                       <th className="px-2 py-3 text-left font-medium">模型</th>
                       <th className="w-20 px-2 py-3 text-left font-medium">状态</th>
                       <th className="w-28 px-2 py-3 text-right font-medium">安全</th>
@@ -489,7 +505,12 @@ function LogRow({
           <td className="px-2 py-2.5 text-xs font-mono text-slate-500 whitespace-nowrap overflow-hidden truncate max-w-[180px]" title={log.trace_id || undefined}>{log.trace_id || "-"}</td>
         )}
         <td className="px-2 py-2.5 text-xs overflow-hidden truncate">{log.api_key_name || "-"}</td>
-        <td className="px-2 py-2.5 text-xs overflow-hidden truncate">{log.channel_name || "-"}</td>
+        <td className="px-2 py-2.5 text-xs overflow-hidden">
+          <div className="flex flex-col gap-1 truncate">
+            <span className="truncate">{log.channel_name || "-"}</span>
+            <UpstreamTypeBadge upstreamType={log.upstream_type} />
+          </div>
+        </td>
         <td className="px-2 py-2.5 text-[13px] font-mono overflow-hidden truncate">
           <div className="flex flex-col gap-0.5">
             <span className="truncate font-medium text-foreground">{log.model}</span>
@@ -548,6 +569,17 @@ function RiskBadge({ log }: { log: RequestLog }) {
     <span title={log.risk_summary || undefined} className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${meta.cls}`}>
       <ShieldAlert size={11} />
       {meta.label}{log.risk_score > 0 ? ` ${log.risk_score}` : ""}
+    </span>
+  );
+}
+
+function UpstreamTypeBadge({ upstreamType }: { upstreamType: RequestLog["upstream_type"] }) {
+  const isAuth = upstreamType === "auth_account";
+  return (
+    <span className={`w-fit rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
+      isAuth ? "bg-violet-50 text-violet-700" : "bg-blue-50 text-blue-700"
+    }`}>
+      {isAuth ? "Auth" : "API"}
     </span>
   );
 }
@@ -711,8 +743,8 @@ function LogDetail({ log }: { log: RequestLog }) {
 
         {/* Channel routing */}
         <div className="rounded-xl border border-slate-200 bg-white p-3">
-          <div className="flex items-center gap-1.5 text-xs text-slate-500"><Shield size={13} /> 渠道路由</div>
-          <div className="mt-1.5 text-sm font-semibold text-slate-900">{log.channel_name || "-"}</div>
+          <div className="flex items-center gap-1.5 text-xs text-slate-500"><Shield size={13} /> 上游路由</div>
+          <div className="mt-1.5 flex items-center gap-2 text-sm font-semibold text-slate-900"><span>{log.channel_name || "-"}</span><UpstreamTypeBadge upstreamType={log.upstream_type} /></div>
           <div className="mt-0.5 text-[11px] text-slate-400">
             {log.is_retry ? "⚠ 重试转发" : "✓ 首选渠道"}
           </div>

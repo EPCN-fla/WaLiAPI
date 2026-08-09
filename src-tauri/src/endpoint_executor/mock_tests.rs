@@ -196,6 +196,7 @@ fn prepared(
     crate::core::attempt::PreparedAttempt {
         channel_id: "ch-test".into(),
         channel_name: "test".into(),
+        upstream_type: "channel".into(),
         route_group: format!("{}_g1_native", endpoint),
         upstream_protocol: protocol.to_string(),
         upstream_endpoint: endpoint.to_string(),

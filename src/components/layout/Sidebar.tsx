@@ -87,6 +87,7 @@ export function Sidebar({
           <NavLink
             key={to}
             to={to}
+            end={to === "/channels"}
             className={({ isActive }) =>
               `group flex items-center gap-3 rounded-2xl px-4 py-3 text-sm transition-colors ${
                 isActive || (to === "/" && location.pathname === "/")

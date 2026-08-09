@@ -29,26 +29,23 @@ impl Service for WikiService {
 
     async fn status(&self, state: &Arc<AppState>) -> ServiceStatus {
         let pool = &state.db.pool;
-        let project_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM wiki_projects WHERE status = 1",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
+        let project_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM wiki_projects WHERE status = 1")
+                .fetch_one(pool)
+                .await
+                .unwrap_or(0);
 
-        let page_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM wiki_pages WHERE status = 'active'",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
+        let page_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM wiki_pages WHERE status = 'active'")
+                .fetch_one(pool)
+                .await
+                .unwrap_or(0);
 
-        let source_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM wiki_sources WHERE status = 'ingested'",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
+        let source_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM wiki_sources WHERE status = 'ingested'")
+                .fetch_one(pool)
+                .await
+                .unwrap_or(0);
 
         ServiceStatus {
             id: self.id().to_string(),

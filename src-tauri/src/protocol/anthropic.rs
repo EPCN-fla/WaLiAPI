@@ -393,7 +393,10 @@ mod tests {
         assert!(joined.contains("\"thinking\":\"cret\""));
         assert!(joined.contains("\"text\":\"hi\""));
         assert_eq!(
-            output.iter().filter(|e| e.contains("content_block_stop")).count(),
+            output
+                .iter()
+                .filter(|e| e.contains("content_block_stop"))
+                .count(),
             2,
             "thinking + text blocks both stop"
         );

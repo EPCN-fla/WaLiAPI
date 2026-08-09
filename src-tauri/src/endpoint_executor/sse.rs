@@ -31,6 +31,10 @@ pub enum SseMode {
     /// Chat SSE -> Responses SSE (downstream Responses, upstream Chat via the
     /// per-record `responses_via_chat_v1` legacy debt).
     ResponsesViaChat,
+    /// Responses SSE -> Chat SSE (auth-account backend).
+    ResponsesToChat,
+    /// Responses SSE -> Chat SSE -> Messages SSE (composition only).
+    ResponsesToMessages,
 }
 
 impl SseMode {
@@ -40,6 +44,8 @@ impl SseMode {
             SseMode::ChatToMessages => "chat_to_messages_v1",
             SseMode::MessagesToChat => "messages_to_chat_v1",
             SseMode::ResponsesViaChat => "responses_via_chat_v1",
+            SseMode::ResponsesToChat => "responses_to_chat_v1",
+            SseMode::ResponsesToMessages => "responses_to_messages_v1",
         }
     }
 }
@@ -113,19 +119,24 @@ pub fn scan_usage_from_chunk(text: &str) -> Option<(i64, i64, i64)> {
             continue;
         }
         if let Ok(json) = serde_json::from_str::<Value>(data_str) {
-            if let Some(usage) = json.get("usage") {
+            if let Some(usage) = json
+                .get("usage")
+                .or_else(|| json.pointer("/response/usage"))
+            {
                 let prompt = usage
                     .get("prompt_tokens")
+                    .or_else(|| usage.get("input_tokens"))
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
                 let completion = usage
                     .get("completion_tokens")
+                    .or_else(|| usage.get("output_tokens"))
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
                 let total = usage
                     .get("total_tokens")
                     .and_then(Value::as_i64)
-                    .unwrap_or(0);
+                    .unwrap_or(prompt + completion);
                 if total > 0 || prompt > 0 || completion > 0 {
                     return Some((prompt, completion, total));
                 }
@@ -133,6 +144,23 @@ pub fn scan_usage_from_chunk(text: &str) -> Option<(i64, i64, i64)> {
         }
     }
     None
+}
+
+/// Scan only complete records from a native stream.  Unlike
+/// [`scan_usage_from_chunk`], this keeps a byte buffer so a TCP boundary inside
+/// a Responses JSON event cannot make usage disappear.
+fn scan_usage_from_records(pending: &mut Vec<u8>, bytes: &[u8]) -> Option<(i64, i64, i64)> {
+    pending.extend_from_slice(bytes);
+    let mut usage = None;
+    while let Some(end) = record_end(pending) {
+        let record: Vec<u8> = pending.drain(..end).collect();
+        if let Ok(payload) = parse_data_payload(&record) {
+            if let Some(found) = scan_usage_from_chunk(&format!("data: {payload}\n\n")) {
+                usage = Some(found);
+            }
+        }
+    }
+    usage
 }
 
 /// Pure streaming pump: drives the supervisor + decoder as bytes arrive.
@@ -158,6 +186,8 @@ pub struct StreamPumpCore {
     responses_buffer: Vec<u8>,
     /// Last native usage observed.
     usage: Option<(i64, i64, i64)>,
+    /// Incomplete native record held solely for framed usage extraction.
+    native_usage_buffer: Vec<u8>,
 }
 
 impl StreamPumpCore {
@@ -205,6 +235,7 @@ impl StreamPumpCore {
             accumulated_content: String::new(),
             responses_buffer: Vec::new(),
             usage: None,
+            native_usage_buffer: Vec::new(),
         };
         match mode {
             SseMode::Native => {
@@ -217,7 +248,7 @@ impl StreamPumpCore {
                 // first-burst stream still records token usage and terminates
                 // exactly once.
                 let text = String::from_utf8_lossy(&buf);
-                if let Some(u) = scan_usage_from_chunk(&text) {
+                if let Some(u) = scan_usage_from_records(&mut core.native_usage_buffer, &buf) {
                     core.usage = Some(u);
                 }
                 if !core.terminal_registered
@@ -227,7 +258,10 @@ impl StreamPumpCore {
                 }
                 core.first_frame = buf;
             }
-            SseMode::ChatToMessages | SseMode::MessagesToChat => {
+            SseMode::ChatToMessages
+            | SseMode::MessagesToChat
+            | SseMode::ResponsesToChat
+            | SseMode::ResponsesToMessages => {
                 let mut out = Vec::new();
                 if !first_frame.is_empty() {
                     out.extend(core.encode_conversion_chunk(&first_frame)?);
@@ -267,7 +301,7 @@ impl StreamPumpCore {
     /// and return the raw bytes.
     fn encode_native_chunk(&mut self, bytes: &[u8]) -> Vec<u8> {
         let text = String::from_utf8_lossy(bytes);
-        if let Some(u) = scan_usage_from_chunk(&text) {
+        if let Some(u) = scan_usage_from_records(&mut self.native_usage_buffer, bytes) {
             self.usage = Some(u);
         }
         if !self.terminal_registered
@@ -371,7 +405,10 @@ impl StreamPumpCore {
             SseMode::Native => {
                 out.extend_from_slice(&self.encode_native_chunk(bytes));
             }
-            SseMode::ChatToMessages | SseMode::MessagesToChat => {
+            SseMode::ChatToMessages
+            | SseMode::MessagesToChat
+            | SseMode::ResponsesToChat
+            | SseMode::ResponsesToMessages => {
                 out.extend_from_slice(&self.encode_conversion_chunk(bytes)?);
             }
             SseMode::ResponsesViaChat => {
@@ -396,7 +433,10 @@ impl StreamPumpCore {
                     self.terminal_registered = self.supervisor.register_terminal();
                 }
             }
-            SseMode::ChatToMessages | SseMode::MessagesToChat => {
+            SseMode::ChatToMessages
+            | SseMode::MessagesToChat
+            | SseMode::ResponsesToChat
+            | SseMode::ResponsesToMessages => {
                 let decoder = self.decoder.as_mut().ok_or_else(|| {
                     PumpError::Protocol("conversion stream is missing its decoder".to_string())
                 })?;
@@ -516,6 +556,18 @@ pub fn decoder_for(mode: SseMode, model: &str, message_id: &str) -> Option<Box<d
             let context = ConversionContext::new(message_id, model, true);
             Some(crate::protocol::codec::messages::MessagesStreamDecoder::boxed(&context))
         }
+        SseMode::ResponsesToChat => {
+            let context = ConversionContext::new(message_id, model, true);
+            Some(crate::protocol::codec::responses_codec::ResponsesStreamDecoder::boxed(&context))
+        }
+        SseMode::ResponsesToMessages => {
+            let context = ConversionContext::new(message_id, model, true);
+            Some(
+                crate::protocol::codec::responses_codec::ResponsesMessagesStreamDecoder::boxed(
+                    &context,
+                ),
+            )
+        }
         _ => None,
     }
 }
@@ -573,6 +625,17 @@ mod tests {
     fn usage_scan_finds_openai_usage() {
         let chunk = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10}}\n\n";
         assert_eq!(scan_usage_from_chunk(chunk), Some((4, 6, 10)));
+    }
+
+    #[test]
+    fn usage_scan_buffers_split_native_responses_record() {
+        let record = b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":6}}}\n\n";
+        let mut pending = Vec::new();
+        assert_eq!(scan_usage_from_records(&mut pending, &record[..17]), None);
+        assert_eq!(
+            scan_usage_from_records(&mut pending, &record[17..]),
+            Some((4, 6, 10))
+        );
     }
 
     #[test]
@@ -745,12 +808,15 @@ mod tests {
         .expect("thinking first frame must be accepted fail-open");
         let first = core.start().unwrap();
         let text = String::from_utf8_lossy(&first);
-        assert!(text.contains("message_start"), "first frame emits message_start: {text}");
+        assert!(
+            text.contains("message_start"),
+            "first frame emits message_start: {text}"
+        );
         // serde_json sorts object keys (no preserve_order), so assert on
         // order-independent fragments rather than `"type":"thinking"` adjacency.
         assert!(
-            text.contains("\"type\":\"thinking\"") &&
-                text.contains("\"thinking\":\"secret chain\""),
+            text.contains("\"type\":\"thinking\"")
+                && text.contains("\"thinking\":\"secret chain\""),
             "reasoning must surface as a Messages thinking block: {text}"
         );
     }
@@ -955,7 +1021,8 @@ mod tests {
         let fin = core.finish().unwrap();
         let full = format!("{text}{}", String::from_utf8_lossy(&fin));
         assert!(
-            full.contains("{\\\"path\\\": \\\"/tmp/x\\\"}") || full.contains("\\\": \\\"/tmp/x\\\"}"),
+            full.contains("{\\\"path\\\": \\\"/tmp/x\\\"}")
+                || full.contains("\\\": \\\"/tmp/x\\\"}"),
             "full arguments `{{\"path\": \"/tmp/x\"}}` must be accumulated: {full}"
         );
         assert!(

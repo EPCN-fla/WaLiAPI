@@ -760,7 +760,7 @@ async fn routing_native_g1_before_conversion_g2_priority() {
     .expect("plan");
     // Native group first, conversion second, regardless of priority.
     assert_eq!(plan.groups[0].tier.as_str(), "native");
-    assert_eq!(plan.groups[0].candidates[0].channel.id, "n1");
+    assert_eq!(plan.groups[0].candidates[0].candidate.id(), "n1");
     assert_eq!(plan.groups[1].tier.as_str(), "conversion");
 
     let resp = run_non_stream(&pool, &key, &audit, plan, "chat").await;
@@ -827,7 +827,7 @@ async fn routing_same_group_priority_tier_and_weight() {
     let ids: Vec<&str> = plan.groups[0]
         .candidates
         .iter()
-        .map(|c| c.channel.id.as_str())
+        .map(|c| c.candidate.id())
         .collect();
     assert_eq!(ids, vec!["hi", "mid", "lo"]);
 }

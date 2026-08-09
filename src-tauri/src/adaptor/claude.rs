@@ -248,7 +248,10 @@ fn convert_openai_messages_to_claude(
                 .and_then(|t| t.as_array())
                 .cloned()
                 .unwrap_or_default();
-            let content = msg.get("content").cloned().unwrap_or(serde_json::Value::Null);
+            let content = msg
+                .get("content")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
 
             let mut blocks: Vec<serde_json::Value> = Vec::new();
 
@@ -266,7 +269,11 @@ fn convert_openai_messages_to_claude(
                             }
                         }
                     }
-                    if t.is_empty() { None } else { Some(t) }
+                    if t.is_empty() {
+                        None
+                    } else {
+                        Some(t)
+                    }
                 }
                 _ => None,
             };
@@ -275,7 +282,11 @@ fn convert_openai_messages_to_claude(
             }
 
             for tc in &tool_calls {
-                let id = tc.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let id = tc
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let name = tc
                     .get("function")
                     .and_then(|f| f.get("name"))
@@ -322,7 +333,11 @@ fn convert_openai_messages_to_claude(
             if tool_use_id.is_empty() {
                 continue;
             }
-            let tool_content = match msg.get("content").cloned().unwrap_or(serde_json::Value::Null) {
+            let tool_content = match msg
+                .get("content")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+            {
                 serde_json::Value::String(s) => s,
                 serde_json::Value::Null => String::new(),
                 serde_json::Value::Array(arr) => arr
@@ -450,15 +465,12 @@ fn convert_claude_to_openai(claude_json: &serde_json::Value, model: &str) -> ser
         message["tool_calls"] = serde_json::Value::Array(tool_calls);
     }
     // stop_reason tool_use → finish_reason tool_calls
-    let finish_reason = if claude_json
-        .get("stop_reason")
-        .and_then(|s| s.as_str())
-        == Some("tool_use")
-    {
-        "tool_calls"
-    } else {
-        "stop"
-    };
+    let finish_reason =
+        if claude_json.get("stop_reason").and_then(|s| s.as_str()) == Some("tool_use") {
+            "tool_calls"
+        } else {
+            "stop"
+        };
 
     serde_json::json!({
         "id": claude_json.get("id").cloned().unwrap_or(serde_json::Value::String("chatcmpl-converted".to_string())),
@@ -537,10 +549,17 @@ mod tests {
         ]);
         let claude_tools = convert_openai_tools_to_claude(&tools);
         let arr = claude_tools.as_array().unwrap();
-        assert_eq!(arr.len(), 1, "namespace/web_search must be dropped for Anthropic");
+        assert_eq!(
+            arr.len(),
+            1,
+            "namespace/web_search must be dropped for Anthropic"
+        );
         assert_eq!(arr[0]["name"], "exec_command");
         assert_eq!(arr[0]["description"], "Run a shell command");
-        assert_eq!(arr[0]["input_schema"]["properties"]["cmd"]["type"], "string");
+        assert_eq!(
+            arr[0]["input_schema"]["properties"]["cmd"]["type"],
+            "string"
+        );
     }
 
     #[test]
@@ -562,7 +581,8 @@ mod tests {
         let tc = &message["tool_calls"][0];
         assert_eq!(tc["id"], "toolu_1");
         assert_eq!(tc["function"]["name"], "exec_command");
-        let args: serde_json::Value = serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["cmd"], "git status");
     }
 }

@@ -10,6 +10,8 @@ import type {
   ChannelProtocolPresetGroup,
   DraftChannelTestInput, DraftChannelTestResult,
   UpstreamModelsResult,
+  AuthAccount, AuthLoginSessionStatus, AuthLoginStart, AuthMutationResult, AuthLogoutResult, AuthWriteBackResult,
+  AuthQuotaStatus, AuthUpdateInput,
 } from "../types";
 
 /**
@@ -75,6 +77,7 @@ export interface GetLogsInput {
   date_from?: string;
   date_to?: string;
   trace_id?: string;
+  upstream_type?: "channel" | "auth_account";
 }
 
 // Log commands
@@ -86,6 +89,25 @@ export const logApi = {
   delete: (id: string) => invoke<void>("delete_log", { id }),
   deleteBefore: (beforeDate: string) => invoke<number>("delete_logs_before", { beforeDate }),
   deleteAll: () => invoke<number>("delete_all_logs"),
+};
+
+// Auth account commands. All result contracts are safe summaries; credential
+// payloads remain inside the native command layer.
+export const authApi = {
+  accountsList: () => invoke<AuthAccount[]>("auth_accounts_list"),
+  login: (provider: string) => invoke<AuthMutationResult>("auth_login", { provider }),
+  loginStart: (provider: string) => invoke<AuthLoginStart>("auth_login_start", { provider }),
+  loginStatus: (sessionId: string) => invoke<AuthLoginSessionStatus>("auth_login_status", { sessionId }),
+  loginCancel: (sessionId: string) => invoke<AuthLoginSessionStatus>("auth_login_cancel", { sessionId }),
+  loginImport: (provider?: string, path?: string) =>
+    invoke<AuthMutationResult>("auth_login_import", { provider, path }),
+  logout: (id: string, revoke = false) => invoke<AuthLogoutResult>("auth_logout", { id, revoke }),
+  refreshToken: (id: string) => invoke<AuthAccount>("auth_refresh_token", { id }),
+  syncModels: (id: string) => invoke<AuthAccount>("auth_sync_models", { id }),
+  writeBack: (id: string) => invoke<AuthWriteBackResult>("auth_write_back", { id }),
+  toggle: (id: string, disabled: boolean) => invoke<AuthAccount>("auth_toggle", { id, disabled }),
+  quotaStatus: (id: string) => invoke<AuthQuotaStatus>("auth_quota_status", { id }),
+  update: (input: AuthUpdateInput) => invoke<AuthAccount>("auth_update", { input }),
 };
 
 // Stats commands

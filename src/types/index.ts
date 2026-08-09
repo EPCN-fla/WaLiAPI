@@ -162,6 +162,104 @@ export interface RequestLog {
   identity_revision: number | null;
   client_cancelled: boolean | null;
   stream_committed: boolean | null;
+  upstream_type: "channel" | "auth_account" | string;
+}
+
+// Auth account contracts intentionally expose only renderer-safe account
+// summaries. Credential payloads never enter this TypeScript boundary.
+export interface AuthModelState {
+  id: string;
+  status: string;
+  unavailable: boolean;
+  next_retry_after: string | null;
+  last_error: string | null;
+}
+
+export interface AuthQuotaWindow {
+  used_percent: number | null;
+  window_minutes: number | null;
+  reset_at: string | null;
+}
+
+export interface AuthQuotaLimit {
+  limit_id: string;
+  limit_name: string | null;
+  primary: AuthQuotaWindow | null;
+  secondary: AuthQuotaWindow | null;
+  credits: number | null;
+}
+
+export interface AuthQuotaState {
+  version: number;
+  exceeded: boolean;
+  reason: string | null;
+  next_recover_at: string | null;
+  backoff_level: number;
+  limits: AuthQuotaLimit[];
+}
+
+export interface AuthAccount {
+  id: string;
+  provider: string;
+  label: string;
+  account_id: string;
+  status: string;
+  disabled: boolean;
+  priority: number;
+  weight: number;
+  email: string | null;
+  plan_type: string | null;
+  models: AuthModelState[];
+  quota: AuthQuotaState | null;
+  expires_at: string | null;
+  hasRefreshToken: boolean;
+  last_refreshed_at: string | null;
+  last_models_sync_at: string | null;
+  next_refresh_after: string | null;
+  next_retry_after: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AuthMutationResult {
+  account: AuthAccount;
+  warning: string | null;
+  notice: string | null;
+}
+
+export interface AuthLoginStart {
+  sessionId: string;
+}
+
+export interface AuthLoginSessionStatus {
+  sessionId: string;
+  state: "pending" | "saving" | "syncing" | "succeeded" | "cancelled" | "failed";
+  step: "listener" | "browser" | "callback" | "saving" | "syncing" | null;
+  result: AuthMutationResult | null;
+  errorCode: "cancelled" | "timeout" | "browser_open" | "callback_state" | "token_exchange" | "login_failed" | null;
+  error: string | null;
+}
+
+export interface AuthLogoutResult {
+  deleted: boolean;
+  warning: string | null;
+}
+
+export interface AuthWriteBackResult {
+  path: string;
+  backup_path: string;
+}
+
+export interface AuthQuotaStatus {
+  quota: AuthQuotaState | null;
+  available: boolean;
+}
+
+export interface AuthUpdateInput {
+  id: string;
+  label: string;
+  priority: number;
+  weight: number;
 }
 
 export interface SecurityFinding {

@@ -1,5 +1,6 @@
 pub mod api_key;
 pub mod app_config;
+pub mod auth;
 pub mod channel;
 pub mod import_export;
 pub mod knowledge_base;

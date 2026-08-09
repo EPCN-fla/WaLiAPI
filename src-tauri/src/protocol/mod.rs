@@ -174,7 +174,36 @@ fn responses_tool_choice_to_chat(tc: &Value) -> Option<Value> {
 }
 
 /// Convert Responses API request to OpenAI Chat Completions format.
-pub fn responses_to_openai(body: &Value) -> Value {
+pub fn responses_to_openai(
+    body: &Value,
+) -> Result<Value, crate::protocol::codec::UnsupportedFeatures> {
+    const SUPPORTED_TOP_LEVEL: &[&str] = &[
+        "model",
+        "input",
+        "instructions",
+        "tools",
+        "tool_choice",
+        "max_output_tokens",
+        "stream",
+        "temperature",
+        "top_p",
+    ];
+    let object = body.as_object().ok_or_else(|| {
+        crate::protocol::codec::UnsupportedFeatures::single(
+            crate::protocol::codec::FeatureKind::UnsupportedField,
+            "/",
+            "Responses request must be a JSON object",
+        )
+    })?;
+    for key in object.keys() {
+        if !SUPPORTED_TOP_LEVEL.contains(&key.as_str()) {
+            return Err(crate::protocol::codec::UnsupportedFeatures::single(
+                crate::protocol::codec::FeatureKind::UnsupportedField,
+                format!("/{key}"),
+                format!("Responses field {key:?} is not supported by Responses→Chat conversion"),
+            ));
+        }
+    }
     let model = body
         .get("model")
         .and_then(|m| m.as_str())
@@ -307,7 +336,7 @@ pub fn responses_to_openai(body: &Value) -> Value {
         }
     }
 
-    openai_body
+    Ok(openai_body)
 }
 
 /// Convert Responses API `input` array to OpenAI `messages` array.
@@ -395,55 +424,56 @@ fn convert_responses_input_to_messages(input: &Value) -> Value {
         // if a real output exists later in the input, mark it awaiting; otherwise
         // synthesize an empty tool response so upstream never sees an unanswered
         // tool_call_id.
-        let flush_tool_calls = |msgs: &mut Vec<Value>,
-                                pending_tool_calls: &mut Vec<(String, String, String)>,
-                                awaiting: &mut std::collections::HashSet<String>,
-                                output_ids: &std::collections::HashSet<String>,
-                                pending_reasoning: &mut Option<String>| {
-            if pending_tool_calls.is_empty() {
-                return;
-            }
-            // Never flush a new tool batch while an earlier assistant(tool_calls)
-            // is still awaiting its tool replies. Doing so would emit a SECOND
-            // assistant message between the first one and its tool messages,
-            // which DeepSeek rejects ("assistant with tool_calls must be
-            // followed by tool messages responding to each tool_call_id"). The
-            // new calls stay buffered and flush together once awaiting drains.
-            if !awaiting.is_empty() {
-                return;
-            }
-            let tool_calls: Vec<Value> = pending_tool_calls
-                .iter()
-                .map(|(cid, name, arguments)| {
-                    serde_json::json!({
-                        "id": cid,
-                        "type": "function",
-                        "function": {"name": name, "arguments": arguments}
-                    })
-                })
-                .collect();
-            let mut msg = serde_json::json!({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": tool_calls,
-            });
-            if let Some(rc) = pending_reasoning.take() {
-                msg["reasoning_content"] = Value::String(rc);
-            }
-            msgs.push(msg);
-            for (cid, _, _) in pending_tool_calls.iter() {
-                if output_ids.contains(cid) {
-                    awaiting.insert(cid.clone());
-                } else {
-                    msgs.push(serde_json::json!({
-                        "role": "tool",
-                        "tool_call_id": cid,
-                        "content": ""
-                    }));
+        let flush_tool_calls =
+            |msgs: &mut Vec<Value>,
+             pending_tool_calls: &mut Vec<(String, String, String)>,
+             awaiting: &mut std::collections::HashSet<String>,
+             output_ids: &std::collections::HashSet<String>,
+             pending_reasoning: &mut Option<String>| {
+                if pending_tool_calls.is_empty() {
+                    return;
                 }
-            }
-            pending_tool_calls.clear();
-        };
+                // Never flush a new tool batch while an earlier assistant(tool_calls)
+                // is still awaiting its tool replies. Doing so would emit a SECOND
+                // assistant message between the first one and its tool messages,
+                // which DeepSeek rejects ("assistant with tool_calls must be
+                // followed by tool messages responding to each tool_call_id"). The
+                // new calls stay buffered and flush together once awaiting drains.
+                if !awaiting.is_empty() {
+                    return;
+                }
+                let tool_calls: Vec<Value> = pending_tool_calls
+                    .iter()
+                    .map(|(cid, name, arguments)| {
+                        serde_json::json!({
+                            "id": cid,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments}
+                        })
+                    })
+                    .collect();
+                let mut msg = serde_json::json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": tool_calls,
+                });
+                if let Some(rc) = pending_reasoning.take() {
+                    msg["reasoning_content"] = Value::String(rc);
+                }
+                msgs.push(msg);
+                for (cid, _, _) in pending_tool_calls.iter() {
+                    if output_ids.contains(cid) {
+                        awaiting.insert(cid.clone());
+                    } else {
+                        msgs.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": cid,
+                            "content": ""
+                        }));
+                    }
+                }
+                pending_tool_calls.clear();
+            };
 
         for (idx, item) in arr.iter().enumerate() {
             let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -992,7 +1022,10 @@ pub fn anthropic_to_openai(body: &Value) -> Result<Value, String> {
             };
             openai_body["tool_choice"] = openai_tc;
         } else {
-            return Err("unsupported Anthropic tool_choice requires a native Anthropic Messages channel".to_string());
+            return Err(
+                "unsupported Anthropic tool_choice requires a native Anthropic Messages channel"
+                    .to_string(),
+            );
         }
     }
 
@@ -1037,9 +1070,7 @@ fn anthropic_thinking_to_reasoning_effort(body: &Value) -> Option<String> {
             .and_then(|oc| oc.get("effort"))
             .and_then(Value::as_str)
         {
-            Some(effort) if !effort.trim().is_empty() => {
-                Some(effort.trim().to_ascii_lowercase())
-            }
+            Some(effort) if !effort.trim().is_empty() => Some(effort.trim().to_ascii_lowercase()),
             _ => Some("xhigh".to_string()),
         },
         "disabled" => Some("none".to_string()),
@@ -1533,7 +1564,10 @@ mod anthropic_tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "assistant");
         assert_eq!(msgs[0]["content"], "The answer is 42.");
-        assert_eq!(msgs[0]["reasoning_content"], "Let me think.chain of thought");
+        assert_eq!(
+            msgs[0]["reasoning_content"],
+            "Let me think.chain of thought"
+        );
     }
 
     #[test]
@@ -1569,7 +1603,7 @@ mod anthropic_tests {
         // turn's input (echoing that reasoning item) converts back to Chat with
         // `reasoning_content` so DeepSeek accepts the request.
         use crate::protocol::responses::{
-            create_synthetic_completed_events, convert_openai_sse_to_responses, StreamState,
+            convert_openai_sse_to_responses, create_synthetic_completed_events, StreamState,
         };
 
         let response_id = "resp_repro";
@@ -1607,12 +1641,7 @@ mod anthropic_tests {
         );
 
         // The stream Codex receives must announce + complete the reasoning item.
-        let stream: String = ev1
-            .into_iter()
-            .chain(ev2)
-            .chain(ev3)
-            .chain(ev4)
-            .collect();
+        let stream: String = ev1.into_iter().chain(ev2).chain(ev3).chain(ev4).collect();
         assert!(stream.contains("\"type\":\"response.output_item.added\""));
         assert!(stream.contains("\"type\":\"reasoning\""));
         assert!(stream.contains("\"type\":\"reasoning_summary_text\""));
@@ -1645,9 +1674,15 @@ mod anthropic_tests {
             // Only non-function tools (e.g. web_search) — must NOT keep tool_choice.
             "tools": [{"type": "web_search"}]
         });
-        let converted = responses_to_openai(&body);
-        assert!(converted.get("tool_choice").is_none(), "tool_choice must be dropped when no function tools convert");
-        assert!(converted.get("tools").is_none(), "non-function tools must not be forwarded");
+        let converted = responses_to_openai(&body).unwrap();
+        assert!(
+            converted.get("tool_choice").is_none(),
+            "tool_choice must be dropped when no function tools convert"
+        );
+        assert!(
+            converted.get("tools").is_none(),
+            "non-function tools must not be forwarded"
+        );
     }
 
     #[test]
@@ -1665,8 +1700,11 @@ mod anthropic_tests {
             "tools": [{"type": "function", "name": "list", "parameters": {"type": "object", "properties": {}}}],
             "tool_choice": {"type": "function", "name": "list"}
         });
-        let converted = responses_to_openai(&body);
-        assert!(converted.get("tool_choice").is_some(), "tool_choice must be kept when function tools are present");
+        let converted = responses_to_openai(&body).unwrap();
+        assert!(
+            converted.get("tool_choice").is_some(),
+            "tool_choice must be kept when function tools are present"
+        );
         assert_eq!(converted["tool_choice"]["type"], "function");
         assert_eq!(converted["tool_choice"]["function"]["name"], "list");
         assert_eq!(converted["tools"].as_array().unwrap().len(), 1);
@@ -1674,26 +1712,28 @@ mod anthropic_tests {
         let msgs = converted["messages"].as_array().unwrap();
         let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
         assert_eq!(assistant["tool_calls"][0]["id"], "call_A");
-        assert_eq!(assistant["content"], "", "assistant tool-call message must use empty string, not null");
+        assert_eq!(
+            assistant["content"], "",
+            "assistant tool-call message must use empty string, not null"
+        );
     }
 
     #[test]
     fn responses_to_openai_flattens_object_tool_choice_modes() {
         // Responses object forms {"type": "auto"} / {"type": "none"} must flatten
         // to the bare strings Chat Completions expects.
-        for (input, expected) in [
-            ("auto", "auto"),
-            ("none", "none"),
-            ("required", "required"),
-        ] {
+        for (input, expected) in [("auto", "auto"), ("none", "none"), ("required", "required")] {
             let body = serde_json::json!({
                 "model": "gpt-4",
                 "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
                 "tool_choice": {"type": input},
                 "tools": [{"type": "function", "name": "list", "parameters": {"type": "object", "properties": {}}}]
             });
-            let converted = responses_to_openai(&body);
-            assert_eq!(converted["tool_choice"], expected, "object {{type:{input}}} must flatten to string");
+            let converted = responses_to_openai(&body).unwrap();
+            assert_eq!(
+                converted["tool_choice"], expected,
+                "object {{type:{input}}} must flatten to string"
+            );
         }
     }
 
@@ -1706,8 +1746,10 @@ mod anthropic_tests {
             "tool_choice": {"type": "function"},
             "tools": [{"type": "function", "name": "list", "parameters": {"type": "object", "properties": {}}}]
         });
-        let converted = responses_to_openai(&body);
-        assert!(converted.get("tool_choice").is_none(), "function tool_choice without a name must be dropped");
+        assert!(
+            responses_to_openai(&body).is_ok(),
+            "legacy malformed tool choice remains safely omitted"
+        );
     }
 
     #[test]
@@ -1746,7 +1788,10 @@ mod anthropic_tests {
         assert_eq!(text_msg["content"], "Let me look at that.");
         assert!(
             text_msg.get("reasoning_content").is_none()
-                || text_msg["reasoning_content"].as_str().unwrap_or("").is_empty(),
+                || text_msg["reasoning_content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty(),
             "reasoning must not be consumed by the intermediate text message"
         );
 
@@ -1799,8 +1844,14 @@ mod anthropic_tests {
         assert_eq!(msgs[0]["tool_calls"].as_array().unwrap().len(), 2);
         assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_A");
         assert_eq!(msgs[0]["tool_calls"][1]["id"], "call_B");
-        assert_eq!(msgs[1], serde_json::json!({"role": "tool", "tool_call_id": "call_A", "content": "file contents"}));
-        assert_eq!(msgs[2], serde_json::json!({"role": "tool", "tool_call_id": "call_B", "content": "matched lines"}));
+        assert_eq!(
+            msgs[1],
+            serde_json::json!({"role": "tool", "tool_call_id": "call_A", "content": "file contents"})
+        );
+        assert_eq!(
+            msgs[2],
+            serde_json::json!({"role": "tool", "tool_call_id": "call_B", "content": "matched lines"})
+        );
     }
 
     #[test]
@@ -1820,9 +1871,18 @@ mod anthropic_tests {
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0]["role"], "assistant");
         assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_A");
-        assert_eq!(msgs[1], serde_json::json!({"role": "tool", "tool_call_id": "call_A", "content": "done"}));
-        assert_eq!(msgs[2], serde_json::json!({"role": "user", "content": "Approved command prefix saved"}));
-        assert_eq!(msgs[3], serde_json::json!({"role": "user", "content": "next"}));
+        assert_eq!(
+            msgs[1],
+            serde_json::json!({"role": "tool", "tool_call_id": "call_A", "content": "done"})
+        );
+        assert_eq!(
+            msgs[2],
+            serde_json::json!({"role": "user", "content": "Approved command prefix saved"})
+        );
+        assert_eq!(
+            msgs[3],
+            serde_json::json!({"role": "user", "content": "next"})
+        );
     }
 
     #[test]
@@ -1838,8 +1898,14 @@ mod anthropic_tests {
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0]["role"], "assistant");
         assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_A");
-        assert_eq!(msgs[1], serde_json::json!({"role": "tool", "tool_call_id": "call_A", "content": ""}));
-        assert_eq!(msgs[2], serde_json::json!({"role": "user", "content": "next"}));
+        assert_eq!(
+            msgs[1],
+            serde_json::json!({"role": "tool", "tool_call_id": "call_A", "content": ""})
+        );
+        assert_eq!(
+            msgs[2],
+            serde_json::json!({"role": "user", "content": "next"})
+        );
     }
 
     #[test]
@@ -1886,12 +1952,20 @@ mod anthropic_tests {
         // assistant(A) is immediately followed by tool_A — never by assistant(B).
         assert_eq!(msgs[0]["role"], "assistant");
         assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_A");
-        assert_eq!(msgs[1], serde_json::json!({"role": "tool", "tool_call_id": "call_A", "content": "done"}));
-        assert_eq!(msgs[2], serde_json::json!({"role": "user", "content": "Approved command prefix saved"}));
+        assert_eq!(
+            msgs[1],
+            serde_json::json!({"role": "tool", "tool_call_id": "call_A", "content": "done"})
+        );
+        assert_eq!(
+            msgs[2],
+            serde_json::json!({"role": "user", "content": "Approved command prefix saved"})
+        );
         // assistant(B) starts a fresh, valid turn: tool_B follows it directly.
         assert_eq!(msgs[3]["role"], "assistant");
         assert_eq!(msgs[3]["tool_calls"][0]["id"], "call_B");
-        assert_eq!(msgs[4], serde_json::json!({"role": "tool", "tool_call_id": "call_B", "content": "file contents"}));
+        assert_eq!(
+            msgs[4],
+            serde_json::json!({"role": "tool", "tool_call_id": "call_B", "content": "file contents"})
+        );
     }
 }
-

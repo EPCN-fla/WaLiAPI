@@ -190,14 +190,23 @@ pub fn encode_chat_to_messages(
         let e = effort.to_ascii_lowercase();
         match e.as_str() {
             "none" | "off" => {
-                claude.insert("thinking".to_string(), serde_json::json!({"type": "disabled"}));
+                claude.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({"type": "disabled"}),
+                );
             }
             "auto" => {
-                claude.insert("thinking".to_string(), serde_json::json!({"type": "adaptive"}));
+                claude.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({"type": "adaptive"}),
+                );
             }
             _ => {
                 let mapped = crate::protocol::thinking::map_effort_to_claude(&e);
-                claude.insert("thinking".to_string(), serde_json::json!({"type": "adaptive"}));
+                claude.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({"type": "adaptive"}),
+                );
                 claude.insert(
                     "output_config".to_string(),
                     serde_json::json!({"effort": mapped}),

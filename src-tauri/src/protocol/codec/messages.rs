@@ -240,7 +240,9 @@ fn anthropic_thinking_to_reasoning_effort(body: &Value) -> Option<String> {
         "enabled" => {
             // budget_tokens present -> ConvertBudgetToLevel; absent -> auto.
             match thinking.get("budget_tokens").and_then(Value::as_i64) {
-                Some(budget) => crate::protocol::thinking::budget_to_level(budget).map(String::from),
+                Some(budget) => {
+                    crate::protocol::thinking::budget_to_level(budget).map(String::from)
+                }
                 None => Some("auto".to_string()),
             }
         }
@@ -1148,10 +1150,7 @@ impl MessagesSseState {
                         }
                     }
                     Some("thinking_delta") => {
-                        let reasoning = delta
-                            .get("thinking")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
+                        let reasoning = delta.get("thinking").and_then(Value::as_str).unwrap_or("");
                         if !reasoning.is_empty() {
                             events.push(sse::data_frame(serde_json::json!({
                                 "choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": null}]
@@ -1291,7 +1290,9 @@ impl MessagesSseState {
             // Same normalization as the non-streaming path: stop-like reasons
             // (refusal / stop_sequence / pause_turn) collapse to `stop`, and a
             // context-window overrun behaves like `length` — never a hard error.
-            Some("end_turn") | Some("refusal") | Some("stop_sequence") | Some("pause_turn") => "stop",
+            Some("end_turn") | Some("refusal") | Some("stop_sequence") | Some("pause_turn") => {
+                "stop"
+            }
             Some("max_tokens") | Some("model_context_window_exceeded") => "length",
             Some("tool_use") => "tool_calls",
             Some(other) => {

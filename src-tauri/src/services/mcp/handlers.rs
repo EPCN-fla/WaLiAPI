@@ -1,7 +1,10 @@
 use crate::db::repository::Repository;
 use crate::server::router::SharedState;
 use crate::services::knowledge::{embedder, rag, repository::KbRepository, retriever};
-use crate::services::wiki::{handlers as wiki_handlers, project as wiki_project, repository::WikiRepository, ingest as wiki_ingest};
+use crate::services::wiki::{
+    handlers as wiki_handlers, ingest as wiki_ingest, project as wiki_project,
+    repository::WikiRepository,
+};
 use axum::{
     body::Body,
     extract::{Query, State},
@@ -1179,7 +1182,10 @@ async fn handle_tool_call(
                             kb.description.as_deref().unwrap_or("无")
                         ));
                     }
-                    lines.push("\n\n请告诉 AI 你要上传到哪个 RAG（提供 ID 或名称），或者要求创建新 RAG。".to_string());
+                    lines.push(
+                        "\n\n请告诉 AI 你要上传到哪个 RAG（提供 ID 或名称），或者要求创建新 RAG。"
+                            .to_string(),
+                    );
 
                     return Ok(serde_json::json!({
                         "content": [{
@@ -1587,11 +1593,19 @@ async fn handle_tool_call(
         }
 
         "get_wiki_project" => {
-            let project_id = args.get("project_id").and_then(|s| s.as_str())
+            let project_id = args
+                .get("project_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing project_id")?;
             let wiki_repo = WikiRepository::new(pool.clone());
-            let proj = wiki_repo.get_project(project_id).await.map_err(|e| e.to_string())?;
-            let stats = wiki_repo.get_stats(project_id).await.unwrap_or(serde_json::json!({}));
+            let proj = wiki_repo
+                .get_project(project_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let stats = wiki_repo
+                .get_stats(project_id)
+                .await
+                .unwrap_or(serde_json::json!({}));
 
             Ok(serde_json::json!({
                 "content": [{
@@ -1608,10 +1622,15 @@ async fn handle_tool_call(
         }
 
         "list_wiki_pages" => {
-            let project_id = args.get("project_id").and_then(|s| s.as_str())
+            let project_id = args
+                .get("project_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing project_id")?;
             let wiki_repo = WikiRepository::new(pool.clone());
-            let pages = wiki_repo.list_pages(project_id).await.map_err(|e| e.to_string())?;
+            let pages = wiki_repo
+                .list_pages(project_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
             if pages.is_empty() {
                 return Ok(serde_json::json!({
@@ -1620,9 +1639,10 @@ async fn handle_tool_call(
                 }));
             }
 
-            let lines: Vec<String> = pages.iter().map(|p| {
-                format!("- {} ({}) | {}", p.title, p.path, p.page_type)
-            }).collect();
+            let lines: Vec<String> = pages
+                .iter()
+                .map(|p| format!("- {} ({}) | {}", p.title, p.path, p.page_type))
+                .collect();
 
             Ok(serde_json::json!({
                 "content": [{
@@ -1634,9 +1654,13 @@ async fn handle_tool_call(
         }
 
         "get_wiki_page" => {
-            let project_id = args.get("project_id").and_then(|s| s.as_str())
+            let project_id = args
+                .get("project_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing project_id")?;
-            let path = args.get("path").and_then(|s| s.as_str())
+            let path = args
+                .get("path")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing path")?;
 
             let content = wiki_project::read_page(project_id, path)
@@ -1653,18 +1677,30 @@ async fn handle_tool_call(
         }
 
         "save_wiki_page" => {
-            let project_id = args.get("project_id").and_then(|s| s.as_str())
+            let project_id = args
+                .get("project_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing project_id")?;
-            let path = args.get("path").and_then(|s| s.as_str())
+            let path = args
+                .get("path")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing path")?;
-            let content = args.get("content").and_then(|s| s.as_str())
+            let content = args
+                .get("content")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing content")?;
 
             // Call the wiki update_page handler logic
             let wiki_repo = WikiRepository::new(pool.clone());
             let result = wiki_handlers::update_page_inner(
-                &shared.app, pool, &wiki_repo, project_id, path, content,
-            ).await;
+                &shared.app,
+                pool,
+                &wiki_repo,
+                project_id,
+                path,
+                content,
+            )
+            .await;
 
             match result {
                 Ok(()) => Ok(serde_json::json!({
@@ -1679,15 +1715,21 @@ async fn handle_tool_call(
         }
 
         "search_wiki" => {
-            let project_id = args.get("project_id").and_then(|s| s.as_str())
+            let project_id = args
+                .get("project_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing project_id")?;
-            let query = args.get("query").and_then(|s| s.as_str())
+            let query = args
+                .get("query")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing query")?;
             let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(10) as usize;
 
             let wiki_repo = WikiRepository::new(pool.clone());
-            let results = wiki_repo.search_pages(project_id, query, top_k)
-                .await.map_err(|e| e.to_string())?;
+            let results = wiki_repo
+                .search_pages(project_id, query, top_k)
+                .await
+                .map_err(|e| e.to_string())?;
 
             if results.is_empty() {
                 return Ok(serde_json::json!({
@@ -1696,13 +1738,16 @@ async fn handle_tool_call(
                 }));
             }
 
-            let lines: Vec<String> = results.iter().map(|r| {
-                let mut line = format!("- {} ({})", r.title, r.path);
-                if !r.snippet.is_empty() {
-                    line.push_str(&format!("\n  {}", r.snippet));
-                }
-                line
-            }).collect();
+            let lines: Vec<String> = results
+                .iter()
+                .map(|r| {
+                    let mut line = format!("- {} ({})", r.title, r.path);
+                    if !r.snippet.is_empty() {
+                        line.push_str(&format!("\n  {}", r.snippet));
+                    }
+                    line
+                })
+                .collect();
 
             Ok(serde_json::json!({
                 "content": [{
@@ -1714,16 +1759,18 @@ async fn handle_tool_call(
         }
 
         "ask_wiki" => {
-            let project_id = args.get("project_id").and_then(|s| s.as_str())
+            let project_id = args
+                .get("project_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing project_id")?;
-            let question = args.get("question").and_then(|s| s.as_str())
+            let question = args
+                .get("question")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing question")?;
             let top_k = args.get("top_k").and_then(|t| t.as_u64()).unwrap_or(5) as usize;
             let model = args.get("model").and_then(|m| m.as_str());
 
-            let result = wiki_handlers::ask_inner(
-                shared, project_id, question, top_k, model,
-            ).await;
+            let result = wiki_handlers::ask_inner(shared, project_id, question, top_k, model).await;
 
             match result {
                 Ok(json) => Ok(serde_json::json!({
@@ -1735,12 +1782,17 @@ async fn handle_tool_call(
         }
 
         "get_wiki_tags" => {
-            let project_id = args.get("project_id").and_then(|s| s.as_str())
+            let project_id = args
+                .get("project_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing project_id")?;
             let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(15) as usize;
 
             let wiki_repo = WikiRepository::new(pool.clone());
-            let tags = wiki_repo.get_tags(project_id, limit).await.map_err(|e| e.to_string())?;
+            let tags = wiki_repo
+                .get_tags(project_id, limit)
+                .await
+                .map_err(|e| e.to_string())?;
 
             if tags.is_empty() {
                 return Ok(serde_json::json!({
@@ -1749,9 +1801,10 @@ async fn handle_tool_call(
                 }));
             }
 
-            let lines: Vec<String> = tags.iter().map(|t| {
-                format!("- {} ({})", t.word, t.count)
-            }).collect();
+            let lines: Vec<String> = tags
+                .iter()
+                .map(|t| format!("- {} ({})", t.word, t.count))
+                .collect();
 
             Ok(serde_json::json!({
                 "content": [{
@@ -1763,20 +1816,38 @@ async fn handle_tool_call(
         }
 
         "get_wiki_graph" => {
-            let project_id = args.get("project_id").and_then(|s| s.as_str())
+            let project_id = args
+                .get("project_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing project_id")?;
 
             let wiki_repo = WikiRepository::new(pool.clone());
-            let graph = wiki_repo.get_graph(project_id).await.map_err(|e| e.to_string())?;
+            let graph = wiki_repo
+                .get_graph(project_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
-            let lines: Vec<String> = graph.nodes.iter().map(|n| {
-                format!("- {} ({}){}", n.label, n.node_type,
-                    n.path.as_deref().map(|p| format!(" [{}]", p)).unwrap_or_default())
-            }).collect();
+            let lines: Vec<String> = graph
+                .nodes
+                .iter()
+                .map(|n| {
+                    format!(
+                        "- {} ({}){}",
+                        n.label,
+                        n.node_type,
+                        n.path
+                            .as_deref()
+                            .map(|p| format!(" [{}]", p))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect();
 
-            let edge_lines: Vec<String> = graph.edges.iter().map(|e| {
-                format!("  {} --{}--> {}", e.source, e.edge_type, e.target)
-            }).collect();
+            let edge_lines: Vec<String> = graph
+                .edges
+                .iter()
+                .map(|e| format!("  {} --{}--> {}", e.source, e.edge_type, e.target))
+                .collect();
 
             Ok(serde_json::json!({
                 "content": [{
@@ -1790,11 +1861,16 @@ async fn handle_tool_call(
         }
 
         "list_wiki_sources" => {
-            let project_id = args.get("project_id").and_then(|s| s.as_str())
+            let project_id = args
+                .get("project_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing project_id")?;
 
             let wiki_repo = WikiRepository::new(pool.clone());
-            let sources = wiki_repo.list_sources(project_id).await.map_err(|e| e.to_string())?;
+            let sources = wiki_repo
+                .list_sources(project_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
             if sources.is_empty() {
                 return Ok(serde_json::json!({
@@ -1803,10 +1879,15 @@ async fn handle_tool_call(
                 }));
             }
 
-            let lines: Vec<String> = sources.iter().map(|s| {
-                format!("- {} | ID: {} | Type: {} | Status: {} | Pages: {}",
-                    s.filename, s.id, s.source_type, s.status, s.page_count)
-            }).collect();
+            let lines: Vec<String> = sources
+                .iter()
+                .map(|s| {
+                    format!(
+                        "- {} | ID: {} | Type: {} | Status: {} | Pages: {}",
+                        s.filename, s.id, s.source_type, s.status, s.page_count
+                    )
+                })
+                .collect();
 
             Ok(serde_json::json!({
                 "content": [{
@@ -1818,14 +1899,18 @@ async fn handle_tool_call(
         }
 
         "ingest_wiki_source" => {
-            let project_id = args.get("project_id").and_then(|s| s.as_str())
+            let project_id = args
+                .get("project_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing project_id")?;
-            let source_id = args.get("source_id").and_then(|s| s.as_str())
+            let source_id = args
+                .get("source_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing source_id")?;
 
-            let result = wiki_ingest::ingest_source(
-                &shared.app, pool, project_id, source_id,
-            ).await.map_err(|e| e.to_string())?;
+            let result = wiki_ingest::ingest_source(&shared.app, pool, project_id, source_id)
+                .await
+                .map_err(|e| e.to_string())?;
 
             Ok(serde_json::json!({
                 "content": [{
@@ -1839,33 +1924,57 @@ async fn handle_tool_call(
 
         // ── Wiki tools: Project lifecycle ───────────────────────────
         "create_wiki_project" => {
-            let name = args.get("name").and_then(|s| s.as_str())
+            let name = args
+                .get("name")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing name")?;
 
             let input = crate::services::wiki::models::CreateProjectInput {
                 name: name.to_string(),
-                description: args.get("description").and_then(|d| d.as_str()).map(|s| s.to_string()),
-                ingest_model: args.get("ingest_model").and_then(|m| m.as_str()).map(|s| s.to_string()),
-                chat_model: args.get("chat_model").and_then(|m| m.as_str()).map(|s| s.to_string()),
-                ingest_channel_id: args.get("ingest_channel_id").and_then(|c| c.as_str()).map(|s| s.to_string()),
-                chat_channel_id: args.get("chat_channel_id").and_then(|c| c.as_str()).map(|s| s.to_string()),
-                schema_text: args.get("schema_text").and_then(|s| s.as_str()).map(|s| s.to_string()),
+                description: args
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(|s| s.to_string()),
+                ingest_model: args
+                    .get("ingest_model")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string()),
+                chat_model: args
+                    .get("chat_model")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string()),
+                ingest_channel_id: args
+                    .get("ingest_channel_id")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string()),
+                chat_channel_id: args
+                    .get("chat_channel_id")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string()),
+                schema_text: args
+                    .get("schema_text")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string()),
             };
 
             let project_id = wiki_project::new_uuid();
-            let schema = input.schema_text.clone().unwrap_or_else(|| {
-                crate::services::wiki::repository::DEFAULT_SCHEMA.to_string()
-            });
+            let schema = input
+                .schema_text
+                .clone()
+                .unwrap_or_else(|| crate::services::wiki::repository::DEFAULT_SCHEMA.to_string());
 
             // Create directory structure
-            wiki_project::init_project_dir(&project_id, &schema).await
+            wiki_project::init_project_dir(&project_id, &schema)
+                .await
                 .map_err(|e| e.to_string())?;
 
             let dir = wiki_project::project_wiki_dir(&project_id);
             let wiki_dir = dir.to_string_lossy().to_string();
 
             let wiki_repo = WikiRepository::new(pool.clone());
-            let project = wiki_repo.create_project_with_id(&project_id, &input, &wiki_dir).await
+            let project = wiki_repo
+                .create_project_with_id(&project_id, &input, &wiki_dir)
+                .await
                 .map_err(|e| e.to_string())?;
 
             Ok(serde_json::json!({
@@ -1885,14 +1994,20 @@ async fn handle_tool_call(
         }
 
         "delete_wiki_project" => {
-            let project_id = args.get("project_id").and_then(|s| s.as_str())
+            let project_id = args
+                .get("project_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing project_id")?;
 
             let wiki_repo = WikiRepository::new(pool.clone());
-            let project = wiki_repo.get_project(project_id).await
+            let project = wiki_repo
+                .get_project(project_id)
+                .await
                 .map_err(|e| e.to_string())?;
 
-            wiki_repo.delete_project(project_id).await
+            wiki_repo
+                .delete_project(project_id)
+                .await
                 .map_err(|e| e.to_string())?;
 
             // Remove directory
@@ -1911,13 +2026,19 @@ async fn handle_tool_call(
 
         // ── Wiki tools: Page deletion ───────────────────────────────
         "delete_wiki_page" => {
-            let project_id = args.get("project_id").and_then(|s| s.as_str())
+            let project_id = args
+                .get("project_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing project_id")?;
-            let path = args.get("path").and_then(|s| s.as_str())
+            let path = args
+                .get("path")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing path")?;
 
             let wiki_repo = WikiRepository::new(pool.clone());
-            wiki_repo.delete_page(project_id, path).await
+            wiki_repo
+                .delete_page(project_id, path)
+                .await
                 .map_err(|e| e.to_string())?;
 
             // Delete file from disk
@@ -1937,16 +2058,28 @@ async fn handle_tool_call(
 
         // ── Wiki tools: Source management ──────────────────────────
         "add_wiki_source" => {
-            let project_id = args.get("project_id").and_then(|s| s.as_str())
+            let project_id = args
+                .get("project_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing project_id")?;
-            let filename = args.get("filename").and_then(|s| s.as_str())
+            let filename = args
+                .get("filename")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing filename")?;
-            let source_type = args.get("source_type").and_then(|s| s.as_str())
+            let source_type = args
+                .get("source_type")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing source_type")?;
 
             let content = args.get("content").and_then(|c| c.as_str());
-            let file_path = args.get("file_path").and_then(|f| f.as_str()).map(|s| s.to_string());
-            let source_url = args.get("source_url").and_then(|u| u.as_str()).map(|s| s.to_string());
+            let file_path = args
+                .get("file_path")
+                .and_then(|f| f.as_str())
+                .map(|s| s.to_string());
+            let source_url = args
+                .get("source_url")
+                .and_then(|u| u.as_str())
+                .map(|s| s.to_string());
 
             // Compute hash and size if content provided
             let (content_hash, file_size) = if let Some(ref content) = content {
@@ -1961,7 +2094,8 @@ async fn handle_tool_call(
 
             // Write content to disk if provided
             if let Some(ref content) = content {
-                wiki_project::write_source_file(project_id, filename, content.as_bytes()).await
+                wiki_project::write_source_file(project_id, filename, content.as_bytes())
+                    .await
                     .map_err(|e| e.to_string())?;
             }
 
@@ -1974,7 +2108,9 @@ async fn handle_tool_call(
             };
 
             let wiki_repo = WikiRepository::new(pool.clone());
-            let source = wiki_repo.add_source(project_id, &input, content_hash.as_deref(), file_size).await
+            let source = wiki_repo
+                .add_source(project_id, &input, content_hash.as_deref(), file_size)
+                .await
                 .map_err(|e| e.to_string())?;
 
             Ok(serde_json::json!({
@@ -1990,22 +2126,31 @@ async fn handle_tool_call(
         }
 
         "delete_wiki_source" => {
-            let project_id = args.get("project_id").and_then(|s| s.as_str())
+            let project_id = args
+                .get("project_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing project_id")?;
-            let source_id = args.get("source_id").and_then(|s| s.as_str())
+            let source_id = args
+                .get("source_id")
+                .and_then(|s| s.as_str())
                 .ok_or("Missing source_id")?;
 
             let wiki_repo = WikiRepository::new(pool.clone());
 
             // Get source info before deletion for the response message
-            let sources = wiki_repo.list_sources(project_id).await
+            let sources = wiki_repo
+                .list_sources(project_id)
+                .await
                 .map_err(|e| e.to_string())?;
-            let source = sources.iter().find(|s| s.id == source_id)
-                .ok_or_else(|| format!("Source {} not found in project {}", source_id, project_id))?;
+            let source = sources.iter().find(|s| s.id == source_id).ok_or_else(|| {
+                format!("Source {} not found in project {}", source_id, project_id)
+            })?;
 
             let filename = source.filename.clone();
 
-            wiki_repo.delete_source(source_id).await
+            wiki_repo
+                .delete_source(source_id)
+                .await
                 .map_err(|e| e.to_string())?;
 
             Ok(serde_json::json!({

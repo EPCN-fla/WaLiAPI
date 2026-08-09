@@ -23,7 +23,7 @@ use crate::core::channel_identity::{
     resolve_channel_identity, ChannelIdentity, ChannelIdentityRow,
 };
 use crate::core::feature_flags::FeatureFlags;
-use crate::db::models::{ApiKey, Channel};
+use crate::db::models::{ApiKey, AuthAccount, Channel};
 use rand::Rng;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -78,6 +78,8 @@ pub enum UpstreamProtocol {
     OpenAI,
     Anthropic,
     Ollama,
+    /// The fixed Codex account adapter speaks the backend Responses wire format.
+    Responses,
 }
 
 impl UpstreamProtocol {
@@ -86,6 +88,7 @@ impl UpstreamProtocol {
             UpstreamProtocol::OpenAI => "openai",
             UpstreamProtocol::Anthropic => "anthropic",
             UpstreamProtocol::Ollama => "ollama",
+            UpstreamProtocol::Responses => "responses",
         }
     }
 }
@@ -106,11 +109,109 @@ impl GroupTier {
     }
 }
 
-/// One channel that survived model matching and endpoint-capability filtering.
+/// A safe, routable upstream candidate.  Auth account payloads remain in the
+/// database model for the provider adapter, but are never exposed by this type's
+/// Debug implementation or RoutePlan snapshots.
+#[derive(Clone)]
+pub enum RouteCandidate {
+    Channel {
+        channel: Channel,
+        identity: ChannelIdentity,
+    },
+    AuthAccount(AuthAccount),
+}
+
+impl std::fmt::Debug for RouteCandidate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouteCandidate")
+            .field("id", &self.id())
+            .field("name", &self.name())
+            .field("upstream_type", &self.upstream_type())
+            .field("provider", &self.provider())
+            .field("priority", &self.priority())
+            .field("weight", &self.weight())
+            .finish()
+    }
+}
+
+impl RouteCandidate {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Channel { channel, .. } => &channel.id,
+            Self::AuthAccount(account) => &account.id,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Channel { channel, .. } => &channel.name,
+            Self::AuthAccount(account) => &account.label,
+        }
+    }
+
+    pub fn priority(&self) -> i64 {
+        match self {
+            Self::Channel { channel, .. } => channel.priority,
+            Self::AuthAccount(account) => account.priority,
+        }
+    }
+
+    pub fn weight(&self) -> i64 {
+        match self {
+            Self::Channel { channel, .. } => channel.weight,
+            Self::AuthAccount(account) => account.weight,
+        }
+    }
+
+    pub fn upstream_type(&self) -> &'static str {
+        match self {
+            Self::Channel { .. } => "channel",
+            Self::AuthAccount(_) => "auth_account",
+        }
+    }
+
+    pub fn provider(&self) -> String {
+        match self {
+            Self::Channel { identity, .. } => identity.provider.clone(),
+            Self::AuthAccount(account) => account.provider.clone(),
+        }
+    }
+
+    pub fn native_base_url(&self) -> String {
+        match self {
+            Self::Channel { identity, .. } => identity.native_base_url.clone(),
+            // This is descriptive routing metadata only.  The account adapter
+            // owns its fixed backend URL and never accepts a caller override.
+            Self::AuthAccount(_) => "https://chatgpt.com/backend-api/codex".to_string(),
+        }
+    }
+
+    pub fn identity_revision(&self) -> i64 {
+        match self {
+            Self::Channel { identity, .. } => identity.identity_revision,
+            Self::AuthAccount(_) => 0,
+        }
+    }
+
+    pub fn channel(&self) -> Option<&Channel> {
+        match self {
+            Self::Channel { channel, .. } => Some(channel),
+            Self::AuthAccount(_) => None,
+        }
+    }
+
+    pub fn auth_account(&self) -> Option<&AuthAccount> {
+        match self {
+            Self::Channel { .. } => None,
+            Self::AuthAccount(account) => Some(account),
+        }
+    }
+}
+
+/// One candidate that survived model matching and endpoint-capability filtering.
 #[derive(Debug, Clone)]
 pub struct RouteGroupCandidate {
-    pub channel: Channel,
-    pub identity: ChannelIdentity,
+    pub candidate: RouteCandidate,
     pub tier: GroupTier,
     pub upstream_protocol: UpstreamProtocol,
     pub upstream_endpoint: String,
@@ -193,12 +294,15 @@ impl PlanError {
             PlanError::ModelNotAllowed(m) => {
                 format!("Model '{}' is not allowed for this API key", m)
             }
-            PlanError::NoChannels => "No available channels".to_string(),
+            PlanError::NoChannels => "No available upstream candidate".to_string(),
             PlanError::NoCandidateForModel(m) => {
-                format!("No channel available for model: {}", m)
+                format!("No available upstream candidate for model: {}", m)
             }
             PlanError::NoEndpointSupported(_endpoint, m) => {
-                format!("No channel supports this endpoint for model: {}", m)
+                format!(
+                    "No available upstream candidate supports this endpoint for model: {}",
+                    m
+                )
             }
         }
     }
@@ -225,10 +329,10 @@ impl HasPriorityWeight for Channel {
 
 impl HasPriorityWeight for RouteGroupCandidate {
     fn priority(&self) -> i64 {
-        self.channel.priority
+        self.candidate.priority()
     }
     fn weight(&self) -> i64 {
-        self.channel.weight
+        self.candidate.weight()
     }
 }
 
@@ -379,6 +483,34 @@ pub fn resolve_model_candidates<'a>(
         .collect()
 }
 
+/// Resolve the mixed candidate pool.  Channels retain their legacy wildcard
+/// and API-key allow-list behavior; Auth accounts are deliberately exempt from
+/// `allowed_channels`, require an exact non-empty model snapshot hit, and never
+/// inherit Channel model mappings.
+pub fn resolve_route_candidates(
+    channels: &[Channel],
+    accounts: &[AuthAccount],
+    model: &str,
+    api_key: &ApiKey,
+) -> Vec<RouteCandidate> {
+    let mut candidates = resolve_model_candidates(channels, model, api_key)
+        .into_iter()
+        .map(|channel| RouteCandidate::Channel {
+            identity: resolve_channel_identity(&ChannelIdentityRow::from(channel)),
+            channel: channel.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    candidates.extend(
+        accounts
+            .iter()
+            .filter(|account| auth_account_accepts_model(account, model))
+            .cloned()
+            .map(RouteCandidate::AuthAccount),
+    );
+    candidates
+}
+
 fn channel_accepts_model(channel: &Channel, model: &str) -> bool {
     let models: Vec<String> = serde_json::from_str(&channel.models).unwrap_or_default();
     if models.is_empty() {
@@ -394,6 +526,43 @@ fn channel_accepts_model(channel: &Channel, model: &str) -> bool {
         .as_object()
         .map(|o| o.contains_key(model))
         .unwrap_or(false)
+}
+
+fn auth_account_accepts_model(account: &AuthAccount, model: &str) -> bool {
+    if account.disabled != 0 || account.status != "active" {
+        return false;
+    }
+    if account_quota_unavailable(account) {
+        return false;
+    }
+    account
+        .model_states()
+        .ok()
+        .map(|states| {
+            states
+                .models
+                .iter()
+                .any(|state| state.id == model && state.status == "available" && !state.unavailable)
+        })
+        .unwrap_or(false)
+}
+
+/// The repository clears expired quota before returning route accounts.  This
+/// duplicate check keeps direct planner callers fail-closed for malformed and
+/// future quota snapshots while still accepting an already-expired recovery.
+fn account_quota_unavailable(account: &AuthAccount) -> bool {
+    let Ok(Some(quota)) = account.quota_state() else {
+        return account.quota_json.is_some();
+    };
+    if !quota.exceeded {
+        return false;
+    }
+    let Some(recover_at) = quota.next_recover_at.as_deref() else {
+        return true;
+    };
+    chrono::DateTime::parse_from_rfc3339(recover_at)
+        .map(|recover_at| recover_at > chrono::Utc::now())
+        .unwrap_or(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -541,11 +710,30 @@ fn classify_channel(
     }
 }
 
+/// Auth accounts have a fixed `/responses` upstream and deliberately do not
+/// consult rollout capability flags.  CountTokens and Embeddings have no
+/// account adapter in v1, so they never form a group.
+fn classify_auth_account(endpoint: EndpointKind) -> Option<(GroupTier, UpstreamProtocol, String)> {
+    match endpoint {
+        EndpointKind::Responses => Some((
+            GroupTier::Native,
+            UpstreamProtocol::Responses,
+            "responses".into(),
+        )),
+        EndpointKind::ChatCompletions | EndpointKind::Messages => Some((
+            GroupTier::Conversion,
+            UpstreamProtocol::Responses,
+            "responses".into(),
+        )),
+        EndpointKind::CountTokens | EndpointKind::Embeddings => None,
+    }
+}
+
 /// Build the ordered group plan from the surviving model candidates.
 fn build_route_plan<R: Rng + ?Sized>(
     endpoint: EndpointKind,
     model: &str,
-    candidates: Vec<&Channel>,
+    candidates: Vec<RouteCandidate>,
     flags: &FeatureFlags,
     body: &Value,
     rng: &mut R,
@@ -554,27 +742,30 @@ fn build_route_plan<R: Rng + ?Sized>(
     let mut conversion: Vec<RouteGroupCandidate> = Vec::new();
     let mut config_errors = Vec::new();
 
-    for ch in candidates {
-        let row = ChannelIdentityRow::from(ch);
-        let id = resolve_channel_identity(&row);
-        if id.native_base_url.is_empty() && id.native_endpoints.is_empty() {
-            config_errors.push(format!(
-                "channel '{}' ({}): native identity not inferable",
-                ch.name, ch.id
-            ));
-            continue;
-        }
-        if let Some((tier, proto, ep)) = classify_channel(endpoint, &id, ch, flags) {
-            let candidate = RouteGroupCandidate {
-                channel: ch.clone(),
-                identity: id,
+    for candidate in candidates {
+        let classified = match &candidate {
+            RouteCandidate::Channel { channel, identity } => {
+                if identity.native_base_url.is_empty() && identity.native_endpoints.is_empty() {
+                    config_errors.push(format!(
+                        "channel '{}' ({}): native identity not inferable",
+                        channel.name, channel.id
+                    ));
+                    continue;
+                }
+                classify_channel(endpoint, identity, channel, flags)
+            }
+            RouteCandidate::AuthAccount(_) => classify_auth_account(endpoint),
+        };
+        if let Some((tier, proto, ep)) = classified {
+            let group_candidate = RouteGroupCandidate {
+                candidate,
                 tier,
                 upstream_protocol: proto,
                 upstream_endpoint: ep,
             };
             match tier {
-                GroupTier::Native => native.push(candidate),
-                GroupTier::Conversion => conversion.push(candidate),
+                GroupTier::Native => native.push(group_candidate),
+                GroupTier::Conversion => conversion.push(group_candidate),
             }
         }
     }
@@ -668,11 +859,27 @@ pub fn authorize_and_plan<R: Rng + ?Sized>(
     body: &Value,
     rng: &mut R,
 ) -> Result<RoutePlan, PlanError> {
+    authorize_and_plan_with_accounts(api_key, model, endpoint, channels, &[], flags, body, rng)
+}
+
+/// Mixed-pool variant used by the production auth rollout gate.  The original
+/// facade remains as a Channel-only compatibility wrapper for existing callers
+/// and tests; both paths share the exact same planning implementation.
+pub fn authorize_and_plan_with_accounts<R: Rng + ?Sized>(
+    api_key: &ApiKey,
+    model: &str,
+    endpoint: EndpointKind,
+    channels: &[Channel],
+    accounts: &[AuthAccount],
+    flags: &FeatureFlags,
+    body: &Value,
+    rng: &mut R,
+) -> Result<RoutePlan, PlanError> {
     authorize_request(api_key, model)?;
-    if channels.is_empty() {
+    if channels.is_empty() && accounts.is_empty() {
         return Err(PlanError::NoChannels);
     }
-    let candidates = resolve_model_candidates(channels, model, api_key);
+    let candidates = resolve_route_candidates(channels, accounts, model, api_key);
     if candidates.is_empty() {
         return Err(PlanError::NoCandidateForModel(model.to_string()));
     }
@@ -704,10 +911,12 @@ impl RoutePlan {
                     "max_attempts": g.max_attempts,
                     "candidates": g.candidates.iter().map(|c| {
                         json!({
-                            "channel_id": c.channel.id,
-                            "channel_name": c.channel.name,
-                            "priority": c.channel.priority,
-                            "weight": c.channel.weight,
+                            "id": c.candidate.id(),
+                            "name": c.candidate.name(),
+                            "type": c.candidate.upstream_type(),
+                            "provider": c.candidate.provider(),
+                            "priority": c.candidate.priority(),
+                            "weight": c.candidate.weight(),
                         })
                     }).collect::<Vec<_>>(),
                 })
@@ -825,6 +1034,40 @@ mod tests {
 
     fn seeded() -> StdRng {
         StdRng::seed_from_u64(0x5EED)
+    }
+
+    fn auth_account(id: &str, model: &str, priority: i64, weight: i64) -> AuthAccount {
+        AuthAccount {
+            id: id.into(),
+            provider: "codex".into(),
+            label: format!("account-{id}"),
+            account_id: format!("remote-{id}"),
+            status: "active".into(),
+            disabled: 0,
+            priority,
+            weight,
+            quota_json: None,
+            model_states_json: json!({
+                "version": 1,
+                "models": [{
+                    "id": model,
+                    "status": "available",
+                    "unavailable": false,
+                    "next_retry_after": null,
+                    "last_error": null
+                }]
+            })
+            .to_string(),
+            attributes_json: "{}".into(),
+            payload_json:
+                "{\"access_token\":\"route-secret\",\"refresh_token\":\"refresh-secret\"}".into(),
+            last_refreshed_at: None,
+            last_models_sync_at: None,
+            next_refresh_after: None,
+            next_retry_after: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        }
     }
 
     fn flags(codec_on: bool) -> FeatureFlags {
@@ -968,9 +1211,9 @@ mod tests {
         assert_eq!(plan.groups[1].tier, GroupTier::Conversion);
         // The first attempt must be the native candidate, not the higher-prio
         // conversion one.
-        assert_eq!(plan.groups[0].candidates[0].channel.id, "n1");
+        assert_eq!(plan.groups[0].candidates[0].candidate.id(), "n1");
         // Conversion group keeps its own priority ordering internally.
-        assert_eq!(plan.groups[1].candidates[0].channel.id, "c1");
+        assert_eq!(plan.groups[1].candidates[0].candidate.id(), "c1");
     }
 
     #[test]
@@ -1038,12 +1281,12 @@ mod tests {
         let ids_a: Vec<&str> = plan_a.groups[0]
             .candidates
             .iter()
-            .map(|c| c.channel.id.as_str())
+            .map(|c| c.candidate.id())
             .collect();
         let ids_b: Vec<&str> = plan_b.groups[0]
             .candidates
             .iter()
-            .map(|c| c.channel.id.as_str())
+            .map(|c| c.candidate.id())
             .collect();
         assert_eq!(ids_a, ids_b);
         // With equal weights every channel appears exactly once.
@@ -1089,12 +1332,12 @@ mod tests {
         let ids_a: Vec<&str> = plan_a.groups[0]
             .candidates
             .iter()
-            .map(|c| c.channel.id.as_str())
+            .map(|c| c.candidate.id())
             .collect();
         let ids_b: Vec<&str> = plan_b.groups[0]
             .candidates
             .iter()
-            .map(|c| c.channel.id.as_str())
+            .map(|c| c.candidate.id())
             .collect();
         assert_ne!(
             ids_a, ids_b,
@@ -1145,7 +1388,7 @@ mod tests {
         let ids: Vec<&str> = plan.groups[0]
             .candidates
             .iter()
-            .map(|c| c.channel.id.as_str())
+            .map(|c| c.candidate.id())
             .collect();
         // High priority must come before low priority regardless of weight.
         assert_eq!(ids[0], "hi");
@@ -1526,9 +1769,9 @@ mod tests {
         .unwrap();
         assert_eq!(plan.groups.len(), 2);
         assert_eq!(plan.groups[0].tier, GroupTier::Native);
-        assert_eq!(plan.groups[0].candidates[0].channel.id, "a1");
+        assert_eq!(plan.groups[0].candidates[0].candidate.id(), "a1");
         assert_eq!(plan.groups[1].tier, GroupTier::Conversion);
-        assert_eq!(plan.groups[1].candidates[0].channel.id, "o1");
+        assert_eq!(plan.groups[1].candidates[0].candidate.id(), "o1");
     }
 
     #[test]
@@ -1564,7 +1807,7 @@ mod tests {
         .unwrap();
         assert_eq!(plan.groups.len(), 1);
         assert_eq!(plan.groups[0].tier, GroupTier::Native);
-        assert_eq!(plan.groups[0].candidates[0].channel.id, "a1");
+        assert_eq!(plan.groups[0].candidates[0].candidate.id(), "a1");
     }
 
     #[test]
@@ -1593,7 +1836,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.groups[0].candidates.len(), 1);
-        assert_eq!(plan.groups[0].candidates[0].channel.id, "good");
+        assert_eq!(plan.groups[0].candidates[0].candidate.id(), "good");
         assert!(!plan.config_errors.is_empty());
     }
 
@@ -1653,5 +1896,180 @@ mod tests {
             "api_key must never leak into plan debug output"
         );
         assert!(s.contains("chat_completions_g1_native"));
+    }
+
+    #[test]
+    fn auth_accounts_share_the_responses_native_pool_and_keep_independent_weighted_candidates() {
+        let key = api_key(&[], &["only-channel"]);
+        let channel = new_channel(
+            "only-channel",
+            "openai",
+            "openai",
+            "https://api.openai.com/v1",
+            &["responses"],
+            5,
+            1,
+        );
+        let a1 = auth_account("auth-1", "m", 10, 1);
+        let a2 = auth_account("auth-2", "m", 10, 9);
+        let plan = authorize_and_plan_with_accounts(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &[channel],
+            &[a1, a2],
+            &flags(false),
+            &json!({}),
+            &mut StdRng::seed_from_u64(9),
+        )
+        .unwrap();
+        let candidates = &plan.groups[0].candidates;
+        assert_eq!(plan.groups[0].tier, GroupTier::Native);
+        assert_eq!(candidates.len(), 3);
+        assert!(matches!(
+            &candidates[0].candidate,
+            RouteCandidate::AuthAccount(_)
+        ));
+        assert!(candidates.iter().any(|c| c.candidate.id() == "auth-1"));
+        assert!(candidates.iter().any(|c| c.candidate.id() == "auth-2"));
+        assert!(candidates
+            .iter()
+            .any(|c| c.candidate.id() == "only-channel"));
+        assert!(candidates
+            .iter()
+            .all(|c| c.candidate.id() != "remote-auth-1"));
+    }
+
+    #[test]
+    fn auth_accounts_filter_models_lifecycle_and_quota_but_allow_expired_recovery() {
+        let key = api_key(&[], &["unrelated-channel"]);
+        let available = auth_account("available", "m", 1, 1);
+        let mut empty_models = auth_account("empty", "m", 1, 1);
+        empty_models.model_states_json = json!({"version": 1, "models": []}).to_string();
+        let mut disabled = auth_account("disabled", "m", 1, 1);
+        disabled.disabled = 1;
+        let mut invalid = auth_account("invalid", "m", 1, 1);
+        invalid.status = "invalid".into();
+        let mut future_quota = auth_account("future", "m", 1, 1);
+        future_quota.quota_json = Some(
+            json!({
+                "version": 1, "exceeded": true, "reason": "quota",
+                "next_recover_at": "2999-01-01T00:00:00Z", "backoff_level": 0, "limits": []
+            })
+            .to_string(),
+        );
+        let mut recovered_quota = auth_account("recovered", "m", 1, 1);
+        recovered_quota.quota_json = Some(
+            json!({
+                "version": 1, "exceeded": true, "reason": "quota",
+                "next_recover_at": "2000-01-01T00:00:00Z", "backoff_level": 0, "limits": []
+            })
+            .to_string(),
+        );
+        let candidates = resolve_route_candidates(
+            &[],
+            &[
+                available,
+                empty_models,
+                disabled,
+                invalid,
+                future_quota,
+                recovered_quota,
+            ],
+            "m",
+            &key,
+        );
+        let ids = candidates
+            .iter()
+            .map(RouteCandidate::id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["available", "recovered"]);
+    }
+
+    #[test]
+    fn auth_classification_ignores_channel_flags_and_never_serves_unsupported_endpoints() {
+        let account = auth_account("auth", "m", 1, 1);
+        let key = api_key(&[], &[]);
+        let flags_off = FeatureFlags {
+            new_routeplan: false,
+            cross_protocol_codec: false,
+            native_responses: false,
+            ollama_native: false,
+        };
+        let responses = authorize_and_plan_with_accounts(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &[],
+            &[account.clone()],
+            &flags_off,
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap();
+        assert_eq!(responses.groups[0].tier, GroupTier::Native);
+        assert_eq!(
+            responses.groups[0].upstream_protocol,
+            UpstreamProtocol::Responses
+        );
+        let chat = authorize_and_plan_with_accounts(
+            &key,
+            "m",
+            EndpointKind::ChatCompletions,
+            &[],
+            &[account.clone()],
+            &flags_off,
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap();
+        assert_eq!(chat.groups[0].tier, GroupTier::Conversion);
+        let messages = authorize_and_plan_with_accounts(
+            &key,
+            "m",
+            EndpointKind::Messages,
+            &[],
+            &[account.clone()],
+            &flags_off,
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap();
+        assert_eq!(messages.groups[0].tier, GroupTier::Conversion);
+        assert!(matches!(
+            authorize_and_plan_with_accounts(
+                &key,
+                "m",
+                EndpointKind::CountTokens,
+                &[],
+                &[account],
+                &flags_off,
+                &json!({}),
+                &mut seeded(),
+            ),
+            Err(PlanError::NoEndpointSupported(EndpointKind::CountTokens, _))
+        ));
+    }
+
+    #[test]
+    fn auth_debug_snapshot_is_metadata_only() {
+        let key = api_key(&[], &[]);
+        let plan = authorize_and_plan_with_accounts(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &[],
+            &[auth_account("auth", "m", 1, 1)],
+            &flags(false),
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap();
+        let snapshot = plan.debug_json().to_string();
+        assert!(snapshot.contains("auth_account"));
+        assert!(snapshot.contains("codex"));
+        assert!(!snapshot.contains("route-secret"));
+        assert!(!snapshot.contains("refresh-secret"));
+        assert!(!snapshot.contains("payload_json"));
     }
 }
