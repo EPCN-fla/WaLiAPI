@@ -11,9 +11,7 @@
 
 </div>
 
-> **WaLiAPI** 是一款本地运行的 LLM API 网关桌面软件。它将多个上游模型供应商（OpenAI、Claude、DeepSeek、Gemini……）统一为 OpenAI 兼容协议，配合 [WaLiCode](https://walicode.xiaofuge.cn/)、Codex、Claude Code、Gemini CLI、OpenClaw 等 AI 编程工具使用，让你清楚知道 AI 对话到底在说什么。
-
-⭐️ 推荐 LLM 套餐(Kimi K3)：[https://mp.weixin.qq.com/s/jb2YzxFLNhIhjW5EONLcDA](https://mp.weixin.qq.com/s/jb2YzxFLNhIhjW5EONLcDA)
+> **WaLiAPI** 是一款本地运行的 LLM API 网关桌面软件。它将多个上游模型供应商（OpenAI、Claude、DeepSeek、Gemini……）统一为 OpenAI 兼容协议，配合 [WaLiCode](https://walicode.xiaofuge.cn/)、Codex、Claude Code、Gemini CLI、OpenClaw 等 AI 编程工具使用，让你清楚知道 AI 对话到底在说什么。 ⭐️ 推荐 LLM 套餐(Kimi K3)：[https://mp.weixin.qq.com/s/jb2YzxFLNhIhjW5EONLcDA](https://mp.weixin.qq.com/s/jb2YzxFLNhIhjW5EONLcDA)
 
 ---
 
@@ -299,10 +297,10 @@ curl http://127.0.0.1:8777/v1/messages \
 
 ### 1. 下载安装包
 
-从 GitHub Releases 或夸克网盘下载对应平台安装包：
+从 GitHub Releases 或网盘下载对应平台安装包：
 
 - GitHub: [https://github.com/fuzhengwei/WaLiAPI/releases](https://github.com/fuzhengwei/WaLiAPI/releases)
-- 夸克网盘: [https://pan.quark.cn/s/b6a134a77efa](https://pan.quark.cn/s/b6a134a77efa)
+- 网盘: [https://drive.weixin.qq.com/s?k=ACMA4AfQABU4S23jg8#/](https://drive.weixin.qq.com/s?k=ACMA4AfQABU4S23jg8#/)
 
 | 平台 | 格式 | 架构 |
 |:---|:---|:---|
