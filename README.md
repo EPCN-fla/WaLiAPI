@@ -64,7 +64,7 @@ graph TD
             G3[向量化<br/>复用渠道 Embedding]
             G4[HNSW 索引<br/>向量检索 + FTS5 混合]
             G5[RAG 引擎<br/>混合检索 → 重排 → 生成回答]
-            G6[MCP Server<br/>Streamable HTTP + SSE<br/>29 个工具 (KB 13 + Wiki 16)]
+            G6["MCP Server<br/>Streamable HTTP + SSE<br/>29 个工具 [KB 13 + Wiki 16]"]
             G7[Wiki 引擎<br/>结构化知识库 · frontmatter 标签<br/>wikilinks 图谱 · 摄入管道]
 
             G1 --> G2 --> G3 --> G4
