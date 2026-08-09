@@ -268,10 +268,20 @@ async fn write_non_stream_log(
 
     // Fallback: estimate tokens locally when upstream didn't return usage.
     // Only estimate for successful (2xx) responses — errors have no real content.
-    if total == 0 && prompt == 0 && completion == 0 && execution.status >= 200 && execution.status < 300 {
-        let req_body: serde_json::Value = serde_json::from_str(sanitized_log_body).unwrap_or(serde_json::Value::Null);
+    if total == 0
+        && prompt == 0
+        && completion == 0
+        && execution.status >= 200
+        && execution.status < 300
+    {
+        let req_body: serde_json::Value =
+            serde_json::from_str(sanitized_log_body).unwrap_or(serde_json::Value::Null);
         let resp_text = super::estimate_usage::extract_response_text(&execution.body);
-        let (p, c, t) = super::estimate_usage::estimate_usage(&req_body, Some(&resp_text), &audited.envelope.model);
+        let (p, c, t) = super::estimate_usage::estimate_usage(
+            &req_body,
+            Some(&resp_text),
+            &audited.envelope.model,
+        );
         prompt = p;
         completion = c;
         total = t;

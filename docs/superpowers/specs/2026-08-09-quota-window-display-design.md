@@ -47,34 +47,41 @@
 - `quota_from_headers` 的 `limits.is_empty() && status != 429 → None` 逻辑不变,空限额时不再写入 quota_json(保留 null/旧值)
 - 路由层只消费 `exceeded`/`next_recover_at`,不读窗口,不受影响
 
-### D2:标签映射对齐上游 `get_limits_duration`(TSX,±5% 容差)
+### D2:标签只支持三种(TSX,±5% 容差),重置显示具体时间点
 
-`QuotaBlock.tsx::windowLabel` 按 `window_minutes` 匹配官方映射:
+`QuotaBlock.tsx::windowLabel` 按 `window_minutes`(**单位是分钟**)近似匹配三种标签:
 
 | `window_minutes` | 标签 |
 |---|---|
-| 300 (5h) | 5小时窗口 |
-| 1440 (1d) | 日窗口 |
-| 10080 (7d) | 周窗口 |
-| 43200 (30d) | 月窗口 |
-| 525600 (365d) | 年窗口 |
-| 其它 ≥60 | N小时窗口 |
-| 其它 <60 | N分钟窗口 |
+| 300 (5h) | 5H限额 |
+| 10080 (7d) | 周限额 |
+| 43200 (30d) | 月限额 |
+| 其它 | 裸「限额」(不猜时长) |
 
-`window_minutes` 缺失 → 回退 fallback("主窗口"/"次窗口")。**不硬编码 free/非 free** —— 上游返回 43200 就显示月、返回 10080 就显示周。
+`window_minutes` 缺失 → 裸「限额」。**不硬编码 free/非 free** —— 上游返回 43200 就显示月、返回 10080 就显示周。
+
+**重置显示具体时间点**:`resetLabel` 用 `reset_at` 本地化格式化为月/日/时/分(如 `9/8 15:03`),不用相对时长(曾误显示「30 天后」且标签「12小时窗口」因单位 bug 错乱)。`reset_at` 缺失 → **不渲染重置行**(用户要求:缺失就不显示重置时间点)。
 
 ### D3:渲染层防御性跳过空窗口(TSX)
 
 `QuotaBlock.tsx` 渲染时用与 D1 相同的规则过滤窗口,使现存 DB 里的脏 `secondary` 立即不显示,不必等下次上游响应刷新。
 
-### D4:reset_at 按可选字段处理(现状已正确,不改)
+### D4:reset_at 按可选字段处理
 
-`reset_at` 为 `Option`,上游返回则展示具体时间,缺失则显示"恢复时间待上游返回"。plus 号实测数据未取得,但解析与渲染均已按可选字段处理。
+`reset_at` 为 `Option`,上游返回则展示具体时间点,缺失则不渲染重置行。plus 号实测(通过 `wham/usage`)返回 `reset_at`,正常显示。
 
-### D5:文档同步(`docs/auth-codex`)
+### D5:主动探测专门限额端点(无流量时更新)
 
-- `00-facts.md`:去掉 "primary=5h / secondary=周" 硬编码假设,改为按实际返回 + 官方标签映射
-- `work/02-design.md` §5.3:补充空窗口丢弃 + 动态标签
+上游提供专门限额端点 `GET {backend-api}/wham/usage`(权威状态),实测:
+- free 号:`limit_window_seconds=2592000`(30 天月限额)
+- plus 号:`limit_window_seconds=604800`(7 天周限额),`used_percent=58`,`credits.balance="1908.09"`
+
+`codex_backend.rs` 加 `quota_from_usage_payload`(归一化秒→分钟、UNIX→RFC3339,只保留 primary)+ `CodexProvider.fetch_quota`(GET `/wham/usage`)。`AuthService.sync_quota` 在**模型同步后/刷新后/维护循环(12h)**调用,失败静默保留旧值。`Provider` trait 加 `fetch_quota` 默认 no-op。
+
+### D6:文档同步(`docs/auth-codex`)
+
+- `00-facts.md`:去掉 "primary=5h / secondary=周" 硬编码,改为按实际返回 + 专门端点
+- `work/02-design.md` §5.3:补充空窗口丢弃 + 动态标签 + 主动探测
 - `01-ui-spec.md` 限额块示例:改用真实月窗口数据
 
 ## 测试
@@ -84,11 +91,14 @@ Rust `codex_backend.rs` 增加 table 测试:
 - `window_minutes=43200` 保留(月窗口)
 - `used-percent=23` 无时长保留(现有 `other` 用例不受影响)
 - 全 null 限额项被丢弃
+- `quota_from_usage_payload`:plus 周窗口(604800s→10080min)、free 月窗口(2592000s→43200min)、limit_reached→exceeded、缺 quota 数据→None
+- `fetch_quota` 命中 `/wham/usage` 端点
+
+`service.rs`:`sync_quota` 成功持久化、失败静默保留旧值。
 
 前端无测试框架,不改。
 
 ## 不在范围
 
-- 不新增主动 quota 探测(沿用响应头 + 429 兜底)
 - 不写死 free/非 free 的窗口类型
-- 不改路由层 quota 语义
+- 不改路由层 quota 语义(路由只看 `exceeded`/`next_recover_at`)

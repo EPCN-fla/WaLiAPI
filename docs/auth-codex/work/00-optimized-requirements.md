@@ -21,7 +21,7 @@
 | # | 原文档说法 | 修正后的现状 | 引用 |
 |---|---|---|---|
 | C-1 | `route_plan.rs` / `attempt.rs` 位于 `endpoint_executor/` | **已迁至 `core/`**（`core/route_plan.rs`、`core/attempt.rs`）。行号仍吻合，仅目录路径过时 | `core/mod.rs` 声明 |
-| C-2 | 兼容审查 risk #1「没有候选抽象，RoutePlan 候选是具体 Channel」 | **`RouteGroupCandidate` 中间类型已存在**（`core/route_plan.rs:110-117`），`HasPriorityWeight` 已为它实现（:226-233）。候选泛化只需把 `channel: Channel` 换成 Channel∪Account 载体，并同步 4 处消费点 | 见 §3.2 |
+| C-2 | 兼容审查 risk #1「没有候选抽象，RoutePlan 候选是具体 Channel」 | **`RouteGroupCandidate` 中间类型已存在**（`core/route_plan.rs:110-117`），`HasPriorityWeight` 已为它实现（:226-233）。候选泛化需把 `channel: Channel` 换成 Channel∪Account 载体，并同步全部消费点（不止 4 处，见 §3.2 / 01-requirements-review §4） | 见 §3.2 |
 | C-3 | 兼容审查 risk #2「driver lookup map 一处硬 panic」 | **两处**：非流式 `route_plan_response`（`endpoint_executor/driver.rs:106-109`）+ 流式 `route_stream_plan`（driver.rs:414-417），各有一份 `HashMap<String,(Channel,ChannelIdentity)>` + `.expect()` | |
 | C-4 | `01-ui-spec.md` 颜色 token `--primary=#3b82f6`、`--border=#e2e8f0` | 实际 `src/App.css:12` `--color-primary: #2f6fed`、`:8` `--color-border: rgba(15,23,42,0.08)`；**无 `--emerald/--amber/--red` 变量**，配色走 Tailwind 默认 palette | 前端实现按实际 token |
 | C-5 | （隐含）zustand / @tanstack/react-query 可用 | 两依赖在 `src/` **零使用**；页面全用 `useState` + 手动 `load()`。新页面沿用此模式，不引入 react-query 体系 | |
@@ -41,7 +41,7 @@
 | C-14 | `request_logs` 无 `upstream_type` 列；无 `auth_accounts` 表 | `db/models.rs:187-227`；迁移最新 018 |
 | C-15 | 原生直通流式 usage 只读顶层 `usage`（`sse.rs:116`）→ `response.completed.response.usage` 取不到；非流式已支持（`endpoint_executor/mod.rs:667-682`） | D-4，v1 必补 |
 | C-16 | 无出站前懒刷新令牌钩子（`send_request` 用静态 `channel.api_key`，`endpoint_executor/mod.rs:461`）；可仿 `gemini_native` override 分叉先例（:434-452） | |
-| C-17 | 命令层返回 `Result<T,String>`，DTO 掩码模式（`ChannelDto.mask_key`，`commands/channel.rs:49-88`）；auth 表需 DTO 掩码 refresh_token | |
+| C-17 | 命令层返回 `Result<T,String>`，DTO 掩码模式（`ChannelDto.mask_key`，`commands/channel.rs:49-88`）；auth 表需 DTO 掩码 refresh_token。复核者补强：不止 refresh_token，**access_token / id_token / 完整 payload_json 一律不得越过 command 边界**（ADR-20），见 01-requirements-review §4 | |
 | C-18 | Sidebar NavLink 前缀匹配（`Sidebar.tsx:87-96`）会把 `/channels/auth` 也标 active，需 `endpoint` 特判 | |
 | C-19 | `allowed_channels` 是 **channel-id 白名单**（`core/route_plan.rs:371-380`），账号无 channel id，语义上天然豁免 → 需显式决策 | 见 §2.2 D-B |
 
@@ -53,7 +53,7 @@
 
 **数据层**
 - `auth_accounts` 表（通用列 + `payload_json` 两层结构，ADR-3/13）：通用列 `id / provider / label / account_id / status / disabled / priority / weight / quota_json / model_states_json / attributes_json / last_refreshed_at / next_refresh_after / next_retry_after / created_at / updated_at`；`payload_json` 存 codex 令牌载荷（access_token / refresh_token / id_token / expires_at）。
-- `request_logs.upstream_type` 列（`TEXT NOT NULL DEFAULT 'channel'`，ADR-30）；三处 RequestLog 写点带上类型；`RequestLog` 结构体追加字段。
+- `request_logs.upstream_type` 列（`TEXT NOT NULL DEFAULT 'channel'`，ADR-30）；**全部** RequestLog 生产构造点（非三处——复核确认至少 19 处生产构造点 + 测试构造点）带上类型，旧路径显式或默认写 `channel`；`RequestLog` 结构体追加非 Optional 字段。
 
 **Provider 抽象（ADR-12）**
 - `Provider` trait：登录 / 刷新 / 出站三块。codex 为首个实现。
@@ -68,7 +68,7 @@
 - 单个 12h 后台任务（D-F 合并）：令牌刷新 + 模型同步 + 失效账号重试刷新，一个循环。
 
 **路由层（ADR-6/9/11/16/22）**
-- 混合候选池：`RouteGroupCandidate.channel` 泛化为 Channel∪Account 载体；`HasPriorityWeight` 对账号候选 impl；同步 4 处消费点（§3.2）。
+- 混合候选池：`RouteGroupCandidate.channel` 泛化为 Channel∪Account 载体；`HasPriorityWeight` 对账号候选 impl；同步全部消费点（§3.2，含 `authorize_and_plan`/handler/`plan_executor::AttemptMeta`/`debug_json`）。
 - 账号过滤：`resolve_model_candidates` 增加账号级 QuotaState / 失效 / 停用过滤（镜像 `status==1`）。
 - `classify_channel` 账号分支：**Chat / Messages / Responses 均出组**（D-A）。
 - `allowed_channels` 账号豁免（D-B，保持白名单 channel-id 语义）。
@@ -79,7 +79,7 @@
 - **保守约束（D-A）**：字段 allowlist（backend-api 拒绝的字段不直通）；`stream:false` 不可靠时强制 `stream:true` 兜底；`codex.rate_limits` SSE 事件**原样透传不归一化**。
 
 **限额（ADR-14/15/16/28）**
-- 写死已知窗口（codex 5h / 周）算恢复点；出站响应头解析 `x-codex-primary-*` / `x-codex-secondary-*`（used-percent / window-minutes / reset-at）更新 `quota_json`（钩子：`AttemptSuccess.response_headers` 已透传）；429 / Retry-After 动态兼容；无返回视为无限额。
+- 出站响应头动态解析 `x-<limit_id>-<primary|secondary>-*`（used-percent / window-minutes / reset-at）更新 `quota_json`（钩子：`AttemptSuccess.response_headers` 已透传）；**不写死窗口类型**（codex 实际无 5h 窗口——free=月限额、非 free=周限额，按 `window-minutes` 推导）；仅 `used-percent:0` 的空窗口丢弃；429 / Retry-After 动态兼容；无返回视为无限额。
 - 账号级踢出/恢复（整个账号为粒度）；30min 空闲主动探测**延后**。
 
 **Codec（ADR-31，D-A）**
@@ -93,7 +93,7 @@
 - 登录时自动拉取 `GET /models` + 12h 后台同步 + 手动刷新；只读、全量支持；`GET /models` 失败保留旧快照。
 
 **Tauri 命令集（ADR-20）**
-- `auth_accounts_list / auth_login / auth_login_import / auth_logout(revoke) / auth_refresh_token / auth_sync_models / auth_write_back / auth_toggle / auth_quota_status / auth_update`。命令文件新建 `commands/auth.rs`，注册 `lib.rs` invoke_handler（:133-228）。
+- `auth_accounts_list / auth_login / auth_login_import / auth_logout（纯本地删除，无 revoke）/ auth_refresh_token / auth_sync_models / auth_write_back / auth_toggle / auth_quota_status / auth_update`。命令文件新建 `commands/auth.rs`，注册 `lib.rs` invoke_handler（:133-228）。
 
 **前端（ADR-4/17/25/26/27/29 + 01-ui-spec）**
 - 路由：`/channels`（更名 API 管理）+ `/channels/auth`（Auth 页）；Sidebar 渠道项前缀匹配需 `endpoint` 处理。
@@ -121,7 +121,7 @@
 
 | 待验证 | v1 兜底处置 |
 |---|---|
-| backend-api 是否接受 `stream:false` | 账号适配器强制 `stream:true`（或扩展 `decode_non_stream` SSE 容忍分支） |
+| backend-api 是否接受 `stream:false` | 账号适配器**统一强制 `stream:true`**，非流式下游在适配器内部缓冲聚合（D-A / ADR-36，复核确认不再保留 `decode_non_stream` 容忍分支选项） |
 | backend-api 拒绝哪些请求字段 | 账号适配器做字段 allowlist（参照 `codex-rs/codex-api` 实际发送），400/422 走 `CallerTerminal` |
 | `/responses` 流是否插入 `codex.rate_limits` SSE 事件 | Native 直通原样透传，不归一化 |
 
@@ -143,8 +143,8 @@
 `RouteGroupCandidate`（`core/route_plan.rs:110-117`）已存在。改动点：
 1. 引入候选载体（enum `RouteCandidate { Channel(Channel), Account(AuthAccount) }` 或 trait）。
 2. `RouteGroupCandidate.channel: Channel` 换成载体；`HasPriorityWeight` 转发目标改（:226-233）。
-3. 消费点 4 处：`resolve_model_candidates`（:366-380）、`build_route_plan`（:545-642）、driver 两处 lookup（`driver.rs:87-97` 非流 / `:354-364` 流，panic 在 :106-109 / :414-417）、`build_prepared_attempt`（`core/attempt.rs:200-285`）。
-4. **AttemptFlow / plan_executor 重试机器不需要改**（executor 闭包已泛化，`plan_executor.rs:74-206`）。
+3. 消费点不止 4 处（复核收窄后补全，01-requirements-review §4）：`resolve_model_candidates`（:366-380）、`build_route_plan`（:545-642）、driver 两处 lookup（`driver.rs:87-97` 非流 / `:354-364` 流，panic 在 :106-109 / :414-417）、`build_prepared_attempt`（`core/attempt.rs:200-285`），以及 `authorize_and_plan` 签名与 `channels.is_empty()` 早退（:662-679, 682-715）、生产 handler 的账号加载（`server/handlers.rs`）、`plan_executor::AttemptMeta` 对候选的读取（`plan_executor.rs:56-113`）、`debug_json`。
+4. **AttemptFlow 重试状态机不需要改**（executor 闭包已泛化，`plan_executor.rs:74-206`），但 `plan_executor.rs` 的候选元数据读取必须改。
 
 ### 3.3 Responses→Chat codec 复用面与缺口（校准后）
 

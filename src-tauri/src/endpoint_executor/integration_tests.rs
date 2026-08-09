@@ -400,8 +400,10 @@ mod auth_account {
         let sse = concat!(
             "event: response.created\n",
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Shanghai\\\"}\"}}\n\n",
             "event: response.completed\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\",\"status\":\"completed\",\"output\":[{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Shanghai\\\"}\"}],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
             "data: [DONE]\n\n"
         );
         ([(header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
@@ -540,7 +542,7 @@ mod auth_account {
                     DownstreamProtocol::ChatCompletions,
                     "chat_completions",
                     "m",
-                    json!({"model":"m","messages":[{"role":"user","content":"hi"}],"stream":stream}),
+                    json!({"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],"stream":stream}),
                 ),
                 "chat",
                 "chat.completion",
@@ -550,7 +552,7 @@ mod auth_account {
                     DownstreamProtocol::Messages,
                     "messages",
                     "m",
-                    json!({"model":"m","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"stream":stream}),
+                    json!({"model":"m","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}],"stream":stream}),
                 ),
                 "anthropic",
                 "message",
@@ -588,6 +590,73 @@ mod auth_account {
         .unwrap()
     }
 
+    fn assert_non_stream_shape(endpoint: EndpointKind, body: &[u8]) {
+        let json: Value = serde_json::from_slice(body).unwrap();
+        match endpoint {
+            EndpointKind::ChatCompletions => {
+                assert_eq!(json["object"], "chat.completion");
+                assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
+                assert_eq!(json["usage"]["prompt_tokens"], 3);
+                assert_eq!(json["usage"]["completion_tokens"], 2);
+                assert_eq!(
+                    json["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+                    "weather"
+                );
+                assert_eq!(
+                    json["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+                    "{\"city\":\"Shanghai\"}"
+                );
+            }
+            EndpointKind::Messages => {
+                assert_eq!(json["type"], "message");
+                assert_eq!(json["stop_reason"], "tool_use");
+                assert_eq!(json["usage"]["input_tokens"], 3);
+                assert_eq!(json["usage"]["output_tokens"], 2);
+                assert_eq!(json["content"][0]["type"], "tool_use");
+                assert_eq!(json["content"][0]["name"], "weather");
+                assert_eq!(json["content"][0]["input"]["city"], "Shanghai");
+            }
+            EndpointKind::Responses => {
+                assert_eq!(json["id"], "resp_1");
+                assert_eq!(json["status"], "completed");
+                assert_eq!(json["usage"]["input_tokens"], 3);
+                assert_eq!(json["usage"]["output_tokens"], 2);
+                assert_eq!(json["output"][0]["type"], "function_call");
+                assert_eq!(json["output"][0]["name"], "weather");
+                assert_eq!(json["output"][0]["arguments"], "{\"city\":\"Shanghai\"}");
+            }
+            _ => unreachable!("account routes only support three downstream endpoints"),
+        }
+    }
+
+    fn assert_stream_shape(endpoint: EndpointKind, body: &[u8]) {
+        let text = String::from_utf8_lossy(body);
+        match endpoint {
+            EndpointKind::ChatCompletions => {
+                assert!(text.contains("\"finish_reason\":\"tool_calls\""), "{text}");
+                assert!(text.contains("\"prompt_tokens\":3"), "{text}");
+                assert!(text.contains("\"completion_tokens\":2"), "{text}");
+                assert!(text.contains("\"name\":\"weather\""), "{text}");
+                assert!(text.contains("Shanghai"), "{text}");
+            }
+            EndpointKind::Messages => {
+                assert!(text.contains("content_block_start"), "{text}");
+                assert!(text.contains("\"type\":\"tool_use\""), "{text}");
+                assert!(text.contains("\"name\":\"weather\""), "{text}");
+                assert!(text.contains("Shanghai"), "{text}");
+                assert!(text.contains("\"stop_reason\":\"tool_use\""), "{text}");
+            }
+            EndpointKind::Responses => {
+                assert!(text.contains("response.completed"), "{text}");
+                assert!(text.contains("\"type\":\"function_call\""), "{text}");
+                assert!(text.contains("\"name\":\"weather\""), "{text}");
+                assert!(text.contains("\"input_tokens\":3"), "{text}");
+                assert!(text.contains("\"output_tokens\":2"), "{text}");
+            }
+            _ => unreachable!("account routes only support three downstream endpoints"),
+        }
+    }
+
     #[tokio::test]
     async fn three_protocols_stream_and_non_stream_force_responses_sse_and_log_account_source() {
         let (repo, service, state, account) = setup().await;
@@ -618,6 +687,7 @@ mod auth_account {
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();
+            assert_non_stream_shape(endpoint, &body);
             assert!(
                 String::from_utf8_lossy(&body).contains(expected),
                 "{endpoint:?} non-stream body: {}",
@@ -650,6 +720,7 @@ mod auth_account {
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();
+            assert_stream_shape(endpoint, &body);
             let stream_expected = if endpoint == EndpointKind::Responses {
                 "response.completed"
             } else {

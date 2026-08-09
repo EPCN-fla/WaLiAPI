@@ -92,15 +92,16 @@ pub fn encode_chat_to_responses(
     let mut response = Map::new();
     response.insert("model".to_owned(), Value::String(model.to_owned()));
     response.insert("input".to_owned(), Value::Array(input));
-    response.insert(
-        "max_output_tokens".to_owned(),
-        object
-            .get("max_completion_tokens")
-            .or_else(|| object.get("max_tokens"))
-            .and_then(Value::as_u64)
-            .map(Value::from)
-            .unwrap_or_else(|| Value::from(4096_u64)),
-    );
+    if let Some(max_output_tokens) = object
+        .get("max_completion_tokens")
+        .or_else(|| object.get("max_tokens"))
+        .and_then(Value::as_u64)
+    {
+        response.insert(
+            "max_output_tokens".to_owned(),
+            Value::from(max_output_tokens),
+        );
+    }
     response.insert(
         "stream".to_owned(),
         Value::Bool(
@@ -433,6 +434,17 @@ fn chat_tools_to_responses(
                     "only function tools are supported",
                 ));
             }
+            if let Some(object) = tool.as_object() {
+                for key in object.keys() {
+                    if !["type", "function"].contains(&key.as_str()) {
+                        return Err(UnsupportedFeatures::single(
+                            FeatureKind::UnsupportedField,
+                            format!("{p}/{key}"),
+                            "tool property is not representable",
+                        ));
+                    }
+                }
+            }
             let function = tool.get("function").ok_or_else(|| {
                 UnsupportedFeatures::single(
                     FeatureKind::MissingToolField,
@@ -616,6 +628,14 @@ pub fn decode_responses_response_to_chat(
                             "function call requires arguments",
                         )
                     })?;
+                if !serde_json::from_str::<Value>(arguments).is_ok_and(|parsed| parsed.is_object())
+                {
+                    return Err(UnsupportedFeatures::single(
+                        FeatureKind::InvalidToolArguments,
+                        format!("/output/{index}/arguments"),
+                        "function call arguments must be a valid JSON object",
+                    ));
+                }
                 calls.push(serde_json::json!({"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}}));
             }
             Some("reasoning") => {
@@ -640,15 +660,48 @@ pub fn decode_responses_response_to_chat(
     if !reasoning.is_empty() {
         message["reasoning_content"] = Value::String(reasoning);
     }
+    let has_tool_calls = !calls.is_empty();
     if !calls.is_empty() {
         message["tool_calls"] = Value::Array(calls);
     }
+    let finish_reason = responses_finish_reason(response, has_tool_calls)?;
     Ok(serde_json::json!({
         "id": response.get("id").and_then(Value::as_str).unwrap_or(&context.request_id),
         "object":"chat.completion", "created":response.get("created_at").and_then(Value::as_i64).unwrap_or_else(|| chrono::Utc::now().timestamp()), "model":response.get("model").and_then(Value::as_str).unwrap_or(&context.upstream_model),
-        "choices":[{"index":0,"message":message,"finish_reason":if message.get("tool_calls").is_some() { "tool_calls" } else { "stop" }}],
+        "choices":[{"index":0,"message":message,"finish_reason":finish_reason}],
         "usage":{"prompt_tokens":usage.input_tokens,"completion_tokens":usage.output_tokens,"total_tokens":usage.input_tokens+usage.output_tokens}
     }))
+}
+
+fn responses_finish_reason(
+    response: &Value,
+    has_tool_calls: bool,
+) -> Result<&'static str, UnsupportedFeatures> {
+    match response.get("status").and_then(Value::as_str) {
+        Some("completed") | None => Ok(if has_tool_calls { "tool_calls" } else { "stop" }),
+        Some("incomplete") => match response
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+        {
+            Some("max_output_tokens") | Some("max_tokens") | None => Ok("length"),
+            Some("content_filter") | Some("safety") => Ok("content_filter"),
+            Some(other) => Err(UnsupportedFeatures::single(
+                FeatureKind::UnknownFinishReason,
+                "/incomplete_details/reason",
+                format!("unknown Responses incomplete reason {other:?}"),
+            )),
+        },
+        Some("failed") => Err(UnsupportedFeatures::single(
+            FeatureKind::UnknownEvent,
+            "/status",
+            "Responses response status is failed",
+        )),
+        Some(other) => Err(UnsupportedFeatures::single(
+            FeatureKind::UnknownEvent,
+            "/status",
+            format!("Responses response has unsupported status {other:?}"),
+        )),
+    }
 }
 
 pub fn usage_from_responses(response: &Value) -> Usage {
@@ -687,6 +740,7 @@ impl NonStreamDecoder for ResponsesNonStreamDecoder {
 pub struct ResponsesEventAccumulator {
     pending: Vec<u8>,
     completed: Option<Value>,
+    output_items: BTreeMap<u64, Value>,
     failed: Option<String>,
 }
 impl ResponsesEventAccumulator {
@@ -711,6 +765,15 @@ impl ResponsesEventAccumulator {
             )
         })?;
         match event.get("type").and_then(Value::as_str) {
+            Some("response.output_item.done") => {
+                if let Some(item) = event.get("item").cloned() {
+                    let index = event
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(self.output_items.len() as u64);
+                    self.output_items.insert(index, item);
+                }
+            }
             Some("response.completed") => self.completed = event.get("response").cloned(),
             Some("response.failed") | Some("response.incomplete") => {
                 self.failed = Some("Responses upstream reported a terminal failure".to_string())
@@ -734,13 +797,24 @@ impl ResponsesEventAccumulator {
                 "Responses upstream failed",
             ));
         }
-        self.completed.take().ok_or_else(|| {
+        let mut completed = self.completed.take().ok_or_else(|| {
             UnsupportedFeatures::single(
                 FeatureKind::UnknownEvent,
                 "/",
                 "Responses SSE ended without response.completed",
             )
-        })
+        })?;
+        let needs_output_backfill = completed
+            .get("output")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty);
+        if needs_output_backfill && !self.output_items.is_empty() {
+            let output = self.output_items.into_values().collect::<Vec<_>>();
+            if let Some(object) = completed.as_object_mut() {
+                object.insert("output".to_owned(), Value::Array(output));
+            }
+        }
+        Ok(completed)
     }
 }
 
@@ -1184,6 +1258,17 @@ mod tests {
         assert_eq!(encoded["model"], "gpt-test");
         assert_eq!(encoded["input"][1]["type"], "function_call");
     }
+
+    #[test]
+    fn chat_request_does_not_synthesize_unsupported_max_output_tokens() {
+        let request = serde_json::json!({
+            "model": "ignored",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (encoded, _) = encode_chat_to_responses(&request, "gpt-test").unwrap();
+        assert!(encoded.get("max_output_tokens").is_none());
+    }
+
     #[test]
     fn responses_stream_terminal_usage_once_and_any_split() {
         let events = concat!(
@@ -1234,9 +1319,23 @@ mod tests {
     }
 
     #[test]
+    fn accumulator_backfills_empty_completed_output_from_item_done() {
+        let mut accumulator = ResponsesEventAccumulator::default();
+        accumulator
+            .push(br#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}
+
+data: {"type":"response.completed","response":{"id":"resp_1","model":"m","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}
+
+"#)
+            .unwrap();
+        let completed = accumulator.finish().unwrap();
+        assert_eq!(completed["output"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
     fn non_stream_decoders_cover_responses_chat_and_messages() {
         let completed = serde_json::json!({
-            "id":"resp_1", "model":"m", "output":[
+            "id":"resp_1", "model":"m", "status":"completed", "output":[
                 {"type":"reasoning", "summary":[{"type":"summary_text", "text":"think"}]},
                 {"type":"message", "content":[{"type":"output_text", "text":"answer"}]},
                 {"type":"function_call", "call_id":"call_1", "name":"weather", "arguments":"{}"}
@@ -1250,6 +1349,39 @@ mod tests {
             .decode(&completed)
             .unwrap();
         assert_eq!(messages["type"], "message");
+    }
+
+    #[test]
+    fn non_stream_responses_incomplete_never_becomes_stop() {
+        let incomplete = serde_json::json!({
+            "id":"resp_1",
+            "model":"m",
+            "status":"incomplete",
+            "incomplete_details":{"reason":"max_output_tokens"},
+            "output":[{"type":"message", "content":[{"type":"output_text", "text":"partial"}]}],
+            "usage":{"input_tokens":2,"output_tokens":3}
+        });
+        let context = ConversionContext::new("chatcmpl_1", "m", false);
+        let chat = decode_responses_response_to_chat(&incomplete, &context).unwrap();
+        assert_eq!(chat["choices"][0]["finish_reason"], "length");
+        let messages = ResponsesMessagesNonStreamDecoder { context }
+            .decode(&incomplete)
+            .unwrap();
+        assert_eq!(messages["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn non_stream_responses_failed_is_rejected() {
+        let failed = serde_json::json!({
+            "id":"resp_1",
+            "model":"m",
+            "status":"failed",
+            "output":[],
+            "usage":{"input_tokens":1,"output_tokens":0}
+        });
+        let context = ConversionContext::new("chatcmpl_1", "m", false);
+        let error = decode_responses_response_to_chat(&failed, &context).unwrap_err();
+        assert!(error.json_pointers.contains(&"/status".to_string()));
     }
 
     #[test]

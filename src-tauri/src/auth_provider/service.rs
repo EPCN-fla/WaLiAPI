@@ -162,6 +162,10 @@ impl AuthService {
             )
             .await
             .map_err(|_| ProviderError::Storage)?;
+        // A user-invoked refresh is a natural moment to refresh quota state too.
+        // The refreshed payload is re-read below so the probe always carries the
+        // newest access token.
+        self.sync_quota(account_id).await;
         let account = self.get_account(account_id).await?;
         AuthAccountSummary::from_account(&account)
     }
@@ -187,8 +191,37 @@ impl AuthService {
             )
             .await
             .map_err(|_| ProviderError::Storage)?;
+        // Model sync is the login/import/refresh-triggered path; probe quota
+        // alongside so a freshly added account shows its limits without waiting
+        // for traffic or the 12h maintenance cycle.
+        self.sync_quota(account_id).await;
         let account = self.get_account(account_id).await?;
         AuthAccountSummary::from_account(&account)
+    }
+
+    /// Probe the provider's dedicated quota endpoint and persist the result.
+    /// Failures are silent and preserve whatever quota was previously stored —
+    /// a quota probe never turns a successful account operation into an error,
+    /// and never wipes known quota when the probe is unavailable.
+    pub async fn sync_quota(&self, account_id: &str) {
+        let Ok(account) = self.get_account(account_id).await else {
+            return;
+        };
+        if account.provider != "codex" {
+            return;
+        }
+        let Ok(payload) = Self::payload_for(&account) else {
+            return;
+        };
+        let Ok(provider) = self.registry.provider_for_name(&account.provider) else {
+            return;
+        };
+        let Ok(Some(quota)) = provider.fetch_quota(&account, &payload).await else {
+            return;
+        };
+        if let Err(error) = self.repository.update_quota(account_id, Some(&quota)).await {
+            tracing::warn!(account_id, "failed to persist auth account quota state: {error}");
+        }
     }
 
     /// Perform one serialized maintenance pass.  It intentionally works from
@@ -218,9 +251,18 @@ impl AuthService {
                 }
             };
             let refresh_result = match account.status.as_str() {
-                "active" if Self::needs_refresh(&payload, now + Duration::minutes(5)) => {
-                    self.refresh_account_if_due(&account.id, now + Duration::minutes(5))
-                        .await
+                "active" => {
+                    // Every active account syncs models on the 12h cycle.  The
+                    // refresh inside `sync_models` is lazy: a fresh token skips
+                    // it, a near-expiry token is refreshed first, and a refresh
+                    // failure aborts before any model request (preserving the
+                    // previous snapshot).  This keeps the model list — and thus
+                    // routeability of new models — fresh even for imported /
+                    // long-lived tokens (ADR-8, design §7 step 3).
+                    if let Err(error) = self.sync_models(&account.id).await {
+                        tracing::warn!(account_id = %account.id, "auth account model sync failed during maintenance: {error}");
+                    }
+                    continue;
                 }
                 "invalid"
                     if Self::has_refresh_token(&payload)
@@ -274,14 +316,17 @@ impl AuthService {
         // persisted payload before retrying so rotated refresh tokens cannot be
         // overwritten by concurrent callers.
         if self.force_refresh_account(account_id).await.is_err() {
-            self.mark_invalid(account_id).await;
+            // Rejected credentials get the same backoff as a failed lazy
+            // refresh, so the maintenance loop does not hammer the provider
+            // on the very next pass.
+            self.schedule_maintenance_retry(account_id).await;
             return Err(ProviderError::Unauthorized);
         }
         let retry = self
             .send_with_persisted_account(account_id, body, headers)
             .await?;
         if retry.status() == reqwest::StatusCode::UNAUTHORIZED {
-            self.mark_invalid(account_id).await;
+            self.schedule_maintenance_retry(account_id).await;
             return Err(ProviderError::Unauthorized);
         }
         self.persist_quota_if_present(account_id, &retry).await;
@@ -305,17 +350,6 @@ impl AuthService {
                 headers,
             })
             .await
-    }
-
-    async fn mark_invalid(&self, account_id: &str) {
-        if self
-            .repository
-            .mark_invalid(account_id, None)
-            .await
-            .is_err()
-        {
-            tracing::warn!(account_id, "failed to mark rejected auth account invalid");
-        }
     }
 
     async fn schedule_maintenance_retry(&self, account_id: &str) {
@@ -415,6 +449,7 @@ mod tests {
 
     use super::*;
     use crate::auth_provider::{LoginResult, Provider, ProviderModels, RefreshedPayload};
+    use crate::db::models::QuotaState;
 
     const ACCESS: &str = "fixture-access-token";
     const REFRESH: &str = "fixture-refresh-token";
@@ -432,6 +467,7 @@ mod tests {
         operations: AtomicUsize,
         models_fail: bool,
         refresh_fails: bool,
+        quota_fail: bool,
     }
     #[async_trait]
     impl Provider for FakeProvider {
@@ -480,6 +516,34 @@ mod tests {
             }
             Ok(vec![])
         }
+        async fn fetch_quota(
+            &self,
+            _account: &crate::db::models::AuthAccount,
+            _payload: &ProviderPayload,
+        ) -> Result<Option<QuotaState>, ProviderError> {
+            self.operations.fetch_add(1, Ordering::SeqCst);
+            if self.quota_fail {
+                return Err(ProviderError::Retryable);
+            }
+            Ok(Some(QuotaState {
+                version: 1,
+                exceeded: false,
+                reason: None,
+                next_recover_at: None,
+                backoff_level: 0,
+                limits: vec![crate::db::models::QuotaLimit {
+                    limit_id: "codex".into(),
+                    limit_name: None,
+                    primary: Some(crate::db::models::QuotaWindow {
+                        used_percent: Some(25.0),
+                        window_minutes: Some(10_080),
+                        reset_at: None,
+                    }),
+                    secondary: None,
+                    credits: None,
+                }],
+            }))
+        }
     }
 
     async fn repository() -> Arc<Repository> {
@@ -509,6 +573,7 @@ mod tests {
             operations: AtomicUsize::new(0),
             models_fail: false,
             refresh_fails: false,
+            quota_fail: false,
         });
         let mut registry = ProviderRegistry::new();
         registry.register(fake.clone());
@@ -542,6 +607,7 @@ mod tests {
             operations: AtomicUsize::new(0),
             models_fail: false,
             refresh_fails: false,
+            quota_fail: false,
         });
         let mut registry = ProviderRegistry::new();
         registry.register(fake.clone());
@@ -593,6 +659,7 @@ mod tests {
             operations: AtomicUsize::new(0),
             models_fail: false,
             refresh_fails: false,
+            quota_fail: false,
         });
         let mut registry = ProviderRegistry::new();
         registry.register(fake.clone());
@@ -605,13 +672,10 @@ mod tests {
         let summary = service.sync_models(&account.id).await.unwrap();
         // The due account is refreshed once before the model snapshot is taken.
         assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
-        // One refresh + one list_models call: the listing runs exactly once on
-        // the refreshed payload.
-        assert_eq!(fake.operations.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            summary.expires_at.as_deref(),
-            Some("2026-08-09T02:00:00Z")
-        );
+        // One refresh + one list_models + one quota probe: the listing runs
+        // exactly once on the refreshed payload, then the quota probe follows.
+        assert_eq!(fake.operations.load(Ordering::SeqCst), 4);
+        assert_eq!(summary.expires_at.as_deref(), Some("2026-08-09T02:00:00Z"));
         let stored = repository.get_auth_account(&account.id).await.unwrap();
         assert_eq!(
             stored.payload_json,
@@ -643,6 +707,7 @@ mod tests {
             operations: AtomicUsize::new(0),
             models_fail: true,
             refresh_fails: false,
+            quota_fail: false,
         });
         let mut registry = ProviderRegistry::new();
         registry.register(fake);
@@ -654,6 +719,67 @@ mod tests {
         let stored = repository.get_auth_account(&account.id).await.unwrap();
         assert_eq!(stored.model_states().unwrap(), old_models);
         assert_eq!(stored.last_models_sync_at.as_deref(), Some(old_sync));
+    }
+
+    #[tokio::test]
+    async fn sync_quota_persists_probe_result() {
+        let repository = repository().await;
+        let account = account(&repository).await;
+        let fake = Arc::new(FakeProvider {
+            refreshes: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            models_fail: false,
+            refresh_fails: false,
+            quota_fail: false,
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(fake);
+        let service = AuthService::new(repository.clone(), registry);
+
+        service.sync_quota(&account.id).await;
+        let stored = repository.get_auth_account(&account.id).await.unwrap();
+        let quota = stored.quota_state().unwrap().unwrap();
+        assert!(!quota.exceeded);
+        assert_eq!(quota.limits.len(), 1);
+        assert_eq!(quota.limits[0].primary.as_ref().unwrap().window_minutes, Some(10_080));
+    }
+
+    #[tokio::test]
+    async fn sync_quota_silently_preserves_existing_on_probe_failure() {
+        let repository = repository().await;
+        let account = account(&repository).await;
+        // Persist an existing quota first.
+        let existing = QuotaState {
+            version: 1,
+            exceeded: true,
+            reason: Some("quota".into()),
+            next_recover_at: Some("2026-08-10T00:00:00Z".into()),
+            backoff_level: 2,
+            limits: vec![],
+        };
+        repository
+            .update_quota(&account.id, Some(&existing))
+            .await
+            .unwrap();
+        let fake = Arc::new(FakeProvider {
+            refreshes: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            models_fail: false,
+            refresh_fails: false,
+            quota_fail: true,
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(fake);
+        let service = AuthService::new(repository.clone(), registry);
+
+        // The failed probe is silent: the account still reports the old quota
+        // rather than being wiped or erroring.
+        service.sync_quota(&account.id).await;
+        let stored = repository.get_auth_account(&account.id).await.unwrap();
+        let quota = stored.quota_state().unwrap().unwrap();
+        assert!(quota.exceeded);
+        assert_eq!(quota.backoff_level, 2);
+        assert_eq!(quota.next_recover_at.as_deref(), Some("2026-08-10T00:00:00Z"));
     }
 
     #[tokio::test]
@@ -682,6 +808,7 @@ mod tests {
             operations: AtomicUsize::new(0),
             models_fail: false,
             refresh_fails: true,
+            quota_fail: false,
         });
         let mut registry = ProviderRegistry::new();
         registry.register(fake.clone());

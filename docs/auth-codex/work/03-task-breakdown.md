@@ -24,7 +24,7 @@
 
 - 目标：完成无需 Codex CLI 的 PKCE 登录、真实 auth.json 形状导入和手动安全写回。
 - 涉及文件：新 `src-tauri/src/auth_provider/codex_login.rs`（或 `codex/login.rs`）、provider registry 接线、`src-tauri/Cargo.toml`/`Cargo.lock`（新增 `oauth2`）、测试 fixtures。
-- 改动点：127.0.0.1 随机端口一次性 axum callback、PKCE S256/state、opener runtime、5min timeout/资源清理、token exchange；解析嵌套 tokens、opaque refresh、id_token 展示 claims；过期导入先 refresh；`CODEX_HOME` 优先路径；upsert 后首次模型同步返回部分成功；写回 temp+fsync+0600+backup+rename；revoke 失败不阻止本地删除的结果结构。
+- 改动点：127.0.0.1 随机端口一次性 axum callback、PKCE S256/state、opener runtime、5min timeout/资源清理、token exchange；解析嵌套 tokens、opaque refresh、id_token 展示 claims；过期导入先 refresh；`CODEX_HOME` 优先路径；upsert 后首次模型同步返回部分成功；写回 temp+fsync+0600+backup+rename；`auth_logout` 纯本地删除（删行 + 快照，不调 provider revoke）。
 - 验收标准：（1）`cd src-tauri && cargo test auth_provider::codex_login::tests -- --nocapture` 通过；（2）本地 mock OAuth 测试断言 callback 在浏览器打开前已监听、错 state 不换 token、正确 state 只换一次、timeout 后端口可重新绑定；（3）导入 fixture 测试断言嵌套 tokens 可读、opaque refresh 不解码、缺 account_id 拒绝、过期 token 先 refresh；（4）写回测试断言 JSON 形状与 facts §7 一致、Unix 权限为 0600、存在备份，注入 rename 失败后旧文件字节不变；（5）所有测试仅访问本地 mock 地址。
 - 依赖：T2
 - 独立 agent：是
@@ -34,7 +34,7 @@
 - 目标：实现 codex 的 `/responses`/`/models` 薄适配和账号级限额状态，不依赖真实令牌。
 - 涉及文件：新 `src-tauri/src/auth_provider/codex_backend.rs`（或 `codex/backend.rs`）、`auth_provider/types.rs`、`service.rs`、本地 HTTP fixtures。
 - 改动点：固定 backend base；Bearer 和可信 actor header；请求最小 allowlist、未知字段 HTTP 前 400、强制 `stream:true`、无 zstd；懒刷新临界值；401 single-flight refresh 后同账号只重试一次；`GET /models` 规范化/失败保留旧快照；解析动态 limit id 的 primary/secondary headers、Retry-After、退避、多个耗尽窗口最晚恢复点。
-- 验收标准：（1）`cd src-tauri && cargo test auth_provider::codex_backend::tests -- --nocapture` 通过；（2）mock 断言出站 URL 精确为 `/backend-api/codex/responses`、body `stream=true`、调用方 Authorization/actor header 未透传、未设置 zstd；（3）未知顶层字段测试断言响应为 caller 400 且 mock hit count=0；（4）401→200 断言 HTTP hit=2、refresh=1，401→401 也只 hit=2 并标 invalid；（5）quota table tests 覆盖无头=null、5h/周、多 limit id、坏 reset、429 Retry-After、两个耗尽窗口取最晚 reset；（6）models 失败测试断言旧快照/时间戳原值不变。
+- 验收标准：（1）`cd src-tauri && cargo test auth_provider::codex_backend::tests -- --nocapture` 通过；（2）mock 断言出站 URL 精确为 `/backend-api/codex/responses`、body `stream=true`、调用方 Authorization/actor header 未透传、未设置 zstd；（3）未知顶层字段测试断言响应为 caller 400 且 mock hit count=0；（4）401→200 断言 HTTP hit=2、refresh=1，401→401 也只 hit=2 并标 invalid；（5）quota table tests 覆盖无头=null、动态窗口（月 43200 保留 / 周）、空窗口（仅 used-percent:0）丢弃、多 limit id、坏 reset、429 Retry-After、两个耗尽窗口取最晚 reset；（6）models 失败测试断言旧快照/时间戳原值不变。
 - 依赖：T2
 - 独立 agent：是
 
@@ -79,7 +79,7 @@
 - 目标：给前端提供 ADR-20 完整命令面，并保证任何列表/错误都不泄漏 token。
 - 涉及文件：新 `src-tauri/src/commands/auth.rs`、`src-tauri/src/commands/mod.rs`、`src-tauri/src/lib.rs`（在 T8 后串行注册）、command tests。
 - 改动点：实现并注册 `auth_accounts_list/auth_login/auth_login_import/auth_logout/auth_refresh_token/auth_sync_models/auth_write_back/auth_toggle/auth_quota_status/auth_update`；输入校验；partial success/warning DTO；列表只含 payload 摘要；所有错误脱敏。
-- 验收标准：（1）`cd src-tauri && cargo test commands::auth::tests -- --nocapture` 通过；（2）序列化 list/login/import/logout/writeback 结果，断言字符串不含 fixture token 和键名 `access_token|refresh_token|id_token|payload_json`；（3）update 输入 label 空、priority<0、weight<1 均在 repository 调用前拒绝；（4）revoke mock 失败后断言本地行已删除且 warning 非空；（5）`test "$(rg -n '^pub async fn auth_(accounts_list|login|login_import|logout|refresh_token|sync_models|write_back|toggle|quota_status|update)' src-tauri/src/commands/auth.rs | wc -l | tr -d ' ')" = 10` 通过；（6）`cd src-tauri && cargo check` 通过，证明 handler 注册名有效。
+- 验收标准：（1）`cd src-tauri && cargo test commands::auth::tests -- --nocapture` 通过；（2）序列化 list/login/import/logout/writeback 结果，断言字符串不含 fixture token 和键名 `access_token|refresh_token|id_token|payload_json`；（3）update 输入 label 空、priority<0、weight<1 均在 repository 调用前拒绝；（4）`auth_logout` 删除账号后断言 DB 行与模型快照均移除，返回被删账号摘要（无 provider 网络调用、无 warning 路径）；（5）`test "$(rg -n '^pub async fn auth_(accounts_list|login|login_import|logout|refresh_token|sync_models|write_back|toggle|quota_status|update)' src-tauri/src/commands/auth.rs | wc -l | tr -d ' ')" = 10` 通过；（6）`cd src-tauri && cargo check` 通过，证明 handler 注册名有效。
 - 依赖：T3、T4、T8
 - 独立 agent：是
 

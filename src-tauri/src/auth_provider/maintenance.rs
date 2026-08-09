@@ -220,14 +220,20 @@ mod tests {
         let service = service(repository, provider.clone());
 
         let loop_handle = tokio::spawn(run_maintenance_loop(service));
-        // The pinned clock keeps "due" due on every pass, so each pass is two
-        // refreshes (cycle + refresh-before-sync) and one model listing.
+        // Both accounts are active.  The pinned clock keeps "due" due on every
+        // pass, so per pass "due" does one lazy refresh inside `sync_models`
+        // (the cycle no longer refreshes separately) plus one model listing.
+        // "not-due" has a fresh token: it never refreshes, but the 12h cycle
+        // still refreshes its model snapshot (design §7 step 3 / ADR-8) — one
+        // listing per pass.
         yield_until("startup", || {
-            provider.refreshes_for("due") == 2 && provider.models_for("due") == 1
+            provider.refreshes_for("due") == 1
+                && provider.models_for("due") == 1
+                && provider.models_for("not-due") == 1
         })
         .await;
         assert_eq!(provider.refreshes_for("not-due"), 0);
-        assert_eq!(provider.models_for("not-due"), 0);
+        assert_eq!(provider.models_for("not-due"), 1);
 
         // Advance the scheduler under paused Tokio time; resume before the
         // SQL-backed scan runs because sqlx's pool acquisition uses Tokio time.
@@ -236,11 +242,13 @@ mod tests {
         tokio::time::advance(MAINTENANCE_INTERVAL).await;
         tokio::time::resume();
         yield_until("first scheduled tick", || {
-            provider.refreshes_for("due") == 4 && provider.models_for("due") == 2
+            provider.refreshes_for("due") == 2
+                && provider.models_for("due") == 2
+                && provider.models_for("not-due") == 2
         })
         .await;
         assert_eq!(provider.refreshes_for("not-due"), 0);
-        assert_eq!(provider.models_for("not-due"), 0);
+        assert_eq!(provider.models_for("not-due"), 2);
         loop_handle.abort();
     }
 
@@ -298,7 +306,9 @@ mod tests {
             failed.next_retry_after.as_deref(),
             Some("2026-08-09T12:00:00+00:00")
         );
-        assert_eq!(provider.refreshes_for("active"), 2);
+        // An active account is driven through `sync_models`, whose internal
+        // lazy refresh runs exactly once for a due token (design §7 step 3).
+        assert_eq!(provider.refreshes_for("active"), 1);
         assert_eq!(provider.models_for("active"), 1);
         assert_eq!(provider.models_for("models-fail"), 1);
     }

@@ -438,7 +438,7 @@ impl AttemptFlow {
     fn halt(&self) -> FlowStep {
         let (status, message) = match &self.last_failure {
             Some(f) => (terminal_status(f.failure_class), f.message.clone()),
-            None => (503, "No channel available for the request".to_string()),
+            None => (503, "No available upstream candidate".to_string()),
         };
         FlowStep::Halt { status, message }
     }

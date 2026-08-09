@@ -29,9 +29,7 @@ pub fn estimate_usage(
     _model: &str,
 ) -> (i64, i64, i64) {
     let prompt = estimate_prompt_tokens(request_body);
-    let completion = response_text
-        .map(|t| count_tokens(t))
-        .unwrap_or(0);
+    let completion = response_text.map(|t| count_tokens(t)).unwrap_or(0);
     let total = prompt + completion;
     (prompt, completion, total)
 }
@@ -155,10 +153,7 @@ pub fn extract_response_text(body: &Value) -> String {
     if let Some(choices) = body.get("choices").and_then(|c| c.as_array()) {
         let mut text = String::new();
         for choice in choices {
-            if let Some(content) = choice
-                .pointer("/message/content")
-                .and_then(|c| c.as_str())
-            {
+            if let Some(content) = choice.pointer("/message/content").and_then(|c| c.as_str()) {
                 text.push_str(content);
                 text.push('\n');
             }
@@ -218,7 +213,8 @@ mod tests {
                 {"role": "user", "content": "Hello, how are you?"}
             ]
         });
-        let (prompt, completion, total) = estimate_usage(&body, Some("I'm fine, thanks!"), "gpt-4o");
+        let (prompt, completion, total) =
+            estimate_usage(&body, Some("I'm fine, thanks!"), "gpt-4o");
         assert!(prompt > 0, "prompt tokens should be > 0");
         assert!(completion > 0, "completion tokens should be > 0");
         assert_eq!(total, prompt + completion);

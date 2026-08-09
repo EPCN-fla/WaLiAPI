@@ -242,7 +242,6 @@ export interface AuthLoginSessionStatus {
 
 export interface AuthLogoutResult {
   deleted: boolean;
-  warning: string | null;
 }
 
 export interface AuthWriteBackResult {

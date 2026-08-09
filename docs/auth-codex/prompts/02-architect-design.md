@@ -12,13 +12,13 @@
 1. 设计覆盖（**每个 ADR + 优化需求书 §2.1 条目必须有落点**）：
    - **数据层**：`auth_accounts` 表迁移（通用列 + payload_json，ADR-3/13）、`request_logs.upstream_type`（ADR-30）、QuotaState / model_states 语义（ADR-16）
    - **provider 抽象**：`Provider` trait（登录/刷新/出站，ADR-12），codex 实现（OAuth PKCE + localhost 回调 + auth.json 导入 + backend-api adapter）
-   - **路由层**：混合候选池（§3.2 候选泛化 4 处消费点）、账号过滤（QuotaState/失效/停用）、`classify_channel` 账号分支对 **Chat/Messages/Responses 均出组**（D-A）
+   - **路由层**：混合候选池（§3.2 候选泛化的全部消费点——不止 4 处，另含 `authorize_and_plan`/handler/`plan_executor::AttemptMeta`/`debug_json`）、账号过滤（QuotaState/失效/停用）、`classify_channel` 账号分支对 **Chat/Messages/Responses 均出组**（D-A）
    - **出站适配**：账号出站分支（§3.4）、懒刷新 + 401 重试（适配器内部，D-3）、限额响应头解析（ADR-15）、**字段 allowlist + 强制 stream:true 兜底 + rate_limits 原样透传（保守约束）**；zstd 不实现（D-E）
    - **Codec（ADR-31 / D-A）**：Responses→Chat 流式状态机 + 非流 decoder（§3.3 复用面/从零写清单）、registry + `SseMode` 接线、严格 fail-closed 请求编码、Native 直通 usage 补提取（D-4）
    - **定时任务**：单个 12h 后台循环（令牌刷新 + 模型同步 + 失效重试，D-F）；30min 探测不做（D-C）
-   - **Tauri 命令集**：ADR-20 的 10 条命令（DTO 掩码 refresh_token）
+   - **Tauri 命令集**：ADR-20 的 10 条命令（DTO 不返回 access_token / refresh_token / id_token / payload_json 全文）
    - **前端**：`/channels` + `/channels/auth` 双路由（ADR-4，注意 Sidebar 前缀匹配）、Auth 页（01-ui-spec 各节，颜色 token 按实际 `src/App.css` 走）、卡片/弹窗/状态变体、风险 banner（ADR-29）
-   - **错误处理与测试策略**：每层如何测、mock 边界（**不依赖真实令牌**）
+   - **错误处理与测试策略**：每层如何测、mock 边界（**不依赖真实令牌**）；前端构建以 `npm run build`（仓库根目录）为验收
 2. 任务拆分：任务卡模板见下；标依赖拓扑与可并行项。
 3. 对 open 风险（优化需求书 §2.3 待验证项）给 v1 保守处置。
 

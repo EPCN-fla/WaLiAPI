@@ -211,6 +211,10 @@ driver 闭包拿到 `RouteCandidate` 后：Channel 继续 `dispatch_executor/dis
 
 `AttemptSuccess.response_headers` 仍负责向下游转发安全头；quota 更新失败只记脱敏 warning，不破坏已成功响应。`codex.rate_limits` SSE 事件不归一化：Responses 原生流字节级直通；Chat/Messages 转换流将该完整 SSE record 作为未改写 side-band record 透传，并用固定夹具锁定字节一致性。
 
+**主动探测（无流量时更新）**：上游提供专门限额端点 `GET {backend-api}/wham/usage`（WaLiAPI base 为 `https://chatgpt.com/backend-api/codex` → 探测 `https://chatgpt.com/backend-api/wham/usage`），响应含 `rate_limit.primary_window`（`used_percent / limit_window_seconds(秒) / reset_at(UNIX 秒)`）、`credits`、`spend_control`。`quota_from_usage_payload` 归一化秒→分钟、UNIX→RFC3339 后写同一 `QuotaState`（只有 `primary`，无 `secondary`）。触发时机：**模型同步后**（登录/导入/同步模型）、**刷新令牌后**、**维护循环**（12h）。探测失败**静默保留旧值**，绝不擦除已知 quota（ADR-14 动态兼容）。
+
+实测：free 号 `limit_window_seconds=2592000`（30 天月限额）、plus 号 `604800`（7 天周限额）；响应头窗口可能为流量上下文、`wham/usage` 为权威状态。
+
 ## 6. Codec（Responses→Chat、registry/SseMode 接线、usage 提取）
 
 ### 6.1 文件与 registry

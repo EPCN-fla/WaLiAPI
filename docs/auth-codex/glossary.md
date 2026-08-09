@@ -13,7 +13,7 @@
 | PKCE | OAuth 授权码流加固（S256），Codex 默认使用 | 外部源 |
 | backend-api | ChatGPT Web 后端（chatgpt.com/backend-api），Codex 用 ChatGPT 登录后走此路径 | 外部源 |
 | 账号型上游（account-as-upstream） | 把用户订阅账号当作一个上游渠道，网关以 OAuth 令牌代表用户访问厂商后端，消耗订阅额度 | ADR-1 |
-| auth_accounts | WaLiAPI 新增的账号表：provider / account_id / access_token / refresh_token / expires_at / status | ADR-3 |
+| auth_accounts | WaLiAPI 新增的账号表：通用列（provider / label / account_id / status / disabled / priority / weight / quota_json / model_states_json / attributes_json / last_refreshed_at / next_refresh_after / next_retry_after / created_at / updated_at）+ `payload_json` 存 provider 特有令牌载荷（codex 的 access_token / refresh_token / expires_at 等，不设独立令牌列） | ADR-3 |
 | payload_json | auth_accounts 中存 provider 特有令牌载荷的 JSON 列（codex 的 token 字段等），使通用列不绑死 codex | ADR-3 |
 | QuotaState | 账号限额运行时状态：Exceeded / Reason / NextRecoverAt / BackoffLevel（指数退避） | CPA 调研 |
 | ModelState | 账号下某模型的执行状态：Status / Unavailable / NextRetryAfter / LastError / Quota | CPA 调研 |

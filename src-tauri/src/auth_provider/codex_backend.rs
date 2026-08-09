@@ -20,6 +20,12 @@ use crate::db::models::{AuthAccount, ModelState, QuotaLimit, QuotaState, QuotaWi
 pub const CODEX_BACKEND_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const RESPONSES_PATH: &str = "responses";
 const MODELS_PATH: &str = "models";
+// `/models` is a Codex client endpoint, not a WaLiAPI endpoint.  The backend
+// filters its catalog by this value, so using our own application version (for
+// example `0.1.7`) can legitimately produce an empty model list.
+const CODEX_CLIENT_VERSION: &str = "0.147.0";
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_USER_AGENT: &str = "codex_cli_rs/0.147.0";
 
 /// The sole Codex provider implementation.  `with_backend_base` is intentionally
 /// test-only so production calls cannot be redirected by frontend/downstream data.
@@ -56,6 +62,46 @@ impl CodexProvider {
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}/{path}", self.backend_base.trim_end_matches('/'))
+    }
+
+    /// The dedicated quota-status endpoint lives at the `backend-api` root, not
+    /// under `/codex` (which is the outbound base).  Derive it by replacing the
+    /// trailing `/codex` segment.  This is the upstream "no-traffic" source of
+    /// truth for quota (the `/wham/usage` payload), distinct from the response
+    /// headers parsed by [`quota_from_headers`].
+    fn usage_endpoint(&self) -> String {
+        let base = self.backend_base.trim_end_matches('/');
+        match base.strip_suffix("/codex") {
+            Some(root) => format!("{root}/wham/usage"),
+            None => format!("{base}/../wham/usage"),
+        }
+    }
+
+    /// Probe the dedicated quota endpoint.  A failure or a payload without
+    /// quota data returns `None` so callers keep whatever was previously
+    /// persisted — a quota probe never erases known state.
+    async fn fetch_quota_inner(
+        &self,
+        account: &crate::db::models::AuthAccount,
+        payload: &ProviderPayload,
+    ) -> Result<Option<QuotaState>, ProviderError> {
+        let mut headers = self.auth_headers(payload, account, &header::HeaderMap::new())?;
+        headers.insert(
+            header::ACCEPT,
+            header::HeaderValue::from_static("application/json"),
+        );
+        let response = self
+            .client
+            .get(self.usage_endpoint())
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|_| ProviderError::Retryable)?;
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        let body: Value = response.json().await.map_err(|_| ProviderError::Protocol)?;
+        Ok(quota_from_usage_payload(&body))
     }
 
     fn auth_headers(
@@ -134,9 +180,30 @@ impl Provider for CodexProvider {
         payload: &ProviderPayload,
     ) -> Result<ProviderModels, ProviderError> {
         let headers = self.auth_headers(payload, account, &header::HeaderMap::new())?;
+        let mut headers = headers;
+        headers.insert(
+            header::ACCEPT,
+            header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            header::USER_AGENT,
+            header::HeaderValue::from_static(CODEX_USER_AGENT),
+        );
+        headers.insert(
+            header::HeaderName::from_static("originator"),
+            header::HeaderValue::from_static(CODEX_ORIGINATOR),
+        );
+        headers.insert(
+            header::HeaderName::from_static("chatgpt-account-id"),
+            header::HeaderValue::from_str(&account.account_id)
+                .map_err(|_| ProviderError::InvalidPayload)?,
+        );
         let response = self
             .client
             .get(self.endpoint(MODELS_PATH))
+            // This is part of Codex's native `/models` request contract.  The
+            // backend uses it to select models compatible with the client.
+            .query(&[("client_version", CODEX_CLIENT_VERSION)])
             .headers(headers)
             .send()
             .await
@@ -158,7 +225,13 @@ impl Provider for CodexProvider {
             .iter()
             .filter_map(|entry| match entry {
                 Value::String(id) => Some(id.clone()),
-                Value::Object(_) => entry.get("id").and_then(Value::as_str).map(str::to_owned),
+                // The ChatGPT Codex endpoint returns `models[].slug`; retain
+                // `id` for OpenAI-compatible proxies and older fixtures.
+                Value::Object(_) => entry
+                    .get("slug")
+                    .or_else(|| entry.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 _ => None,
             })
             .filter(|id| !id.trim().is_empty())
@@ -171,6 +244,14 @@ impl Provider for CodexProvider {
             })
             .collect();
         Ok(models)
+    }
+
+    async fn fetch_quota(
+        &self,
+        account: &AuthAccount,
+        payload: &ProviderPayload,
+    ) -> Result<Option<QuotaState>, ProviderError> {
+        self.fetch_quota_inner(account, payload).await
     }
 }
 
@@ -200,8 +281,8 @@ fn trusted_actor_authorization(account: &crate::db::models::AuthAccount) -> Opti
 }
 
 /// Reject unsupported non-null top-level values before any network activity and
-/// force the backend's only supported stream mode.  Null unknown fields carry no
-/// request semantics and are discarded rather than forwarded.
+/// force the backend's only supported stream/store mode.  Null unknown fields
+/// carry no request semantics and are discarded rather than forwarded.
 pub fn validate_backend_request(body: &Value) -> Result<Value, ProviderError> {
     let object = body.as_object().ok_or(ProviderError::InvalidPayload)?;
     const ALLOWED: &[&str] = &[
@@ -212,6 +293,7 @@ pub fn validate_backend_request(body: &Value) -> Result<Value, ProviderError> {
         "tool_choice",
         "max_output_tokens",
         "stream",
+        "store",
     ];
     for (key, value) in object {
         if !ALLOWED.contains(&key.as_str()) && !value.is_null() {
@@ -221,12 +303,17 @@ pub fn validate_backend_request(body: &Value) -> Result<Value, ProviderError> {
         }
     }
     let mut encoded = serde_json::Map::new();
-    for key in ALLOWED.iter().copied().filter(|key| *key != "stream") {
+    for key in ALLOWED
+        .iter()
+        .copied()
+        .filter(|key| !matches!(*key, "stream" | "store"))
+    {
         if let Some(value) = object.get(key) {
             encoded.insert(key.to_owned(), value.clone());
         }
     }
     encoded.insert("stream".to_owned(), Value::Bool(true));
+    encoded.insert("store".to_owned(), Value::Bool(false));
     Ok(Value::Object(encoded))
 }
 
@@ -285,6 +372,65 @@ pub fn quota_from_headers(
         quota.next_recover_at = exhausted_resets.iter().max().map(|time| time.to_rfc3339());
     }
     Some(quota)
+}
+
+/// Parse the dedicated `GET /backend-api/wham/usage` payload into a
+/// [`QuotaState`].  Unlike response headers (minutes / RFC3339), this endpoint
+/// reports `limit_window_seconds` in seconds and `reset_at` as a UNIX epoch
+/// seconds; both are normalized here.  `None` preserves whatever quota was
+/// previously persisted (a failed probe never wipes known state).
+pub fn quota_from_usage_payload(payload: &Value) -> Option<QuotaState> {
+    let rate_limit = payload.get("rate_limit")?;
+    let primary_window = rate_limit.get("primary_window")?;
+    let used_percent = primary_window.get("used_percent")?.as_f64()?;
+    let window_seconds = primary_window.get("limit_window_seconds")?.as_i64()?;
+    let reset_at = primary_window
+        .get("reset_at")
+        .and_then(Value::as_i64)
+        .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
+        .map(|time| time.to_rfc3339());
+
+    // Only carry the primary window.  `secondary_window` is null on both
+    // current plans, and dropping it keeps the card from rendering an empty
+    // secondary bar (same rule as the header parser's `has_data`).
+    let limit = QuotaLimit {
+        limit_id: "codex".to_owned(),
+        limit_name: None,
+        primary: Some(QuotaWindow {
+            used_percent: Some(used_percent),
+            window_minutes: Some(window_seconds / 60),
+            reset_at: reset_at.clone(),
+        }),
+        secondary: None,
+        credits: None,
+    };
+    let has_data = limit.primary.as_ref().is_some_and(|window| {
+        window
+            .used_percent
+            .is_some_and(|used| used != 0.0)
+            || window.window_minutes.is_some_and(|minutes| minutes != 0)
+            || window.reset_at.is_some()
+    });
+    if !has_data {
+        return None;
+    }
+
+    let exhausted = used_percent >= 100.0;
+    let exceeded = rate_limit.get("limit_reached").and_then(Value::as_bool) == Some(true)
+        || exhausted;
+    let next_recover_at = if exceeded {
+        reset_at.clone()
+    } else {
+        None
+    };
+    Some(QuotaState {
+        version: 1,
+        exceeded,
+        reason: exceeded.then(|| "quota".to_owned()),
+        next_recover_at,
+        backoff_level: 0,
+        limits: vec![limit],
+    })
 }
 
 fn retry_after(headers: &header::HeaderMap, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
@@ -353,21 +499,30 @@ fn parse_limits(headers: &header::HeaderMap) -> Vec<QuotaLimit> {
             secondary: quota_window(parts.secondary),
             credits: parts.credits,
         })
+        // A limit entry with no windows and no credits carries nothing
+        // displayable (e.g. `codex-credits-has` with only an empty header) —
+        // drop it so the UI never renders an empty quota card.
+        .filter(|limit| limit.primary.is_some() || limit.secondary.is_some() || limit.credits.is_some())
         .collect()
 }
 
 fn quota_window(parts: BTreeMap<String, String>) -> Option<QuotaWindow> {
-    (!parts.is_empty()).then(|| QuotaWindow {
-        used_percent: parts
-            .get("used-percent")
-            .and_then(|value| value.parse().ok()),
-        window_minutes: parts
-            .get("window-minutes")
-            .and_then(|value| value.parse().ok()),
-        reset_at: parts
-            .get("reset-at")
-            .and_then(|value| parse_reset_at(value))
-            .map(|time| time.to_rfc3339()),
+    // Mirror upstream codex `rate_limits.rs` `has_data`: a window is only kept
+    // when it carries real data (used_percent != 0, window_minutes != 0, or a
+    // parseable reset).  A header like `x-codex-secondary-used-percent: 0` alone
+    // must not manufacture an empty "secondary" window.
+    let used_percent = parts.get("used-percent").and_then(|value| value.parse().ok());
+    let window_minutes = parts
+        .get("window-minutes")
+        .and_then(|value| value.parse().ok());
+    let reset_at = parts.get("reset-at").and_then(|value| parse_reset_at(value));
+    let has_data = used_percent.is_some_and(|used| used != 0.0)
+        || window_minutes.is_some_and(|minutes| minutes != 0)
+        || reset_at.is_some();
+    has_data.then(|| QuotaWindow {
+        used_percent,
+        window_minutes,
+        reset_at: reset_at.map(|time| time.to_rfc3339()),
     })
 }
 
@@ -392,7 +547,7 @@ mod tests {
 
     use axum::{
         body::Bytes,
-        extract::State,
+        extract::{OriginalUri, State},
         http::{HeaderMap, StatusCode},
         response::IntoResponse,
         routing::{get, post},
@@ -407,8 +562,10 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockState {
         hits: Arc<AtomicUsize>,
+        usage_hits: Arc<AtomicUsize>,
         refreshes: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<(HeaderMap, Value)>>>,
+        model_queries: Arc<Mutex<Vec<Option<String>>>>,
         statuses: Arc<Mutex<Vec<StatusCode>>>,
         models_status: Arc<Mutex<StatusCode>>,
     }
@@ -428,14 +585,25 @@ mod tests {
         (status, Json(json!({"ok": true})))
     }
 
-    async fn models(State(state): State<MockState>, headers: HeaderMap) -> impl IntoResponse {
+    async fn models(
+        State(state): State<MockState>,
+        OriginalUri(uri): OriginalUri,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
         let status = *state.models_status.lock().await;
+        state
+            .model_queries
+            .lock()
+            .await
+            .push(uri.query().map(str::to_owned));
         state
             .requests
             .lock()
             .await
             .push((headers, serde_json::json!({})));
-        (status, Json(json!({"data": [{"id": "gpt-test"}]})))
+        // This is the native Codex schema: model identity is `slug`, not the
+        // OpenAI-compatible `data[].id` shape.
+        (status, Json(json!({"models": [{"slug": "gpt-test"}]})))
     }
 
     async fn refresh_token(State(state): State<MockState>) -> impl IntoResponse {
@@ -447,6 +615,29 @@ mod tests {
         }))
     }
 
+    async fn usage(State(state): State<MockState>) -> impl IntoResponse {
+        let hits = state.usage_hits.fetch_add(1, Ordering::SeqCst);
+        if hits == 0 {
+            return Json(json!({
+                "plan_type": "plus",
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": 58,
+                        "limit_window_seconds": 604800,
+                        "reset_after_seconds": 574587,
+                        "reset_at": 1786867084
+                    },
+                    "secondary_window": null
+                },
+                "credits": { "has_credits": true, "unlimited": false, "balance": "1908.09" },
+                "spend_control": { "reached": false, "individual_limit": null }
+            }));
+        }
+        Json(json!({"error": "rate limited"}))
+    }
+
     async fn provider(statuses: Vec<StatusCode>) -> (CodexProvider, MockState) {
         let state = MockState {
             statuses: Arc::new(Mutex::new(statuses)),
@@ -455,6 +646,7 @@ mod tests {
         let app = Router::new()
             .route("/backend-api/codex/responses", post(responses))
             .route("/backend-api/codex/models", get(models))
+            .route("/backend-api/wham/usage", get(usage))
             .route("/oauth/token", post(refresh_token))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -531,9 +723,23 @@ mod tests {
         let requests = state.requests.lock().await;
         let (headers, body) = &requests[0];
         assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
         assert_eq!(headers[header::AUTHORIZATION], "Bearer fixture-access");
         assert_eq!(headers["x-openai-actor-authorization"], "trusted-actor");
         assert!(!headers.contains_key("content-encoding"));
+    }
+
+    #[test]
+    fn fixed_backend_request_never_allows_store_true() {
+        let body = validate_backend_request(&json!({
+            "model": "gpt-test",
+            "input": "hi",
+            "stream": false,
+            "store": true
+        }))
+        .unwrap();
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
     }
 
     #[tokio::test]
@@ -563,10 +769,7 @@ mod tests {
     async fn models_are_normalized_from_local_backend() {
         let (provider, state) = provider(vec![]).await;
         let account = account();
-        let models = provider
-            .list_models(&account, &payload())
-            .await
-            .unwrap();
+        let models = provider.list_models(&account, &payload()).await.unwrap();
         assert_eq!(models[0].id, "gpt-test");
         let requests = state.requests.lock().await;
         let (headers, _) = &requests[0];
@@ -574,6 +777,15 @@ mod tests {
         // carries the account actor header, never the caller's.
         assert_eq!(headers[header::AUTHORIZATION], "Bearer fixture-access");
         assert_eq!(headers["x-openai-actor-authorization"], "trusted-actor");
+        assert_eq!(headers[header::ACCEPT], "application/json");
+        assert_eq!(headers[header::USER_AGENT], CODEX_USER_AGENT);
+        assert_eq!(headers["originator"], CODEX_ORIGINATOR);
+        assert_eq!(headers["chatgpt-account-id"], "remote");
+        drop(requests);
+        assert_eq!(
+            state.model_queries.lock().await.as_slice(),
+            [Some(format!("client_version={CODEX_CLIENT_VERSION}"))]
+        );
     }
 
     async fn repository() -> Arc<crate::db::repository::Repository> {
@@ -753,5 +965,158 @@ mod tests {
             quota.next_recover_at.as_deref(),
             Some("2026-08-09T00:04:00+00:00")
         );
+    }
+
+    #[test]
+    fn quota_window_discards_empty_windows_and_empty_limits() {
+        let now: DateTime<Utc> = "2026-08-09T00:00:00Z".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        // Free-account real shape: monthly primary (43200 min + reset), an
+        // empty secondary (`used-percent: 0` only), and an empty credits flag.
+        headers.insert("x-codex-primary-used-percent", "0".parse().unwrap());
+        headers.insert("x-codex-primary-window-minutes", "43200".parse().unwrap());
+        headers.insert(
+            "x-codex-primary-reset-at",
+            "2026-09-08T15:03:25Z".parse().unwrap(),
+        );
+        headers.insert("x-codex-secondary-used-percent", "0".parse().unwrap());
+        // `x-codex-credits-*-credits` is a boolean flag upstream; it cannot be
+        // parsed as f64, so the credits-only `codex-credits-has` limit is empty
+        // and must be dropped.
+        headers.insert("x-codex-credits-has-credits", "true".parse().unwrap());
+        let quota = quota_from_headers(&headers, StatusCode::OK, None, now).unwrap();
+
+        // The empty `secondary` window and the credits-only limit are dropped;
+        // only the real monthly `codex` window survives.
+        assert_eq!(quota.limits.len(), 1);
+        let codex = quota.limits.iter().find(|limit| limit.limit_id == "codex").unwrap();
+        assert!(codex.secondary.is_none(), "empty secondary window must be dropped");
+        let primary = codex.primary.as_ref().unwrap();
+        assert_eq!(primary.window_minutes, Some(43_200));
+        assert_eq!(primary.used_percent, Some(0.0));
+        assert_eq!(
+            primary.reset_at.as_deref(),
+            Some("2026-09-08T15:03:25+00:00")
+        );
+    }
+
+    #[test]
+    fn quota_window_keeps_nonzero_usage_without_duration() {
+        let now: DateTime<Utc> = "2026-08-09T00:00:00Z".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        // A window carrying real usage but no duration/reset must be preserved.
+        headers.insert("x-codex-primary-used-percent", "23".parse().unwrap());
+        let quota = quota_from_headers(&headers, StatusCode::OK, None, now).unwrap();
+        assert_eq!(quota.limits.len(), 1);
+        let primary = quota.limits[0].primary.as_ref().unwrap();
+        assert_eq!(primary.used_percent, Some(23.0));
+        assert_eq!(primary.window_minutes, None);
+        assert_eq!(primary.reset_at, None);
+    }
+
+    #[test]
+    fn usage_payload_parses_plus_weekly_window() {
+        // Real `/wham/usage` shape for a plus account: 604800s = 7d weekly
+        // window, UNIX-epoch reset.  The parser normalizes seconds -> minutes
+        // and epoch -> RFC3339.
+        let payload = json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 58,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 574587,
+                    "reset_at": 1786867084
+                },
+                "secondary_window": null
+            },
+            "credits": { "has_credits": true, "unlimited": false, "balance": "1908.09" },
+            "spend_control": { "reached": false, "individual_limit": null }
+        });
+        let quota = quota_from_usage_payload(&payload).unwrap();
+        assert!(!quota.exceeded);
+        assert!(quota.next_recover_at.is_none());
+        assert_eq!(quota.limits.len(), 1);
+        let limit = &quota.limits[0];
+        assert_eq!(limit.limit_id, "codex");
+        let primary = limit.primary.as_ref().unwrap();
+        assert_eq!(primary.window_minutes, Some(10_080)); // 604800 / 60
+        assert_eq!(primary.used_percent, Some(58.0));
+        // 1786867084 epoch -> 2026-08-16T...Z
+        assert!(primary.reset_at.as_deref().unwrap().starts_with("2026-08-16T"));
+    }
+
+    #[test]
+    fn usage_payload_parses_free_monthly_window() {
+        let payload = json!({
+            "plan_type": "free",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 0,
+                    "limit_window_seconds": 2592000,
+                    "reset_after_seconds": 2587279,
+                    "reset_at": 1788879805
+                },
+                "secondary_window": null
+            },
+            "credits": { "has_credits": false, "unlimited": false, "balance": null },
+            "spend_control": { "reached": false, "individual_limit": null }
+        });
+        let quota = quota_from_usage_payload(&payload).unwrap();
+        let primary = quota.limits[0].primary.as_ref().unwrap();
+        assert_eq!(primary.window_minutes, Some(43_200)); // 2592000 / 60
+        assert_eq!(primary.used_percent, Some(0.0));
+    }
+
+    #[test]
+    fn usage_payload_none_when_limit_reached_sets_exceeded() {
+        let payload = json!({
+            "rate_limit": {
+                "allowed": false,
+                "limit_reached": true,
+                "primary_window": {
+                    "used_percent": 100,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 0,
+                    "reset_at": 1786867084
+                },
+                "secondary_window": null
+            }
+        });
+        let quota = quota_from_usage_payload(&payload).unwrap();
+        assert!(quota.exceeded);
+        assert_eq!(quota.reason.as_deref(), Some("quota"));
+        assert!(quota.next_recover_at.is_some());
+    }
+
+    #[test]
+    fn usage_payload_none_on_missing_quota_data() {
+        // A payload with no rate_limit (or an empty window) must yield None so
+        // previously persisted quota is preserved.
+        assert!(quota_from_usage_payload(&json!({ "plan_type": "plus" })).is_none());
+        assert!(
+            quota_from_usage_payload(&json!({ "rate_limit": { "primary_window": null } })).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_quota_hits_dedicated_usage_endpoint() {
+        let (provider, state) = provider(vec![]).await;
+        let account = account();
+        let payload = payload();
+        let quota = provider
+            .fetch_quota(&account, &payload)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.usage_hits.load(Ordering::SeqCst), 1);
+        let primary = quota.limits[0].primary.as_ref().unwrap();
+        // Weekly plus window normalized from seconds.
+        assert_eq!(primary.window_minutes, Some(10_080));
+        assert_eq!(primary.used_percent, Some(58.0));
     }
 }

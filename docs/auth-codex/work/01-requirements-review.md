@@ -14,7 +14,7 @@
 - **Codec 与 usage 缺口属实（ADR-31/33/36）**：registry 仅有 Chat↔Messages，`Downstream/Upstream` 无 Responses；`SseMode` 无 ResponsesToChat；字节级 framing 与 `ResponsesSseAssembler` 可复用；Native usage 只扫顶层 `usage`，读不到 `response.completed.response.usage`。来源：`src-tauri/src/protocol/codec/registry.rs:16-28,98-119`、`src-tauri/src/endpoint_executor/sse.rs:20-44,103-136,498-521`、`src-tauri/src/protocol/codec/sse.rs:9-59`、`src-tauri/src/protocol/responses.rs:5-54`。结论：**VERIFIED + GAP**。
 - **模型同步需求无现成实现（ADR-8/21/34）**：账号模型须来自 `/models`、只读全量、空快照拒绝路由、失败保留旧快照；当前仅有 Channel 的模型同步能力，没有账号快照或同步时间字段。来源：`docs/auth-codex/work/00-optimized-requirements.md:92-93`、`docs/auth-codex/ADRs.md:50-54,135-139,225-233`，以及当前无 `AuthAccount` 模型。结论：**GAP**。
 - **日志区分需求成立（ADR-30/33）**：`request_logs.channel_id` 无外键，可复用为账号 id；repository 的 insert 和 Rust/TS DTO 都要增加 `upstream_type`，日志页当前只有 channel name 过滤。来源：`src-tauri/migrations/001_init.sql:40-60`、`src-tauri/src/db/repository.rs:536-582,658-705`、`src/types/index.ts:126-165`、`src/pages/LogsPage.tsx:167-198`。结论：**GAP**。
-- **前端基线与校准一致（ADR-4/17/18/19/26/27/29）**：目前只有 `/channels`；Sidebar 的非 `end` NavLink 会让 `/channels/auth` 同时命中；页面采用 `useState` + 手动 load；现有 underline tab、provider pill、双列卡片和实际颜色 token 均与优化需求书指出的位置一致。来源：`src/App.tsx:42-57`、`src/components/layout/Sidebar.tsx:22-30,85-108`、`src/pages/SettingsPage.tsx:194-214`、`src/pages/UsagePage.tsx:413-453`、`src/pages/ApiKeysPage.tsx:111-120`、`src/App.css:3-20`。结论：**VERIFIED + GAP**（样式基础存在，Auth 页面/路由/API/types 尚未实现）。
+- **前端基线与校准一致（ADR-4/17/18/19/26/27/29）**：目前只有 `/channels`；Sidebar 的非 `end` NavLink 会让 `/channels/auth` 同时命中；页面采用 `useState` + 手动 load；现有 underline tab、provider pill、双列卡片和实际颜色 token 均与优化需求书指出的位置一致。来源：`src/App.tsx:42-57`、`src/components/layout/Sidebar.tsx:22-30,85-108`、`src/pages/SettingsPage.tsx:194-214`、`src/pages/UsagePage.tsx:413-453`、`src/pages/ApiKeysPage.tsx:111-120`、`src/App.css:3-20`。结论：**VERIFIED + GAP**（样式基础存在，Auth 页面/路由/API/types 尚未实现）。注：ADR-27 正文为「编辑弹窗（名称/P/W）」，非早期标题「重命名 = label 内联编辑」；以正文为准。
 - **本机 CLI 配置逻辑与 Auth 相互独立（ADR-18/19）**：`write_codex` 是普通 helper，只写 `config.toml` 且明确不写 auth.json；扫描器只读 Codex config 的顶层 `api_key`。来源：`src-tauri/src/commands/app_config.rs:363-428`、`src-tauri/src/commands/import_export.rs:586-686`。结论：**VERIFIED**，C-7 保持 out of scope。
 
 ADR 核对覆盖：ADR-1～12、14～37 均已在以上确认项或下方疑点/缺口中核对；文档中不存在 ADR-13 正文，已按优化需求书将其视为 ADR-3 的同义引用并在 §4 记录。
@@ -49,7 +49,7 @@ ADR 核对覆盖：ADR-1～12、14～37 均已在以上确认项或下方疑点/
 6. **revoke / 写回的文件与远端失败语义未定义**
    - 问题：`auth_logout(revoke)` 未说明 revoke 失败是否阻止本地删除；`auth_write_back` 会覆盖单账号 auth.json，但未写明原子性、权限和备份。
    - 影响：网络故障可能让账号无法本地删除；写回失败可能破坏 Codex CLI 登录文件。
-   - 建议假设（**假设**）：本地删除不被 revoke 网络失败阻塞，但返回警告；写回采用同目录原子替换、权限 0600，并在覆盖前生成可恢复备份。理由：远端失败不应阻止本地控制，凭据文件覆盖必须可恢复。
+   - **拍板（2026-08-09）**：**v1 删除不做 revoke**——`auth_logout` 仅本地移除账号（数据库行 + 模型快照），不调用 provider `oauth/revoke`。理由：CPA 调研证实删除即本地移除（00-facts §5.3），且自动 revoke 会误伤已写回 `~/.codex/auth.json` 的本机 Codex CLI 会话。写回仍采用同目录原子替换、权限 0600，并在覆盖前生成可恢复备份。
 
 ## 3. 阻塞性疑点
 
@@ -67,7 +67,7 @@ ADR 核对覆盖：ADR-1～12、14～37 均已在以上确认项或下方疑点/
 - **DTO 不能只“掩码 refresh_token”**（GAP）：ADR-20 明确列表不含令牌明文；因此 access_token、refresh_token、id_token 均不得由 `auth_accounts_list` DTO 返回，日志/debug/error 也不得包含。优化需求书 C-17 的措辞过窄。来源：优化需求书 `:44`；`ADRs.md:141-154`。
 - **日志 UI/统计接线在优化需求书中范围不足**（GAP）：ADR-30 要求日志页/统计按 `upstream_type` 区分，但 §2.1 只明确 migration、RequestLog 和三个写点；当前 log 查询输入和页面没有 upstream_type 过滤/展示。应把 Rust command DTO、TS type、至少来源标识纳入 v1 验收；是否增加筛选可由架构设计按 ADR-30 落地。来源：`ADRs.md:75-79`、优化需求书 `:54-56`、`commands/log.rs:126-160`、`LogsPage.tsx:167-198`。
 - **同一优化需求书对非流兜底表述不一致**（OUTDATED）：§2.1/ADR-36/D-A 指向账号上游统一强制 `stream:true` 并内部缓冲，而 §2.3 仍保留“或扩展 decode_non_stream SSE 容忍分支”。按最高优先级中更明确的 D-A 与 ADR-36，复核采用“统一强制 + 内部缓冲”，不再视为待选方案。来源：优化需求书 `:79,124,134`、`ADRs.md:38-42`。
-- **ADR 编号缺口**（OUTDATED）：`ADRs.md` 没有 ADR-13 正文，但优化需求书和决策索引把 ADR-13 用作“通用列 + payload_json”存储模型；该内容与 ADR-3 完全重合。复核按 ADR-3 采纳，不新增产品疑点，后续应修正文档编号/索引。
+- **ADR 编号缺口**（OUTDATED）：`ADRs.md` 原没有 ADR-13 正文，但优化需求书和决策索引把 ADR-13 用作“通用列 + payload_json”存储模型；该内容与 ADR-3 完全重合。复核按 ADR-3 采纳，不新增产品疑点。**（复核补记：ADR-13 正文已补为 ADR-3 同义引用，决策索引已扩到 ADR-37。）**
 
 ## 5. 决策清单
 
@@ -79,8 +79,8 @@ ADR 核对覆盖：ADR-1～12、14～37 均已在以上确认项或下方疑点/
 | 4 | cooldown 到期如何恢复，status/disabled/quota 如何分工？ | 影响账号是否错误停用或最长延迟 12h 恢复 | disabled=用户开关；status=凭据生命周期；quota_json=限额；路由时懒恢复到期 cooldown | 否 |
 | 5 | OAuth 五步进度、取消、超时如何对齐单一 auth_login 命令？ | 影响前后端契约和 callback listener 资源释放 | 单异步 invoke + 前端本地阶段 + 后端明确超时/取消清理，不增轮询命令 | 否 |
 | 6 | 过期 access token 导入和首次模型同步失败如何返回？ | 影响可恢复账号导入与登录成功语义 | 先 refresh；模型同步失败仍保存账号并明确返回部分成功，空快照拒绝路由 | 否 |
-| 7 | revoke 失败及 auth.json 覆盖失败如何处理？ | 影响本地删除可用性与 CLI 凭据文件安全 | revoke 失败不阻止本地删除但告警；写回原子、0600、覆盖前备份 | 否 |
+| 7 | revoke 失败及 auth.json 覆盖失败如何处理？ | 影响本地删除可用性与 CLI 凭据文件安全 | **v1 不做 revoke**：删除=纯本地移除，不调 provider 端点（ADR-38）；写回原子、0600、覆盖前备份 | 否 |
 
 ## 6. 用户决策
 
-用户于 2026-08-09 对上述决策清单 **1～7 项全部采纳建议假设**。其中第 1 项的生效边界为：存在可用 Auth 账号时强制进入混合 RoutePlan 并为账号分支启用所需 Responses/跨协议能力；无可用 Auth 账号时保持既有 feature flags 行为。
+用户于 2026-08-09 对上述决策清单 **1～7 项全部采纳建议假设**；其中第 6、7 项在采纳后进一步拍板：**删除不做 revoke，改为纯本地移除**（见上）。第 1 项的生效边界为：存在可用 Auth 账号时强制进入混合 RoutePlan 并为账号分支启用所需 Responses/跨协议能力；无可用 Auth 账号时保持既有 feature flags 行为。

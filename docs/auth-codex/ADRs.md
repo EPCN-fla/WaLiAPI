@@ -29,6 +29,12 @@
 - **理由**：路由可寻址、结构清晰、与 KnowledgeBasePage 的多路由 tab 模式一致。
 - **影响**：`App.tsx` 加路由；ChannelsPage 顶部加分段控件跳转；Auth 页为独立组件。
 
+## ADR-38：删除账号 = 纯本地移除，v1 不做远端 revoke
+
+- **决策**：`auth_logout`（删除账号）v1 **只做本地移除**——删除 `auth_accounts` 行与模型快照，账号退出路由；**不调用 provider 的 `oauth/revoke` 端点**，不影响已写回 `~/.codex/auth.json` 的本机 Codex CLI 登录态。删除弹窗只问「是否删除」：`取消` / `确认删除`，无 revoke 选项；若检测到本机 auth.json 含该账号副本，提示可另行 `codex logout` 注销。
+- **理由**：CPA 源码复核确认删除即本地移除（00-facts §5.3，`deleteAuthFileByName` → store `Delete`，无任何 `oauth/revoke` 调用）；自动 revoke 会把写回 CLI 的同一会话一并注销，误伤正在使用的 Codex CLI 登录；远端 revoke 能力依赖 provider 端点，v1 不承担该不确定性。
+- **影响**：`auth_logout` 无「revoke 失败」路径，返回被删账号摘要；删除弹窗文案定为「是否删除该账号？删除后此账号不再参与路由。仅从本应用移除，不影响本机 Codex CLI 登录态。」；修订 ADR-20 的 `auth_logout` 语义、02-design §8 命令表与 §9.3 弹窗、01-ui-spec §4.4 删除弹窗、00-optimized-requirements 与 03-task-breakdown 验收标准。
+
 ## ADR-37：账号出站请求体 = 字段 allowlist/变换
 
 - **决策**：账号适配器对发往 backend-api 的请求体做**字段 allowlist/变换**——参照 `codex-rs/codex-api` 实际发送的字段，过滤/改写后端不接受的字段（如 `store`/`background`/`metadata`/`parallel_tool_calls`/`reasoning` 等）。400/422 走 `classify_http_status`（已是 `CallerTerminal`，诚实报错给下游）。
@@ -89,10 +95,11 @@
 
 - **决策**：账号限额信息完全依赖上游返回（ADR-14 动态兼容）——**有则显示/参与限额路由，无则视为无限额**：
   - 上游响应返回限额字段（如 codex 的 `x-codex-primary/secondary-*`）→ 卡片显示进度条，参与限额退出/恢复（ADR-15/16）；
-  - 上游不返回任何限额字段（部分 provider 无 5h/周窗口）→ 卡片不显示限额块（或显示「未返回限额信息」），路由**不因限额退出**；
+  - 上游不返回任何限额字段 → 卡片不显示限额块，路由**不因限额退出**；
+  - 空窗口（仅 `used-percent:0`、无时长无重置）同样不渲染限额块——上游没有给出真实限额；
   - 无论有无返回，运行时实际撞 429 仍走 cooldown 退避兜底（ADR-14）。
-- **理由**：不写死「每个 provider 必须有 5h 窗口」；上游返回什么兼容什么（用户「有些有 5h、有些没有」的明确要求）。
-- **影响**：`auth_accounts.quota_json` 无限额时为 null/空；前端有值才渲染限额条。
+- **理由**：不写死任何 provider 的窗口类型（codex 实际无 5h 窗口——free=30 天月限额、非 free=周限额，由 `window-minutes` 动态推导）；上游返回什么兼容什么。
+- **影响**：`auth_accounts.quota_json` 无限额时为 null/空；前端有值且非空窗口才渲染限额条。
 
 ## ADR-27：账号编辑 = 名称 / 优先级 / 权重（弹窗）
 
@@ -144,7 +151,7 @@
   - `auth_accounts_list` — 列所有账号（通用字段 + provider 载荷摘要，不含令牌明文）
   - `auth_login` — 启动 OAuth 登录（provider 参数），完成后入库
   - `auth_login_import` — 从 `~/.codex/auth.json` 导入（ADR-2 C 路径）
-  - `auth_logout` — 删除账号（含 revoke）
+  - `auth_logout` — 删除账号（**纯本地移除**，v1 不做远端 revoke，见 ADR-38）
   - `auth_refresh_token` — 手动刷新某账号令牌
   - `auth_sync_models` — 手动拉取某账号模型列表（ADR-8）
   - `auth_write_back` — 手动写回 `~/.codex/auth.json`（ADR-18）
@@ -175,25 +182,31 @@
 ## ADR-16：限额退出粒度 = 账号级
 
 - **决策**：限额触发后**整个账号踢出路由候选**（账号所有模型一起不可用），`QuotaState.Exceeded` 置位 + `NextRecoverAt`；恢复时账号整体回到候选。不按模型分别标记不可用。
-- **理由**：5h/周限额是账号/订阅级，退出粒度与之对齐；实现简单、语义清晰。
+- **理由**：限额（free=月、非 free=周，均为账号/订阅级）退出粒度与之对齐；实现简单、语义清晰。
 - **影响**：`QuotaState` 是账号级字段；模型状态列 `model_states_json` 可仅作展示（ADR-3 已含），不承担路由分派。
 
 ## ADR-15：限额更新 = 每次请求响应头解析（主路径）+ 空闲 30min 主动探测兜底
 
 - **决策**：限额更新的两层机制，**不做有流量时的定时探测**：
-  1. **请求响应头解析（主路径）**：codex 每个响应头都返回 `x-codex-primary-*`（5h 窗口）和 `x-codex-secondary-*`（周窗口）限额（used-percent / window-minutes / reset-at）。有流量时**每次出站响应即解析更新** `QuotaState`，天然最新，无需额外定时。
+  1. **请求响应头解析（主路径）**：codex 每个响应头都返回 `x-<limit_id>-<primary|secondary>-*` 限额（used-percent / window-minutes / reset-at）。窗口类型由 `window-minutes` 决定，**不写死**（实测 free=30 天月限额、非 free=周限额；`secondary` 常为空，仅 `used-percent:0` 的空窗口按 `has_data` 规则丢弃）。有流量时**每次出站响应即解析更新** `QuotaState`，天然最新，无需额外定时。
   2. **空闲主动探测（兜底）**：仅当**无流量**时每 **30 分钟**主动查一次限额，防止闲置期间限额恢复/耗尽被漏过。
 - **理由**：用户指出「codex 有返回就不用有流量 5min 更新一次」——响应头已覆盖活跃场景，定时探测在有流量时是重复劳动；只在空闲时兜底。
 - **影响**：出站响应解析限额头（参考 codex `parse_rate_limit_for_limit`）；空闲探测仅无流量时触发。
 
-## ADR-14：provider 限额 = 写死已知窗口 + 动态兼容 + 30min 刷新路由
+## ADR-14：provider 限额 = 完全按上游动态解析 + 429/Retry-After 兜底
 
-- **决策**：限额处理分三层：
-  1. **写死已知窗口**：在 provider 定义里配已知限额（codex 等有 5h / 周），据此计算已知恢复点；
-  2. **运行时动态兼容**：不假设所有 provider 限额结构一致——遇 429/限额错误，解析 `Retry-After` 头或错误体中的限额字段更新 `QuotaState`；有响应则更新恢复时间，未知/缺字段则回退到指数退避。**上游返回什么就兼容什么**（有的 provider 是周、有的是 5h，不能写死单一窗口结构）；
+- **决策**：限额处理分层：
+  1. **动态解析（主路径）**：不假设任何 provider 的窗口类型——解析响应头 `x-<limit_id>-<primary|secondary>-*`，窗口类型由 `window-minutes` 推导，前端只识别三种标签：**5H限额 / 周限额 / 月限额**（codex 实际无 5h 窗口，free=30 天月限额、非 free=周限额）；仅 `used-percent:0` 的空窗口按 `has_data` 规则丢弃；
+  2. **运行时动态兼容（兜底）**：遇 429/限额错误，解析 `Retry-After` 头或错误体中的限额字段更新 `QuotaState`；有响应则更新恢复时间，未知/缺字段则回退到指数退避。**上游返回什么就兼容什么**；
   3. **自动恢复**：每 **30 分钟**检查 cooldown 状态，到期账号自动回到路由候选。
-- **理由**：用户明确「有些是周，有些有 5h，必须根据上游动态兼容」；CPA 的运行时标记 + 恢复模型为基底，叠加已知窗口提升精确度。
-- **影响**：`QuotaState` 通用列承载恢复点/退避；每 provider 可声明已知窗口；响应解析"有就更新、无则退避"。
+- **理由**：用户确认「codex 没有 5 小时限额，free=月限额、非 free=周限额，限额应以实际返回为准」；CPA 的运行时标记 + 恢复模型为基底，动态解析天然适配任何窗口。
+- **影响**：`QuotaState` 通用列承载恢复点/退避；窗口类型不落 provider 定义，完全按 `window-minutes` 动态推导；响应解析"有就更新、无则退避"。
+
+## ADR-13：存储模型 = 通用列 + payload_json（CPA 式两层结构）
+
+- **决策**：`auth_accounts` 采用「通用列 + provider 载荷」两层结构——通用路由/展示字段落通用列（`id / provider / label / account_id / status / disabled / priority / weight / quota_json / model_states_json / attributes_json / last_refreshed_at / next_refresh_after / next_retry_after / created_at / updated_at`），provider 特有令牌数据（codex 的 `access_token / refresh_token / expires_at` 等）存 `payload_json`。
+- **理由**：早期作为独立决策条目编号引用，正文未单独成篇；其内容与 ADR-3 完全重合（ADR-3 已完整记录该决策）。
+- **影响**：以 ADR-3 为准，本号视为 ADR-3 的同义引用；不引入独立约束。设计落点见 `docs/auth-codex/work/02-design.md` §2。
 
 ## ADR-12：provider 抽象一步到位，codex 为首个实现
 
@@ -250,7 +263,9 @@
 - **理由**：用户明确选择多账号；路由层按账号做选择时具备更多自由度。
 - **影响**：`auth_accounts` 表可存多行同 provider；路由/负载需在账号间选择（后续决策）。
 
-## 决策索引（ADR-1 ~ ADR-26）
+## 决策索引（ADR-1 ~ ADR-37）
+
+> 注：ADR-13 正文为 ADR-3 的同义引用（原编号正文缺失，复核已补）。正文编号在文件内非升序排列（按追加时间倒序），以索引为准。
 
 | ADR | 主题 |
 | --- | --- |
@@ -266,8 +281,8 @@
 | 10 | 令牌刷新 = 12h 定时兜底 + 懒刷新 + 401 重试 |
 | 11 | 同 provider 多账号 = 每账号独立候选，weight 抽样 |
 | 12 | provider 抽象一步到位，codex 为首个实现 |
-| 13 | 存储模型 = 通用列 + payload_json（CPA 式两层结构） |
-| 14 | provider 限额 = 写死已知窗口 + 动态兼容 + 30min 刷新路由 |
+| 13 | 存储模型 = 通用列 + payload_json（CPA 式两层结构，ADR-3 同义） |
+| 14 | provider 限额 = 完全按上游动态解析 + 429/Retry-After 兜底 |
 | 15 | 限额更新 = 每次请求响应头解析 + 空闲 30min 探测兜底 |
 | 16 | 限额退出粒度 = 账号级 |
 | 17 | Auth tab UI = 账号卡片列表，界面细节延后 |
@@ -280,4 +295,14 @@
 | 24 | 导入 auth.json = 校验 + 提示本机 codex 状态 |
 | 25 | 失效账号 = 后台自动重试刷新 + 手动重登引导 |
 | 26 | 账号权重/优先级 = 登录默认 + 前端可调 |
-| 27 | 账号重命名 = label 通用列，前端内联编辑 |
+| 27 | 账号编辑 = 名称 / 优先级 / 权重（弹窗） |
+| 28 | 限额缺失 = 不显示、不受限（动态兼容） |
+| 29 | 风险提示 = Auth tab 固定警示条 |
+| 30 | 请求日志区分 = upstream_type 列 |
+| 31 | 账号服务全部下游协议（含 Chat）— 新增 Responses→Chat codec |
+| 32 | 账号不受 allowed_channels 约束 |
+| 33 | 原生 Responses 流式补 usage 提取 |
+| 34 | 账号空模型 = 拒绝所有（区别于渠道空=通配） |
+| 35 | 账号 401 刷新重试 = 适配器内部，AttemptFlow 无感知 |
+| 36 | 账号强制流式，非流式下游内部缓冲 |
+| 37 | 账号出站请求体 = 字段 allowlist/变换 |

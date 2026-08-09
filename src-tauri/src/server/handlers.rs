@@ -1563,9 +1563,15 @@ async fn record_anthropic_outcome(
     let mut completion_tokens = completion_tokens;
 
     // Fallback: estimate tokens when upstream didn't return usage.
-    if total_tokens == 0 && prompt_tokens == 0 && completion_tokens == 0 && status_code >= 200 && status_code < 300 {
+    if total_tokens == 0
+        && prompt_tokens == 0
+        && completion_tokens == 0
+        && status_code >= 200
+        && status_code < 300
+    {
         let req_body = serde_json::to_value(request).unwrap_or(serde_json::Value::Null);
-        let (p, c, t) = crate::endpoint_executor::estimate_usage::estimate_usage(&req_body, None, model);
+        let (p, c, t) =
+            crate::endpoint_executor::estimate_usage::estimate_usage(&req_body, None, model);
         prompt_tokens = p;
         completion_tokens = c;
         total_tokens = t;
@@ -3208,8 +3214,11 @@ pub async fn handle_embeddings(
 
                 // Fallback: estimate tokens when upstream didn't return usage.
                 if usage_total == 0 && usage_prompt == 0 && status.is_success() {
-                    let req_body: serde_json::Value = serde_json::from_str(&request_body_str).unwrap_or(serde_json::Value::Null);
-                    let (p, _, t) = crate::endpoint_executor::estimate_usage::estimate_usage(&req_body, None, &model);
+                    let req_body: serde_json::Value =
+                        serde_json::from_str(&request_body_str).unwrap_or(serde_json::Value::Null);
+                    let (p, _, t) = crate::endpoint_executor::estimate_usage::estimate_usage(
+                        &req_body, None, &model,
+                    );
                     usage_prompt = p;
                     usage_total = t;
                     if usage_total > 0 {

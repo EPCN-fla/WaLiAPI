@@ -15,7 +15,7 @@
 | 1 | **High** | RoutePlan 候选是具体 `Channel`，账号无法进入候选集 | route_plan.rs:111-117, 366-380, 545-642, 662-680；debug_json:705-712 | 引入 `RouteCandidate` enum（`Channel \| Account`）或 trait（id/name/priority/weight/models/model_mapping）；`RouteGroupCandidate` 持有它。priority/weight 抽样已泛化到 `HasPriorityWeight`，不用改 |
 | 2 | **High** | driver `lookup` map 对非 Channel 候选硬 panic | driver.rs:87-97, 354-364, `.expect()` | map 值改 `RouteCandidate`；executor 闭包分叉到账号适配器 |
 | 3 | **High** | `send_request` 以 channel 为中心，无账号头/令牌刷新钩子 | mod.rs:426-476, auth_headers:140-154, auth_scheme_for:157-166 | 在 `dispatch_executor`/`dispatch_stream_executor` 加账号分支（或 `legacy_executor_override` 风格 `"codex_account"` 选择器），带账号头 + 注入新鲜 access_token（出站前懒刷新，ADR-10） |
-| 4 | **High/Med** | 账号只服务 **Responses 下游**；Chat/Messages 路由到账号会发不兼容字节 | sse.rs:22-34, 506-521；attempt.rs:287-301；route_plan.rs:444-542 | **决策：v1 账号只服务 `EndpointKind::Responses`**；`classify_channel` 对账号在 Chat/Messages/CountTokens/Embeddings 返回 None。`ResponsesToChat` codec 是未来工作 |
+| 4 | **High/Med** | 账号只服务 **Responses 下游**；Chat/Messages 路由到账号会发不兼容字节 | sse.rs:22-34, 506-521；attempt.rs:287-301；route_plan.rs:444-542 | **旧决策已由 D-1 / ADR-31 取代**：v1 账号服务**全部下游**（Responses / Chat / Messages），新增 `ResponsesToChat` codec + Messages 链式路径；`classify_channel` 对账号在三种下游均出组（CountTokens/Embeddings 不出组）。`ResponsesToChat` codec 从「未来工作」改为 v1 必做 |
 | 5 | **Med** | ADR-10 的 401→刷新重试同一账号在 `AttemptFlow` 里不可表达 | attempt.rs:82-94（401→ChannelAuthTerminal）, 366-398 | 刷新在**账号适配器内部**做（成功刷新后重试一次→Retryable；失败→ChannelAuthTerminal/EndpointUnsupported），不动 AttemptFlow |
 | 6 | **Med** | 429→账号级 QuotaState 踢出路由（ADR-14/16）没有钩子 | attempt.rs:88（429→Retryable）；route_plan.rs:366-380 | 账号适配器解析 `x-codex-primary/secondary-*` 写 `quota_json`；`resolve_model_candidates` 增加账号过滤（跳过 Exceeded/失效/停用，镜像 `status==1`） |
 | 7 | **Med** | `allowed_channels` 静默排除账号 | route_plan.rs:371-377 | **决策：账号是否受 `allowed_channels` 约束**（见决策 D-2） |
@@ -39,7 +39,7 @@
 
 1. `RouteGroupCandidate`/`authorize_and_plan`/driver `lookup` 接受混合 Channel+Account 候选（问题 1-2）——其它改动都依赖它。
 2. 账号适配器在 `dispatch_executor`/`dispatch_stream_executor`（问题 3, 5, 13）。
-3. 明确范围：账号只服务 Responses 下游（问题 4）。
+3. 明确范围：账号服务**全部下游**（Responses / Chat / Messages，含新增 `ResponsesToChat` codec）——见 §六 D-1 / ADR-31，取代问题 4 的「仅 Responses」旧限缩。
 4. `auth_accounts` + `request_logs.upstream_type` 迁移 + QuotaState 过滤（问题 6, 10）。
 
 ## 五、待验证（需真实令牌探测）

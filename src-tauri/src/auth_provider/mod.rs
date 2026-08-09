@@ -11,11 +11,11 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 
+pub use crate::db::models::{AuthAccount, QuotaState};
 pub use types::{
     AuthAccountSummary, LoginResult, ProviderError, ProviderKind, ProviderModels, ProviderPayload,
     ProviderRequest, RefreshedPayload,
 };
-pub use crate::db::models::AuthAccount;
 
 /// Minimal host capability needed by an interactive provider login.  Specific
 /// providers may add their own local callback handling without coupling that
@@ -42,8 +42,23 @@ pub trait Provider: Send + Sync {
         request: ProviderRequest<'_>,
     ) -> Result<reqwest::Response, ProviderError>;
 
-    async fn list_models(&self, account: &AuthAccount, payload: &ProviderPayload)
-        -> Result<ProviderModels, ProviderError>;
+    async fn list_models(
+        &self,
+        account: &AuthAccount,
+        payload: &ProviderPayload,
+    ) -> Result<ProviderModels, ProviderError>;
+
+    /// Probe the provider's dedicated quota endpoint.  `Ok(None)` means no quota
+    /// data is currently available (callers preserve previously persisted state).
+    /// The default is a no-op so providers without a dedicated endpoint stay
+    /// header/cooldown-only.
+    async fn fetch_quota(
+        &self,
+        _account: &AuthAccount,
+        _payload: &ProviderPayload,
+    ) -> Result<Option<QuotaState>, ProviderError> {
+        Ok(None)
+    }
 }
 
 /// Runtime registry, deliberately separate from persisted provider strings.

@@ -70,27 +70,37 @@
 - **共享元数据**：`type`（provider）、`email`、`project_id`、`priority`、`weight`（`AttributeWeight`）、`note`、`websockets` 等由 `gjson` 从文件头读取做列表展示（`auth_files.go:247-289`）。
 - **泛化理由**：CPA 用 `Auth`（通用）+ `TokenStorage`（provider 特有）两层——**表/文件结构不绑死任何 provider 的字段**。这正是用户「基于 codex 设计的表不通用」想避免的。
 
-### 5.2 限额/降级路由（用户第二点：5 小时、周限额）
+### 5.2 限额/降级路由（用户第二点：限额与账号退出）
 
 - **QuotaState**（`types.go:168-177`）：`Exceeded` / `Reason` / `NextRecoverAt` / `BackoffLevel`（指数退避 `quotaBackoffBase * 2^level`）。
 - **ModelState**（`types.go:180-195`）：每模型执行状态 `Status` / `Unavailable` / `NextRetryAfter` / `LastError` / `Quota`。
 - **触发**：HTTP 429 → `Quota.Exceeded=true, Reason="quota"`，`NextRecoverAt` 取 `Retry-After` 头或指数退避；404 冷 12h；408/500/502/503/504 冷临时错（`conductor_cooldown.go:1775-1806`）。
 - **恢复**：`ResetQuota`（`conductor_cooldown.go:425`）清空该 auth 的 cooldown/quota；cooldown 状态独立持久化到 `.cds` 文件（`FileCooldownStateStore`），与 auth 令牌文件分离。
-- **按 provider 限额窗口（5h/周）**：CPA 没有为 codex 的「5 小时/周限额」写死专用窗口字段；它把限额当作**运行时 cooldown/quota 状态**（429 触发、Retry-After/退避恢复），通用化到所有 auth。用户提到的 5h/周这类 provider 专属限额，CPA 的做法是「不特判，触发时标记 + 自动恢复」。
+- **按 provider 限额窗口（free=月、非 free=周）**：codex 实际**没有 5 小时限额**——free 号实测返回 30 天月窗口（`primary.window_minutes=43200`），非 free 常见周窗口。CPA 没有写死专用窗口字段；它把限额当作**运行时 cooldown/quota 状态**（429 触发、Retry-After/退避恢复），通用化到所有 auth。CPA 的做法是「不特判，触发时标记 + 自动恢复」。WaLiAPI 对齐：窗口类型按 `window_minutes` 动态推导，不硬编码 free/非 free。
 - **自动刷新路由**：`auto_refresh_loop.go` 存在（后台刷新循环）；cooldown 过期后 auth 自动回到候选（`restoreCooldownRecordLocked`）。
+
+### 5.3 CPA 删除 auth = 纯本地移除，无远端 revoke（调研事实，2026-08-09 复核源码）
+
+- **删除链路**：TUI `y` 确认 → 管理 API `deleteAuthFileByName`（`internal/api/handlers/management/auth_files_crud.go:342-375`）→ `os.Remove` 本地 auth 文件 + `deleteTokenRecord`（store `Delete`）+ `removeAuthsForPath` 清运行时内存。
+- **Store 层 `Delete`**（三处实现，动作一致）：`ObjectTokenStore` 删本地文件 + 删远端**对象存储**副本（`internal/store/objectstore.go:273-294`）；`PostgresStore` 删本地文件 + 删 DB 行（`postgresstore.go:366-388`）；`GitTokenStore` 删本地文件 + git commit/push「Delete auth …」（`gitstore.go:522-529`）。
+- **「远端」≠ provider revoke**：上面的远端只指 CPA 自己存储后端（对象存储 / git 仓库 / DB），是删除持久化副本，**不调用 provider 的 `oauth/revoke` 端点**。
+- **全仓库 `revoke` 检索**：仅 refresh 错误分支出现 `refresh_token_reused` 字样（`internal/runtime/executor/helps/home_refresh.go`），**无任何 `oauth/revoke` 调用**。删除动作不触碰 OpenAI/Claude 服务端会话。
+- **结论**：CPA 的删除语义 = 本网关移除（持久化 + 内存），与用户「删除后此账号不再参与路由」一致；WaLiAPI v1 对齐此语义（ADR-38），弹窗只问「是否删除」。
 
 ## 6. codex 限额响应头（事实）
 
 来自 [openai/codex `rate_limits.rs`](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/rate_limits.rs)（用户要求「看看每个请求里有没有返回限额信息，有的话就更新一下」）：
 
 - **响应头携带限额**：codex 在**每个响应头**返回限额，格式 `x-<limit_id>-<primary|secondary>-...`：
-  - `x-codex-primary-used-percent` / `x-codex-primary-window-minutes` / `x-codex-primary-reset-at` —— **primary = 5h 窗口**；
-  - `x-codex-secondary-used-percent` / `x-codex-secondary-window-minutes` / `x-codex-secondary-reset-at` —— **secondary = 周窗口**；
-  - 另有 `x-codex-limit-name`、credits 快照、`rate_limit_reached_type` 等。
+  - `x-codex-primary-used-percent` / `x-codex-primary-window-minutes` / `x-codex-primary-reset-at` —— primary/secondary 是**两个平行的可选项**，窗口类型完全由 `window-minutes` 决定，不写死；实测 free 号 `primary.window_minutes=43200` = **30 天月限额**（非 free 常见周限额）；`secondary` 常为空。
+  - 另有 `x-codex-limit-name`、credits 快照（`x-codex-credits-*` 是**布尔标志**，非数值）、`rate_limit_reached_type` 等。
 - **多 limit_id**：header 名里可带不同 limit id（`codex` / `codex_other`），解析时遍历。
 - **codex 自带解析器** `parse_rate_limit_for_limit` / `parse_all_rate_limits`（`rate_limits.rs:23-101`），返回 `RateLimitSnapshot { limit_id, limit_name, primary, secondary, credits, ... }`。可移植参考。
+- **空窗口丢弃**：上游保留规则（`has_data`）= `used_percent != 0 || window_minutes != 0 || reset_at 存在`；只有 `used-percent: 0` 的窗口不构成限额，WaLiAPI 解析层镜像该规则丢弃（见 02-design §5.3）。
+- **窗口标签**：WaLiAPI 前端只支持三种限额标签，按 `window_minutes` 近似匹配（±5%）→ **5H限额 / 周限额 / 月限额**；其它时长不标类型，显示裸「限额」，避免误导（曾因单位错误误标「12小时窗口」）。重置时间显示**具体时间点**（本地化月/日/时/分），而非相对时长；**上游未返回 `reset_at` 则不显示重置行**。
 - **事件通道**：`codex.rate_limits` SSE 事件也携带 `used_percent / window_minutes / reset_at`。
-- 这就构成「每个请求返回限额信息」的落点：**解析响应头更新 `QuotaState`**，无需额外探测端点；「主动探测」主要在不活跃时段兜底（C 方案）。
+- **专门限额端点（无流量权威源）**：`GET {backend-api}/wham/usage` 返回权威限额状态，字段为 `rate_limit.primary_window.{used_percent, limit_window_seconds, reset_at(UNIX秒)}` + `credits` + `spend_control`。实测：free 号 `limit_window_seconds=2592000`（30 天月限额）、plus 号 `604800`（7 天周限额）。WaLiAPI 在**模型同步后/刷新后/维护循环**主动探测并归一化写 `QuotaState`，失败静默保留旧值。
+- 这就构成「有流量时解析响应头、无流量时主动探测 `wham/usage`」的完整更新链。
 
 ## 7. 本机 codex 登录态（实际 auth.json 结构 — 导入/写回的权威依据）
 
@@ -119,6 +129,8 @@
 
 ## 8. 设计树（grilling 进度）
 
+> 注：下表为 grilling 期间决策快照。Q14/Q15 中的「30min 主动探测/刷新路由」已被**已拍板决策 D-C（延后）**取代（见 `work/00-optimized-requirements.md` §2.2 / §3.1）；Q10 的「12h 定时兜底 + 懒刷新 + 401 重试」保留。
+
 | 决策 | 状态 |
 | --- | --- |
 | Q1 Auth 定位 | ✅ A 账号即上游（消耗订阅额度） |
@@ -134,13 +146,13 @@
 | Q11 同 provider 多账号路由选择 | ✅ A 每个账号是独立候选，复用 weight 无放回抽样 |
 | Q12 provider 抽象深度 | ✅ A 抽象层一步到位：Provider trait（登录/刷新/出站），codex 为首个实现 |
 | Q13 存储模型 | ✅ A 通用列 + payload_json（CPA 式两层结构）：通用列 + 每 provider JSON 载荷 |
-| Q14 限额实现 | ✅ C 写死已知窗口（5h/周）+ 运行时 429/Retry-After 兜底 + 30min 刷新路由 + 响应动态解析 |
+| Q14 限额实现 | ✅ C 动态窗口（free=月、非 free=周，按 `window_minutes` 推导）+ 运行时 429/Retry-After 兜底 + 30min 刷新路由 + 响应动态解析 |
 | Q15 限额探测频率 | ✅ 有流量：每次请求响应头解析即更新（无需定时）；空闲：每 30min 主动探测兜底 |
 | Q16 限额退出粒度 | ✅ A 账号级：限额触发整个账号踢出路由，恢复时整体回来 |
 | Q17 Auth tab UI | ✅ A 账号卡片列表（对齐 ApiKeysPage）；界面细节后续再设计，先核心功能 |
 | Q18 回写 codex CLI | ✅ D 手动：账号卡片上提供「写回本地 Codex CLI」按钮，点击才写 ~/.codex/auth.json |
 | Q19 与 UsagePage Codex 配置关系 | ✅ C 暂不联动：两者独立，用户手动切换 codex 用 WaLiAPI |
-| Q20 Tauri 命令集 | ✅ auth_accounts_list / auth_login / auth_login_import / auth_logout(revoke) / auth_refresh_token / auth_sync_models / auth_write_back / auth_toggle / auth_quota_status / auth_update(编辑名称/P/W) |
+| Q20 Tauri 命令集 | ✅ auth_accounts_list / auth_login / auth_login_import / auth_logout（纯本地删除，无 revoke）/ auth_refresh_token / auth_sync_models / auth_write_back / auth_toggle / auth_quota_status / auth_update(编辑名称/P/W) |
 | Q21 账号模型映射 | ✅ B v1 不支持 model_mapping：账号只透传上游 /models 模型名 |
 | Q22 账号失败降级 | ✅ A 账号与普通渠道同等级降级：失败自动试下一个候选（账号或普通渠道） |
 | Q23 登录冲突/覆盖 | ✅ B 同 account_id 覆盖刷新现有账号（保留 id/权重/优先级），不重复新增 |

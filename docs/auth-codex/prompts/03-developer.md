@@ -14,7 +14,7 @@
 4. 测试命令（按需）：
    - 后端全量：`cd src-tauri && cargo test`
    - 后端聚焦：`cargo test <模块名>`（如 `cargo test route_plan`）
-   - 前端类型检查：`npx tsc --noEmit`（或 `pnpm build`）
+   - 前端类型检查：`npx tsc --noEmit`（或 `npm run build`，仓库根目录）
 5. 完成一个任务返回**实现说明**（模板见下）。
 
 ## 实现说明模板（回复里返回）

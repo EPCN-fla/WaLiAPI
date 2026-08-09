@@ -18,7 +18,7 @@
 | 1 | `docs/auth-codex/00-facts.md` | 事实底座（代码现状 / codex 登录机制 / 真实 auth.json 结构） |
 | 2 | `docs/auth-codex/01-ui-spec.md` | UI 设计规格 |
 | 3 | `docs/auth-codex/02-routing-compat-review.md` | 路由/协议兼容审查（注意其 D-1 已被优化需求书 §3.1 D-A 取代） |
-| 4 | `docs/auth-codex/ADRs.md` | 决策记录（ADR-1 ~ ADR-31） |
+| 4 | `docs/auth-codex/ADRs.md` | 决策记录（ADR-1 ~ ADR-37；ADR-13 为 ADR-3 同义引用，无独立正文） |
 | 5 | `docs/auth-codex/glossary.md` | 术语表 |
 | 6 | `docs/auth-codex/prototype.html` | 静态原型（UI 视觉参考） |
 
@@ -115,10 +115,10 @@
 角色提示词：docs/auth-codex/prompts/05-verifier.md（全文注入）
 输入：实现 + 实现说明 + CR 通过记录
 输出：docs/auth-codex/work/05-verification-report.md
-指示：执行 cargo test + pnpm build，客观 PASS/FAIL
+指示：执行 cargo test + npm run build（本仓库为 pnpm 管理，build 脚本即 `npm run build`），客观 PASS/FAIL
 ```
 **收到验证报告**：
-- **PASS**（cargo test 全绿 + pnpm build 通过）→ 终止（§十）；
+- **PASS**（cargo test 全绿 + npm run build 通过）→ 终止（§十）；
 - **FAIL** → 打回修复，验证轮次 +1。
 - **验证最多 3 轮**；3 轮后未通过 → 停下向用户汇报。
 
@@ -132,7 +132,7 @@
 | Phase 2 | [ ] `02-design.md` 覆盖优化需求书 §2.1 全部条目；[ ] 每个 ADR 有落点；[ ] `03-task-breakdown.md` 任务卡含 编号/目标/涉及文件/改动点/验收标准/依赖；[ ] 用户已确认设计摘要 |
 | Phase 3 | [ ] 每任务返回实现说明（文件/测试/自测/偏差）；[ ] 任务卡验收标准逐项满足；[ ] 相关模块 `cargo test` 通过 |
 | Phase 4 | [ ] `04-cr-report.md` 含 结论/问题清单/通过项；[ ] FAIL 时问题可执行 |
-| Phase 5 | [ ] `05-verification-report.md` 含 结论/cargo test 摘要/pnpm build 结果；[ ] PASS 判定严格（§五 Phase 5） |
+| Phase 5 | [ ] `05-verification-report.md` 含 结论/cargo test 摘要/npm run build 结果；[ ] PASS 判定严格（§五 Phase 5） |
 
 任一产物缺失或不达标 = 打回该阶段重做，不推进。
 
@@ -173,7 +173,7 @@ Phase 1 结束，把疑点整理成表给用户：
 
 验证 PASS 后输出**交付总结**：
 - 变更文件清单（`git status` / diff stat）
-- `cargo test` 摘要、`pnpm build` 结果
+- `cargo test` 摘要、`npm run build` 结果
 - 用户拍板决策摘要
 - 遗留风险与未做项（真实令牌 E2E 未验、§2.2 延后项等）
 
