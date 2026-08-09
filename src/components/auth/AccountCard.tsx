@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
 import { Check, Download, Edit3, KeyRound, Loader2, Power, RefreshCw, RotateCw, Trash2, X } from "lucide-react";
 import type { AuthAccount, AuthModelState } from "../../types";
+import { QuotaBlock } from "./QuotaBlock";
 
 // 统一 chip 尺寸：+N 与模型 id 完全一致，文字水平垂直居中，样式对齐底部「P0 · W1」等 pill
 const chipBase =
   "inline-flex items-center justify-center gap-1 rounded-full bg-muted px-2 py-1 text-[10px] text-muted-foreground";
-import { QuotaBlock } from "./QuotaBlock";
 
 function formatTime(value: string | null) {
   if (!value) return "未同步";
