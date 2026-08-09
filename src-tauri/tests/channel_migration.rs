@@ -867,10 +867,12 @@ async fn rollback_write_then_reupgrade_live_infers() {
 
     // "Rolled-back" old binary UPDATEs the legacy base_url -> trigger clears.
     // main 约定：deepseek anthropic 兼容 base 带 /v1。
-    sqlx::query("UPDATE channels SET base_url='https://api.deepseek.com/anthropic/v1' WHERE id='r1'")
-        .execute(&pool)
-        .await
-        .expect("rollback write");
+    sqlx::query(
+        "UPDATE channels SET base_url='https://api.deepseek.com/anthropic/v1' WHERE id='r1'",
+    )
+    .execute(&pool)
+    .await
+    .expect("rollback write");
     let row = get_row(&pool, "r1").await;
     assert_eq!(row.identity_revision, 0);
     assert!(row.provider.is_none());

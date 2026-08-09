@@ -27,7 +27,7 @@ tauri-plugin-process = "2"
 
 # HTTP Server
 axum = "0.8"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 
@@ -56,6 +56,7 @@ rand = "0.9"
 dirs = "5"
 async-trait = "0.1"
 bytes = "1"
+oauth2 = "5"
 
 # Logging
 log = "0.4"

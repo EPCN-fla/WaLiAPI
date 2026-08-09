@@ -78,6 +78,7 @@ fn full_log(channel_id: Option<&str>, channel_name: Option<&str>) -> models::Req
         identity_revision: Some(1),
         client_cancelled: Some(0),
         stream_committed: Some(1),
+        upstream_type: "channel".into(),
     }
 }
 
@@ -202,6 +203,64 @@ async fn request_log_create_log_persists_t09_fields_and_log_dto_maps_them() {
     assert_eq!(dto.identity_revision, Some(1));
     assert_eq!(dto.client_cancelled, Some(false));
     assert_eq!(dto.stream_committed, Some(true));
+}
+
+#[tokio::test]
+async fn request_log_upstream_type_defaults_filters_and_round_trips() {
+    let pool = fresh_db().await;
+    let repo = Repository::new(pool);
+
+    let channel_log = full_log(Some("channel-1"), Some("API channel"));
+    assert_eq!(channel_log.upstream_type, "channel");
+    repo.create_log(&channel_log).await.expect("channel log");
+
+    let mut account_log = full_log(Some("account-1"), Some("Codex account"));
+    account_log.upstream_type = "auth_account".into();
+    repo.create_log(&account_log).await.expect("account log");
+
+    let stored = repo
+        .get_log(&account_log.id)
+        .await
+        .expect("account log read");
+    assert_eq!(stored.upstream_type, "auth_account");
+    let dto: waliapi_lib::commands::log::LogDto = stored.into();
+    assert_eq!(dto.upstream_type, "auth_account");
+
+    let channel_only = repo
+        .search_logs_by_upstream_type(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("channel"),
+            50,
+            0,
+        )
+        .await
+        .expect("channel filter");
+    assert_eq!(channel_only.len(), 1);
+    assert_eq!(channel_only[0].id, channel_log.id);
+
+    let account_only = repo
+        .search_logs_by_upstream_type(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("auth_account"),
+            50,
+            0,
+        )
+        .await
+        .expect("account filter");
+    assert_eq!(account_only.len(), 1);
+    assert_eq!(account_only[0].id, account_log.id);
 }
 
 #[tokio::test]

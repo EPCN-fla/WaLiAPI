@@ -44,6 +44,7 @@ use crate::core::channel_identity::ChannelIdentity;
 use crate::core::route_plan::EndpointKind;
 use crate::db::models::Channel;
 use futures_util::StreamExt;
+use reqwest::header;
 use serde_json::Value;
 
 /// A connected upstream stream response (2xx, content still flowing).
@@ -62,6 +63,142 @@ pub enum StreamAttemptResult {
     Connected(UpstreamStream),
     /// Failed before any downstream bytes were committed (classified).
     Failure(AttemptFailure),
+}
+
+/// Dispatch an Auth Account attempt.  Account providers intentionally own their
+/// request policy (including the forced `stream: true` backend contract,
+/// credential headers, 401 refresh/retry, and quota persistence); this module
+/// only converts the provider result into the executor's common attempt shape.
+pub async fn dispatch_auth_account_executor(
+    downstream: EndpointKind,
+    attempt: &PreparedAttempt,
+    auth_service: &crate::auth_provider::service::AuthService,
+    safe_headers: &[(String, String)],
+) -> AttemptResult {
+    let response = match auth_service
+        .outbound(
+            &attempt.channel_id,
+            &force_responses_stream(&attempt.encoded_body),
+            &header_map(safe_headers),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return AttemptResult::Failure(provider_failure(error)),
+    };
+    let status = response.status().as_u16();
+    if status >= 400 {
+        let text = response.text().await.unwrap_or_default();
+        return AttemptResult::Failure(failure_from_upstream(status, &text));
+    }
+    let response_headers = safe_response_headers(response.headers());
+    let bytes = response.bytes().await.unwrap_or_default();
+    let mut accumulator =
+        crate::protocol::codec::responses_codec::ResponsesEventAccumulator::default();
+    if let Err(error) = accumulator.push(&bytes) {
+        return AttemptResult::Failure(responses_protocol_failure(error.message));
+    }
+    let body = match accumulator.finish() {
+        Ok(body) => body,
+        Err(error) => return AttemptResult::Failure(responses_protocol_failure(error.message)),
+    };
+    match decode_non_stream(downstream, attempt, &body) {
+        Ok((body, usage)) => AttemptResult::Success(AttemptSuccess {
+            status,
+            body,
+            usage,
+            downstream_events: None,
+            upstream_model: Some(attempt.upstream_model.clone()),
+            response_headers,
+        }),
+        Err(failure) => AttemptResult::Failure(failure),
+    }
+}
+
+/// Connect an Auth Account's forced Responses SSE stream without committing
+/// downstream bytes.  The driver retains the same first-frame commit barrier
+/// used for Channels, so a malformed first event can still fail over.
+pub async fn dispatch_auth_account_stream_executor(
+    attempt: &PreparedAttempt,
+    auth_service: &crate::auth_provider::service::AuthService,
+    safe_headers: &[(String, String)],
+) -> StreamAttemptResult {
+    let response = match auth_service
+        .outbound(
+            &attempt.channel_id,
+            &force_responses_stream(&attempt.encoded_body),
+            &header_map(safe_headers),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return StreamAttemptResult::Failure(provider_failure(error)),
+    };
+    let status = response.status().as_u16();
+    if status >= 400 {
+        let text = response.text().await.unwrap_or_default();
+        return StreamAttemptResult::Failure(failure_from_upstream(status, &text));
+    }
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("text/event-stream")
+        .to_owned();
+    let headers = safe_response_headers(response.headers());
+    StreamAttemptResult::Connected(UpstreamStream {
+        content_type,
+        headers,
+        body: response
+            .bytes_stream()
+            .map(|result| result.map_err(std::io::Error::other))
+            .boxed(),
+    })
+}
+
+fn force_responses_stream(body: &Value) -> Value {
+    let mut body = body.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.insert("stream".to_owned(), Value::Bool(true));
+    }
+    body
+}
+
+fn header_map(headers: &[(String, String)]) -> reqwest::header::HeaderMap {
+    let mut map = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = reqwest::header::HeaderValue::from_str(value) else {
+            continue;
+        };
+        map.insert(name, value);
+    }
+    map
+}
+
+fn provider_failure(error: crate::auth_provider::ProviderError) -> AttemptFailure {
+    let failure_class = error.failure_class();
+    AttemptFailure {
+        status_code: Some(match failure_class {
+            FailureClass::CallerTerminal => 400,
+            FailureClass::ChannelAuthTerminal => 502,
+            _ => 502,
+        }),
+        failure_class,
+        message: error.to_string(),
+        retry_after: None,
+    }
+}
+
+fn responses_protocol_failure(message: String) -> AttemptFailure {
+    AttemptFailure {
+        failure_class: FailureClass::UpstreamProtocolError,
+        message: format!("Responses SSE aggregation failed: {message}"),
+        status_code: Some(502),
+        retry_after: None,
+    }
 }
 
 /// RFC 9110 hop-by-hop fields and credentials belonging to the *client* must
@@ -636,6 +773,64 @@ fn decode_non_stream(
                     })?;
             Ok((out, usage))
         }
+        Some("chat_to_responses_v1") => {
+            let context = crate::protocol::codec::report::ConversionContext::new(
+                format!("chatcmpl_{}", uuid::Uuid::new_v4().simple()),
+                attempt.upstream_model.clone(),
+                false,
+            );
+            let out = crate::protocol::codec::responses_codec::decode_responses_response_to_chat(
+                body, &context,
+            )
+            .map_err(|error| AttemptFailure {
+                failure_class: FailureClass::UpstreamProtocolError,
+                message: format!(
+                    "Responses response cannot be decoded to Chat: {}",
+                    error.message
+                ),
+                status_code: Some(502),
+                retry_after: None,
+            })?;
+            Ok((out, usage))
+        }
+        Some("messages_to_responses_v1") => {
+            let context = crate::protocol::codec::report::ConversionContext::new(
+                format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                attempt.upstream_model.clone(),
+                false,
+            );
+            let chat = crate::protocol::codec::responses_codec::decode_responses_response_to_chat(
+                body, &context,
+            )
+            .map_err(|error| AttemptFailure {
+                failure_class: FailureClass::UpstreamProtocolError,
+                message: format!(
+                    "Responses response cannot be decoded to Chat: {}",
+                    error.message
+                ),
+                status_code: Some(502),
+                retry_after: None,
+            })?;
+            let messages_context = crate::protocol::codec::report::ConversionContext::new(
+                format!("msg_{}", uuid::Uuid::new_v4().simple()),
+                attempt.upstream_model.clone(),
+                false,
+            );
+            let out = crate::protocol::codec::chat::decode_chat_response_to_messages(
+                &chat,
+                &messages_context,
+            )
+            .map_err(|error| AttemptFailure {
+                failure_class: FailureClass::UpstreamProtocolError,
+                message: format!(
+                    "Responses response cannot be decoded to Messages: {}",
+                    error.message
+                ),
+                status_code: Some(502),
+                retry_after: None,
+            })?;
+            Ok((out, usage))
+        }
         Some("responses_via_chat_v1") => {
             // downstream Responses, upstream Chat: Chat body -> Responses body.
             let out = crate::protocol::openai_to_responses(body, &attempt.upstream_model);
@@ -762,6 +957,12 @@ mod tests {
             final_url("http://localhost:11434/", "/api/chat", None),
             "http://localhost:11434/api/chat"
         );
+    }
+
+    #[test]
+    fn auth_account_body_always_forces_responses_streaming() {
+        let forced = force_responses_stream(&serde_json::json!({"model":"m","stream":false}));
+        assert_eq!(forced["stream"], true);
     }
 
     #[test]

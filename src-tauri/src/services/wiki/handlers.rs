@@ -1,11 +1,10 @@
+use super::ingest;
 use super::models::*;
 use super::project;
-use super::ingest;
 use super::repository::WikiRepository;
-use crate::server::router::SharedState;
 use crate::core::proxy;
 use crate::db::repository::Repository;
-use tauri::AppHandle;
+use crate::server::router::SharedState;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -15,6 +14,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tauri::AppHandle;
 
 #[derive(Deserialize)]
 pub struct SearchQuery {
@@ -23,7 +23,9 @@ pub struct SearchQuery {
     pub top_k: usize,
 }
 
-fn default_top_k() -> usize { 10 }
+fn default_top_k() -> usize {
+    10
+}
 
 // ── Project handlers ──
 
@@ -41,9 +43,10 @@ pub async fn create_project(
 ) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     let project_id = project::new_uuid();
-    let schema = input.schema_text.clone().unwrap_or_else(|| {
-        super::repository::DEFAULT_SCHEMA.to_string()
-    });
+    let schema = input
+        .schema_text
+        .clone()
+        .unwrap_or_else(|| super::repository::DEFAULT_SCHEMA.to_string());
 
     // Create directory structure
     if let Err(e) = project::init_project_dir(&project_id, &schema).await {
@@ -59,10 +62,7 @@ pub async fn create_project(
     }
 }
 
-pub async fn get_project(
-    State(shared): State<SharedState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn get_project(State(shared): State<SharedState>, Path(id): Path<String>) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match repo.get_project(&id).await {
         Ok(p) => Json(p).into_response(),
@@ -90,10 +90,7 @@ pub async fn update_project(
     }
 }
 
-pub async fn delete_project(
-    State(shared): State<SharedState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn delete_project(State(shared): State<SharedState>, Path(id): Path<String>) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     if let Err(e) = repo.delete_project(&id).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
@@ -117,10 +114,7 @@ pub async fn get_project_stats(
 
 // ── Source handlers ──
 
-pub async fn list_sources(
-    State(shared): State<SharedState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn list_sources(State(shared): State<SharedState>, Path(id): Path<String>) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match repo.list_sources(&id).await {
         Ok(sources) => Json(serde_json::json!({ "data": sources })).into_response(),
@@ -150,7 +144,10 @@ pub async fn add_source(
         }
     }
 
-    match repo.add_source(&id, &input, content_hash.as_deref(), file_size).await {
+    match repo
+        .add_source(&id, &input, content_hash.as_deref(), file_size)
+        .await
+    {
         Ok(s) => (StatusCode::CREATED, Json(s)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -183,20 +180,20 @@ pub async fn ingest_source(
             "status": "done",
             "pages_created": result.pages_created,
             "page_paths": result.page_paths,
-        })).into_response(),
+        }))
+        .into_response(),
         Err(e) => {
             // Update source status to failed
             let repo = WikiRepository::new(pool);
-            let _ = repo.update_source_status(&source_id, "failed", 0, Some(&e)).await;
+            let _ = repo
+                .update_source_status(&source_id, "failed", 0, Some(&e))
+                .await;
             (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
         }
     }
 }
 
-pub async fn rescan_sources(
-    State(shared): State<SharedState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn rescan_sources(State(shared): State<SharedState>, Path(id): Path<String>) -> Response {
     let app = shared.app.clone();
     let pool = shared.state.db.pool.clone();
     let repo = WikiRepository::new(pool.clone());
@@ -231,15 +228,13 @@ pub async fn rescan_sources(
         "status": "done",
         "processed": pending.len(),
         "results": results,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 // ── Page handlers ──
 
-pub async fn list_pages(
-    State(shared): State<SharedState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn list_pages(State(shared): State<SharedState>, Path(id): Path<String>) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match repo.list_pages(&id).await {
         Ok(pages) => Json(serde_json::json!({ "data": pages })).into_response(),
@@ -271,21 +266,27 @@ pub async fn get_page(
                 "content": content,
                 "created_at": page.created_at,
                 "updated_at": page.updated_at,
-            })).into_response();
+            }))
+            .into_response();
         }
     }
 
     // Try reading file directly from disk
     match project::read_page(&id, &path).await {
         Ok(content) => {
-            let title = path.split('/').last().unwrap_or(&path)
-                .trim_end_matches(".md").to_string();
+            let title = path
+                .split('/')
+                .last()
+                .unwrap_or(&path)
+                .trim_end_matches(".md")
+                .to_string();
             Json(serde_json::json!({
                 "path": path,
                 "title": title,
                 "content": content,
                 "page_type": "unknown",
-            })).into_response()
+            }))
+            .into_response()
         }
         Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
     }
@@ -296,12 +297,19 @@ pub async fn update_page(
     Path((id, path)): Path<(String, String)>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    let content = body.get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
+    let content = body.get("content").and_then(|c| c.as_str()).unwrap_or("");
 
     let repo = WikiRepository::new(shared.state.db.pool.clone());
-    match update_page_inner(&shared.app, &shared.state.db.pool, &repo, &id, &path, content).await {
+    match update_page_inner(
+        &shared.app,
+        &shared.state.db.pool,
+        &repo,
+        &id,
+        &path,
+        content,
+    )
+    .await
+    {
         Ok(()) => Json(serde_json::json!({ "ok": true, "path": path })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -324,12 +332,19 @@ pub async fn update_page_inner(
     hasher.update(content.as_bytes());
     let hash = format!("{:x}", hasher.finalize());
     let title = ingest::extract_title_from_content(content, path);
-    let page_type = if path.contains("entities/") { "entity" }
-        else if path.contains("concepts/") { "concept" }
-        else if path.contains("summaries/") { "summary" }
-        else if path.ends_with("index.md") { "index" }
-        else if path.ends_with("log.md") { "log" }
-        else { "entity" };
+    let page_type = if path.contains("entities/") {
+        "entity"
+    } else if path.contains("concepts/") {
+        "concept"
+    } else if path.contains("summaries/") {
+        "summary"
+    } else if path.ends_with("index.md") {
+        "index"
+    } else if path.ends_with("log.md") {
+        "log"
+    } else {
+        "entity"
+    };
 
     let token_count = (content.len() / 4) as i64; // rough estimate
 
@@ -341,7 +356,18 @@ pub async fn update_page_inner(
     let tags = crate::services::wiki::ingest::extract_tags_from_frontmatter(content);
     let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
 
-    repo.upsert_page(id, path, &title, page_type, &hash, token_count, &wikilinks_json, "{}", &tags_json).await?;
+    repo.upsert_page(
+        id,
+        path,
+        &title,
+        page_type,
+        &hash,
+        token_count,
+        &wikilinks_json,
+        "{}",
+        &tags_json,
+    )
+    .await?;
 
     // Rebuild knowledge graph edges based on updated wikilinks
     let _ = ingest::rebuild_graph_edges(pool, id).await;
@@ -375,7 +401,9 @@ pub async fn search(
 ) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match repo.search_pages(&id, &params.q, params.top_k).await {
-        Ok(results) => Json(serde_json::json!({ "data": results, "query": params.q })).into_response(),
+        Ok(results) => {
+            Json(serde_json::json!({ "data": results, "query": params.q })).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -408,7 +436,10 @@ pub async fn ask_inner(
     let app = shared.app.clone();
 
     // Search relevant pages
-    let results = repo.search_pages(id, question, top_k).await.unwrap_or_default();
+    let results = repo
+        .search_pages(id, question, top_k)
+        .await
+        .unwrap_or_default();
 
     // Read page contents
     let mut contexts = Vec::new();
@@ -437,9 +468,12 @@ pub async fn ask_inner(
     let chat_channel_id = match proj.chat_channel_id.as_deref() {
         Some(id) if !id.is_empty() => id.to_string(),
         _ => {
-            let row: Option<(String,)> = sqlx::query_as("SELECT id FROM channels WHERE status = 1 ORDER BY priority DESC LIMIT 1")
-                .fetch_optional(pool).await
-                .map_err(|e| format!("DB error: {}", e))?;
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT id FROM channels WHERE status = 1 ORDER BY priority DESC LIMIT 1",
+            )
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
             match row.map(|(id,)| id) {
                 Some(id) => id,
                 None => return Err("No active channel configured. Please create a channel first or set chat_channel_id in Wiki project settings.".to_string()),
@@ -477,11 +511,13 @@ pub async fn ask_inner(
         Some(chat_request_str),
         Some(format!("wiki-chat_{}", id)),
         None,
-    ).await;
+    )
+    .await;
 
     let (answer, usage) = match proxy_result {
         Ok(result) => {
-            let answer_text = result.body
+            let answer_text = result
+                .body
                 .get("choices")
                 .and_then(|c| c.get(0))
                 .and_then(|c| c.get("message"))
@@ -503,15 +539,26 @@ pub async fn ask_inner(
         }
     };
 
-    let sources: Vec<WikiAnswerSource> = results.iter().map(|r| WikiAnswerSource {
-        path: r.path.clone(),
-        title: r.title.clone(),
-        score: r.score,
-        snippet: r.snippet.clone(),
-    }).collect();
+    let sources: Vec<WikiAnswerSource> = results
+        .iter()
+        .map(|r| WikiAnswerSource {
+            path: r.path.clone(),
+            title: r.title.clone(),
+            score: r.score,
+            snippet: r.snippet.clone(),
+        })
+        .collect();
 
     // Save assistant message
-    let _ = repo.add_session(id, "assistant", &answer, Some(&serde_json::to_string(&sources).unwrap_or_default()), Some(chat_model)).await;
+    let _ = repo
+        .add_session(
+            id,
+            "assistant",
+            &answer,
+            Some(&serde_json::to_string(&sources).unwrap_or_default()),
+            Some(chat_model),
+        )
+        .await;
 
     Ok(serde_json::json!({
         "answer": answer,
@@ -522,10 +569,7 @@ pub async fn ask_inner(
 
 // ── Graph ──
 
-pub async fn get_graph(
-    State(shared): State<SharedState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn get_graph(State(shared): State<SharedState>, Path(id): Path<String>) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match repo.get_graph(&id).await {
         Ok(graph) => Json(graph).into_response(),
@@ -535,10 +579,7 @@ pub async fn get_graph(
 
 // ── Sessions ──
 
-pub async fn list_sessions(
-    State(shared): State<SharedState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn list_sessions(State(shared): State<SharedState>, Path(id): Path<String>) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match repo.list_sessions(&id).await {
         Ok(sessions) => Json(serde_json::json!({ "data": sessions })).into_response(),
@@ -546,10 +587,7 @@ pub async fn list_sessions(
     }
 }
 
-pub async fn clear_sessions(
-    State(shared): State<SharedState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn clear_sessions(State(shared): State<SharedState>, Path(id): Path<String>) -> Response {
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     if let Err(e) = repo.clear_sessions(&id).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();

@@ -6,7 +6,6 @@ use crate::core::proxy;
 use crate::core::route_plan::{self, EndpointKind};
 use crate::db::repository::Repository;
 use crate::protocol;
-use sqlx::sqlite::SqlitePool;
 use crate::security;
 use axum::{
     body::Body,
@@ -16,6 +15,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use rand::SeedableRng;
+use sqlx::sqlite::SqlitePool;
 /// Run the unified security audit gate against the ORIGINAL downstream
 /// protocol JSON full tree (never a converted Chat JSON).  Returns
 /// `Ok(AuditedRequest)` for audit-allow / redact, or a ready HTTP response
@@ -113,7 +113,22 @@ async fn maybe_route_plan(
     trace_id: Option<String>,
 ) -> Result<Option<Response>, Response> {
     let flags = feature_flags::read_feature_flags(&shared.app);
-    if !flags.new_routeplan {
+    // Auth accounts are request-scoped route candidates. They force the mixed
+    // RoutePlan rollout while the global Channel rollout flag is off; absent a
+    // usable account, retain the legacy pure-Channel path unchanged.
+    let accounts = repo
+        .list_route_accounts(&crate::utils::time::now_iso())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+                .into_response()
+        })?;
+    let has_request_scoped_auth_candidate =
+        has_request_scoped_auth_candidate(key, endpoint, &audited.envelope.model, &accounts);
+    if !auth_routeplan_rollout_enabled(&flags, has_request_scoped_auth_candidate) {
         return Ok(None);
     }
     let channels = repo.get_enabled_channels().await.map_err(|e| {
@@ -124,11 +139,12 @@ async fn maybe_route_plan(
             .into_response()
     })?;
     let mut plan_rng = rand::rngs::StdRng::from_os_rng();
-    let plan = match route_plan::authorize_and_plan(
+    let plan = match route_plan::authorize_and_plan_with_accounts(
         key,
         &audited.envelope.model,
         endpoint,
         &channels,
+        &accounts,
         &flags,
         &audited.forward_json,
         &mut plan_rng,
@@ -162,7 +178,7 @@ async fn maybe_route_plan(
         }
     };
     if is_stream {
-        let resp = crate::endpoint_executor::driver::route_stream_plan(
+        let resp = crate::endpoint_executor::driver::route_stream_plan_with_auth_service(
             plan,
             audited,
             key,
@@ -171,11 +187,12 @@ async fn maybe_route_plan(
             repo,
             sanitized_log_body,
             trace_id,
+            shared.state.auth_service.clone(),
         )
         .await;
         Ok(Some(resp))
     } else {
-        let resp = crate::endpoint_executor::driver::route_plan_response(
+        let resp = crate::endpoint_executor::driver::route_plan_response_with_auth_service(
             plan,
             audited,
             key,
@@ -184,9 +201,150 @@ async fn maybe_route_plan(
             repo,
             sanitized_log_body,
             trace_id,
+            shared.state.auth_service.clone(),
         )
         .await;
         Ok(Some(resp))
+    }
+}
+
+/// The auth rollout is deliberately request-scoped: Auth accounts turn on the
+/// mixed planner for this request only, while an all-Channel request continues
+/// to use the legacy path until the global flag is enabled.
+fn auth_routeplan_rollout_enabled(
+    flags: &crate::core::feature_flags::FeatureFlags,
+    has_route_account: bool,
+) -> bool {
+    flags.new_routeplan || has_route_account
+}
+
+/// Auth must only force the RoutePlan for a request it can actually serve.  In
+/// particular, an account with a model snapshot for another model must not
+/// turn an otherwise legacy Responses/Messages request into a RoutePlan
+/// rejection while all Channel rollout flags remain off.
+fn has_request_scoped_auth_candidate(
+    key: &crate::db::models::ApiKey,
+    endpoint: EndpointKind,
+    model: &str,
+    accounts: &[crate::db::models::AuthAccount],
+) -> bool {
+    matches!(
+        endpoint,
+        EndpointKind::ChatCompletions | EndpointKind::Responses | EndpointKind::Messages
+    ) && route_plan::resolve_route_candidates(&[], accounts, model, key)
+        .iter()
+        .any(|candidate| candidate.auth_account().is_some())
+}
+
+#[cfg(test)]
+mod auth_routeplan_rollout_tests {
+    use super::{auth_routeplan_rollout_enabled, has_request_scoped_auth_candidate};
+    use crate::core::feature_flags::FeatureFlags;
+    use crate::core::route_plan::EndpointKind;
+    use crate::db::models::{ApiKey, AuthAccount};
+    use serde_json::json;
+
+    fn key() -> ApiKey {
+        ApiKey {
+            id: "key".into(),
+            name: "key".into(),
+            key: "sk-test".into(),
+            status: 1,
+            allowed_models: "[]".into(),
+            allowed_channels: "[]".into(),
+            quota_limit: 0,
+            quota_used: 0,
+            expires_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn account(model: &str) -> AuthAccount {
+        AuthAccount {
+            id: "account-a".into(),
+            provider: "codex".into(),
+            label: "Account A".into(),
+            account_id: "remote-a".into(),
+            status: "active".into(),
+            disabled: 0,
+            priority: 1,
+            weight: 1,
+            quota_json: None,
+            model_states_json: json!({
+                "version": 1,
+                "models": [{
+                    "id": model,
+                    "status": "available",
+                    "unavailable": false,
+                    "next_retry_after": null,
+                    "last_error": null
+                }]
+            })
+            .to_string(),
+            attributes_json: "{}".into(),
+            payload_json: "{}".into(),
+            last_refreshed_at: None,
+            last_models_sync_at: None,
+            next_refresh_after: None,
+            next_retry_after: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn auth_routeplan_rollout_forces_only_requests_with_a_routeable_account() {
+        let flags_off = FeatureFlags {
+            new_routeplan: false,
+            cross_protocol_codec: false,
+            native_responses: false,
+            ollama_native: false,
+        };
+        assert!(auth_routeplan_rollout_enabled(&flags_off, true));
+        assert!(!auth_routeplan_rollout_enabled(&flags_off, false));
+        // The gate is not allowed to mutate ordinary Channel capability flags.
+        assert!(!flags_off.cross_protocol_codec);
+        assert!(!flags_off.native_responses);
+    }
+
+    #[test]
+    fn flags_off_keep_unmatched_auth_models_on_legacy_responses_and_messages_paths() {
+        let flags_off = FeatureFlags::all_off();
+        let account = account("model-a");
+        for endpoint in [EndpointKind::Responses, EndpointKind::Messages] {
+            let eligible = has_request_scoped_auth_candidate(
+                &key(),
+                endpoint,
+                "model-b",
+                std::slice::from_ref(&account),
+            );
+            assert!(
+                !eligible,
+                "{endpoint:?} must not be forced into RoutePlan by an unrelated model snapshot"
+            );
+            assert!(
+                !auth_routeplan_rollout_enabled(&flags_off, eligible),
+                "{endpoint:?} with model-b must remain on its legacy handler"
+            );
+        }
+    }
+
+    #[test]
+    fn flags_off_force_routeplan_only_for_matching_auth_endpoint_and_model() {
+        let account = account("model-a");
+        assert!(has_request_scoped_auth_candidate(
+            &key(),
+            EndpointKind::Responses,
+            "model-a",
+            std::slice::from_ref(&account),
+        ));
+        assert!(!has_request_scoped_auth_candidate(
+            &key(),
+            EndpointKind::CountTokens,
+            "model-a",
+            &[account],
+        ));
     }
 }
 
@@ -475,7 +633,8 @@ fn accumulate_openai_chat_record(
                             accumulated_content.push_str(content);
                         }
                         // Accumulate reasoning/thinking content (DeepSeek R1, OpenAI o1/o3, etc.)
-                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str())
+                        if let Some(reasoning) =
+                            delta.get("reasoning_content").and_then(|c| c.as_str())
                         {
                             accumulated_reasoning.push_str(reasoning);
                         }
@@ -488,18 +647,16 @@ fn accumulate_openai_chat_record(
                         if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                             for tc in tcs {
                                 let idx = tc.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
-                                let entry = tool_calls_map
-                                    .entry(idx)
-                                    .or_insert_with(|| {
-                                        serde_json::json!({
-                                            "id": "",
-                                            "type": "function",
-                                            "function": {
-                                                "name": "",
-                                                "arguments": ""
-                                            }
-                                        })
-                                    });
+                                let entry = tool_calls_map.entry(idx).or_insert_with(|| {
+                                    serde_json::json!({
+                                        "id": "",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "",
+                                            "arguments": ""
+                                        }
+                                    })
+                                });
                                 if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                                     if !id.is_empty() {
                                         entry["id"] = serde_json::json!(id);
@@ -516,11 +673,11 @@ fn accumulate_openai_chat_record(
                                             entry["function"]["name"] = serde_json::json!(name);
                                         }
                                     }
-                                    if let Some(args) = func.get("arguments").and_then(|v| v.as_str())
+                                    if let Some(args) =
+                                        func.get("arguments").and_then(|v| v.as_str())
                                     {
-                                        let existing = entry["function"]["arguments"]
-                                            .as_str()
-                                            .unwrap_or("");
+                                        let existing =
+                                            entry["function"]["arguments"].as_str().unwrap_or("");
                                         entry["function"]["arguments"] =
                                             serde_json::json!(format!("{}{}", existing, args));
                                     }
@@ -529,10 +686,7 @@ fn accumulate_openai_chat_record(
                         }
                     }
                     if finish_reason.is_none() {
-                        if let Some(reason) = choice
-                            .get("finish_reason")
-                            .and_then(|r| r.as_str())
-                        {
+                        if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
                             if !reason.is_empty() && reason != "null" {
                                 *finish_reason = Some(reason.to_string());
                             }
@@ -2275,7 +2429,22 @@ pub async fn handle_responses(
     }
 
     // Convert (already-gated) Responses request to OpenAI Chat Completions format
-    let openai_body = protocol::responses_to_openai(&forward_json);
+    let openai_body = match protocol::responses_to_openai(&forward_json) {
+        Ok(body) => body,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("request cannot be converted to chat_completions: {}", error.message),
+                        "type": "invalid_request_error",
+                        "code": "unsupported_features"
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
 
     if is_stream {
         handle_responses_stream(
@@ -2362,7 +2531,8 @@ fn process_openai_record_for_responses(
                         if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
                             accumulated_content.push_str(content);
                         }
-                        if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str())
+                        if let Some(reasoning) =
+                            delta.get("reasoning_content").and_then(|c| c.as_str())
                         {
                             accumulated_reasoning.push_str(reasoning);
                         }
@@ -3184,7 +3354,10 @@ fn collect_config_models(channels: &[crate::db::models::Channel]) -> Vec<ConfigM
         let ch_models: Vec<String> = serde_json::from_str(&ch.models).unwrap_or_default();
         for m in ch_models {
             if seen.insert(m.clone()) {
-                out.push(ConfigModel { id: m, owned_by: ch.channel_type.clone() });
+                out.push(ConfigModel {
+                    id: m,
+                    owned_by: ch.channel_type.clone(),
+                });
             }
         }
         let mapping: serde_json::Value = serde_json::from_str(&ch.model_mapping)
@@ -3192,7 +3365,10 @@ fn collect_config_models(channels: &[crate::db::models::Channel]) -> Vec<ConfigM
         if let Some(obj) = mapping.as_object() {
             for key in obj.keys() {
                 if seen.insert(key.clone()) {
-                    out.push(ConfigModel { id: key.clone(), owned_by: ch.channel_type.clone() });
+                    out.push(ConfigModel {
+                        id: key.clone(),
+                        owned_by: ch.channel_type.clone(),
+                    });
                 }
             }
         }
@@ -3246,7 +3422,12 @@ fn openai_error(status: StatusCode, message: impl Into<String>, kind: &str) -> R
 }
 
 /// Build an error in the caller's protocol format (Anthropic vs OpenAI).
-fn models_error(anthropic: bool, status: StatusCode, kind: &str, message: impl Into<String>) -> Response {
+fn models_error(
+    anthropic: bool,
+    status: StatusCode,
+    kind: &str,
+    message: impl Into<String>,
+) -> Response {
     if anthropic {
         anthropic_error(status, kind, message)
     } else {
@@ -3262,23 +3443,43 @@ async fn list_models_impl(pool: SqlitePool, headers: &HeaderMap) -> Response {
     let api_key = match protocol::extract_api_key(headers) {
         Some(key) => key,
         None => {
-            return models_error(anthropic, StatusCode::UNAUTHORIZED, "authentication_error", "Missing API key")
+            return models_error(
+                anthropic,
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Missing API key",
+            )
         }
     };
     let repo = Repository::new(pool);
     let key = match repo.get_api_key_by_key(&api_key).await {
         Ok(key) => key,
         Err(_) => {
-            return models_error(anthropic, StatusCode::UNAUTHORIZED, "authentication_error", "Invalid API key")
+            return models_error(
+                anthropic,
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Invalid API key",
+            )
         }
     };
     if key.quota_limit > 0 && key.quota_used >= key.quota_limit {
-        return models_error(anthropic, StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", "Quota exceeded");
+        return models_error(
+            anthropic,
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "Quota exceeded",
+        );
     }
     let channels = match repo.get_enabled_channels().await {
         Ok(channels) => channels,
         Err(_) => {
-            return models_error(anthropic, StatusCode::INTERNAL_SERVER_ERROR, "api_error", "Failed to load channels")
+            return models_error(
+                anthropic,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "Failed to load channels",
+            )
         }
     };
     let models = collect_config_models(&channels);
@@ -3290,10 +3491,7 @@ async fn list_models_impl(pool: SqlitePool, headers: &HeaderMap) -> Response {
     (StatusCode::OK, Json(body)).into_response()
 }
 
-pub async fn handle_list_models(
-    State(shared): State<SharedState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn handle_list_models(State(shared): State<SharedState>, headers: HeaderMap) -> Response {
     list_models_impl(shared.state.db.pool.clone(), &headers).await
 }
 
@@ -3538,7 +3736,12 @@ mod list_models_tests {
         assert!(!request_is_anthropic(&headers));
     }
 
-    fn channel(name: &str, ch_type: &str, models: &[&str], mapping: serde_json::Value) -> crate::db::models::Channel {
+    fn channel(
+        name: &str,
+        ch_type: &str,
+        models: &[&str],
+        mapping: serde_json::Value,
+    ) -> crate::db::models::Channel {
         crate::db::models::Channel {
             id: name.to_string(),
             name: name.to_string(),
@@ -3569,14 +3772,27 @@ mod list_models_tests {
     #[test]
     fn aggregates_models_and_mapping_keys_with_dedup() {
         let channels = vec![
-            channel("a", "openai", &["gpt-4o", "gpt-4o-mini"], serde_json::json!({"gpt-4o": "upstream-x"})),
-            channel("b", "claude", &["claude-sonnet-4"], serde_json::json!({"gpt-4o": "claude-sonnet-5", "claude-35": "claude-3-5-sonnet"})),
+            channel(
+                "a",
+                "openai",
+                &["gpt-4o", "gpt-4o-mini"],
+                serde_json::json!({"gpt-4o": "upstream-x"}),
+            ),
+            channel(
+                "b",
+                "claude",
+                &["claude-sonnet-4"],
+                serde_json::json!({"gpt-4o": "claude-sonnet-5", "claude-35": "claude-3-5-sonnet"}),
+            ),
         ];
         let models = collect_config_models(&channels);
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         // a.models → gpt-4o, gpt-4o-mini；a.mapping keys → gpt-4o(重复跳过)；
         // b.models → claude-sonnet-4；b.mapping keys → gpt-4o(重复跳过), claude-35
-        assert_eq!(ids, vec!["gpt-4o", "gpt-4o-mini", "claude-sonnet-4", "claude-35"]);
+        assert_eq!(
+            ids,
+            vec!["gpt-4o", "gpt-4o-mini", "claude-sonnet-4", "claude-35"]
+        );
         // 首个列出该模型的渠道胜出（owned_by 为 openai，而非 claude）
         assert_eq!(models[0].owned_by, "openai");
     }
@@ -3584,7 +3800,12 @@ mod list_models_tests {
     #[test]
     fn mapping_values_are_never_listed_as_models() {
         // value（"upstream-y"）是上游实际模型，不参与列出
-        let channels = vec![channel("a", "openai", &["real-a"], serde_json::json!({"alias": "upstream-y"}))];
+        let channels = vec![channel(
+            "a",
+            "openai",
+            &["real-a"],
+            serde_json::json!({"alias": "upstream-y"}),
+        )];
         let models = collect_config_models(&channels);
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["real-a", "alias"]);
@@ -3593,8 +3814,14 @@ mod list_models_tests {
     #[test]
     fn builds_openai_models_response() {
         let models = vec![
-            ConfigModel { id: "gpt-4o".to_string(), owned_by: "openai".to_string() },
-            ConfigModel { id: "claude-35".to_string(), owned_by: "claude".to_string() },
+            ConfigModel {
+                id: "gpt-4o".to_string(),
+                owned_by: "openai".to_string(),
+            },
+            ConfigModel {
+                id: "claude-35".to_string(),
+                owned_by: "claude".to_string(),
+            },
         ];
         let value = openai_models_response(&models);
         assert_eq!(value["object"], "list");
@@ -3608,7 +3835,10 @@ mod list_models_tests {
 
     #[test]
     fn builds_anthropic_models_response() {
-        let models = vec![ConfigModel { id: "claude-sonnet-4".to_string(), owned_by: "claude".to_string() }];
+        let models = vec![ConfigModel {
+            id: "claude-sonnet-4".to_string(),
+            owned_by: "claude".to_string(),
+        }];
         let value = anthropic_models_response(&models);
         let data = value["data"].as_array().unwrap();
         assert_eq!(data.len(), 1);
@@ -3620,9 +3850,15 @@ mod list_models_tests {
 
     #[tokio::test]
     async fn builds_openai_style_errors() {
-        let resp = openai_error(StatusCode::UNAUTHORIZED, "Missing API key", "authentication_error");
+        let resp = openai_error(
+            StatusCode::UNAUTHORIZED,
+            "Missing API key",
+            "authentication_error",
+        );
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "authentication_error");
         assert_eq!(json["error"]["message"], "Missing API key");
@@ -3631,13 +3867,27 @@ mod list_models_tests {
 
     #[tokio::test]
     async fn models_error_dispatches_by_protocol() {
-        let resp = models_error(true, StatusCode::UNAUTHORIZED, "authentication_error", "nope");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let resp = models_error(
+            true,
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "nope",
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["type"], "error"); // Anthropic wrapper
 
-        let resp = models_error(false, StatusCode::UNAUTHORIZED, "authentication_error", "nope");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let resp = models_error(
+            false,
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "nope",
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "authentication_error");
         assert_eq!(json["error"]["code"], "401");
@@ -3674,14 +3924,19 @@ mod list_models_tests {
             test_run_id: None,
             draft_fingerprint: None,
             force_save: None,
-        }).await.unwrap();
-        let api_key = repo.create_api_key(&CreateApiKeyInput {
-            name: "test-key".to_string(),
-            allowed_models: None,
-            allowed_channels: None,
-            quota_limit: Some(1000),
-            expires_at: None,
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
+        let api_key = repo
+            .create_api_key(&CreateApiKeyInput {
+                name: "test-key".to_string(),
+                allowed_models: None,
+                allowed_channels: None,
+                quota_limit: Some(1000),
+                expires_at: None,
+            })
+            .await
+            .unwrap();
         (pool, api_key)
     }
 
@@ -3689,21 +3944,34 @@ mod list_models_tests {
     async fn openai_bearer_returns_openai_format() {
         let (pool, api_key) = seed_test_db().await;
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", format!("Bearer {}", api_key.key).parse().unwrap());
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", api_key.key).parse().unwrap(),
+        );
         let resp = list_models_impl(pool, &headers).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["object"], "list");
-        let ids: Vec<&str> = json["data"].as_array().unwrap()
-            .iter().map(|m| m["id"].as_str().unwrap()).collect();
+        let ids: Vec<&str> = json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
         // models: gpt-4o, gpt-4o-mini；mapping keys: alias-1, alias-2 → 4 个，去重后无重复
         assert_eq!(ids.len(), 4);
         assert!(ids.contains(&"gpt-4o"));
         assert!(ids.contains(&"gpt-4o-mini"));
         assert!(ids.contains(&"alias-1"));
         assert!(ids.contains(&"alias-2"));
-        assert!(json["data"].as_array().unwrap().iter().all(|m| m["object"] == "model"));
+        assert!(json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["object"] == "model"));
     }
 
     #[tokio::test]
@@ -3713,7 +3981,9 @@ mod list_models_tests {
         headers.insert("x-api-key", api_key.key.parse().unwrap());
         let resp = list_models_impl(pool, &headers).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let data = json["data"].as_array().unwrap();
         assert!(!data.is_empty());
@@ -3726,7 +3996,9 @@ mod list_models_tests {
         let (pool, _) = seed_test_db().await;
         let resp = list_models_impl(pool, &HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "authentication_error");
         assert_eq!(json["error"]["code"], "401");
@@ -3748,7 +4020,9 @@ mod list_models_tests {
         headers.insert("x-api-key", "sk-wrong".parse().unwrap());
         let resp = list_models_impl(pool, &headers).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["type"], "error");
         assert_eq!(json["error"]["type"], "authentication_error");
@@ -3757,15 +4031,22 @@ mod list_models_tests {
     #[tokio::test]
     async fn quota_exceeded_returns_429() {
         let (pool, api_key) = seed_test_db().await;
-        Repository::new(pool.clone()).increment_quota(&api_key.id, 2000).await.unwrap();
+        Repository::new(pool.clone())
+            .increment_quota(&api_key.id, 2000)
+            .await
+            .unwrap();
         let mut headers = HeaderMap::new();
-        headers.insert("authorization", format!("Bearer {}", api_key.key).parse().unwrap());
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", api_key.key).parse().unwrap(),
+        );
         let resp = list_models_impl(pool, &headers).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"]["type"], "rate_limit_error");
         assert_eq!(json["error"]["code"], "429");
-
     }
 }

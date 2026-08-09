@@ -200,9 +200,9 @@ async fn protocol_routing_integration_chat_native_first_then_conversion() {
 
     assert_eq!(plan.groups.len(), 2);
     assert_eq!(plan.groups[0].tier.as_str(), "native");
-    assert_eq!(plan.groups[0].candidates[0].channel.id, "n1");
+    assert_eq!(plan.groups[0].candidates[0].candidate.id(), "n1");
     assert_eq!(plan.groups[1].tier.as_str(), "conversion");
-    assert_eq!(plan.groups[1].candidates[0].channel.id, "c1");
+    assert_eq!(plan.groups[1].candidates[0].candidate.id(), "c1");
 
     // Drive execute_plan with a mock executor that records which attempt it
     // saw and classifies by upstream protocol: native succeeds, conversion
@@ -288,8 +288,8 @@ async fn protocol_routing_integration_messages_native_anthropic_first() {
     )
     .unwrap();
     assert_eq!(plan.groups.len(), 2);
-    assert_eq!(plan.groups[0].candidates[0].channel.id, "a1");
-    assert_eq!(plan.groups[1].candidates[0].channel.id, "o1");
+    assert_eq!(plan.groups[0].candidates[0].candidate.id(), "a1");
+    assert_eq!(plan.groups[1].candidates[0].candidate.id(), "o1");
 }
 
 /// Non-stream CountTokens: only Anthropic channels with the capability are
@@ -335,8 +335,399 @@ async fn protocol_routing_integration_count_tokens_capability_gated() {
     )
     .unwrap();
     assert_eq!(plan.groups.len(), 1);
-    assert_eq!(plan.groups[0].candidates[0].channel.id, "a1");
+    assert_eq!(plan.groups[0].candidates[0].candidate.id(), "a1");
     assert_eq!(plan.groups[0].upstream_endpoint, "count_tokens");
+}
+
+// ── auth_account ─────────────────────────────────────────────────────────
+
+/// T7 integration coverage: the Codex account adapter always receives an SSE
+/// request, while the driver presents the requested downstream protocol for all
+/// three supported endpoints on both facade paths.
+mod auth_account {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use async_trait::async_trait;
+    use axum::{
+        body::Bytes,
+        extract::State,
+        http::{header, StatusCode},
+        response::{IntoResponse, Response},
+        routing::post,
+        Router,
+    };
+    use serde_json::{json, Value};
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::auth_provider::service::AuthService;
+    use crate::{
+        auth_provider::{
+            LoginResult, LoginRuntime, Provider, ProviderError, ProviderKind, ProviderModels,
+            ProviderPayload, ProviderRegistry, ProviderRequest, RefreshedPayload,
+        },
+        core::route_plan::authorize_and_plan_with_accounts,
+        db::models::{AuthAccountUpsert, ModelState, ModelStates},
+        endpoint_executor::driver::{
+            route_plan_response_with_auth_service, route_stream_plan_with_auth_service,
+        },
+    };
+
+    #[derive(Clone, Default)]
+    struct MockState {
+        hits: Arc<AtomicUsize>,
+        seen: Arc<Mutex<Vec<Value>>>,
+        fail_upstream: bool,
+    }
+
+    async fn responses(State(state): State<MockState>, body: Bytes) -> Response {
+        state.hits.fetch_add(1, Ordering::SeqCst);
+        state
+            .seen
+            .lock()
+            .await
+            .push(serde_json::from_slice(&body).unwrap());
+        if state.fail_upstream {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fixture upstream failure",
+            )
+                .into_response();
+        }
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        ([(header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+    }
+
+    #[derive(Clone)]
+    struct LocalProvider {
+        endpoint: String,
+    }
+
+    #[async_trait]
+    impl Provider for LocalProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Codex
+        }
+
+        async fn login(&self, _: &dyn LoginRuntime) -> Result<LoginResult, ProviderError> {
+            Err(ProviderError::LoginFailed)
+        }
+
+        async fn import(&self, _: &[u8]) -> Result<LoginResult, ProviderError> {
+            Err(ProviderError::ImportFailed)
+        }
+
+        async fn refresh(
+            &self,
+            payload: &ProviderPayload,
+        ) -> Result<RefreshedPayload, ProviderError> {
+            Ok(RefreshedPayload {
+                payload: payload.clone(),
+                last_refreshed_at: None,
+                next_refresh_after: None,
+                next_retry_after: None,
+            })
+        }
+
+        async fn outbound(
+            &self,
+            request: ProviderRequest<'_>,
+        ) -> Result<reqwest::Response, ProviderError> {
+            reqwest::Client::new()
+                .post(&self.endpoint)
+                .headers(request.headers.clone())
+                .json(request.body)
+                .send()
+                .await
+                .map_err(|_| ProviderError::Retryable)
+        }
+
+        async fn list_models(
+            &self,
+            _account: &crate::db::models::AuthAccount,
+            _payload: &ProviderPayload,
+        ) -> Result<ProviderModels, ProviderError> {
+            Ok(vec![])
+        }
+    }
+
+    async fn setup_with_failure(
+        fail_upstream: bool,
+    ) -> (
+        Arc<Repository>,
+        Arc<AuthService>,
+        MockState,
+        crate::db::models::AuthAccount,
+    ) {
+        let pool = fresh_db().await;
+        let repo = Arc::new(Repository::new(pool));
+        let state = MockState {
+            fail_upstream,
+            ..MockState::default()
+        };
+        let app = Router::new()
+            .route("/responses", post(responses))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let account = repo
+            .upsert_by_provider_account_id(&AuthAccountUpsert {
+                provider: "codex".into(),
+                label: "Codex fixture".into(),
+                account_id: "remote-account".into(),
+                attributes: json!({}),
+                payload: json!({"access_token":"fixture", "expires_at":"2099-01-01T00:00:00Z"}),
+                last_refreshed_at: None,
+                next_refresh_after: None,
+                next_retry_after: None,
+            })
+            .await
+            .unwrap();
+        repo.update_models_if_success(
+            &account.id,
+            &ModelStates {
+                version: 1,
+                models: vec![ModelState {
+                    id: "m".into(),
+                    status: "available".into(),
+                    unavailable: false,
+                    next_retry_after: None,
+                    last_error: None,
+                }],
+            },
+            &now(),
+        )
+        .await
+        .unwrap();
+        let account = repo.get_auth_account(&account.id).await.unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(LocalProvider { endpoint }));
+        let service = Arc::new(AuthService::new(repo.clone(), registry));
+        (repo, service, state, account)
+    }
+
+    async fn setup() -> (
+        Arc<Repository>,
+        Arc<AuthService>,
+        MockState,
+        crate::db::models::AuthAccount,
+    ) {
+        setup_with_failure(false).await
+    }
+
+    fn make_request(
+        endpoint: EndpointKind,
+        stream: bool,
+    ) -> (
+        crate::security::gate::AuditedRequest,
+        &'static str,
+        &'static str,
+    ) {
+        match endpoint {
+            EndpointKind::ChatCompletions => (
+                audited(
+                    DownstreamProtocol::ChatCompletions,
+                    "chat_completions",
+                    "m",
+                    json!({"model":"m","messages":[{"role":"user","content":"hi"}],"stream":stream}),
+                ),
+                "chat",
+                "chat.completion",
+            ),
+            EndpointKind::Messages => (
+                audited(
+                    DownstreamProtocol::Messages,
+                    "messages",
+                    "m",
+                    json!({"model":"m","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"stream":stream}),
+                ),
+                "anthropic",
+                "message",
+            ),
+            EndpointKind::Responses => (
+                audited(
+                    DownstreamProtocol::Responses,
+                    "responses",
+                    "m",
+                    json!({"model":"m","input":"hi","stream":stream}),
+                ),
+                "responses",
+                "output",
+            ),
+            _ => unreachable!("account routes only support three downstream endpoints"),
+        }
+    }
+
+    fn plan(
+        key: &ApiKey,
+        account: &crate::db::models::AuthAccount,
+        endpoint: EndpointKind,
+        request: &crate::security::gate::AuditedRequest,
+    ) -> crate::core::route_plan::RoutePlan {
+        authorize_and_plan_with_accounts(
+            key,
+            "m",
+            endpoint,
+            &[],
+            std::slice::from_ref(account),
+            &flags(true),
+            &request.forward_json,
+            &mut rand::rngs::StdRng::seed_from_u64(7),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn three_protocols_stream_and_non_stream_force_responses_sse_and_log_account_source() {
+        let (repo, service, state, account) = setup().await;
+        let key = api_key();
+        for endpoint in [
+            EndpointKind::ChatCompletions,
+            EndpointKind::Messages,
+            EndpointKind::Responses,
+        ] {
+            let (request, mode, expected) = make_request(endpoint, false);
+            let response = route_plan_response_with_auth_service(
+                plan(&key, &account, endpoint, &request),
+                &request,
+                &key,
+                &[],
+                mode,
+                &repo,
+                "{}",
+                None,
+                service.clone(),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::OK,
+                "{endpoint:?} non-stream"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains(expected),
+                "{endpoint:?} non-stream body: {}",
+                String::from_utf8_lossy(&body)
+            );
+
+            let (request, mode, expected) = make_request(endpoint, true);
+            let response = route_stream_plan_with_auth_service(
+                plan(&key, &account, endpoint, &request),
+                &request,
+                &key,
+                &[],
+                mode,
+                &repo,
+                "{}",
+                None,
+                service.clone(),
+            )
+            .await;
+            if response.status() != axum::http::StatusCode::OK {
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                panic!(
+                    "{endpoint:?} stream status {status}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+            }
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let stream_expected = if endpoint == EndpointKind::Responses {
+                "response.completed"
+            } else {
+                expected
+            };
+            assert!(
+                String::from_utf8_lossy(&body).contains(stream_expected),
+                "{endpoint:?} stream body: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        tokio::task::yield_now().await;
+        let seen = state.seen.lock().await;
+        assert_eq!(seen.len(), 6);
+        assert!(seen.iter().all(|body| body["stream"] == true));
+        drop(seen);
+        let logs = repo.get_logs(20, 0).await.unwrap();
+        assert!(logs.len() >= 5, "all completed facade paths must be logged");
+        assert!(logs.iter().all(|log| log.upstream_type == "auth_account"));
+    }
+
+    /// CR-1 #5: exhausting a single Auth Account must retain the LAST attempted
+    /// candidate metadata in both facade failure logs.  A pre-plan rejection is
+    /// the only case permitted to have no upstream candidate fields.
+    #[tokio::test]
+    async fn exhausted_auth_account_failure_logs_keep_candidate_metadata_for_stream_and_non_stream()
+    {
+        let (repo, service, state, account) = setup_with_failure(true).await;
+        let key = api_key();
+
+        let (request, mode, _) = make_request(EndpointKind::ChatCompletions, false);
+        let response = route_plan_response_with_auth_service(
+            plan(&key, &account, EndpointKind::ChatCompletions, &request),
+            &request,
+            &key,
+            &[],
+            mode,
+            &repo,
+            "{}",
+            None,
+            service.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let (stream_request, stream_mode, _) = make_request(EndpointKind::ChatCompletions, true);
+        let response = route_stream_plan_with_auth_service(
+            plan(
+                &key,
+                &account,
+                EndpointKind::ChatCompletions,
+                &stream_request,
+            ),
+            &stream_request,
+            &key,
+            &[],
+            stream_mode,
+            &repo,
+            "{}",
+            None,
+            service,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        assert_eq!(state.hits.load(Ordering::SeqCst), 2);
+        let logs = repo.get_logs(10, 0).await.unwrap();
+        assert_eq!(logs.len(), 2);
+        for log in logs {
+            assert_eq!(log.upstream_type, "auth_account");
+            assert_eq!(log.channel_id.as_deref(), Some(account.id.as_str()));
+            assert_eq!(log.channel_name.as_deref(), Some(account.label.as_str()));
+            assert_eq!(log.provider.as_deref(), Some("codex"));
+            assert_eq!(log.upstream_protocol.as_deref(), Some("responses"));
+            assert_eq!(log.upstream_endpoint.as_deref(), Some("responses"));
+            assert_eq!(log.codec_version.as_deref(), Some("chat_to_responses_v1"));
+        }
+    }
 }
 
 // ── stream_failover ───────────────────────────────────────────────────────

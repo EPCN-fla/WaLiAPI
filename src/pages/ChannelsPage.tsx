@@ -6,6 +6,7 @@ import { getProtocolLabel, getChannelProviderLabel, formatTime, formatNumber, fo
 import { Plus, Radio, Trash2, Zap, Power, Edit, Download, ChevronDown, Upload, Loader2, X, Activity, Clock, GripVertical, Eye, EyeOff, Copy, Check, AlertCircle } from "lucide-react";
 import { ChannelForm } from "../components/ChannelForm";
 import { ImportDialog } from "../components/ImportDialog";
+import { ChannelTabs } from "../components/layout/ChannelTabs";
 
 export function ChannelsPage() {
   const [channels, setChannels] = useState<Channel[]>([]);
@@ -183,11 +184,12 @@ export function ChannelsPage() {
 
   return (
     <div className="page-shell space-y-6">
-      <div className="page-header sticky top-0 z-30 -mx-7 -mt-7 mb-2 bg-white/90 px-7 py-5 backdrop-blur-md border-b border-slate-100">
-        <div>
-          <h1 className="page-title">渠道管理</h1>
-          <p className="page-subtitle">拖拽排序 · 配置上游供应商与调度优先级</p>
-        </div>
+      <div className="page-header sticky top-0 z-30 -mx-7 -mt-7 mb-2 flex-col bg-white/90 px-7 pt-3 backdrop-blur-md">
+        <div className="flex w-full items-start justify-between gap-4 pb-1.5">
+          <div>
+            <h1 className="page-title">渠道管理</h1>
+            <p className="page-subtitle mt-0.5">配置上游 API 供应商与调度优先级</p>
+          </div>
         <div className="flex items-center gap-2">
           <button onClick={handleExport} disabled={exporting} className="action-secondary flex items-center gap-1.5">
             {exporting ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
@@ -218,6 +220,8 @@ export function ChannelsPage() {
             <Plus size={16} /> 新建渠道
           </button>
         </div>
+        </div>
+        <ChannelTabs />
       </div>
 
       {actionError && (

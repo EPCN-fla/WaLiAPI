@@ -116,6 +116,9 @@ pub fn terminal_status(class: FailureClass) -> u16 {
 pub struct PreparedAttempt {
     pub channel_id: String,
     pub channel_name: String,
+    /// `channel` or `auth_account`, used by the executor/log boundary without
+    /// ever deriving that information from credentials.
+    pub upstream_type: String,
     pub route_group: String,
     pub upstream_protocol: String,
     pub upstream_endpoint: String,
@@ -183,11 +186,16 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
     rng: &mut R,
     attempt_no: usize,
 ) -> Result<PreparedAttempt, AttemptFailure> {
-    let mapping: Value = serde_json::from_str(&candidate.channel.model_mapping).unwrap_or_default();
+    let mapping: Value = candidate
+        .candidate
+        .channel()
+        .and_then(|channel| serde_json::from_str(&channel.model_mapping).ok())
+        .unwrap_or_default();
     let upstream_model = resolve_upstream_model(&mapping, &audit.envelope.model, rng);
     let is_retry = attempt_no > 1;
-    let channel_id = candidate.channel.id.clone();
-    let channel_name = candidate.channel.name.clone();
+    let channel_id = candidate.candidate.id().to_string();
+    let channel_name = candidate.candidate.name().to_string();
+    let upstream_type = candidate.candidate.upstream_type().to_string();
     let route_group = group.id.clone();
     // Use the CANDIDATE's own protocol/endpoint, not the group's: a native group
     // may (legitimately) hold more than one upstream protocol when ollama_native
@@ -195,7 +203,7 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
     // group-level fields only mirror the first candidate.
     let upstream_protocol = candidate.upstream_protocol.as_str().to_string();
     let upstream_endpoint = candidate.upstream_endpoint.clone();
-    let native_base_url = candidate.identity.native_base_url.clone();
+    let native_base_url = candidate.candidate.native_base_url();
 
     match group.tier {
         GroupTier::Native => {
@@ -206,6 +214,7 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
             Ok(PreparedAttempt {
                 channel_id,
                 channel_name,
+                upstream_type,
                 route_group,
                 upstream_protocol,
                 upstream_endpoint,
@@ -219,7 +228,11 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
             })
         }
         GroupTier::Conversion => {
-            let codec_version = codec_direction(group);
+            // A conversion group intentionally pools candidates by tier, not
+            // by wire protocol.  Its summary protocol mirrors the first
+            // candidate only, so every attempt must derive its codec from the
+            // candidate it is about to contact.
+            let codec_version = codec_direction(group.downstream, candidate.upstream_protocol);
             if let Some((downstream, upstream, version_label)) = codec_version {
                 let prepared = CodecRegistry::prepare(
                     downstream,
@@ -233,7 +246,7 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
                         failure_class: FailureClass::CallerTerminal,
                         message: format!(
                             "request cannot be converted to {}: {}",
-                            group.upstream_protocol.as_str(),
+                            candidate.upstream_protocol.as_str(),
                             e.message
                         ),
                         status_code: Some(400),
@@ -244,6 +257,7 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
                 Ok(PreparedAttempt {
                     channel_id,
                     channel_name,
+                    upstream_type,
                     route_group,
                     upstream_protocol,
                     upstream_endpoint,
@@ -258,7 +272,17 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
             } else {
                 // Legacy Responses→Chat debt conversion (not in the codec
                 // registry; handled by the existing protocol helpers).
-                let mut encoded = crate::protocol::responses_to_openai(&audit.forward_json);
+                let mut encoded = crate::protocol::responses_to_openai(&audit.forward_json)
+                    .map_err(|e| AttemptFailure {
+                        failure_class: FailureClass::CallerTerminal,
+                        message: format!(
+                            "request cannot be converted to {}: {}",
+                            candidate.upstream_protocol.as_str(),
+                            e.message
+                        ),
+                        status_code: Some(400),
+                        retry_after: None,
+                    })?;
                 // The sampled upstream model must be baked into the encoded body
                 // (matching the native and codec paths) so the actual request,
                 // logs and statistics all use the SAME model (§11.4).
@@ -268,6 +292,7 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
                 Ok(PreparedAttempt {
                     channel_id,
                     channel_name,
+                    upstream_type,
                     route_group,
                     upstream_protocol,
                     upstream_endpoint,
@@ -284,8 +309,11 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
     }
 }
 
-fn codec_direction(group: &RouteGroup) -> Option<(Downstream, Upstream, &'static str)> {
-    match (group.downstream, group.upstream_protocol) {
+fn codec_direction(
+    downstream: EndpointKind,
+    upstream_protocol: UpstreamProtocol,
+) -> Option<(Downstream, Upstream, &'static str)> {
+    match (downstream, upstream_protocol) {
         (EndpointKind::ChatCompletions, UpstreamProtocol::Anthropic) => Some((
             Downstream::ChatCompletions,
             Upstream::Messages,
@@ -295,6 +323,16 @@ fn codec_direction(group: &RouteGroup) -> Option<(Downstream, Upstream, &'static
             Downstream::Messages,
             Upstream::ChatCompletions,
             "messages_to_chat_v1",
+        )),
+        (EndpointKind::ChatCompletions, UpstreamProtocol::Responses) => Some((
+            Downstream::ChatCompletions,
+            Upstream::Responses,
+            "chat_to_responses_v1",
+        )),
+        (EndpointKind::Messages, UpstreamProtocol::Responses) => Some((
+            Downstream::Messages,
+            Upstream::Responses,
+            "messages_to_responses_v1",
         )),
         _ => None,
     }
@@ -410,8 +448,10 @@ impl AttemptFlow {
 mod tests {
     use super::*;
     use crate::core::feature_flags::FeatureFlags;
-    use crate::core::route_plan::{authorize_and_plan, EndpointKind};
-    use crate::db::models::{ApiKey, Channel};
+    use crate::core::route_plan::{
+        authorize_and_plan, authorize_and_plan_with_accounts, EndpointKind,
+    };
+    use crate::db::models::{ApiKey, AuthAccount, Channel};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
@@ -474,6 +514,39 @@ mod tests {
         FeatureFlags::all_on()
     }
 
+    fn auth_account(id: &str, model: &str, priority: i64) -> AuthAccount {
+        AuthAccount {
+            id: id.into(),
+            provider: "codex".into(),
+            label: format!("account-{id}"),
+            account_id: format!("remote-{id}"),
+            status: "active".into(),
+            disabled: 0,
+            priority,
+            weight: 1,
+            quota_json: None,
+            model_states_json: json!({
+                "version": 1,
+                "models": [{
+                    "id": model,
+                    "status": "available",
+                    "unavailable": false,
+                    "next_retry_after": null,
+                    "last_error": null
+                }]
+            })
+            .to_string(),
+            attributes_json: "{}".into(),
+            payload_json: "{}".into(),
+            last_refreshed_at: None,
+            last_models_sync_at: None,
+            next_refresh_after: None,
+            next_retry_after: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
     fn chat_plan(channels: Vec<Channel>, rng: &mut StdRng) -> RoutePlan {
         let key = api_key();
         authorize_and_plan(
@@ -517,6 +590,201 @@ mod tests {
             body_len: 0,
             audit_result: SecurityScanResult::default(),
             request_features: RequestFeatures::default(),
+        }
+    }
+
+    fn audited_messages() -> crate::security::gate::AuditedRequest {
+        use crate::security::gate::{DownstreamProtocol, RequestEnvelope, RequestFeatures};
+        use crate::security::SecurityScanResult;
+        let body = json!({
+            "model": "m",
+            "max_tokens": 32,
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        crate::security::gate::AuditedRequest {
+            envelope: RequestEnvelope {
+                downstream_protocol: DownstreamProtocol::Messages,
+                endpoint: "messages".into(),
+                original_json: body.clone(),
+                safe_forward_headers: vec![],
+                query: None,
+                model: "m".into(),
+                stream: false,
+                trace_id: None,
+            },
+            forward_json: body.clone(),
+            sanitized_log_json: body,
+            body_hash: "h".into(),
+            body_len: 0,
+            audit_result: SecurityScanResult::default(),
+            request_features: RequestFeatures::default(),
+        }
+    }
+
+    fn with_stream(
+        mut audit: crate::security::gate::AuditedRequest,
+        stream: bool,
+    ) -> crate::security::gate::AuditedRequest {
+        audit.envelope.stream = stream;
+        for body in [
+            &mut audit.envelope.original_json,
+            &mut audit.forward_json,
+            &mut audit.sanitized_log_json,
+        ] {
+            body.as_object_mut()
+                .expect("request fixture is an object")
+                .insert("stream".into(), Value::Bool(stream));
+        }
+        audit
+    }
+
+    #[test]
+    fn chat_conversion_failover_uses_each_candidate_codec_direction() {
+        for stream in [false, true] {
+            let audit = with_stream(audited(), stream);
+            let first = channel(
+                "anthropic",
+                "claude",
+                "https://api.anthropic.com/v1",
+                &["m"],
+                10,
+                1,
+            );
+            let account = auth_account("responses", "m", 1);
+            let plan = authorize_and_plan_with_accounts(
+                &api_key(),
+                "m",
+                EndpointKind::ChatCompletions,
+                &[first],
+                &[account],
+                &flags(),
+                &audit.forward_json,
+                &mut StdRng::seed_from_u64(7),
+            )
+            .expect("mixed conversion plan");
+            let group = &plan.groups[0];
+            assert_eq!(group.candidates.len(), 2);
+
+            let mut flow = AttemptFlow::new(plan);
+            let FlowStep::Execute {
+                group_idx,
+                candidate_idx,
+                ..
+            } = flow.next_step()
+            else {
+                panic!("first conversion candidate");
+            };
+            let mut rng = StdRng::seed_from_u64(7);
+            let first_attempt = build_prepared_attempt(
+                &audit,
+                &flow.plan.groups[group_idx],
+                &flow.plan.groups[group_idx].candidates[candidate_idx],
+                &mut rng,
+                1,
+            )
+            .expect("Anthropic conversion encodes");
+            assert_eq!(
+                first_attempt.codec_version.as_deref(),
+                Some("chat_to_messages_v1")
+            );
+
+            flow.record_failure(&failure(FailureClass::Retryable));
+            let FlowStep::Execute {
+                group_idx,
+                candidate_idx,
+                ..
+            } = flow.next_step()
+            else {
+                panic!("second conversion candidate after first failure");
+            };
+            let second_attempt = build_prepared_attempt(
+                &audit,
+                &flow.plan.groups[group_idx],
+                &flow.plan.groups[group_idx].candidates[candidate_idx],
+                &mut rng,
+                2,
+            )
+            .expect("Responses auth fallback encodes");
+            assert_eq!(second_attempt.upstream_type, "auth_account");
+            assert_eq!(
+                second_attempt.codec_version.as_deref(),
+                Some("chat_to_responses_v1")
+            );
+            assert!(second_attempt.encoded_body.get("input").is_some());
+        }
+    }
+
+    #[test]
+    fn messages_conversion_failover_uses_each_candidate_codec_direction() {
+        for stream in [false, true] {
+            let first = channel(
+                "openai",
+                "openai",
+                "https://api.openai.com/v1",
+                &["m"],
+                10,
+                1,
+            );
+            let account = auth_account("responses", "m", 1);
+            let audit = with_stream(audited_messages(), stream);
+            let plan = authorize_and_plan_with_accounts(
+                &api_key(),
+                "m",
+                EndpointKind::Messages,
+                &[first],
+                &[account],
+                &flags(),
+                &audit.forward_json,
+                &mut StdRng::seed_from_u64(7),
+            )
+            .expect("mixed conversion plan");
+
+            let mut flow = AttemptFlow::new(plan);
+            let FlowStep::Execute {
+                group_idx,
+                candidate_idx,
+                ..
+            } = flow.next_step()
+            else {
+                panic!("first conversion candidate");
+            };
+            let mut rng = StdRng::seed_from_u64(7);
+            let first_attempt = build_prepared_attempt(
+                &audit,
+                &flow.plan.groups[group_idx],
+                &flow.plan.groups[group_idx].candidates[candidate_idx],
+                &mut rng,
+                1,
+            )
+            .expect("OpenAI conversion encodes");
+            assert_eq!(
+                first_attempt.codec_version.as_deref(),
+                Some("messages_to_chat_v1")
+            );
+
+            flow.record_failure(&failure(FailureClass::Retryable));
+            let FlowStep::Execute {
+                group_idx,
+                candidate_idx,
+                ..
+            } = flow.next_step()
+            else {
+                panic!("second conversion candidate after first failure");
+            };
+            let second_attempt = build_prepared_attempt(
+                &audit,
+                &flow.plan.groups[group_idx],
+                &flow.plan.groups[group_idx].candidates[candidate_idx],
+                &mut rng,
+                2,
+            )
+            .expect("Responses auth fallback encodes");
+            assert_eq!(second_attempt.upstream_type, "auth_account");
+            assert_eq!(
+                second_attempt.codec_version.as_deref(),
+                Some("messages_to_responses_v1")
+            );
+            assert!(second_attempt.encoded_body.get("input").is_some());
         }
     }
 
@@ -595,8 +863,8 @@ mod tests {
         assert_eq!(group_idx, 0);
         assert_eq!(
             flow.plan.groups[group_idx].candidates[candidate_idx]
-                .channel
-                .id,
+                .candidate
+                .id(),
             "n1"
         );
         flow.record_failure(&failure(FailureClass::ChannelAuthTerminal));
@@ -613,8 +881,8 @@ mod tests {
         assert_eq!(group_idx, 0, "auth terminal continues within the group");
         assert_eq!(
             flow.plan.groups[group_idx].candidates[candidate_idx]
-                .channel
-                .id,
+                .candidate
+                .id(),
             "n2"
         );
         flow.record_failure(&failure(FailureClass::Retryable));
@@ -632,8 +900,8 @@ mod tests {
         assert_eq!(group_idx, 1, "cross to conversion group");
         assert_eq!(
             flow.plan.groups[group_idx].candidates[candidate_idx]
-                .channel
-                .id,
+                .candidate
+                .id(),
             "c1"
         );
     }
@@ -680,8 +948,8 @@ mod tests {
         assert_eq!(group_idx, 0, "native group first");
         assert_eq!(
             flow.plan.groups[group_idx].candidates[candidate_idx]
-                .channel
-                .id,
+                .candidate
+                .id(),
             "n1"
         );
         assert_eq!(attempt_no, 1);
@@ -699,8 +967,8 @@ mod tests {
         assert_eq!(group_idx, 1, "conversion group after native exhausted");
         assert_eq!(
             flow.plan.groups[group_idx].candidates[candidate_idx]
-                .channel
-                .id,
+                .candidate
+                .id(),
             "c1"
         );
         assert_eq!(attempt_no, 2);
@@ -746,8 +1014,8 @@ mod tests {
         assert_eq!(group_idx, 0);
         assert_eq!(
             flow.plan.groups[group_idx].candidates[candidate_idx]
-                .channel
-                .id,
+                .candidate
+                .id(),
             "n1"
         );
 
@@ -764,8 +1032,8 @@ mod tests {
         assert_eq!(group_idx, 0, "must stay in the native group");
         assert_eq!(
             flow.plan.groups[group_idx].candidates[candidate_idx]
-                .channel
-                .id,
+                .candidate
+                .id(),
             "n2"
         );
     }
@@ -831,7 +1099,7 @@ mod tests {
         };
         assert_eq!(group_idx, 0);
         assert_eq!(
-            flow.plan.groups[0].candidates[candidate_idx].channel.id,
+            flow.plan.groups[0].candidates[candidate_idx].candidate.id(),
             "n1"
         );
         flow.record_failure(&failure(FailureClass::ChannelAuthTerminal));
@@ -846,7 +1114,7 @@ mod tests {
         };
         assert_eq!(group_idx, 0);
         assert_eq!(
-            flow.plan.groups[0].candidates[candidate_idx].channel.id,
+            flow.plan.groups[0].candidates[candidate_idx].candidate.id(),
             "n2"
         );
     }
@@ -879,9 +1147,9 @@ mod tests {
         } = flow.next_step()
         {
             let id = flow.plan.groups[group_idx].candidates[candidate_idx]
-                .channel
-                .id
-                .clone();
+                .candidate
+                .id()
+                .to_string();
             assert!(!seen.contains(&id), "candidate must be tried at most once");
             seen.push(id);
             flow.record_failure(&failure(FailureClass::Retryable));

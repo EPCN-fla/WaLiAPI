@@ -20,32 +20,60 @@ pub async fn ingest_source(
 
     // 1. Load source record
     let sources = repo.list_sources(project_id).await?;
-    let source = sources.iter().find(|s| s.id == source_id)
+    let source = sources
+        .iter()
+        .find(|s| s.id == source_id)
         .ok_or_else(|| format!("Source {} not found", source_id))?;
 
     // 2. Update task status
-    let task_id = repo.create_task(project_id, Some(source_id), "ingest").await?;
-    repo.update_task_status(&task_id, "running", 0, 0, 3, None, None).await?;
-    emit_wiki_progress(app, source_id, project_id, &source.filename, "processing", 0, "准备摄入");
+    let task_id = repo
+        .create_task(project_id, Some(source_id), "ingest")
+        .await?;
+    repo.update_task_status(&task_id, "running", 0, 0, 3, None, None)
+        .await?;
+    emit_wiki_progress(
+        app,
+        source_id,
+        project_id,
+        &source.filename,
+        "processing",
+        0,
+        "准备摄入",
+    );
 
     // 3. Read source file content
     let content = if let Some(ref file_path) = source.file_path {
         // Read from disk path
-        tokio::fs::read_to_string(file_path).await
+        tokio::fs::read_to_string(file_path)
+            .await
             .map_err(|e| format!("Failed to read source file: {}", e))?
     } else {
         // Read from project raw/sources/ dir
-        let raw = project::read_source_file(project_id, &source.filename).await
+        let raw = project::read_source_file(project_id, &source.filename)
+            .await
             .map_err(|e| format!("Failed to read source: {}", e))?;
         String::from_utf8_lossy(&raw).to_string()
     };
 
     let source_filename = &source.filename;
-    let file_ext = source_filename.rsplit('.').next().unwrap_or("txt").to_lowercase();
+    let file_ext = source_filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("txt")
+        .to_lowercase();
 
     // 4. Parse content into sections/chunks
-    repo.update_task_status(&task_id, "running", 10, 0, 3, None, None).await?;
-    emit_wiki_progress(app, source_id, project_id, &source.filename, "parsing", 10, "解析文档");
+    repo.update_task_status(&task_id, "running", 10, 0, 3, None, None)
+        .await?;
+    emit_wiki_progress(
+        app,
+        source_id,
+        project_id,
+        &source.filename,
+        "parsing",
+        10,
+        "解析文档",
+    );
     let sections = parse_content(&content, &file_ext);
 
     // 5. Get project config for LLM
@@ -55,17 +83,29 @@ pub async fn ingest_source(
         Some(id) if !id.is_empty() => id.to_string(),
         _ => {
             // Fallback: find first active channel from DB
-            let row: Option<(String,)> = sqlx::query_as("SELECT id FROM channels WHERE status = 1 ORDER BY priority DESC LIMIT 1")
-                .fetch_optional(pool).await
-                .map_err(|e| format!("DB error: {}", e))?;
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT id FROM channels WHERE status = 1 ORDER BY priority DESC LIMIT 1",
+            )
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
             let id = row.map(|(id,)| id).ok_or_else(|| "No active channel configured. Please create a channel first or set ingest_channel_id in Wiki project settings.".to_string())?;
             id
         }
     };
 
     // 6. Generate wiki pages via LLM
-    repo.update_task_status(&task_id, "running", 30, 1, 3, None, None).await?;
-    emit_wiki_progress(app, source_id, project_id, &source.filename, "generating", 30, "LLM 生成页面");
+    repo.update_task_status(&task_id, "running", 30, 1, 3, None, None)
+        .await?;
+    emit_wiki_progress(
+        app,
+        source_id,
+        project_id,
+        &source.filename,
+        "generating",
+        30,
+        "LLM 生成页面",
+    );
     let pages = generate_wiki_pages(
         app,
         &db_repo,
@@ -74,12 +114,24 @@ pub async fn ingest_source(
         project_id,
         source_filename,
         &sections,
-        proj.schema_text.as_deref().unwrap_or(super::repository::DEFAULT_SCHEMA),
-    ).await?;
+        proj.schema_text
+            .as_deref()
+            .unwrap_or(super::repository::DEFAULT_SCHEMA),
+    )
+    .await?;
 
     // 7. Write pages to disk + DB
-    repo.update_task_status(&task_id, "running", 60, 2, 3, None, None).await?;
-    emit_wiki_progress(app, source_id, project_id, &source.filename, "writing", 60, "写入页面");
+    repo.update_task_status(&task_id, "running", 60, 2, 3, None, None)
+        .await?;
+    emit_wiki_progress(
+        app,
+        source_id,
+        project_id,
+        &source.filename,
+        "writing",
+        60,
+        "写入页面",
+    );
     let mut written_pages = Vec::new();
     for page in &pages {
         let page_path = &page.path;
@@ -112,7 +164,8 @@ pub async fn ingest_source(
             &wikilinks_json,
             "{}",
             &tags_json,
-        ).await?;
+        )
+        .await?;
 
         written_pages.push(WrittenPage {
             path: page_path.clone(),
@@ -123,21 +176,39 @@ pub async fn ingest_source(
     }
 
     // 8. Update graph edges from wikilinks
-    repo.update_task_status(&task_id, "running", 80, 2, 3, None, None).await?;
-    emit_wiki_progress(app, source_id, project_id, &source.filename, "linking", 80, "更新知识图谱");
+    repo.update_task_status(&task_id, "running", 80, 2, 3, None, None)
+        .await?;
+    emit_wiki_progress(
+        app,
+        source_id,
+        project_id,
+        &source.filename,
+        "linking",
+        80,
+        "更新知识图谱",
+    );
     update_graph_edges(pool, project_id, &written_pages).await?;
 
     // 9. Update source status
-    repo.update_source_status(source_id, "ingested", written_pages.len() as i64, None).await?;
+    repo.update_source_status(source_id, "ingested", written_pages.len() as i64, None)
+        .await?;
 
     // Update project counts
     let page_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM wiki_pages WHERE project_id = ? AND status = 'active'"
-    ).bind(project_id).fetch_one(pool).await.unwrap_or(0);
+        "SELECT COUNT(*) FROM wiki_pages WHERE project_id = ? AND status = 'active'",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
 
     let source_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM wiki_sources WHERE project_id = ? AND status = 'ingested'"
-    ).bind(project_id).fetch_one(pool).await.unwrap_or(0);
+        "SELECT COUNT(*) FROM wiki_sources WHERE project_id = ? AND status = 'ingested'",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
 
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
@@ -147,15 +218,33 @@ pub async fn ingest_source(
     .execute(pool).await.map_err(|e| format!("DB error: {}", e))?;
 
     // Append log
-    let _ = project::append_log(project_id, &format!("ingest | {} → {} pages", source_filename, written_pages.len())).await;
+    let _ = project::append_log(
+        project_id,
+        &format!(
+            "ingest | {} → {} pages",
+            source_filename,
+            written_pages.len()
+        ),
+    )
+    .await;
 
     // Update task
     let result_json = serde_json::json!({
         "pages_created": written_pages.len(),
         "source": source_filename,
-    }).to_string();
-    repo.update_task_status(&task_id, "done", 100, 3, 3, Some(&result_json), None).await?;
-    emit_wiki_progress(app, source_id, project_id, &source.filename, "done", 100, &format!("完成，生成 {} 个页面", written_pages.len()));
+    })
+    .to_string();
+    repo.update_task_status(&task_id, "done", 100, 3, 3, Some(&result_json), None)
+        .await?;
+    emit_wiki_progress(
+        app,
+        source_id,
+        project_id,
+        &source.filename,
+        "done",
+        100,
+        &format!("完成，生成 {} 个页面", written_pages.len()),
+    );
 
     Ok(IngestResult {
         pages_created: written_pages.len(),
@@ -317,7 +406,8 @@ fn parse_json(content: &str) -> Vec<ContentSection> {
     // Try to parse and flatten JSON into readable sections
     match serde_json::from_str::<serde_json::Value>(content) {
         Ok(json) => {
-            let pretty = serde_json::to_string_pretty(&json).unwrap_or_else(|_| content.to_string());
+            let pretty =
+                serde_json::to_string_pretty(&json).unwrap_or_else(|_| content.to_string());
             parse_plain_text(&pretty)
         }
         Err(_) => parse_plain_text(content),
@@ -336,7 +426,8 @@ async fn generate_wiki_pages(
     schema: &str,
 ) -> Result<Vec<GeneratedPage>, String> {
     // Build a combined context from all sections
-    let combined: String = sections.iter()
+    let combined: String = sections
+        .iter()
         .map(|s| format!("## {}\n{}", s.heading, s.content))
         .collect::<Vec<_>>()
         .join("\n\n");
@@ -396,7 +487,10 @@ Generate 3-8 pages depending on document complexity. Focus on the most important
         schema, source_filename, source_filename
     );
 
-    let user_prompt = format!("Source document: {}\n\nContent:\n{}", source_filename, truncated);
+    let user_prompt = format!(
+        "Source document: {}\n\nContent:\n{}",
+        source_filename, truncated
+    );
 
     let chat_request = serde_json::json!({
         "model": model,
@@ -420,7 +514,8 @@ Generate 3-8 pages depending on document complexity. Focus on the most important
         Some(chat_request_str),
         Some(format!("wiki-ingest_{}", project_id)),
         None,
-    ).await;
+    )
+    .await;
 
     let response_body = match proxy_result {
         Ok(result) => result.body,
@@ -540,7 +635,9 @@ fn parse_generated_pages(text: &str, source_filename: &str) -> Vec<GeneratedPage
             page_type: "summary".to_string(),
             content: format!(
                 "---\ntitle: {}\ntype: summary\ntags: []\nsource: {}\n---\n\n# {}\n\n{}",
-                source_filename, source_filename, source_filename,
+                source_filename,
+                source_filename,
+                source_filename,
                 text.chars().take(8000).collect::<String>()
             ),
         });
@@ -555,7 +652,10 @@ fn extract_path_from_content(content: &str) -> Option<String> {
         let trimmed = line.trim();
         if trimmed.ends_with(".md") && trimmed.len() < 200 {
             // Clean up markdown code fences
-            let clean = trimmed.trim_start_matches("```").trim_end_matches("```").trim();
+            let clean = trimmed
+                .trim_start_matches("```")
+                .trim_end_matches("```")
+                .trim();
             if clean.ends_with(".md") {
                 return Some(clean.to_string());
             }
@@ -566,7 +666,8 @@ fn extract_path_from_content(content: &str) -> Option<String> {
 
 fn build_page(path: &str, raw_content: &str, source_filename: &str) -> GeneratedPage {
     // Remove path line from content if present
-    let content = raw_content.lines()
+    let content = raw_content
+        .lines()
         .filter(|l| {
             let t = l.trim();
             !(t.ends_with(".md") && t.len() < 200)
@@ -703,13 +804,10 @@ fn extract_wikilinks(content: &str) -> Vec<String> {
 
 /// Rebuild graph edges for a project based on current page wikilinks.
 /// Called after page save/delete to keep the knowledge graph up-to-date.
-pub async fn rebuild_graph_edges(
-    pool: &sqlx::SqlitePool,
-    project_id: &str,
-) -> Result<(), String> {
+pub async fn rebuild_graph_edges(pool: &sqlx::SqlitePool, project_id: &str) -> Result<(), String> {
     // Load all pages from DB
     let existing_pages: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT path, wikilinks, title FROM wiki_pages WHERE project_id = ? AND status = 'active'"
+        "SELECT path, wikilinks, title FROM wiki_pages WHERE project_id = ? AND status = 'active'",
     )
     .bind(project_id)
     .fetch_all(pool)
@@ -761,7 +859,7 @@ async fn update_graph_edges(
 
     // Also load existing pages from DB
     let existing_pages: Vec<(String, String)> = sqlx::query_as(
-        "SELECT path, wikilinks FROM wiki_pages WHERE project_id = ? AND status = 'active'"
+        "SELECT path, wikilinks FROM wiki_pages WHERE project_id = ? AND status = 'active'",
     )
     .bind(project_id)
     .fetch_all(pool)
@@ -839,7 +937,13 @@ pub fn extract_tags_from_frontmatter(content: &str) -> Vec<String> {
             }
             return cleaned
                 .split(',')
-                .map(|t| t.trim().trim_matches('"').trim_matches('\'').trim().to_string())
+                .map(|t| {
+                    t.trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .trim()
+                        .to_string()
+                })
                 .filter(|t| !t.is_empty())
                 .collect();
         }
@@ -854,8 +958,15 @@ fn normalize_wikilink(link: &str) -> String {
         return link.to_string();
     }
     // Otherwise, assume it's an entity name
-    let slug: String = link.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c.to_ascii_lowercase() } else { '-' })
+    let slug: String = link
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     let slug = slug.trim_matches('-');
     format!("entities/{}.md", slug)
@@ -863,11 +974,7 @@ fn normalize_wikilink(link: &str) -> String {
 
 /// Resolve a wikilink to an actual page path by matching against known page titles.
 /// Falls back to `normalize_wikilink` if no title match is found.
-async fn resolve_wikilink_to_path(
-    pool: &sqlx::SqlitePool,
-    project_id: &str,
-    link: &str,
-) -> String {
+async fn resolve_wikilink_to_path(pool: &sqlx::SqlitePool, project_id: &str, link: &str) -> String {
     let link = link.trim();
     // If it already looks like a path, use as-is
     if link.contains('/') && link.ends_with(".md") {

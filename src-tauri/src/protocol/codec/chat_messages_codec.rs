@@ -226,7 +226,9 @@ fn chat_request_reasoning_effort_maps_to_thinking() {
         "messages": [{"role": "user", "content": "u"}],
         "reasoning_effort": "none"
     });
-    let out = &CodecRegistry::chat_to_messages("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::chat_to_messages("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["thinking"], json!({"type": "disabled"}));
     assert!(out.get("output_config").is_none());
 
@@ -236,7 +238,9 @@ fn chat_request_reasoning_effort_maps_to_thinking() {
         "messages": [{"role": "user", "content": "u"}],
         "reasoning_effort": "auto"
     });
-    let out = &CodecRegistry::chat_to_messages("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::chat_to_messages("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["thinking"], json!({"type": "adaptive"}));
     assert!(out.get("output_config").is_none());
 
@@ -246,7 +250,9 @@ fn chat_request_reasoning_effort_maps_to_thinking() {
         "messages": [{"role": "user", "content": "u"}],
         "reasoning_effort": "medium"
     });
-    let out = &CodecRegistry::chat_to_messages("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::chat_to_messages("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["thinking"], json!({"type": "adaptive"}));
     assert_eq!(out["output_config"], json!({"effort": "medium"}));
 
@@ -256,7 +262,9 @@ fn chat_request_reasoning_effort_maps_to_thinking() {
         "messages": [{"role": "user", "content": "u"}],
         "reasoning_effort": "xhigh"
     });
-    let out = &CodecRegistry::chat_to_messages("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::chat_to_messages("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["output_config"], json!({"effort": "high"}));
 }
 
@@ -660,7 +668,9 @@ fn messages_request_thinking_variants_map_reasoning_effort() {
         "messages": [{"role": "user", "content": "u"}],
         "thinking": {"type": "enabled", "budget_tokens": 1024}
     });
-    let out = &CodecRegistry::messages_to_chat("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::messages_to_chat("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["reasoning_effort"], "low", "1024 -> low");
 
     // enabled without budget -> auto
@@ -669,7 +679,9 @@ fn messages_request_thinking_variants_map_reasoning_effort() {
         "messages": [{"role": "user", "content": "u"}],
         "thinking": {"type": "enabled"}
     });
-    let out = &CodecRegistry::messages_to_chat("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::messages_to_chat("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["reasoning_effort"], "auto");
 
     // adaptive + output_config.effort -> passthrough (lowercased)
@@ -679,8 +691,13 @@ fn messages_request_thinking_variants_map_reasoning_effort() {
         "thinking": {"type": "adaptive"},
         "output_config": {"effort": "MEDIUM"}
     });
-    let out = &CodecRegistry::messages_to_chat("m", &body).unwrap().encoded_request;
-    assert_eq!(out["reasoning_effort"], "medium", "effort lowercased passthrough");
+    let out = &CodecRegistry::messages_to_chat("m", &body)
+        .unwrap()
+        .encoded_request;
+    assert_eq!(
+        out["reasoning_effort"], "medium",
+        "effort lowercased passthrough"
+    );
 
     // adaptive without effort -> xhigh
     let body = json!({
@@ -688,7 +705,9 @@ fn messages_request_thinking_variants_map_reasoning_effort() {
         "messages": [{"role": "user", "content": "u"}],
         "thinking": {"type": "adaptive"}
     });
-    let out = &CodecRegistry::messages_to_chat("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::messages_to_chat("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["reasoning_effort"], "xhigh");
 
     // disabled -> none
@@ -697,7 +716,9 @@ fn messages_request_thinking_variants_map_reasoning_effort() {
         "messages": [{"role": "user", "content": "u"}],
         "thinking": {"type": "disabled"}
     });
-    let out = &CodecRegistry::messages_to_chat("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::messages_to_chat("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["reasoning_effort"], "none");
 }
 
@@ -720,12 +741,10 @@ fn messages_request_container_dropped_fail_open() {
     // The report surfaces the drop pointers.
     let report = &prepared.report;
     assert!(report.normalized.iter().any(|p| p.contains("container")));
-    assert!(
-        report
-            .normalized
-            .iter()
-            .any(|p| p.contains("context_management"))
-    );
+    assert!(report
+        .normalized
+        .iter()
+        .any(|p| p.contains("context_management")));
 }
 
 #[test]
@@ -743,7 +762,9 @@ fn messages_request_assistant_thinking_becomes_reasoning_content() {
             ]}
         ]
     });
-    let out = &CodecRegistry::messages_to_chat("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::messages_to_chat("m", &body)
+        .unwrap()
+        .encoded_request;
     let assistant = &out["messages"][1];
     assert_eq!(assistant["reasoning_content"], "chain");
     assert_eq!(assistant["content"], "answer");
@@ -1003,8 +1024,8 @@ fn messages_response_maps_stop_reasons() {
     // Stop-like reasons collapse to `stop` (refusal text rides in content).
     for stop in ["refusal", "stop_sequence", "pause_turn"] {
         assert_eq!(
-            messages::decode_messages_response_to_chat(&base(stop), &Default::default())
-                .unwrap()["choices"][0]["finish_reason"],
+            messages::decode_messages_response_to_chat(&base(stop), &Default::default()).unwrap()
+                ["choices"][0]["finish_reason"],
             "stop",
             "stop_reason {stop:?} should map to stop, not error"
         );
@@ -1124,9 +1145,7 @@ fn messages_stream_stop_like_reasons_normalize_not_error() {
     assert!(stream("refusal").contains("\"finish_reason\":\"stop\""));
     assert!(stream("pause_turn").contains("\"finish_reason\":\"stop\""));
     assert!(stream("stop_sequence").contains("\"finish_reason\":\"stop\""));
-    assert!(
-        stream("model_context_window_exceeded").contains("\"finish_reason\":\"length\"")
-    );
+    assert!(stream("model_context_window_exceeded").contains("\"finish_reason\":\"length\""));
 }
 
 #[test]
@@ -1143,7 +1162,11 @@ fn messages_stream_thinking_fail_open_to_reasoning_content() {
     events.extend(state.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"abc\"}}\n\n").unwrap());
     events.extend(state.feed(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap());
     events.extend(state.feed(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n").unwrap());
-    events.extend(state.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n").unwrap());
+    events.extend(
+        state
+            .feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+            .unwrap(),
+    );
     events.extend(state.finish().unwrap());
     let joined = events.join("");
     assert!(joined.contains("\"reasoning_content\":\"se\""));
@@ -1158,9 +1181,21 @@ fn chat_stream_reasoning_fail_open_to_thinking_block() {
     // emitted as a Messages `thinking` block, never rejected.
     let mut state = chat::ChatSseState::new("up-model", "msg_1");
     let mut events = Vec::new();
-    events.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"se\"}}]}\n\n").unwrap());
-    events.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"cret\"}}]}\n\n").unwrap());
-    events.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n").unwrap());
+    events.extend(
+        state
+            .feed(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"se\"}}]}\n\n")
+            .unwrap(),
+    );
+    events.extend(
+        state
+            .feed(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"cret\"}}]}\n\n")
+            .unwrap(),
+    );
+    events.extend(
+        state
+            .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+            .unwrap(),
+    );
     events.extend(state.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n").unwrap());
     events.extend(state.finish().unwrap());
     let joined = events.join("");
@@ -1172,7 +1207,10 @@ fn chat_stream_reasoning_fail_open_to_thinking_block() {
     assert!(joined.contains("\"text\":\"hi\""));
     // both blocks are stopped exactly once.
     assert_eq!(
-        events.iter().filter(|e| e.contains("content_block_stop")).count(),
+        events
+            .iter()
+            .filter(|e| e.contains("content_block_stop"))
+            .count(),
         2,
         "thinking + text blocks both stop"
     );

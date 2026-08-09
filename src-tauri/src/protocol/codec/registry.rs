@@ -11,13 +11,14 @@
 
 use super::error::{CodecError, UnsupportedFeatures};
 use super::report::{ConversionContext, ConversionReport};
-use super::{chat, messages};
+use super::{chat, messages, responses_codec};
 
 /// Downstream endpoint protocol kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Downstream {
     ChatCompletions,
     Messages,
+    Responses,
 }
 
 /// Upstream endpoint protocol kind.
@@ -25,6 +26,7 @@ pub enum Downstream {
 pub enum Upstream {
     ChatCompletions,
     Messages,
+    Responses,
 }
 
 /// A codec version identifier for registry lookup.
@@ -109,9 +111,21 @@ impl CodecRegistry {
             non_stream: messages::NonStreamResponseDecoder::boxed,
             streaming: messages::MessagesStreamDecoder::boxed,
         };
+        static V3: Direction = Direction {
+            encode: responses_codec::encode_chat_to_responses,
+            non_stream: responses_codec::ResponsesNonStreamDecoder::boxed,
+            streaming: responses_codec::ResponsesStreamDecoder::boxed,
+        };
+        static V4: Direction = Direction {
+            encode: responses_codec::encode_messages_to_responses,
+            non_stream: responses_codec::ResponsesMessagesNonStreamDecoder::boxed,
+            streaming: responses_codec::ResponsesMessagesStreamDecoder::boxed,
+        };
         match (downstream, upstream) {
             (Downstream::ChatCompletions, Upstream::Messages) => Ok(&V1),
             (Downstream::Messages, Upstream::ChatCompletions) => Ok(&V2),
+            (Downstream::ChatCompletions, Upstream::Responses) => Ok(&V3),
+            (Downstream::Messages, Upstream::Responses) => Ok(&V4),
             _ => Err(CodecError::new(format!(
                 "no codec registered for downstream {:?} -> upstream {:?}",
                 downstream, upstream
@@ -177,6 +191,34 @@ impl CodecRegistry {
         Self::prepare(
             Downstream::Messages,
             Upstream::ChatCompletions,
+            &Self::version(),
+            model,
+            request,
+        )
+    }
+
+    /// Prepare a Chat → Responses conversion for an auth-account backend.
+    pub fn chat_to_responses(
+        model: &str,
+        request: &serde_json::Value,
+    ) -> Result<PreparedConversion, UnsupportedFeatures> {
+        Self::prepare(
+            Downstream::ChatCompletions,
+            Upstream::Responses,
+            &Self::version(),
+            model,
+            request,
+        )
+    }
+
+    /// Prepare a Messages → Chat → Responses composition.
+    pub fn messages_to_responses(
+        model: &str,
+        request: &serde_json::Value,
+    ) -> Result<PreparedConversion, UnsupportedFeatures> {
+        Self::prepare(
+            Downstream::Messages,
+            Upstream::Responses,
             &Self::version(),
             model,
             request,

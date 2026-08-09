@@ -14,12 +14,11 @@ pub async fn get_wiki_projects(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<WikiProject>, String> {
     let pool = state.db.pool.clone();
-    let rows = sqlx::query_as::<_, WikiProject>(
-        "SELECT * FROM wiki_projects ORDER BY created_at DESC"
-    )
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| format!("DB error: {}", e))?;
+    let rows =
+        sqlx::query_as::<_, WikiProject>("SELECT * FROM wiki_projects ORDER BY created_at DESC")
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
     Ok(rows)
 }
 
@@ -30,9 +29,10 @@ pub async fn create_wiki_project(
 ) -> Result<WikiProject, String> {
     let pool = state.db.pool.clone();
     let project_id = crate::services::wiki::project::new_uuid();
-    let schema = input.schema_text.clone().unwrap_or_else(|| {
-        crate::services::wiki::repository::DEFAULT_SCHEMA.to_string()
-    });
+    let schema = input
+        .schema_text
+        .clone()
+        .unwrap_or_else(|| crate::services::wiki::repository::DEFAULT_SCHEMA.to_string());
 
     // Create directory structure
     crate::services::wiki::project::init_project_dir(&project_id, &schema).await?;
@@ -126,7 +126,12 @@ pub async fn get_wiki_page(
     // Try reading from disk
     match crate::services::wiki::project::read_page(&projectId, &path).await {
         Ok(content) => {
-            let title = path.split('/').last().unwrap_or(&path).trim_end_matches(".md").to_string();
+            let title = path
+                .split('/')
+                .last()
+                .unwrap_or(&path)
+                .trim_end_matches(".md")
+                .to_string();
             Ok(serde_json::json!({
                 "path": path,
                 "title": title,
@@ -153,16 +158,41 @@ pub async fn save_wiki_page(
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     let hash = format!("{:x}", hasher.finalize());
-    let title = path.split('/').last().unwrap_or(&path).trim_end_matches(".md").to_string();
-    let page_type = if path.contains("entities/") { "entity" }
-        else if path.contains("concepts/") { "concept" }
-        else if path.contains("summaries/") { "summary" }
-        else if path.ends_with("index.md") { "index" }
-        else if path.ends_with("log.md") { "log" }
-        else { "entity" };
+    let title = path
+        .split('/')
+        .last()
+        .unwrap_or(&path)
+        .trim_end_matches(".md")
+        .to_string();
+    let page_type = if path.contains("entities/") {
+        "entity"
+    } else if path.contains("concepts/") {
+        "concept"
+    } else if path.contains("summaries/") {
+        "summary"
+    } else if path.ends_with("index.md") {
+        "index"
+    } else if path.ends_with("log.md") {
+        "log"
+    } else {
+        "entity"
+    };
     let token_count = (content.len() / 4) as i64;
-    let _ = repo.upsert_page(&projectId, &path, &title, page_type, &hash, token_count, "[]", "{}", "[]").await;
-    let _ = crate::services::wiki::project::append_log(&projectId, &format!("update | {}", path)).await;
+    let _ = repo
+        .upsert_page(
+            &projectId,
+            &path,
+            &title,
+            page_type,
+            &hash,
+            token_count,
+            "[]",
+            "{}",
+            "[]",
+        )
+        .await;
+    let _ =
+        crate::services::wiki::project::append_log(&projectId, &format!("update | {}", path)).await;
     Ok(())
 }
 
@@ -195,10 +225,16 @@ pub async fn add_wiki_source(
     let file_size = input.content.as_ref().map(|c| c.len() as i64).unwrap_or(0);
 
     if let Some(ref content) = input.content {
-        crate::services::wiki::project::write_source_file(&projectId, &input.filename, content.as_bytes()).await?;
+        crate::services::wiki::project::write_source_file(
+            &projectId,
+            &input.filename,
+            content.as_bytes(),
+        )
+        .await?;
     }
 
-    repo.add_source(&projectId, &input, content_hash.as_deref(), file_size).await
+    repo.add_source(&projectId, &input, content_hash.as_deref(), file_size)
+        .await
 }
 
 #[tauri::command]
@@ -222,7 +258,8 @@ pub async fn search_wiki(
 ) -> Result<Vec<WikiSearchResult>, String> {
     let pool = state.db.pool.clone();
     let repo = crate::services::wiki::repository::WikiRepository::new(pool);
-    repo.search_pages(&projectId, &query, topK.unwrap_or(10)).await
+    repo.search_pages(&projectId, &query, topK.unwrap_or(10))
+        .await
 }
 
 // ── Wiki Graph ──
@@ -272,12 +309,15 @@ pub async fn ingest_wiki_source(
     sourceId: String,
 ) -> Result<serde_json::Value, String> {
     let pool = state.db.pool.clone();
-    crate::services::wiki::ingest::ingest_source(&app, &pool, &projectId, &sourceId).await
-        .map(|r| serde_json::json!({
-            "status": "done",
-            "pages_created": r.pages_created,
-            "page_paths": r.page_paths,
-        }))
+    crate::services::wiki::ingest::ingest_source(&app, &pool, &projectId, &sourceId)
+        .await
+        .map(|r| {
+            serde_json::json!({
+                "status": "done",
+                "pages_created": r.pages_created,
+                "page_paths": r.page_paths,
+            })
+        })
         .map_err(|e| {
             let pool_clone = pool.clone();
             let sid = sourceId.clone();
@@ -286,7 +326,9 @@ pub async fn ingest_wiki_source(
             let app_clone = app.clone();
             tokio::spawn(async move {
                 let repo = crate::services::wiki::repository::WikiRepository::new(pool_clone);
-                let _ = repo.update_source_status(&sid, "failed", 0, Some(&err)).await;
+                let _ = repo
+                    .update_source_status(&sid, "failed", 0, Some(&err))
+                    .await;
                 let _ = app_clone.emit(
                     "wiki-source-progress",
                     serde_json::json!({
@@ -317,7 +359,9 @@ pub async fn rescan_wiki_sources(
     let mut results = Vec::new();
 
     for source in &pending {
-        match crate::services::wiki::ingest::ingest_source(&app, &pool, &projectId, &source.id).await {
+        match crate::services::wiki::ingest::ingest_source(&app, &pool, &projectId, &source.id)
+            .await
+        {
             Ok(r) => results.push(serde_json::json!({
                 "source_id": source.id,
                 "filename": source.filename,

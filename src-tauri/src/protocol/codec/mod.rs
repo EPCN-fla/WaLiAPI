@@ -21,6 +21,7 @@ pub mod messages;
 pub mod registry;
 pub mod report;
 pub mod request;
+pub mod responses_codec;
 pub mod sse;
 
 pub use error::{
