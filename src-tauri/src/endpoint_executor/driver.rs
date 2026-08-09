@@ -188,7 +188,22 @@ async fn write_non_stream_log(
             u.total_tokens as i64,
         )
     });
-    let (prompt, completion, total) = usage.unwrap_or((0, 0, 0));
+    let (mut prompt, mut completion, mut total) = usage.unwrap_or((0, 0, 0));
+
+    // Fallback: estimate tokens locally when upstream didn't return usage.
+    // Only estimate for successful (2xx) responses — errors have no real content.
+    if total == 0 && prompt == 0 && completion == 0 && execution.status >= 200 && execution.status < 300 {
+        let req_body: serde_json::Value = serde_json::from_str(sanitized_log_body).unwrap_or(serde_json::Value::Null);
+        let resp_text = super::estimate_usage::extract_response_text(&execution.body);
+        let (p, c, t) = super::estimate_usage::estimate_usage(&req_body, Some(&resp_text), &audited.envelope.model);
+        prompt = p;
+        completion = c;
+        total = t;
+        if total > 0 {
+            eprintln!("[INFO] token usage estimated (upstream didn't return usage): prompt={}, completion={}, total={}", prompt, completion, total);
+        }
+    }
+
     let is_retry = execution.attempts > 1;
     let last_failure = execution.last_failure.as_ref();
     let log = RequestLog {
@@ -884,7 +899,22 @@ fn stream_response_body(
             yield Ok::<_, std::io::Error>(bytes::Bytes::from(ev));
         }
 
-        let (usage_prompt, usage_completion, usage_total) = pump.usage();
+        let (mut usage_prompt, mut usage_completion, mut usage_total) = pump.usage();
+
+        // Fallback: estimate tokens locally when upstream didn't return usage.
+        // Only estimate for successful streams (no error).
+        if usage_total == 0 && usage_prompt == 0 && usage_completion == 0 && !had_error {
+            let req_body: serde_json::Value = serde_json::from_str(&finalizer.sanitized_log_body).unwrap_or(serde_json::Value::Null);
+            let resp_text = pump.accumulated_content();
+            let (p, c, t) = super::estimate_usage::estimate_usage(&req_body, Some(resp_text), &finalizer.model);
+            usage_prompt = p;
+            usage_completion = c;
+            usage_total = t;
+            if usage_total > 0 {
+                eprintln!("[INFO] stream token usage estimated (upstream didn't return usage): prompt={}, completion={}, total={}", usage_prompt, usage_completion, usage_total);
+            }
+        }
+
         // Mark the request completed so the Drop finalizer does NOT write a
         // duplicate client_cancelled row, then write the normal log inline.
         completed.store(true, std::sync::atomic::Ordering::SeqCst);

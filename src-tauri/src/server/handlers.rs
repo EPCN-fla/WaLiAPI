@@ -830,6 +830,17 @@ async fn handle_stream(
                     };
 
                     // Log after stream completes
+                    // Fallback: estimate tokens when upstream didn't return usage.
+                    if usage_total == 0 && usage_prompt == 0 && usage_completion == 0 && !had_error {
+                        let req_body: serde_json::Value = serde_json::from_str(&request_body_clone).unwrap_or(serde_json::Value::Null);
+                        let (p, c, t) = crate::endpoint_executor::estimate_usage::estimate_usage(&req_body, Some(&accumulated_content), &model_clone);
+                        usage_prompt = p;
+                        usage_completion = c;
+                        usage_total = t;
+                        if usage_total > 0 {
+                            eprintln!("[INFO] stream token usage estimated (handlers.rs chat): prompt={}, completion={}, total={}", usage_prompt, usage_completion, usage_total);
+                        }
+                    }
                     let quota_to_add = usage_total;
                     let key_id_for_quota = api_key_id_clone.clone();
                     let log = crate::db::models::RequestLog {
@@ -1393,7 +1404,22 @@ async fn record_anthropic_outcome(
     usage: Option<(i64, i64)>,
 ) {
     let (prompt_tokens, completion_tokens) = usage.unwrap_or((0, 0));
-    let total_tokens = prompt_tokens + completion_tokens;
+    let mut total_tokens = prompt_tokens + completion_tokens;
+    let mut prompt_tokens = prompt_tokens;
+    let mut completion_tokens = completion_tokens;
+
+    // Fallback: estimate tokens when upstream didn't return usage.
+    if total_tokens == 0 && prompt_tokens == 0 && completion_tokens == 0 && status_code >= 200 && status_code < 300 {
+        let req_body = serde_json::to_value(request).unwrap_or(serde_json::Value::Null);
+        let (p, c, t) = crate::endpoint_executor::estimate_usage::estimate_usage(&req_body, None, model);
+        prompt_tokens = p;
+        completion_tokens = c;
+        total_tokens = t;
+        if total_tokens > 0 {
+            eprintln!("[INFO] anthropic token usage estimated (handlers.rs): prompt={}, completion={}, total={}", prompt_tokens, completion_tokens, total_tokens);
+        }
+    }
+
     let (request_body, log_sanitized) = sanitized_anthropic_log_body(request);
     let log = crate::db::models::RequestLog {
         id: crate::utils::id::new_id(),
@@ -2626,6 +2652,17 @@ async fn handle_responses_stream(
                     }
 
                     // Build response_choices for logging
+                    // Fallback: estimate tokens when upstream didn't return usage.
+                    if usage_total == 0 && usage_prompt == 0 && usage_completion == 0 && !had_error {
+                        let req_body: serde_json::Value = serde_json::from_str(&request_body_clone).unwrap_or(serde_json::Value::Null);
+                        let (p, c, t) = crate::endpoint_executor::estimate_usage::estimate_usage(&req_body, Some(&accumulated_content), &model_clone);
+                        usage_prompt = p;
+                        usage_completion = c;
+                        usage_total = t;
+                        if usage_total > 0 {
+                            eprintln!("[INFO] stream token usage estimated (handlers.rs responses): prompt={}, completion={}, total={}", usage_prompt, usage_completion, usage_total);
+                        }
+                    }
                     let response_choices = if !accumulated_content.is_empty() || !accumulated_reasoning.is_empty() {
                         let mut msg = serde_json::json!({"role": "assistant"});
                         if !accumulated_content.is_empty() {
@@ -2988,16 +3025,27 @@ pub async fn handle_embeddings(
                 }
 
                 // Extract usage from response
-                let usage_total = resp_body
+                let mut usage_total = resp_body
                     .get("usage")
                     .and_then(|u| u.get("total_tokens"))
                     .and_then(|t| t.as_u64())
                     .unwrap_or(0) as i64;
-                let usage_prompt = resp_body
+                let mut usage_prompt = resp_body
                     .get("usage")
                     .and_then(|u| u.get("prompt_tokens"))
                     .and_then(|t| t.as_u64())
                     .unwrap_or(0) as i64;
+
+                // Fallback: estimate tokens when upstream didn't return usage.
+                if usage_total == 0 && usage_prompt == 0 && status.is_success() {
+                    let req_body: serde_json::Value = serde_json::from_str(&request_body_str).unwrap_or(serde_json::Value::Null);
+                    let (p, _, t) = crate::endpoint_executor::estimate_usage::estimate_usage(&req_body, None, &model);
+                    usage_prompt = p;
+                    usage_total = t;
+                    if usage_total > 0 {
+                        eprintln!("[INFO] embedding token usage estimated (handlers.rs): prompt={}, total={}", usage_prompt, usage_total);
+                    }
+                }
 
                 let log = crate::db::models::RequestLog {
                     id: crate::utils::id::new_id(),

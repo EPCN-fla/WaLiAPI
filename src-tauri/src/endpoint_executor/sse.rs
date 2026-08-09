@@ -484,6 +484,14 @@ impl StreamPumpCore {
         (0, 0, 0)
     }
 
+    /// Return the accumulated response content text (for fallback token estimation).
+    /// For ResponsesViaChat mode this is the concatenated delta content.
+    /// For decoder modes, the decoder's content buffer is not directly accessible,
+    /// so this returns the pump's own accumulation (ResponsesViaChat only).
+    pub fn accumulated_content(&self) -> &str {
+        &self.accumulated_content
+    }
+
     #[allow(dead_code)]
     pub fn abort(&mut self, reason: impl Into<String>) -> Result<(), PumpError> {
         self.supervisor.abort(reason).map_err(PumpError::from)

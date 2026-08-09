@@ -27,6 +27,7 @@
 //! | optional_bearer | `Authorization: Bearer <key>` only when the key is non-empty (Ollama) |
 
 pub mod driver;
+pub mod estimate_usage;
 pub mod sse;
 
 #[cfg(test)]

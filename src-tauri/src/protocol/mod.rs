@@ -1048,6 +1048,7 @@ fn anthropic_thinking_to_reasoning_effort(body: &Value) -> Option<String> {
 }
 
 /// Estimate structured Anthropic request size for the optional count_tokens endpoint.
+#[allow(dead_code)]
 pub fn estimate_anthropic_input_tokens(body: &Value) -> u64 {
     fn estimate(value: &Value) -> u64 {
         match value {

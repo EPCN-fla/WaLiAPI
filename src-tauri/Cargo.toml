@@ -67,6 +67,9 @@ bincode = "1"
 base64 = "0.22"
 pdf-extract = "0.7"
 
+# Token estimation (fallback when upstream doesn't return usage)
+tiktoken-rs = "0.6"
+
 # tree-sitter code parsing
 tree-sitter = "0.25"
 tree-sitter-typescript = "0.23"
