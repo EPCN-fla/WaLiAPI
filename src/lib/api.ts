@@ -101,7 +101,8 @@ export const authApi = {
   loginCancel: (sessionId: string) => invoke<AuthLoginSessionStatus>("auth_login_cancel", { sessionId }),
   loginImport: (provider?: string, path?: string) =>
     invoke<AuthMutationResult>("auth_login_import", { provider, path }),
-  logout: (id: string, revoke = false) => invoke<AuthLogoutResult>("auth_logout", { id, revoke }),
+  defaultImportPath: () => invoke<string>("auth_default_import_path"),
+  logout: (id: string) => invoke<AuthLogoutResult>("auth_logout", { id }),
   refreshToken: (id: string) => invoke<AuthAccount>("auth_refresh_token", { id }),
   syncModels: (id: string) => invoke<AuthAccount>("auth_sync_models", { id }),
   writeBack: (id: string) => invoke<AuthWriteBackResult>("auth_write_back", { id }),
