@@ -1381,6 +1381,246 @@ impl NonStreamDecoder for ResponsesMessagesNonStreamDecoder {
     }
 }
 
+// ===========================================================================
+// 路径① response direction: Messages → Responses.
+// ===========================================================================
+
+/// Chat SSE → Responses SSE streaming decoder.
+///
+/// Wraps `responses::convert_openai_sse_to_responses` (which owns the
+/// per-stream item state) plus the byte-framed record buffer needed to survive
+/// TCP splits, mirroring `encode_responses_buffered` in the legacy
+/// ResponsesViaChat pump.  Emits `response.created`/`response.in_progress`
+/// once before the first converted record; forwards `codex.rate_limits`
+/// records verbatim; and at `finish()` synthesizes `response.completed` +
+/// `[DONE]` via `create_synthetic_completed_events`.  An upstream Chat stream
+/// that ends mid-record or without a terminal `finish_reason` fails closed so
+/// the gateway can fail over before committing the downstream response.
+pub struct ChatToResponsesStreamDecoder {
+    pending: Vec<u8>,
+    state: crate::protocol::responses::StreamState,
+    model: String,
+    response_id: String,
+    accumulated_content: String,
+    usage: Usage,
+    started: bool,
+    terminal_seen: bool,
+    done: bool,
+}
+
+impl ChatToResponsesStreamDecoder {
+    pub fn new(context: &ConversionContext) -> Self {
+        Self {
+            pending: Vec::new(),
+            state: crate::protocol::responses::StreamState::default(),
+            model: context.upstream_model.clone(),
+            response_id: responses_response_id(&context.request_id),
+            accumulated_content: String::new(),
+            usage: Usage {
+                usage_unknown: true,
+                ..Usage::default()
+            },
+            started: false,
+            terminal_seen: false,
+            done: false,
+        }
+    }
+    pub fn boxed(context: &ConversionContext) -> Box<dyn StreamDecoder + Send + Sync> {
+        Box::new(Self::new(context))
+    }
+    /// Emit the Responses preamble exactly once, before the first record.
+    fn ensure_created(&mut self, output: &mut Vec<String>) {
+        if !self.started {
+            self.started = true;
+            output.push(crate::protocol::responses::create_response_created_event(
+                &self.model,
+                &self.response_id,
+            ));
+        }
+    }
+    /// Convert one complete Chat SSE record into Responses SSE events.
+    fn record(&mut self, record: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
+        let payload = sse::parse_data_payload(record)?;
+        if payload.is_empty() || payload == "[DONE]" {
+            return Ok(Vec::new());
+        }
+        let json: Value = serde_json::from_str(&payload).map_err(|_| {
+            UnsupportedFeatures::single(
+                FeatureKind::UnknownEvent,
+                "/",
+                "Chat SSE data is not JSON",
+            )
+        })?;
+        // `codex.rate_limits` has no Chat/Responses representation — forward the
+        // raw record so the downstream client still observes the quota signal.
+        if json.get("type").and_then(Value::as_str) == Some("codex.rate_limits") {
+            return Ok(vec![String::from_utf8_lossy(record).into_owned()]);
+        }
+        self.accumulate(&json);
+        let text = String::from_utf8_lossy(record);
+        Ok(crate::protocol::responses::convert_openai_sse_to_responses(
+            &text,
+            &self.model,
+            &self.response_id,
+            &self.accumulated_content,
+            &mut self.state,
+        ))
+    }
+    /// Accumulate text / usage / finish-reason observables from a Chat SSE
+    /// record (mirrors `encode_responses_chunk`'s accumulation).
+    fn accumulate(&mut self, json: &Value) {
+        if let Some(content) = json
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str)
+        {
+            self.accumulated_content.push_str(content);
+        }
+        if let Some(usage) = json.get("usage") {
+            if let Some(prompt) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+                self.usage.input_tokens = prompt;
+            }
+            if let Some(completion) = usage.get("completion_tokens").and_then(Value::as_u64) {
+                self.usage.output_tokens = completion;
+            }
+            self.usage.usage_unknown = false;
+        }
+        if json
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|finish| !finish.is_empty())
+        {
+            self.terminal_seen = true;
+        }
+    }
+}
+
+impl StreamDecoder for ChatToResponsesStreamDecoder {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
+        self.pending.extend_from_slice(bytes);
+        let mut output = Vec::new();
+        while let Some(end) = sse::record_end(&self.pending) {
+            self.ensure_created(&mut output);
+            let record: Vec<u8> = self.pending.drain(..end).collect();
+            output.extend(self.record(&record)?);
+        }
+        Ok(output)
+    }
+    fn finish(&mut self) -> Result<Vec<String>, UnsupportedFeatures> {
+        let mut output = Vec::new();
+        self.ensure_created(&mut output);
+        if !self.pending.is_empty() {
+            return Err(UnsupportedFeatures::single(
+                FeatureKind::UnknownEvent,
+                "/",
+                "Chat SSE ended mid-record",
+            ));
+        }
+        if !self.terminal_seen {
+            return Err(UnsupportedFeatures::single(
+                FeatureKind::UnknownEvent,
+                "/",
+                "Chat SSE ended without a terminal finish_reason",
+            ));
+        }
+        if self.done {
+            return Ok(Vec::new());
+        }
+        self.done = true;
+        output.extend(crate::protocol::responses::create_synthetic_completed_events(
+            &self.model,
+            &self.response_id,
+            &self.accumulated_content,
+            &self.state,
+            self.usage.input_tokens as i64,
+            self.usage.output_tokens as i64,
+        ));
+        output.push("data: [DONE]\n\n".to_string());
+        Ok(output)
+    }
+    fn usage(&self) -> Option<Usage> {
+        Some(self.usage)
+    }
+}
+
+/// Composition-only streaming decoder: Messages SSE → Chat SSE then the new
+/// Chat SSE → Responses SSE machine (mirror of `ResponsesMessagesStreamDecoder`
+/// in reverse).  There is intentionally no second direct Messages → Responses
+/// protocol machine.
+pub struct MessagesResponsesStreamDecoder {
+    messages: Box<dyn StreamDecoder + Send + Sync>,
+    chat: ChatToResponsesStreamDecoder,
+}
+impl MessagesResponsesStreamDecoder {
+    pub fn boxed(context: &ConversionContext) -> Box<dyn StreamDecoder + Send + Sync> {
+        Box::new(Self {
+            messages: messages::MessagesStreamDecoder::boxed(context),
+            chat: ChatToResponsesStreamDecoder::new(context),
+        })
+    }
+}
+impl StreamDecoder for MessagesResponsesStreamDecoder {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
+        let events = self.messages.feed(bytes)?;
+        let mut output = Vec::new();
+        for event in events {
+            if event.contains("codex.rate_limits") {
+                output.push(event);
+            } else {
+                output.extend(self.chat.feed(event.as_bytes())?);
+            }
+        }
+        Ok(output)
+    }
+    fn finish(&mut self) -> Result<Vec<String>, UnsupportedFeatures> {
+        let events = self.messages.finish()?;
+        let mut output = Vec::new();
+        for event in events {
+            if event.contains("codex.rate_limits") {
+                output.push(event);
+            } else {
+                output.extend(self.chat.feed(event.as_bytes())?);
+            }
+        }
+        output.extend(self.chat.finish()?);
+        Ok(output)
+    }
+    fn usage(&self) -> Option<Usage> {
+        self.messages.usage()
+    }
+}
+
+pub struct MessagesResponsesNonStreamDecoder {
+    context: ConversionContext,
+}
+impl MessagesResponsesNonStreamDecoder {
+    pub fn boxed(context: &ConversionContext) -> Box<dyn NonStreamDecoder + Send + Sync> {
+        Box::new(Self {
+            context: context.clone(),
+        })
+    }
+}
+impl NonStreamDecoder for MessagesResponsesNonStreamDecoder {
+    fn decode(&self, body: &Value) -> Result<Value, UnsupportedFeatures> {
+        let chat = messages::decode_messages_response_to_chat(body, &self.context)?;
+        Ok(crate::protocol::openai_to_responses(
+            &chat,
+            &self.context.upstream_model,
+        ))
+    }
+}
+
+/// Derive a Responses-canonical `resp_…` id from the downstream request id.
+///
+/// The request encoder stamps `chatcmpl_<uuid>` on the context; reusing that
+/// suffix keeps the Responses stream traceable to the request while retaining
+/// the `resp_` prefix the Responses API expects.
+fn responses_response_id(request_id: &str) -> String {
+    match request_id.strip_prefix("chatcmpl_") {
+        Some(suffix) if !suffix.is_empty() => format!("resp_{suffix}"),
+        _ => format!("resp_{request_id}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1801,5 +2041,181 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output
         assert_eq!(encoded["max_tokens"], 2048);
         // No field from the dropped set present -> nothing recorded.
         assert!(context.normalized.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // 路径① response direction: Messages → Responses.
+    // ------------------------------------------------------------------
+
+    /// Extract the ordered Responses event-type sequence from a joined stream:
+    /// `event:` field names plus the standalone `data: [DONE]` terminator.
+    fn responses_event_types(joined: &str) -> Vec<String> {
+        let mut types = Vec::new();
+        for line in joined.lines() {
+            let trimmed = line.trim();
+            if let Some(name) = trimmed.strip_prefix("event:") {
+                types.push(name.trim().to_string());
+            } else if trimmed == "data: [DONE]" {
+                types.push("[DONE]".to_string());
+            }
+        }
+        types
+    }
+
+    /// A representative 9router Messages SSE stream: text + tool_use, ending in
+    /// tool_use with usage.  Covers message_start / content_block_start /
+    /// content_block_delta / content_block_stop / message_delta / message_stop / ping.
+    fn messages_responses_fixture_sse() -> &'static str {
+        concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"model\":\"oc/m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"weather\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"Shanghai\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+        )
+    }
+
+    #[test]
+    fn messages_responses_non_stream_decodes_to_responses() {
+        let messages = serde_json::json!({
+            "id": "msg_01",
+            "type": "message",
+            "role": "assistant",
+            "model": "oc/m",
+            "content": [
+                {"type": "text", "text": "Hello there"},
+                {"type": "tool_use", "id": "toolu_1", "name": "weather", "input": {"city": "Shanghai"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 5, "output_tokens": 3}
+        });
+        let context = ConversionContext::new("chatcmpl_1", "oc/m", false);
+        let decoded = MessagesResponsesNonStreamDecoder { context }
+            .decode(&messages)
+            .unwrap();
+        assert_eq!(decoded["object"], "response");
+        assert_eq!(decoded["model"], "oc/m");
+        assert_eq!(decoded["status"], "completed");
+        assert_eq!(decoded["finish_reason"], "tool_calls");
+        assert_eq!(decoded["usage"]["input_tokens"], 5);
+        assert_eq!(decoded["usage"]["output_tokens"], 3);
+        assert_eq!(decoded["usage"]["total_tokens"], 8);
+        let output = decoded["output"].as_array().unwrap();
+        assert!(
+            output.iter().any(|i| i["type"] == "function_call"
+                && i["name"] == "weather"
+                && i["call_id"] == "toolu_1"),
+            "function_call output item missing"
+        );
+        let text_item = output.iter().find(|i| i["type"] == "message").unwrap();
+        assert_eq!(text_item["content"][0]["text"], "Hello there");
+    }
+
+    #[test]
+    fn messages_responses_stream_emits_full_event_sequence() {
+        let context = ConversionContext::new("chatcmpl_1", "oc/m", true);
+        let mut decoder = MessagesResponsesStreamDecoder::boxed(&context);
+        let mut events = decoder.feed(messages_responses_fixture_sse().as_bytes()).unwrap();
+        events.extend(decoder.finish().unwrap());
+        let joined = events.concat();
+
+        // The brief-required subsequence, in order: response.created /
+        // response.output_item.added / response.output_text.delta /
+        // response.function_call_arguments.delta / response.completed / [DONE].
+        let types = responses_event_types(&joined);
+        for required in [
+            "response.created",
+            "response.output_item.added",
+            "response.output_text.delta",
+            "response.function_call_arguments.delta",
+            "response.completed",
+            "[DONE]",
+        ] {
+            assert!(
+                types.contains(&required.to_string()),
+                "missing event {required:?} in {types:?}"
+            );
+        }
+        let positions: Vec<usize> = [
+            "response.created",
+            "response.output_item.added",
+            "response.output_text.delta",
+            "response.function_call_arguments.delta",
+            "response.completed",
+            "[DONE]",
+        ]
+        .iter()
+        .map(|t| types.iter().position(|x| x == t).unwrap())
+        .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "events out of order: {types:?}"
+        );
+
+        // Content and tool arguments survive the whole chain.
+        assert!(joined.contains("Hello"));
+        assert!(joined.contains("Shanghai"));
+        // Usage reaches response.completed.
+        let completed = events
+            .iter()
+            .find(|e| e.contains("event: response.completed"))
+            .unwrap();
+        assert!(completed.contains(r#""input_tokens":5"#));
+        assert!(completed.contains(r#""output_tokens":3"#));
+    }
+
+    #[test]
+    fn messages_responses_stream_is_deterministic_across_any_split() {
+        let sse = messages_responses_fixture_sse();
+        let context = ConversionContext::new("chatcmpl_1", "oc/m", true);
+        let mut expected: Option<Vec<String>> = None;
+        for split in 0..=sse.len() {
+            let mut decoder = MessagesResponsesStreamDecoder::boxed(&context);
+            let mut events = decoder.feed(&sse.as_bytes()[..split]).unwrap();
+            events.extend(decoder.feed(&sse.as_bytes()[split..]).unwrap());
+            events.extend(decoder.finish().unwrap());
+            let joined = events.concat();
+            assert_eq!(joined.matches("data: [DONE]").count(), 1);
+            assert_eq!(joined.matches("event: response.completed").count(), 1);
+            let types = responses_event_types(&joined);
+            if let Some(previous) = &expected {
+                assert_eq!(&types, previous, "split at byte {split} diverged");
+            } else {
+                expected = Some(types);
+            }
+        }
+    }
+
+    #[test]
+    fn chat_to_responses_stream_passes_through_rate_limits() {
+        let context = ConversionContext::new("chatcmpl_1", "oc/m", true);
+        let mut decoder = ChatToResponsesStreamDecoder::new(&context);
+        let record = "event: codex.rate_limits\ndata: {\"type\":\"codex.rate_limits\",\"x\":1}\n\n";
+        let events = decoder.feed(record.as_bytes()).unwrap();
+        assert_eq!(events.len(), 2, "created preamble + rate_limits record");
+        assert_eq!(events[1], record);
+    }
+
+    #[test]
+    fn chat_to_responses_stream_rejects_incomplete_finish() {
+        let context = ConversionContext::new("chatcmpl_1", "oc/m", true);
+
+        // Mid-record EOF fails closed.
+        let mut mid_record = ChatToResponsesStreamDecoder::new(&context);
+        mid_record.feed(b"data: {\"partial").unwrap();
+        assert!(mid_record.finish().is_err());
+
+        // A well-formed Chat stream that never delivered finish_reason is
+        // incomplete and must fail for pre-commit failover.
+        let mut truncated = ChatToResponsesStreamDecoder::new(&context);
+        truncated
+            .feed(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n")
+            .unwrap();
+        assert!(truncated.finish().is_err());
     }
 }
