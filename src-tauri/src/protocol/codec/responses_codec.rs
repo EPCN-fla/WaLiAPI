@@ -649,6 +649,49 @@ pub fn encode_messages_to_responses(
     encode_chat_to_responses(&chat, model)
 }
 
+/// Responses → Chat → Messages composition (V5 `responses_to_messages_v1`).
+///
+/// The first leg (`responses_to_openai`) is the authoritative Responses
+/// validator; the second leg (`encode_chat_to_messages`) is the authoritative
+/// Chat→Messages validator, which already maps `reasoning_effort` to Anthropic
+/// thinking.  This wrapper raises the downstream `max_tokens` cap to 32000 when
+/// the Responses request did not carry `max_output_tokens` (the legacy
+/// `responses_via_chat` path keeps its 4096 default), and records the
+/// codex-only top-level fields that have no Chat representation in the
+/// ConversionReport.
+pub fn encode_responses_to_messages(
+    body: &Value,
+    model: &str,
+) -> Result<(Value, ConversionContext), UnsupportedFeatures> {
+    let mut chat = crate::protocol::responses_to_openai(body)?;
+    // V5 output cap: only override when the Responses request did not specify
+    // one. A caller-supplied `max_output_tokens` is respected as-is (it was
+    // already mapped to `max_tokens` by `responses_to_openai`).
+    if body.get("max_output_tokens").is_none() {
+        if let Some(object) = chat.as_object_mut() {
+            object.insert("max_tokens".to_owned(), Value::from(32000u64));
+        }
+    }
+    let (claude, mut context) = super::chat::encode_chat_to_messages(&chat, model)?;
+    // Codex Responses fields with no Chat representation: dropped by
+    // `responses_to_openai`; surface the drop in the ConversionReport.
+    const DROPPED: &[&str] = &[
+        "parallel_tool_calls",
+        "store",
+        "include",
+        "prompt_cache_key",
+        "client_metadata",
+    ];
+    if let Some(object) = body.as_object() {
+        for key in DROPPED {
+            if object.contains_key(*key) {
+                context.normalized.push(format!("/{key}"));
+            }
+        }
+    }
+    Ok((claude, context))
+}
+
 /// Convert a completed Responses object to a non-stream Chat completion.
 pub fn decode_responses_response_to_chat(
     body: &Value,
@@ -1680,5 +1723,83 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output
             .normalized
             .contains(&"/reasoning_effort".to_string()));
         assert!(context.normalized.contains(&"/verbosity".to_string()));
+    }
+
+    #[test]
+    fn encode_responses_to_messages_maps_codex_request() {
+        // Real codex 0.147.0 request shape (§1.1): instructions + input +
+        // tools + tool_choice + parallel_tool_calls + reasoning:{effort:high}
+        // + store + stream + include + prompt_cache_key + client_metadata.
+        let request = serde_json::json!({
+            "model": "deepseek-v4-flash-free",
+            "instructions": "You are a helpful assistant.",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "list files"}]}
+            ],
+            "tools": [
+                {"type": "function", "name": "list", "description": "list files", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}
+            ],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "reasoning": {"effort": "high"},
+            "store": true,
+            "stream": true,
+            "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": "cache-key",
+            "client_metadata": {"turn": "1"}
+        });
+        let (encoded, context) =
+            encode_responses_to_messages(&request, "oc/deepseek-v4-flash-free").unwrap();
+
+        assert_eq!(encoded["model"], "oc/deepseek-v4-flash-free");
+        assert_eq!(encoded["stream"], true);
+        // instructions -> top-level system text block
+        assert_eq!(encoded["system"][0]["type"], "text");
+        assert_eq!(encoded["system"][0]["text"], "You are a helpful assistant.");
+        // input -> messages
+        assert_eq!(encoded["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(encoded["messages"][0]["role"], "user");
+        assert_eq!(encoded["messages"][0]["content"][0]["text"], "hi");
+        // reasoning.effort=high -> adaptive thinking + output_config.effort=high
+        assert_eq!(encoded["thinking"], serde_json::json!({"type": "adaptive"}));
+        assert_eq!(encoded["output_config"]["effort"], "high");
+        // no max_output_tokens carried -> V5 default cap
+        assert_eq!(encoded["max_tokens"], 32000);
+        // tools / tool_choice
+        assert_eq!(encoded["tools"][0]["name"], "list");
+        assert_eq!(
+            encoded["tools"][0]["input_schema"]["properties"]["path"]["type"],
+            "string"
+        );
+        assert_eq!(encoded["tool_choice"], "auto");
+        // codex-only dropped fields are recorded in the ConversionReport
+        for pointer in [
+            "/parallel_tool_calls",
+            "/store",
+            "/include",
+            "/prompt_cache_key",
+            "/client_metadata",
+        ] {
+            assert!(
+                context.normalized.contains(&pointer.to_string()),
+                "missing dropped-field record {pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_responses_to_messages_respects_max_output_tokens() {
+        let request = serde_json::json!({
+            "model": "m",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "max_output_tokens": 2048
+        });
+        let (encoded, context) = encode_responses_to_messages(&request, "oc/model").unwrap();
+        // Caller-supplied cap wins; the V5 32000 default must not apply.
+        assert_eq!(encoded["max_tokens"], 2048);
+        // No field from the dropped set present -> nothing recorded.
+        assert!(context.normalized.is_empty());
     }
 }

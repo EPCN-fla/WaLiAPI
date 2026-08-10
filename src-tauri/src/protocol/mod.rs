@@ -187,6 +187,16 @@ pub fn responses_to_openai(
         "stream",
         "temperature",
         "top_p",
+        // Codex Responses controls with no Chat representation: tolerated and
+        // dropped (the Responses→Messages composition wrapper records them in
+        // the ConversionReport).
+        "parallel_tool_calls",
+        "store",
+        "include",
+        "prompt_cache_key",
+        "client_metadata",
+        // Mapped below: `reasoning.effort` → top-level `reasoning_effort`.
+        "reasoning",
     ];
     let object = body.as_object().ok_or_else(|| {
         crate::protocol::codec::UnsupportedFeatures::single(
@@ -316,6 +326,17 @@ pub fn responses_to_openai(
                 openai_body["tool_choice"] = normalized;
             }
         }
+    }
+
+    // Map Responses `reasoning.effort` to Chat `reasoning_effort` so the
+    // Chat→Messages leg (encode_chat_to_messages) can express it as Anthropic
+    // thinking. A missing or malformed `reasoning` is tolerated fail-open.
+    if let Some(effort) = body
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(Value::as_str)
+    {
+        openai_body["reasoning_effort"] = Value::String(effort.to_string());
     }
 
     // Pass through instructions as a system message if present
@@ -1751,6 +1772,42 @@ mod anthropic_tests {
             responses_to_openai(&body).is_ok(),
             "legacy malformed tool choice remains safely omitted"
         );
+    }
+
+    #[test]
+    fn responses_to_openai_tolerates_codex_controls_and_maps_reasoning_effort() {
+        // codex 0.147.0 always sends these top-level controls alongside the
+        // standard Responses fields. They have no Chat representation and must
+        // be tolerated (dropped) rather than rejected, and `reasoning.effort`
+        // must map to top-level `reasoning_effort` for the Chat→Messages leg.
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "parallel_tool_calls": false,
+            "store": true,
+            "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": "key",
+            "client_metadata": {"turn": "1"},
+            "reasoning": {"effort": "high"}
+        });
+        let converted = responses_to_openai(&body).unwrap();
+        // The controls are dropped from the Chat body...
+        for key in [
+            "parallel_tool_calls",
+            "store",
+            "include",
+            "prompt_cache_key",
+            "client_metadata",
+        ] {
+            assert!(
+                converted.get(key).is_none(),
+                "{key} must not leak into the Chat body"
+            );
+        }
+        // ...and reasoning.effort is mapped to reasoning_effort.
+        assert_eq!(converted["reasoning_effort"], "high");
+        // Legacy max_tokens default is unchanged (4096) on this path.
+        assert_eq!(converted["max_tokens"], 4096);
     }
 
     #[test]
