@@ -831,6 +831,29 @@ fn decode_non_stream(
             })?;
             Ok((out, usage))
         }
+        Some("responses_to_messages_v1") => {
+            // downstream Responses, upstream Messages: Messages body -> Responses
+            // body.  Mirror of `MessagesResponsesNonStreamDecoder` (V5 codec).
+            let context = crate::protocol::codec::report::ConversionContext::new(
+                format!("chatcmpl_{}", uuid::Uuid::new_v4().simple()),
+                attempt.upstream_model.clone(),
+                false,
+            );
+            let chat = crate::protocol::codec::messages::decode_messages_response_to_chat(
+                body, &context,
+            )
+            .map_err(|error| AttemptFailure {
+                failure_class: FailureClass::UpstreamProtocolError,
+                message: format!(
+                    "Messages response cannot be decoded to Responses: {}",
+                    error.message
+                ),
+                status_code: Some(502),
+                retry_after: None,
+            })?;
+            let out = crate::protocol::openai_to_responses(&chat, &attempt.upstream_model);
+            Ok((out, usage))
+        }
         Some("responses_via_chat_v1") => {
             // downstream Responses, upstream Chat: Chat body -> Responses body.
             let out = crate::protocol::openai_to_responses(body, &attempt.upstream_model);

@@ -803,6 +803,332 @@ mod auth_account {
     }
 }
 
+// ── codex_responses_anthropic (V5 path ①) ─────────────────────────────────
+
+/// End-to-end 路径①: a codex Responses request routed to an Anthropic Messages
+/// channel (conversion group `responses_to_messages_v1`).  Drives the REAL
+/// streaming facade (`authorize_and_plan` + `route_stream_plan`) against a local
+/// axum mock upstream speaking Messages SSE.  Asserts:
+///   * the mock received the codec-encoded Messages body (mapped upstream model,
+///     max_tokens=32000, system from instructions, messages from input,
+///     thinking from reasoning.effort);
+///   * the downstream body is Responses SSE with the required event sequence
+///     (`response.created` / `response.output_text.delta` / `response.completed`
+///     / `[DONE]`) and the converted usage.
+mod codex_responses_anthropic {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::{
+        body::Bytes,
+        extract::State,
+        http::{header, StatusCode},
+        response::{IntoResponse, Response},
+        routing::post,
+        Router,
+    };
+    use serde_json::json;
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::endpoint_executor::driver::route_stream_plan;
+
+    #[derive(Clone)]
+    struct MockState {
+        hits: Arc<AtomicUsize>,
+        seen: Arc<Mutex<Vec<Value>>>,
+    }
+
+    /// Mock Anthropic Messages upstream: records the request body, then replies
+    /// with a small thinking + text Messages SSE stream when the request is a
+    /// stream, or a single non-stream Messages JSON document otherwise.
+    async fn messages(State(state): State<MockState>, body: Bytes) -> Response {
+        let req: Value = serde_json::from_slice(&body).unwrap();
+        state.hits.fetch_add(1, Ordering::SeqCst);
+        state.seen.lock().await.push(req.clone());
+        if req.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+            return messages_sse().into_response();
+        }
+        (
+            [(header::CONTENT_TYPE, "application/json")],
+            messages_json().to_string(),
+        )
+            .into_response()
+    }
+
+    fn messages_sse() -> &'static str {
+        concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"oc/deepseek-v4-flash-free\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"thinking trace\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":15}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+            "data: [DONE]\n\n"
+        )
+    }
+
+    /// Non-stream Messages response matching the SSE fixture above.
+    fn messages_json() -> Value {
+        serde_json::json!({
+            "type": "message",
+            "id": "msg_02",
+            "model": "oc/deepseek-v4-flash-free",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Hello world"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 12, "output_tokens": 15}
+        })
+    }
+
+    /// Split a downstream SSE body into (event, data) frames.  A data-only
+    /// `[DONE]` frame is labelled `"[DONE]"` so ordering assertions can treat it
+    /// as an event; other data-only frames get an empty event name.
+    fn sse_frames(text: &str) -> Vec<(String, String)> {
+        text.split("\n\n")
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .map(|f| {
+                let mut event = String::new();
+                let mut data = String::new();
+                for line in f.lines() {
+                    if let Some(rest) = line.strip_prefix("event:").map(str::trim) {
+                        event = rest.to_string();
+                    } else if let Some(rest) = line.strip_prefix("data:").map(str::trim) {
+                        data = rest.to_string();
+                    }
+                }
+                if event.is_empty() && data == "[DONE]" {
+                    event = "[DONE]".to_string();
+                }
+                (event, data)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn responses_downstream_via_anthropic_messages_upstream() {
+        let state = MockState {
+            hits: Arc::new(AtomicUsize::new(0)),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/messages", post(messages))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let pool = fresh_db().await;
+        let repo = Arc::new(Repository::new(pool.clone()));
+        let mut ch = channel("a1", "anthropic", "deepseek", &base, &["messages"], 1);
+        ch.model_mapping = json!({ "m": "oc/deepseek-v4-flash-free" }).to_string();
+        insert_channels(&pool, &[ch]).await;
+
+        let key = api_key();
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "instructions": "You are a helpful assistant.",
+            "reasoning": {"effort": "high"},
+            "stream": true,
+        });
+        let audited = audited(DownstreamProtocol::Responses, "responses", "m", body.clone());
+
+        let channels = repo.get_enabled_channels().await.unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let plan = authorize_and_plan(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &channels,
+            &flags(true),
+            &body,
+            &mut rng,
+        )
+        .expect("V5 conversion plan");
+
+        // The anthropic channel must form a single conversion group routed at the
+        // Messages upstream endpoint.
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].tier.as_str(), "conversion");
+        assert_eq!(plan.groups[0].candidates[0].candidate.id(), "a1");
+        assert_eq!(plan.groups[0].upstream_endpoint, "messages");
+
+        let resp = route_stream_plan(
+            plan,
+            &audited,
+            &key,
+            &[],
+            "responses",
+            &repo,
+            &serde_json::to_string(&audited.sanitized_log_json).unwrap_or_default(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "V5 stream must commit a 200"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+
+        // ── upstream body: codec-encoded Messages request ─────────────────────
+        assert_eq!(state.hits.load(Ordering::SeqCst), 1, "exactly one upstream call");
+        let seen = state.seen.lock().await;
+        assert_eq!(seen.len(), 1);
+        let req = &seen[0];
+        assert_eq!(req["model"], "oc/deepseek-v4-flash-free", "mapped upstream model");
+        assert_eq!(req["max_tokens"], 32000, "V5 default output cap");
+        assert_eq!(req["system"][0]["text"], "You are a helpful assistant.");
+        assert_eq!(req["messages"][0]["role"], "user");
+        assert_eq!(req["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(req["messages"][0]["content"][0]["text"], "hi");
+        assert_eq!(req["stream"], true);
+        assert_eq!(req["thinking"]["type"], "adaptive", "reasoning.effort -> thinking");
+        assert_eq!(req["output_config"]["effort"], "high");
+        drop(seen);
+
+        // ── downstream body: Responses SSE event sequence ────────────────────
+        let frames = sse_frames(&text);
+        assert!(!frames.is_empty(), "downstream body must not be empty");
+        let names: Vec<&str> = frames.iter().map(|(e, _)| e.as_str()).collect();
+
+        let find = |name: &str| names.iter().position(|&n| n == name);
+        let created = find("response.created").expect("response.created");
+        let in_progress = find("response.in_progress").expect("response.in_progress");
+        let delta = find("response.output_text.delta").expect("response.output_text.delta");
+        let completed = find("response.completed").expect("response.completed");
+        let done = find("[DONE]").expect("[DONE]");
+        assert!(
+            created < in_progress && in_progress < delta && delta < completed && completed < done,
+            "event order must be created -> in_progress -> output_text.delta -> completed -> [DONE]\n{names:?}"
+        );
+
+        // The created event carries the mapped upstream model.
+        let created_data: Value =
+            serde_json::from_str(&frames[created].1).expect("created data JSON");
+        assert_eq!(created_data["response"]["model"], "oc/deepseek-v4-flash-free");
+
+        // The text deltas carry "Hello" then " world".
+        let delta_datas: Vec<String> = frames
+            .iter()
+            .filter(|(e, _)| e == "response.output_text.delta")
+            .map(|(_, d)| d.clone())
+            .collect();
+        assert_eq!(delta_datas.len(), 2, "two text deltas");
+        let first: Value = serde_json::from_str(&delta_datas[0]).unwrap();
+        let second: Value = serde_json::from_str(&delta_datas[1]).unwrap();
+        assert_eq!(first["delta"], "Hello");
+        assert_eq!(second["delta"], " world");
+
+        // The completed event carries the usage observed upstream (12 in / 15 out).
+        let completed_data: Value =
+            serde_json::from_str(&frames[completed].1).expect("completed data JSON");
+        assert_eq!(completed_data["response"]["status"], "completed");
+        assert_eq!(completed_data["response"]["usage"]["input_tokens"], 12);
+        assert_eq!(completed_data["response"]["usage"]["output_tokens"], 15);
+        assert_eq!(
+            completed_data["response"]["output"][1]["content"][0]["text"], "Hello world",
+            "completed output text must be the accumulated deltas"
+        );
+    }
+
+    /// Non-stream V5: a codex Responses request with `stream:false` routed to an
+    /// Anthropic Messages channel must decode the upstream Messages JSON into a
+    /// Responses JSON document (not fail as an "unknown codec version").
+    #[tokio::test]
+    async fn non_stream_responses_downstream_via_anthropic_messages_upstream() {
+        let state = MockState {
+            hits: Arc::new(AtomicUsize::new(0)),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/messages", post(messages))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let pool = fresh_db().await;
+        let repo = Arc::new(Repository::new(pool.clone()));
+        let mut ch = channel("a1", "anthropic", "deepseek", &base, &["messages"], 1);
+        ch.model_mapping = json!({ "m": "oc/deepseek-v4-flash-free" }).to_string();
+        insert_channels(&pool, &[ch]).await;
+
+        let key = api_key();
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "instructions": "You are a helpful assistant.",
+            "reasoning": {"effort": "high"},
+            "stream": false,
+        });
+        let audited = audited(DownstreamProtocol::Responses, "responses", "m", body.clone());
+
+        let channels = repo.get_enabled_channels().await.unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let plan = authorize_and_plan(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &channels,
+            &flags(true),
+            &body,
+            &mut rng,
+        )
+        .expect("V5 conversion plan (non-stream)");
+
+        let resp = crate::endpoint_executor::driver::route_plan_response(
+            plan,
+            &audited,
+            &key,
+            &[],
+            "responses",
+            &repo,
+            &serde_json::to_string(&audited.sanitized_log_json).unwrap_or_default(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "non-stream V5 must decode Messages -> Responses (no 502 unknown-codec)"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(out["status"], "completed");
+        assert_eq!(out["finish_reason"], "stop");
+        assert_eq!(out["model"], "oc/deepseek-v4-flash-free");
+        assert_eq!(out["output"][0]["type"], "message");
+        assert_eq!(out["output"][0]["content"][0]["text"], "Hello world");
+        assert_eq!(out["usage"]["input_tokens"], 12);
+        assert_eq!(out["usage"]["output_tokens"], 15);
+    }
+}
+
 // ── stream_failover ───────────────────────────────────────────────────────
 
 /// Pre-commit: an invalid first frame allows an upstream swap (retry the next
