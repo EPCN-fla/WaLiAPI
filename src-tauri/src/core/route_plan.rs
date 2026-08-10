@@ -379,6 +379,95 @@ where
     ordered
 }
 
+fn route_bucket(candidate: &RouteGroupCandidate, flags: &FeatureFlags) -> usize {
+    let is_auth = candidate.candidate.auth_account().is_some();
+    let is_same_protocol = candidate.tier == GroupTier::Native;
+    match (flags.prefer_auth_accounts, flags.prefer_same_protocol) {
+        (true, true) => match (is_auth, is_same_protocol) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, true) => 2,
+            (false, false) => 3,
+        },
+        (true, false) => {
+            if is_auth {
+                0
+            } else {
+                1
+            }
+        }
+        (false, true) => {
+            if is_same_protocol {
+                0
+            } else {
+                1
+            }
+        }
+        (false, false) => 0,
+    }
+}
+
+fn push_route_group(
+    groups: &mut Vec<RouteGroup>,
+    endpoint: EndpointKind,
+    candidates: Vec<RouteGroupCandidate>,
+    per_group: usize,
+) {
+    if candidates.is_empty() {
+        return;
+    }
+    let max_attempts = per_group.min(candidates.len()).max(1);
+    let first = &candidates[0];
+    groups.push(RouteGroup {
+        id: format!(
+            "{}_g{}_{}",
+            endpoint.as_str(),
+            groups.len() + 1,
+            first.tier.as_str()
+        ),
+        tier: first.tier,
+        downstream: endpoint,
+        upstream_protocol: first.upstream_protocol,
+        upstream_endpoint: first.upstream_endpoint.clone(),
+        max_attempts,
+        candidates,
+    });
+}
+
+fn build_ordered_route_groups<R>(
+    endpoint: EndpointKind,
+    candidates: Vec<RouteGroupCandidate>,
+    flags: &FeatureFlags,
+    per_group: usize,
+    rng: &mut R,
+) -> Vec<RouteGroup>
+where
+    R: Rng + ?Sized,
+{
+    let mut buckets: Vec<Vec<RouteGroupCandidate>> =
+        vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for candidate in candidates {
+        buckets[route_bucket(&candidate, flags)].push(candidate);
+    }
+
+    let mut groups = Vec::new();
+    for bucket in buckets.into_iter().filter(|bucket| !bucket.is_empty()) {
+        let ordered = order_by_priority_weight(bucket, rng);
+        let mut current: Vec<RouteGroupCandidate> = Vec::new();
+        let mut current_tier: Option<GroupTier> = None;
+        for candidate in ordered {
+            if current_tier.is_some_and(|tier| tier != candidate.tier) {
+                push_route_group(&mut groups, endpoint, current, per_group);
+                current = Vec::new();
+            }
+            current_tier = Some(candidate.tier);
+            current.push(candidate);
+        }
+        push_route_group(&mut groups, endpoint, current, per_group);
+    }
+    groups
+}
+
 // ---------------------------------------------------------------------------
 // Model mapping resolution (sampled EXACTLY ONCE per attempt)
 // ---------------------------------------------------------------------------
@@ -738,8 +827,7 @@ fn build_route_plan<R: Rng + ?Sized>(
     body: &Value,
     rng: &mut R,
 ) -> Result<RoutePlan, PlanError> {
-    let mut native: Vec<RouteGroupCandidate> = Vec::new();
-    let mut conversion: Vec<RouteGroupCandidate> = Vec::new();
+    let mut routed: Vec<RouteGroupCandidate> = Vec::new();
     let mut config_errors = Vec::new();
 
     for candidate in candidates {
@@ -757,16 +845,12 @@ fn build_route_plan<R: Rng + ?Sized>(
             RouteCandidate::AuthAccount(_) => classify_auth_account(endpoint),
         };
         if let Some((tier, proto, ep)) = classified {
-            let group_candidate = RouteGroupCandidate {
+            routed.push(RouteGroupCandidate {
                 candidate,
                 tier,
                 upstream_protocol: proto,
                 upstream_endpoint: ep,
-            };
-            match tier {
-                GroupTier::Native => native.push(group_candidate),
-                GroupTier::Conversion => conversion.push(group_candidate),
-            }
+            });
         }
     }
 
@@ -778,35 +862,7 @@ fn build_route_plan<R: Rng + ?Sized>(
         DEFAULT_MAX_ATTEMPTS_PER_GROUP
     };
 
-    let mut groups = Vec::new();
-    if !native.is_empty() {
-        let ordered = order_by_priority_weight(native, rng);
-        let max_attempts = per_group.min(ordered.len()).max(1);
-        let first = &ordered[0];
-        groups.push(RouteGroup {
-            id: format!("{}_g1_native", endpoint.as_str()),
-            tier: GroupTier::Native,
-            downstream: endpoint,
-            upstream_protocol: first.upstream_protocol,
-            upstream_endpoint: first.upstream_endpoint.clone(),
-            max_attempts,
-            candidates: ordered,
-        });
-    }
-    if !conversion.is_empty() {
-        let ordered = order_by_priority_weight(conversion, rng);
-        let max_attempts = per_group.min(ordered.len()).max(1);
-        let first = &ordered[0];
-        groups.push(RouteGroup {
-            id: format!("{}_g2_conversion", endpoint.as_str()),
-            tier: GroupTier::Conversion,
-            downstream: endpoint,
-            upstream_protocol: first.upstream_protocol,
-            upstream_endpoint: first.upstream_endpoint.clone(),
-            max_attempts,
-            candidates: ordered,
-        });
-    }
+    let groups = build_ordered_route_groups(endpoint, routed, flags, per_group, rng);
 
     if groups.is_empty() {
         return Err(PlanError::NoEndpointSupported(endpoint, model.to_string()));
@@ -1076,6 +1132,8 @@ mod tests {
             cross_protocol_codec: codec_on,
             native_responses: true,
             ollama_native: false,
+            prefer_auth_accounts: false,
+            prefer_same_protocol: true,
         }
     }
 
@@ -1941,6 +1999,92 @@ mod tests {
     }
 
     #[test]
+    fn prefer_auth_accounts_orders_auth_before_higher_priority_channels() {
+        let key = api_key(&[], &[]);
+        let channel = new_channel(
+            "high-priority-channel",
+            "openai",
+            "custom",
+            "https://example.test/v1",
+            &["chat_completions"],
+            1000,
+            1,
+        );
+        let account = auth_account("auth-low-priority", "m", 0, 1);
+        let mut normal_flags = flags(true);
+        normal_flags.prefer_auth_accounts = false;
+        let normal = authorize_and_plan_with_accounts(
+            &key,
+            "m",
+            EndpointKind::Messages,
+            std::slice::from_ref(&channel),
+            std::slice::from_ref(&account),
+            &normal_flags,
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap();
+        assert_eq!(
+            normal.groups[0].candidates[0].candidate.id(),
+            "high-priority-channel"
+        );
+
+        let mut prefer_auth = normal_flags;
+        prefer_auth.prefer_auth_accounts = true;
+        let preferred = authorize_and_plan_with_accounts(
+            &key,
+            "m",
+            EndpointKind::Messages,
+            &[channel],
+            &[account],
+            &prefer_auth,
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap();
+        assert_eq!(
+            preferred.groups[0].candidates[0].candidate.id(),
+            "auth-low-priority"
+        );
+    }
+
+    #[test]
+    fn prefer_auth_and_same_protocol_prioritizes_same_protocol_auth_first() {
+        let key = api_key(&[], &[]);
+        let same_protocol_channel = new_channel(
+            "same-protocol-channel",
+            "openai",
+            "openai",
+            "https://api.openai.com/v1",
+            &["responses"],
+            1000,
+            1,
+        );
+        let account = auth_account("same-protocol-auth", "m", 0, 1);
+        let mut flags = flags(true);
+        flags.prefer_auth_accounts = true;
+        flags.prefer_same_protocol = true;
+
+        let plan = authorize_and_plan_with_accounts(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &[same_protocol_channel],
+            &[account],
+            &flags,
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.groups[0].tier, GroupTier::Native);
+        assert_eq!(
+            plan.groups[0].candidates[0].candidate.id(),
+            "same-protocol-auth"
+        );
+    }
+
+    #[test]
     fn auth_accounts_filter_models_lifecycle_and_quota_but_allow_expired_recovery() {
         let key = api_key(&[], &["unrelated-channel"]);
         let available = auth_account("available", "m", 1, 1);
@@ -1995,6 +2139,8 @@ mod tests {
             cross_protocol_codec: false,
             native_responses: false,
             ollama_native: false,
+            prefer_auth_accounts: false,
+            prefer_same_protocol: true,
         };
         let responses = authorize_and_plan_with_accounts(
             &key,

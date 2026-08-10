@@ -39,6 +39,10 @@ pub struct Settings {
     pub security_redact_secrets: bool,
     #[serde(default = "default_false")]
     pub security_block_on_critical: bool,
+    #[serde(default = "default_true")]
+    pub routing_prefer_auth_accounts: bool,
+    #[serde(default = "default_true")]
+    pub routing_prefer_same_protocol: bool,
 }
 
 fn default_port() -> u16 {
@@ -92,6 +96,8 @@ impl Default for Settings {
             security_scan_response: default_false(),
             security_redact_secrets: default_false(),
             security_block_on_critical: default_false(),
+            routing_prefer_auth_accounts: default_true(),
+            routing_prefer_same_protocol: default_true(),
         }
     }
 }
@@ -122,6 +128,8 @@ pub struct FeatureFlagsDto {
     pub cross_protocol_codec: bool,
     pub native_responses: bool,
     pub ollama_native: bool,
+    pub prefer_auth_accounts: bool,
+    pub prefer_same_protocol: bool,
 }
 
 #[tauri::command]
@@ -132,6 +140,8 @@ pub fn get_feature_flags(app: AppHandle) -> Result<FeatureFlagsDto, String> {
         cross_protocol_codec: f.cross_protocol_codec,
         native_responses: f.native_responses,
         ollama_native: f.ollama_native,
+        prefer_auth_accounts: f.prefer_auth_accounts,
+        prefer_same_protocol: f.prefer_same_protocol,
     })
 }
 
@@ -156,6 +166,8 @@ pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
         security_scan_response: get_bool(&store, "security.scan_response", false),
         security_redact_secrets: get_bool(&store, "security.redact_secrets", false),
         security_block_on_critical: get_bool(&store, "security.block_on_critical", false),
+        routing_prefer_auth_accounts: get_bool(&store, "routing.prefer_auth_accounts", true),
+        routing_prefer_same_protocol: get_bool(&store, "routing.prefer_same_protocol", true),
     };
     Ok(settings)
 }
@@ -182,6 +194,14 @@ pub async fn save_settings(settings: Settings, app: AppHandle) -> Result<(), Str
     store.set(
         "security.block_on_critical",
         settings.security_block_on_critical,
+    );
+    store.set(
+        "routing.prefer_auth_accounts",
+        settings.routing_prefer_auth_accounts,
+    );
+    store.set(
+        "routing.prefer_same_protocol",
+        settings.routing_prefer_same_protocol,
     );
     store.save().map_err(|e| e.to_string())?;
     Ok(())

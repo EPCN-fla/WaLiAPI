@@ -23,6 +23,7 @@ const CHAT_TOP_LEVEL: &[&str] = &[
     "tool_choice",
     "reasoning_effort",
     "verbosity",
+    "metadata",
 ];
 
 /// Encode a Chat Completions request as a Responses request.  This deliberately
@@ -146,6 +147,12 @@ pub fn encode_chat_to_responses(
         // Codex backend allow-list is narrower than the public API.
         normalized.push("/verbosity".to_owned());
     }
+    if object.get("metadata").is_some() {
+        // Client metadata is an annotation only.  The Codex account backend
+        // does not accept the public Responses metadata field, so keep the
+        // request usable by dropping it with an audit entry.
+        normalized.push("/metadata".to_owned());
+    }
     if !instruction_parts.is_empty() {
         response.insert(
             "instructions".to_owned(),
@@ -192,7 +199,16 @@ fn chat_message_to_responses(
         )
     })?;
     for key in message.keys() {
-        if !["role", "content", "tool_calls", "tool_call_id", "name"].contains(&key.as_str()) {
+        if ![
+            "role",
+            "content",
+            "reasoning_content",
+            "tool_calls",
+            "tool_call_id",
+            "name",
+        ]
+        .contains(&key.as_str())
+        {
             return Err(UnsupportedFeatures::single(
                 FeatureKind::UnsupportedField,
                 format!("{pointer}/{key}"),
@@ -237,6 +253,12 @@ fn chat_message_to_responses(
         }),
         "assistant" => {
             let mut items = Vec::new();
+            if let Some(reasoning) = chat_reasoning_content_to_responses(
+                message.get("reasoning_content"),
+                &format!("{pointer}/reasoning_content"),
+            )? {
+                items.push(reasoning);
+            }
             if !content.is_empty() {
                 items.push(
                     serde_json::json!({"type":"message", "role":"assistant", "content": content}),
@@ -292,6 +314,40 @@ fn chat_message_to_responses(
             format!("Chat role {role:?} is not supported"),
         )),
     }
+}
+
+fn chat_reasoning_content_to_responses(
+    reasoning: Option<&Value>,
+    pointer: &str,
+) -> Result<Option<Value>, UnsupportedFeatures> {
+    let Some(reasoning) = reasoning else {
+        return Ok(None);
+    };
+    let text = match reasoning {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        Value::Object(object) => object
+            .get("text")
+            .or_else(|| object.get("reasoning"))
+            .or_else(|| object.get("thinking"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        _ => {
+            return Err(UnsupportedFeatures::single(
+                FeatureKind::UnsupportedField,
+                pointer,
+                "reasoning_content must be a string or text object",
+            ))
+        }
+    };
+    if text.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::json!({
+        "type": "reasoning",
+        "summary": [{"type": "summary_text", "text": text}]
+    })))
 }
 
 fn chat_content_to_responses(
@@ -1532,11 +1588,69 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output
     #[test]
     fn unsupported_chat_field_fails_before_encoding() {
         let error = encode_chat_to_responses(
-            &serde_json::json!({"model":"m", "messages":[], "metadata":{"x":1}}),
+            &serde_json::json!({"model":"m", "messages":[], "unknown":true}),
             "m",
         )
         .unwrap_err();
-        assert!(error.json_pointers.contains(&"/metadata".to_string()));
+        assert!(error.json_pointers.contains(&"/unknown".to_string()));
+    }
+
+    #[test]
+    fn chat_metadata_is_dropped_for_responses_backend() {
+        let (encoded, context) = encode_chat_to_responses(
+            &serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "metadata": {"user_id": "u1"}
+            }),
+            "m",
+        )
+        .unwrap();
+        assert!(encoded.get("metadata").is_none());
+        assert!(context.normalized.contains(&"/metadata".to_string()));
+    }
+
+    #[test]
+    fn chat_request_reasoning_content_becomes_responses_reasoning_item() {
+        let (encoded, _) = encode_chat_to_responses(
+            &serde_json::json!({
+                "model": "m",
+                "messages": [
+                    {"role": "assistant", "reasoning_content": "think", "content": "answer"},
+                    {"role": "user", "content": "continue"}
+                ]
+            }),
+            "m",
+        )
+        .unwrap();
+        assert_eq!(encoded["input"][0]["type"], "reasoning");
+        assert_eq!(encoded["input"][0]["summary"][0]["text"], "think");
+        assert_eq!(encoded["input"][1]["type"], "message");
+        assert_eq!(encoded["input"][1]["role"], "assistant");
+        assert_eq!(encoded["input"][1]["content"][0]["text"], "answer");
+    }
+
+    #[test]
+    fn messages_request_thinking_survives_messages_to_responses() {
+        let (encoded, _) = encode_messages_to_responses(
+            &serde_json::json!({
+                "model": "m",
+                "stream": true,
+                "messages": [
+                    {"role": "assistant", "content": [
+                        {"type": "thinking", "thinking": "chain"},
+                        {"type": "text", "text": "answer"}
+                    ]},
+                    {"role": "user", "content": "continue"}
+                ]
+            }),
+            "m",
+        )
+        .unwrap();
+        assert_eq!(encoded["input"][0]["type"], "reasoning");
+        assert_eq!(encoded["input"][0]["summary"][0]["text"], "chain");
+        assert_eq!(encoded["input"][1]["type"], "message");
+        assert_eq!(encoded["input"][1]["role"], "assistant");
     }
 
     #[test]

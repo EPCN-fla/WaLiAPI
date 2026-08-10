@@ -440,6 +440,8 @@ fn flags(codec: bool, responses: bool, ollama: bool) -> FeatureFlags {
         cross_protocol_codec: codec,
         native_responses: responses,
         ollama_native: ollama,
+        prefer_auth_accounts: false,
+        prefer_same_protocol: true,
     }
 }
 

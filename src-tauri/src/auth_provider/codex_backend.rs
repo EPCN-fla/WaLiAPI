@@ -294,7 +294,7 @@ pub fn validate_backend_request(body: &Value) -> Result<Value, ProviderError> {
         "stream",
         "store",
     ];
-    const STRIPPED: &[&str] = &["max_output_tokens"];
+    const STRIPPED: &[&str] = &["max_output_tokens", "metadata"];
     for (key, value) in object {
         if !ALLOWED.contains(&key.as_str()) && !STRIPPED.contains(&key.as_str()) && !value.is_null()
         {
@@ -406,9 +406,7 @@ pub fn quota_from_usage_payload(payload: &Value) -> Option<QuotaState> {
         credits: None,
     };
     let has_data = limit.primary.as_ref().is_some_and(|window| {
-        window
-            .used_percent
-            .is_some_and(|used| used != 0.0)
+        window.used_percent.is_some_and(|used| used != 0.0)
             || window.window_minutes.is_some_and(|minutes| minutes != 0)
             || window.reset_at.is_some()
     });
@@ -417,13 +415,9 @@ pub fn quota_from_usage_payload(payload: &Value) -> Option<QuotaState> {
     }
 
     let exhausted = used_percent >= 100.0;
-    let exceeded = rate_limit.get("limit_reached").and_then(Value::as_bool) == Some(true)
-        || exhausted;
-    let next_recover_at = if exceeded {
-        reset_at.clone()
-    } else {
-        None
-    };
+    let exceeded =
+        rate_limit.get("limit_reached").and_then(Value::as_bool) == Some(true) || exhausted;
+    let next_recover_at = if exceeded { reset_at.clone() } else { None };
     Some(QuotaState {
         version: 1,
         exceeded,
@@ -503,7 +497,9 @@ fn parse_limits(headers: &header::HeaderMap) -> Vec<QuotaLimit> {
         // A limit entry with no windows and no credits carries nothing
         // displayable (e.g. `codex-credits-has` with only an empty header) —
         // drop it so the UI never renders an empty quota card.
-        .filter(|limit| limit.primary.is_some() || limit.secondary.is_some() || limit.credits.is_some())
+        .filter(|limit| {
+            limit.primary.is_some() || limit.secondary.is_some() || limit.credits.is_some()
+        })
         .collect()
 }
 
@@ -512,11 +508,15 @@ fn quota_window(parts: BTreeMap<String, String>) -> Option<QuotaWindow> {
     // when it carries real data (used_percent != 0, window_minutes != 0, or a
     // parseable reset).  A header like `x-codex-secondary-used-percent: 0` alone
     // must not manufacture an empty "secondary" window.
-    let used_percent = parts.get("used-percent").and_then(|value| value.parse().ok());
+    let used_percent = parts
+        .get("used-percent")
+        .and_then(|value| value.parse().ok());
     let window_minutes = parts
         .get("window-minutes")
         .and_then(|value| value.parse().ok());
-    let reset_at = parts.get("reset-at").and_then(|value| parse_reset_at(value));
+    let reset_at = parts
+        .get("reset-at")
+        .and_then(|value| parse_reset_at(value));
     let has_data = used_percent.is_some_and(|used| used != 0.0)
         || window_minutes.is_some_and(|minutes| minutes != 0)
         || reset_at.is_some();
@@ -773,11 +773,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_top_level_field_never_hits_mock() {
+    async fn metadata_annotation_is_stripped_before_account_backend() {
         let (provider, state) = provider(vec![]).await;
         let account = account();
         let payload = payload();
-        let error = provider
+        provider
             .outbound(ProviderRequest {
                 account: &account,
                 payload: &payload,
@@ -785,14 +785,10 @@ mod tests {
                 headers: &HeaderMap::new(),
             })
             .await
-            .unwrap_err();
-        assert_eq!(
-            error,
-            ProviderError::UnsupportedFeatures {
-                pointer: "/metadata".into()
-            }
-        );
-        assert_eq!(state.hits.load(Ordering::SeqCst), 0);
+            .unwrap();
+        assert_eq!(state.hits.load(Ordering::SeqCst), 1);
+        let requests = state.requests.lock().await;
+        assert!(requests[0].1.get("metadata").is_none());
     }
 
     #[tokio::test]
@@ -1019,8 +1015,15 @@ mod tests {
         // The empty `secondary` window and the credits-only limit are dropped;
         // only the real monthly `codex` window survives.
         assert_eq!(quota.limits.len(), 1);
-        let codex = quota.limits.iter().find(|limit| limit.limit_id == "codex").unwrap();
-        assert!(codex.secondary.is_none(), "empty secondary window must be dropped");
+        let codex = quota
+            .limits
+            .iter()
+            .find(|limit| limit.limit_id == "codex")
+            .unwrap();
+        assert!(
+            codex.secondary.is_none(),
+            "empty secondary window must be dropped"
+        );
         let primary = codex.primary.as_ref().unwrap();
         assert_eq!(primary.window_minutes, Some(43_200));
         assert_eq!(primary.used_percent, Some(0.0));
@@ -1075,7 +1078,11 @@ mod tests {
         assert_eq!(primary.window_minutes, Some(10_080)); // 604800 / 60
         assert_eq!(primary.used_percent, Some(58.0));
         // 1786867084 epoch -> 2026-08-16T...Z
-        assert!(primary.reset_at.as_deref().unwrap().starts_with("2026-08-16T"));
+        assert!(primary
+            .reset_at
+            .as_deref()
+            .unwrap()
+            .starts_with("2026-08-16T"));
     }
 
     #[test]
@@ -1129,7 +1136,8 @@ mod tests {
         // previously persisted quota is preserved.
         assert!(quota_from_usage_payload(&json!({ "plan_type": "plus" })).is_none());
         assert!(
-            quota_from_usage_payload(&json!({ "rate_limit": { "primary_window": null } })).is_none()
+            quota_from_usage_payload(&json!({ "rate_limit": { "primary_window": null } }))
+                .is_none()
         );
     }
 

@@ -300,6 +300,8 @@ mod auth_routeplan_rollout_tests {
             cross_protocol_codec: false,
             native_responses: false,
             ollama_native: false,
+            prefer_auth_accounts: false,
+            prefer_same_protocol: true,
         };
         assert!(auth_routeplan_rollout_enabled(&flags_off, true));
         assert!(!auth_routeplan_rollout_enabled(&flags_off, false));

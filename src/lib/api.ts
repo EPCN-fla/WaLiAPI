@@ -122,6 +122,8 @@ export interface FeatureFlagsDto {
   cross_protocol_codec: boolean;
   native_responses: boolean;
   ollama_native: boolean;
+  prefer_auth_accounts: boolean;
+  prefer_same_protocol: boolean;
 }
 
 export const settingsApi = {

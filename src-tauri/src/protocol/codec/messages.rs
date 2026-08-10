@@ -50,8 +50,9 @@ pub fn encode_messages_to_chat(
     // both fail-open by decision (T13):
     //   - `thinking`/`output_config` are *mapped* to `reasoning_effort` below
     //     (CLIProxyAPI semantics); they are never rejected.
-    //   - `container`/`context_management`/`context_management_config` have no
-    //     Chat equivalent and are dropped, recorded on the report's
+    //   - `metadata` and `container`/`context_management`/
+    //     `context_management_config` have no Chat equivalent and are dropped,
+    //     recorded on the report's
     //     `normalized` list rather than rejected.
     if let Some(obj) = body.as_object() {
         for (key, value) in obj.iter() {
@@ -61,7 +62,10 @@ pub fn encode_messages_to_chat(
                         // Mapped to `reasoning_effort` in the assembly section.
                         let _ = value;
                     }
-                    "container" | "context_management" | "context_management_config" => {
+                    "metadata"
+                    | "container"
+                    | "context_management"
+                    | "context_management_config" => {
                         normalized.push(format!("/{key}"));
                         let _ = value;
                     }

@@ -1188,13 +1188,19 @@ impl ChatSseState {
 
     fn consume_tool_call(&mut self, call: &Value) -> Result<(), UnsupportedFeatures> {
         let source_index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-        if let Some(id) = call.get("id").and_then(Value::as_str) {
+        if let Some(id) = call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
             self.tools.entry(source_index).or_default().id = id.to_string();
         }
         if let Some(name) = call
             .get("function")
             .and_then(|f| f.get("name"))
             .and_then(Value::as_str)
+            .or_else(|| call.get("name").and_then(Value::as_str))
+            .filter(|name| !name.is_empty())
         {
             self.tools.entry(source_index).or_default().name = name.to_string();
         }
@@ -1202,6 +1208,7 @@ impl ChatSseState {
             .get("function")
             .and_then(|f| f.get("arguments"))
             .and_then(Value::as_str)
+            .or_else(|| call.get("arguments").and_then(Value::as_str))
         {
             self.tools
                 .entry(source_index)
@@ -1245,12 +1252,15 @@ impl ChatSseState {
             ));
         }
         for tool in self.tools.values_mut() {
-            if tool.id.is_empty() || tool.name.is_empty() {
+            if tool.name.is_empty() {
                 return Err(UnsupportedFeatures::single(
                     FeatureKind::MissingToolField,
                     "/choices/0/delta/tool_calls",
                     "OpenAI stream ended with an incomplete tool call",
                 ));
+            }
+            if tool.id.is_empty() {
+                tool.id = format!("call_{}", uuid::Uuid::new_v4().simple());
             }
             let input: Value = serde_json::from_str(&tool.arguments).map_err(|e| {
                 UnsupportedFeatures::single(

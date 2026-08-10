@@ -114,7 +114,7 @@ impl AuthService {
         account_id: &str,
         refresh_before: DateTime<Utc>,
     ) -> Result<AuthAccountSummary, ProviderError> {
-        self.refresh_with_lock(account_id, refresh_before, false)
+        self.refresh_with_lock(account_id, refresh_before, false, true)
             .await
     }
 
@@ -123,7 +123,7 @@ impl AuthService {
         &self,
         account_id: &str,
     ) -> Result<AuthAccountSummary, ProviderError> {
-        self.refresh_with_lock(account_id, self.clock.now(), true)
+        self.refresh_with_lock(account_id, self.clock.now(), true, true)
             .await
     }
 
@@ -132,6 +132,7 @@ impl AuthService {
         account_id: &str,
         refresh_before: DateTime<Utc>,
         force: bool,
+        probe_quota: bool,
     ) -> Result<AuthAccountSummary, ProviderError> {
         let lock = {
             let mut locks = self.refresh_locks.lock().await;
@@ -162,10 +163,12 @@ impl AuthService {
             )
             .await
             .map_err(|_| ProviderError::Storage)?;
-        // A user-invoked refresh is a natural moment to refresh quota state too.
-        // The refreshed payload is re-read below so the probe always carries the
-        // newest access token.
-        self.sync_quota(account_id).await;
+        if probe_quota {
+            // A user-invoked refresh is a natural moment to refresh quota state too.
+            // The refreshed payload is re-read below so the probe always carries the
+            // newest access token.
+            self.sync_quota(account_id).await;
+        }
         let account = self.get_account(account_id).await?;
         AuthAccountSummary::from_account(&account)
     }
@@ -177,7 +180,13 @@ impl AuthService {
         // overwritten.  A refresh failure aborts before any model request.
         let account = self.get_account(account_id).await?;
         if Self::has_refresh_token(&Self::payload_for(&account)?) {
-            self.refresh_account(account_id).await?;
+            self.refresh_with_lock(
+                account_id,
+                self.clock.now() + Duration::minutes(5),
+                false,
+                false,
+            )
+            .await?;
         }
         let account = self.get_account(account_id).await?;
         let payload = Self::payload_for(&account)?;
@@ -220,7 +229,10 @@ impl AuthService {
             return;
         };
         if let Err(error) = self.repository.update_quota(account_id, Some(&quota)).await {
-            tracing::warn!(account_id, "failed to persist auth account quota state: {error}");
+            tracing::warn!(
+                account_id,
+                "failed to persist auth account quota state: {error}"
+            );
         }
     }
 
@@ -464,6 +476,7 @@ mod tests {
 
     struct FakeProvider {
         refreshes: AtomicUsize,
+        quota_hits: AtomicUsize,
         operations: AtomicUsize,
         models_fail: bool,
         refresh_fails: bool,
@@ -522,6 +535,7 @@ mod tests {
             _payload: &ProviderPayload,
         ) -> Result<Option<QuotaState>, ProviderError> {
             self.operations.fetch_add(1, Ordering::SeqCst);
+            self.quota_hits.fetch_add(1, Ordering::SeqCst);
             if self.quota_fail {
                 return Err(ProviderError::Retryable);
             }
@@ -570,6 +584,7 @@ mod tests {
         let account = account(&repository).await;
         let fake = Arc::new(FakeProvider {
             refreshes: AtomicUsize::new(0),
+            quota_hits: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
             models_fail: false,
             refresh_fails: false,
@@ -600,10 +615,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn due_model_sync_probes_quota_once_after_refresh() {
+        let repository = repository().await;
+        let account = account(&repository).await;
+        let fake = Arc::new(FakeProvider {
+            refreshes: AtomicUsize::new(0),
+            quota_hits: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            models_fail: false,
+            refresh_fails: false,
+            quota_fail: false,
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(fake.clone());
+        let service = AuthService::with_clock(
+            repository,
+            registry,
+            Arc::new(FixedClock("2026-08-09T00:00:00Z".parse().unwrap())),
+        );
+
+        service.sync_models(&account.id).await.unwrap();
+
+        assert_eq!(fake.quota_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn unknown_provider_fails_before_any_provider_operation() {
         let repository = repository().await;
         let fake = Arc::new(FakeProvider {
             refreshes: AtomicUsize::new(0),
+            quota_hits: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
             models_fail: false,
             refresh_fails: false,
@@ -656,6 +697,7 @@ mod tests {
         let account = account(&repository).await;
         let fake = Arc::new(FakeProvider {
             refreshes: AtomicUsize::new(0),
+            quota_hits: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
             models_fail: false,
             refresh_fails: false,
@@ -674,7 +716,7 @@ mod tests {
         assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
         // One refresh + one list_models + one quota probe: the listing runs
         // exactly once on the refreshed payload, then the quota probe follows.
-        assert_eq!(fake.operations.load(Ordering::SeqCst), 4);
+        assert_eq!(fake.operations.load(Ordering::SeqCst), 3);
         assert_eq!(summary.expires_at.as_deref(), Some("2026-08-09T02:00:00Z"));
         let stored = repository.get_auth_account(&account.id).await.unwrap();
         assert_eq!(
@@ -704,6 +746,7 @@ mod tests {
             .unwrap();
         let fake = Arc::new(FakeProvider {
             refreshes: AtomicUsize::new(0),
+            quota_hits: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
             models_fail: true,
             refresh_fails: false,
@@ -727,6 +770,7 @@ mod tests {
         let account = account(&repository).await;
         let fake = Arc::new(FakeProvider {
             refreshes: AtomicUsize::new(0),
+            quota_hits: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
             models_fail: false,
             refresh_fails: false,
@@ -741,7 +785,10 @@ mod tests {
         let quota = stored.quota_state().unwrap().unwrap();
         assert!(!quota.exceeded);
         assert_eq!(quota.limits.len(), 1);
-        assert_eq!(quota.limits[0].primary.as_ref().unwrap().window_minutes, Some(10_080));
+        assert_eq!(
+            quota.limits[0].primary.as_ref().unwrap().window_minutes,
+            Some(10_080)
+        );
     }
 
     #[tokio::test]
@@ -763,6 +810,7 @@ mod tests {
             .unwrap();
         let fake = Arc::new(FakeProvider {
             refreshes: AtomicUsize::new(0),
+            quota_hits: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
             models_fail: false,
             refresh_fails: false,
@@ -779,7 +827,10 @@ mod tests {
         let quota = stored.quota_state().unwrap().unwrap();
         assert!(quota.exceeded);
         assert_eq!(quota.backoff_level, 2);
-        assert_eq!(quota.next_recover_at.as_deref(), Some("2026-08-10T00:00:00Z"));
+        assert_eq!(
+            quota.next_recover_at.as_deref(),
+            Some("2026-08-10T00:00:00Z")
+        );
     }
 
     #[tokio::test]
@@ -805,6 +856,7 @@ mod tests {
             .unwrap();
         let fake = Arc::new(FakeProvider {
             refreshes: AtomicUsize::new(0),
+            quota_hits: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
             models_fail: false,
             refresh_fails: true,

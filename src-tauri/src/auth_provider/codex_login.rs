@@ -523,10 +523,7 @@ fn login_result_from_payload(
         .or_else(|| claims.pointer("/https:~1~1api.openai.com~1auth/chatgpt_plan_type"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let label = email
-        .as_deref()
-        .map(|email| format!("Codex · {email}"))
-        .unwrap_or_else(|| "Codex · ChatGPT".to_owned());
+    let label = email.clone().unwrap_or_else(|| "ChatGPT".to_owned());
     Ok(LoginResult {
         account_id,
         label,
@@ -774,6 +771,27 @@ mod tests {
                 .map(|value| value.as_ref()),
             Some("true")
         );
+    }
+
+    #[test]
+    fn login_result_label_uses_account_name_without_provider_prefix() {
+        let payload = ProviderPayload::new(json!({
+            "id_token": jwt(json!({"email": "person@example.test", "plan_type": "plus"})),
+            "access_token": ACCESS,
+            "refresh_token": REFRESH,
+            "account_id": "account-1"
+        }));
+        let result = login_result_from_payload(payload, None).unwrap();
+        assert_eq!(result.label, "person@example.test");
+
+        let payload_without_email = ProviderPayload::new(json!({
+            "id_token": jwt(json!({"plan_type": "plus"})),
+            "access_token": ACCESS,
+            "refresh_token": REFRESH,
+            "account_id": "account-1"
+        }));
+        let result_without_email = login_result_from_payload(payload_without_email, None).unwrap();
+        assert_eq!(result_without_email.label, "ChatGPT");
     }
 
     #[derive(Clone)]

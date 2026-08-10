@@ -129,6 +129,8 @@ fn flags(codec_on: bool) -> FeatureFlags {
         cross_protocol_codec: codec_on,
         native_responses: true,
         ollama_native: false,
+        prefer_auth_accounts: false,
+        prefer_same_protocol: true,
     }
 }
 

@@ -318,6 +318,8 @@ export interface Settings {
   security_scan_response: boolean;
   security_redact_secrets: boolean;
   security_block_on_critical: boolean;
+  routing_prefer_auth_accounts: boolean;
+  routing_prefer_same_protocol: boolean;
 }
 
 // Security rule types

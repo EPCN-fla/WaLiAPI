@@ -483,6 +483,50 @@ fn chat_stream_arbitrary_fragmentation_and_tool_accumulation() {
 }
 
 #[test]
+fn chat_stream_tool_call_without_upstream_id_gets_generated_id() {
+    let mut state = chat::ChatSseState::default();
+    let mut output = Vec::new();
+    output.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"a\\\":\"}}]}}]}\n\n").unwrap());
+    output.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n").unwrap());
+    output.extend(state.finish().unwrap());
+    let output = output.join("");
+    assert!(output.contains("\"type\":\"tool_use\""));
+    assert!(output.contains("\"name\":\"run\""));
+    assert!(output.contains("\"id\":\"call_"));
+    assert!(output.contains("\"partial_json\":\"{\\\"a\\\":1}\""));
+    assert!(output.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[test]
+fn chat_stream_tool_arguments_can_arrive_before_name() {
+    let mut state = chat::ChatSseState::default();
+    let mut output = Vec::new();
+    output.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"a\\\":\"}}]}}]}\n\n").unwrap());
+    output.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"run\",\"arguments\":\"1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n").unwrap());
+    output.extend(state.finish().unwrap());
+    let output = output.join("");
+    assert!(output.contains("\"id\":\"call_1\""));
+    assert!(output.contains("\"name\":\"run\""));
+    assert!(output.contains("\"partial_json\":\"{\\\"a\\\":1}\""));
+    assert!(output.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[test]
+fn chat_stream_empty_tool_name_delta_does_not_clear_name() {
+    let mut state = chat::ChatSseState::default();
+    let mut output = Vec::new();
+    output.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\n").unwrap());
+    output.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"{\\\"path\\\":\\\"/tmp/x\\\"}\"}}]}}]}\n\n").unwrap());
+    output.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"tool_calls\"}]}\n\n").unwrap());
+    output.extend(state.finish().unwrap());
+    let output = output.join("");
+    assert!(output.contains("\"id\":\"call_1\""));
+    assert!(output.contains("\"name\":\"read\""));
+    assert!(output.contains("\"partial_json\":\"{\\\"path\\\":\\\"/tmp/x\\\"}\""));
+    assert!(output.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[test]
 fn chat_stream_incomplete_tool_arguments_are_rejected() {
     let mut state = chat::ChatSseState::default();
     state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"run\",\"arguments\":\"{bad\"}}]}}]}\n\n").unwrap();
@@ -848,13 +892,28 @@ fn messages_request_rejects_unknown_top_level_fields() {
     let body = json!({
         "model": "m",
         "messages": [{"role": "user", "content": "u"}],
-        "metadata": {"user_id": "u1"}
+        "unknown": true
     });
     let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
     assert!(reject_features(&e)
         .iter()
         .any(|c| c.contains("unsupported_feature.field")));
-    assert!(e.json_pointers.iter().any(|p| p == "/metadata"));
+    assert!(e.json_pointers.iter().any(|p| p == "/unknown"));
+}
+
+#[test]
+fn messages_request_drops_metadata_annotation() {
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "u"}],
+        "metadata": {"user_id": "u1"}
+    });
+    let prepared = CodecRegistry::messages_to_chat("m", &body).unwrap();
+    assert!(prepared.encoded_request.get("metadata").is_none());
+    assert!(prepared
+        .report
+        .normalized
+        .contains(&"/metadata".to_string()));
 }
 
 #[test]
