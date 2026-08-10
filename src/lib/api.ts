@@ -10,7 +10,7 @@ import type {
   ChannelProtocolPresetGroup,
   DraftChannelTestInput, DraftChannelTestResult,
   UpstreamModelsResult,
-  AuthAccount, AuthLoginSessionStatus, AuthLoginStart, AuthMutationResult, AuthLogoutResult, AuthWriteBackResult,
+  AuthAccount, AuthLoginSessionStatus, AuthLoginStart, AuthMutationResult, AuthLogoutResult, AuthExportResult,
   AuthQuotaStatus, AuthUpdateInput,
 } from "../types";
 
@@ -105,7 +105,7 @@ export const authApi = {
   logout: (id: string) => invoke<AuthLogoutResult>("auth_logout", { id }),
   refreshToken: (id: string) => invoke<AuthAccount>("auth_refresh_token", { id }),
   syncModels: (id: string) => invoke<AuthAccount>("auth_sync_models", { id }),
-  writeBack: (id: string) => invoke<AuthWriteBackResult>("auth_write_back", { id }),
+  exportJson: (id: string, path: string) => invoke<AuthExportResult>("auth_export_json", { id, path }),
   toggle: (id: string, disabled: boolean) => invoke<AuthAccount>("auth_toggle", { id, disabled }),
   quotaStatus: (id: string) => invoke<AuthQuotaStatus>("auth_quota_status", { id }),
   update: (input: AuthUpdateInput) => invoke<AuthAccount>("auth_update", { input }),

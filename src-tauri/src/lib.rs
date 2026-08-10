@@ -175,7 +175,7 @@ pub fn run() {
             commands::auth::auth_logout,
             commands::auth::auth_refresh_token,
             commands::auth::auth_sync_models,
-            commands::auth::auth_write_back,
+            commands::auth::auth_export_json,
             commands::auth::auth_toggle,
             commands::auth::auth_quota_status,
             commands::auth::auth_update,

@@ -291,12 +291,13 @@ pub fn validate_backend_request(body: &Value) -> Result<Value, ProviderError> {
         "instructions",
         "tools",
         "tool_choice",
-        "max_output_tokens",
         "stream",
         "store",
     ];
+    const STRIPPED: &[&str] = &["max_output_tokens"];
     for (key, value) in object {
-        if !ALLOWED.contains(&key.as_str()) && !value.is_null() {
+        if !ALLOWED.contains(&key.as_str()) && !STRIPPED.contains(&key.as_str()) && !value.is_null()
+        {
             return Err(ProviderError::UnsupportedFeatures {
                 pointer: format!("/{key}"),
             });
@@ -738,6 +739,35 @@ mod tests {
             "store": true
         }))
         .unwrap();
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn backend_request_rejects_public_responses_controls() {
+        let error = validate_backend_request(&json!({
+            "model": "gpt-test",
+            "input": "hi",
+            "reasoning": {"effort": "high"},
+            "text": {"verbosity": "low"}
+        }))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderError::UnsupportedFeatures { ref pointer } if pointer == "/reasoning"
+        ));
+    }
+
+    #[test]
+    fn backend_request_strips_max_output_tokens() {
+        let body = validate_backend_request(&json!({
+            "model": "gpt-test",
+            "input": "hi",
+            "max_output_tokens": 32000
+        }))
+        .unwrap();
+
+        assert!(body.get("max_output_tokens").is_none());
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
     }

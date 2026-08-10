@@ -18,8 +18,11 @@ const CHAT_TOP_LEVEL: &[&str] = &[
     "max_tokens",
     "max_completion_tokens",
     "stream",
+    "stream_options",
     "tools",
     "tool_choice",
+    "reasoning_effort",
+    "verbosity",
 ];
 
 /// Encode a Chat Completions request as a Responses request.  This deliberately
@@ -37,7 +40,8 @@ pub fn encode_chat_to_responses(
         )
     })?;
     let mut rejected = Vec::new();
-    for key in object.keys() {
+    let mut normalized = Vec::new();
+    for (key, value) in object {
         if !CHAT_TOP_LEVEL.contains(&key.as_str()) {
             request::reject(
                 &mut rejected,
@@ -48,6 +52,20 @@ pub fn encode_chat_to_responses(
                 },
                 format!("/{key}"),
                 format!("Chat field {key:?} has no Responses backend representation"),
+            );
+        } else if key == "reasoning_effort" && !value.is_string() {
+            request::reject(
+                &mut rejected,
+                FeatureKind::UnsupportedField,
+                "/reasoning_effort",
+                "Chat reasoning_effort must be a string",
+            );
+        } else if key == "verbosity" && !value.is_string() {
+            request::reject(
+                &mut rejected,
+                FeatureKind::UnsupportedField,
+                "/verbosity",
+                "Chat verbosity must be a string",
             );
         }
     }
@@ -92,15 +110,14 @@ pub fn encode_chat_to_responses(
     let mut response = Map::new();
     response.insert("model".to_owned(), Value::String(model.to_owned()));
     response.insert("input".to_owned(), Value::Array(input));
-    if let Some(max_output_tokens) = object
-        .get("max_completion_tokens")
-        .or_else(|| object.get("max_tokens"))
-        .and_then(Value::as_u64)
-    {
-        response.insert(
-            "max_output_tokens".to_owned(),
-            Value::from(max_output_tokens),
-        );
+    if object.get("max_completion_tokens").is_some() {
+        // The ChatGPT Codex backend currently rejects max_output_tokens on this
+        // path. The model catalog may expose output capacity, but request
+        // translation must not forward a completion cap.
+        normalized.push("/max_completion_tokens".to_owned());
+    }
+    if object.get("max_tokens").is_some() {
+        normalized.push("/max_tokens".to_owned());
     }
     response.insert(
         "stream".to_owned(),
@@ -111,6 +128,24 @@ pub fn encode_chat_to_responses(
                 .unwrap_or(false),
         ),
     );
+    if object.get("stream_options").is_some() {
+        // Chat-only streaming options such as include_usage are not part of the
+        // Responses request. Codex Responses streams report usage in
+        // response.completed, so dropping this is intentional and observable.
+        normalized.push("/stream_options".to_owned());
+    }
+    if object.get("reasoning_effort").is_some() {
+        // Codex backend-api does not accept the public Responses `reasoning`
+        // request field on this account endpoint. Keep the Chat request
+        // compatible by dropping the preference and letting the account/model
+        // default apply.
+        normalized.push("/reasoning_effort".to_owned());
+    }
+    if object.get("verbosity").is_some() {
+        // Same story for the public Responses `text.verbosity` control: the
+        // Codex backend allow-list is narrower than the public API.
+        normalized.push("/verbosity".to_owned());
+    }
     if !instruction_parts.is_empty() {
         response.insert(
             "instructions".to_owned(),
@@ -128,17 +163,16 @@ pub fn encode_chat_to_responses(
             response.insert("tool_choice".to_owned(), choice);
         }
     }
-    Ok((
-        Value::Object(response),
-        ConversionContext::new(
-            format!("chatcmpl_{}", uuid::Uuid::new_v4().simple()),
-            model,
-            object
-                .get("stream")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        ),
-    ))
+    let mut context = ConversionContext::new(
+        format!("chatcmpl_{}", uuid::Uuid::new_v4().simple()),
+        model,
+        object
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    context.normalized = normalized;
+    Ok((Value::Object(response), context))
 }
 
 struct ChatMessageParts {
@@ -1263,10 +1297,12 @@ mod tests {
     fn chat_request_does_not_synthesize_unsupported_max_output_tokens() {
         let request = serde_json::json!({
             "model": "ignored",
-            "messages": [{"role": "user", "content": "hi"}]
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32000
         });
-        let (encoded, _) = encode_chat_to_responses(&request, "gpt-test").unwrap();
+        let (encoded, context) = encode_chat_to_responses(&request, "gpt-test").unwrap();
         assert!(encoded.get("max_output_tokens").is_none());
+        assert!(context.normalized.contains(&"/max_tokens".to_string()));
     }
 
     #[test]
@@ -1501,5 +1537,34 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output
         )
         .unwrap_err();
         assert!(error.json_pointers.contains(&"/metadata".to_string()));
+    }
+
+    #[test]
+    fn chat_gpt5_options_map_or_drop_for_responses_backend() {
+        let (encoded, context) = encode_chat_to_responses(
+            &serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 32000,
+                "stream": true,
+                "stream_options": {"include_usage": true},
+                "reasoning_effort": "HIGH",
+                "verbosity": "LOW"
+            }),
+            "gpt-5.5",
+        )
+        .unwrap();
+
+        assert_eq!(encoded["model"], "gpt-5.5");
+        assert!(encoded.get("reasoning").is_none());
+        assert!(encoded.get("text").is_none());
+        assert!(encoded.get("max_output_tokens").is_none());
+        assert!(encoded.get("stream_options").is_none());
+        assert!(context.normalized.contains(&"/max_tokens".to_string()));
+        assert!(context.normalized.contains(&"/stream_options".to_string()));
+        assert!(context
+            .normalized
+            .contains(&"/reasoning_effort".to_string()));
+        assert!(context.normalized.contains(&"/verbosity".to_string()));
     }
 }

@@ -244,9 +244,9 @@ export interface AuthLogoutResult {
   deleted: boolean;
 }
 
-export interface AuthWriteBackResult {
+export interface AuthExportResult {
   path: string;
-  backup_path: string;
+  backup_path: string | null;
 }
 
 export interface AuthQuotaStatus {

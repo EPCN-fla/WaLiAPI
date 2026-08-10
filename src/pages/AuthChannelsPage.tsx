@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { CircleAlert, Download, KeyRound, Loader2, Upload, X } from "lucide-react";
+import { CircleAlert, KeyRound, Loader2, Upload, X } from "lucide-react";
 import { authApi } from "../lib/api";
 import type { AuthAccount, AuthMutationResult } from "../types";
 import { AccountCard } from "../components/auth/AccountCard";
@@ -9,15 +9,21 @@ import { ModelSyncModal } from "../components/auth/ModelSyncModal";
 import { ProviderPills } from "../components/auth/ProviderPills";
 import { ChannelTabs } from "../components/layout/ChannelTabs";
 
-type Confirmation = { kind: "delete" | "write-back"; account: AuthAccount };
+type Confirmation = { kind: "delete"; account: AuthAccount };
+
+function exportFileName(account: AuthAccount) {
+  const base = (account.label || account.email || account.account_id || "codex-auth")
+    .replace(/[\\/:*?"<>|]/g, "-")
+    .trim();
+  return `${base || "codex-auth"}.json`;
+}
 
 function EmptyAccountSlot({ onLogin, onImport, busy }: { onLogin: () => void; onImport: () => void; busy: boolean }) {
   return <section className="flex min-h-80 flex-col items-center justify-center rounded-[24px] border border-dashed border-border bg-card/50 p-6 text-center"><div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-success/10 text-xl font-bold text-success">⌘</div><h2 className="mt-4 font-semibold">＋ 登录 Codex 账号</h2><p className="mt-2 max-w-xs text-sm leading-6 text-muted-foreground">浏览器 OAuth 登录（PKCE）或从本机 ~/.codex/auth.json 导入</p><div className="mt-5 flex flex-wrap justify-center gap-2"><button onClick={onLogin} disabled={busy} className="action-primary"><KeyRound size={16} />登录</button><button onClick={onImport} disabled={busy} className="action-secondary"><Upload size={16} />导入</button></div></section>;
 }
 
 function ConfirmationDialog({ confirmation, pending, onCancel, onConfirm }: { confirmation: Confirmation; pending: boolean; onCancel: () => void; onConfirm: () => void }) {
-  const deleting = confirmation.kind === "delete";
-  return <div className="fixed inset-0 z-50 flex items-center justify-center bg-foreground/35 p-4" role="dialog" aria-modal="true" aria-labelledby="auth-confirm-title"><div className="surface w-full max-w-md rounded-[24px] p-6 shadow-2xl"><div className="flex items-start justify-between gap-3"><div><h2 id="auth-confirm-title" className="text-lg font-semibold">{deleting ? "删除 Auth 账号" : "写回 Codex CLI"}</h2><p className="mt-1 text-sm text-muted-foreground">{confirmation.account.label}</p></div><button onClick={onCancel} aria-label="关闭确认弹窗" className="rounded-lg p-1 text-muted-foreground hover:bg-muted"><X size={18} /></button></div>{deleting ? <><p className="mt-5 text-sm leading-6 text-muted-foreground">是否删除该账号？删除后此账号不再参与路由。仅从本应用移除，不影响本机 Codex CLI 登录态。</p><div className="mt-6 flex flex-wrap justify-end gap-2"><button onClick={onCancel} className="action-secondary">取消</button><button disabled={pending} onClick={onConfirm} className="inline-flex items-center gap-2 rounded-xl bg-destructive px-4 py-2.5 text-sm font-semibold text-destructive-foreground">{pending ? <Loader2 size={16} className="animate-spin" /> : null}确认删除</button></div></> : <><p className="mt-5 text-sm leading-6 text-muted-foreground">将原子覆盖本机 Codex CLI 的 auth.json，并在覆盖前创建时间戳备份。确认后不会改动 config.toml。</p><div className="mt-6 flex justify-end gap-2"><button onClick={onCancel} className="action-secondary">取消</button><button disabled={pending} onClick={onConfirm} className="action-primary">{pending ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}确认写回 CLI</button></div></>}</div></div>;
+  return <div className="fixed inset-0 z-50 flex items-center justify-center bg-foreground/35 p-4" role="dialog" aria-modal="true" aria-labelledby="auth-confirm-title"><div className="surface w-full max-w-md rounded-[24px] p-6 shadow-2xl"><div className="flex items-start justify-between gap-3"><div><h2 id="auth-confirm-title" className="text-lg font-semibold">删除 Auth 账号</h2><p className="mt-1 text-sm text-muted-foreground">{confirmation.account.label}</p></div><button onClick={onCancel} aria-label="关闭确认弹窗" className="rounded-lg p-1 text-muted-foreground hover:bg-muted"><X size={18} /></button></div><p className="mt-5 text-sm leading-6 text-muted-foreground">是否删除该账号？删除后此账号不再参与路由。仅从本应用移除，不影响本机 Codex CLI 登录态。</p><div className="mt-6 flex flex-wrap justify-end gap-2"><button onClick={onCancel} className="action-secondary">取消</button><button disabled={pending} onClick={onConfirm} className="inline-flex items-center gap-2 rounded-xl bg-destructive px-4 py-2.5 text-sm font-semibold text-destructive-foreground">{pending ? <Loader2 size={16} className="animate-spin" /> : null}确认删除</button></div></div></div>;
 }
 
 export function AuthChannelsPage() {
@@ -82,20 +88,41 @@ export function AuthChannelsPage() {
   };
   const confirmAction = async () => {
     if (!confirmation) return;
-    const { account, kind } = confirmation;
+    const { account } = confirmation;
     setPendingId(account.id);
     try {
-      if (kind === "delete") {
-        await authApi.logout(account.id);
-        setNotice({ kind: "success", message: "账号已删除。" });
-      } else {
-        const result = await authApi.writeBack(account.id);
-        setNotice({ kind: "success", message: `已写入 ${result.path}；备份：${result.backup_path}` });
-      }
+      await authApi.logout(account.id);
+      setNotice({ kind: "success", message: "账号已删除。" });
       setConfirmation(null);
       await load();
     } catch (_) {
       setNotice({ kind: "error", message: "操作失败，请稍后重试。" });
+    } finally {
+      setPendingId(null);
+    }
+  };
+  const exportAuth = async (account: AuthAccount) => {
+    let path: string | null = null;
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      path = await save({
+        title: "导出 Codex auth JSON",
+        filters: [{ name: "Codex auth JSON", extensions: ["json"] }],
+        defaultPath: exportFileName(account),
+      });
+    } catch {
+      setNotice({ kind: "error", message: "无法打开保存位置选择器，请稍后重试。" });
+      return;
+    }
+    if (path === null) return;
+    setPendingId(account.id);
+    try {
+      const result = await authApi.exportJson(account.id, path);
+      const backup = result.backup_path ? `；已备份原文件：${result.backup_path}` : "";
+      setNotice({ kind: "success", message: `已导出到 ${result.path}${backup}` });
+      await load();
+    } catch (_) {
+      setNotice({ kind: "error", message: "导出失败，请稍后重试。" });
     } finally {
       setPendingId(null);
     }
@@ -105,7 +132,7 @@ export function AuthChannelsPage() {
     {notice && <div role="status" className={`flex items-center justify-between gap-3 rounded-2xl border px-4 py-3 text-sm ${notice.kind === "error" ? "border-destructive/25 bg-destructive/10 text-destructive" : notice.kind === "warning" ? "border-warning/25 bg-warning/10 text-warning" : "border-success/25 bg-success/10 text-success"}`}><span>{notice.message}</span><button onClick={() => setNotice(null)} aria-label="关闭提示"><X size={16} /></button></div>}
     <ProviderPills /><p className="text-sm text-muted-foreground">登录后账号将作为上游路由候选，并消耗对应订阅额度。仅 Codex 已开放，其他提供商仍在规划中。</p>
     <div className="flex gap-2 rounded-2xl border border-destructive/25 bg-destructive/10 px-4 py-3 text-xs leading-5 text-destructive"><CircleAlert className="mt-0.5 shrink-0" size={16} /><p>⚠️ 风险提示：此提供商使用的订阅 / OAuth 会话未获官方授权用于代理 / 路由器使用。账户可能被限制或封禁。使用风险自负。</p></div>
-    {loading ? <div className="flex min-h-64 items-center justify-center gap-2 text-sm text-muted-foreground"><Loader2 size={18} className="animate-spin" />加载 Auth 账号…</div> : <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">{accounts.map(account => <AccountCard key={account.id} account={account} pending={pendingId === account.id} onEdit={() => setEditAccount(account)} onToggle={() => void runFor(account.id, account.disabled ? "账号已启用。" : "账号已停用。", () => authApi.toggle(account.id, !account.disabled).then(() => undefined))} onDelete={() => setConfirmation({ kind: "delete", account })} onRefresh={() => void runFor(account.id, "令牌刷新完成。", () => authApi.refreshToken(account.id).then(() => undefined))} onSync={() => setSyncAccount(account)} onWriteBack={() => setConfirmation({ kind: "write-back", account })} onRelogin={() => setShowLogin(true)} />)}<EmptyAccountSlot onLogin={() => setShowLogin(true)} onImport={() => void importAuth()} busy={pendingId === "import"} /></div>}
+    {loading ? <div className="flex min-h-64 items-center justify-center gap-2 text-sm text-muted-foreground"><Loader2 size={18} className="animate-spin" />加载 Auth 账号…</div> : <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">{accounts.map(account => <AccountCard key={account.id} account={account} pending={pendingId === account.id} onEdit={() => setEditAccount(account)} onToggle={() => void runFor(account.id, account.disabled ? "账号已启用。" : "账号已停用。", () => authApi.toggle(account.id, !account.disabled).then(() => undefined))} onDelete={() => setConfirmation({ kind: "delete", account })} onRefresh={() => void runFor(account.id, "令牌刷新完成。", () => authApi.refreshToken(account.id).then(() => undefined))} onSync={() => setSyncAccount(account)} onExport={() => void exportAuth(account)} onRelogin={() => setShowLogin(true)} />)}<EmptyAccountSlot onLogin={() => setShowLogin(true)} onImport={() => void importAuth()} busy={pendingId === "import"} /></div>}
     {showLogin && <LoginModal onClose={() => setShowLogin(false)} onCompleted={completeLogin} />}
     {editAccount && <EditModal account={editAccount} pending={pendingId === editAccount.id} onClose={() => setEditAccount(null)} onSave={async input => { await runFor(input.id, "账号配置已保存。", () => authApi.update(input).then(() => undefined)); setEditAccount(null); }} />}
     {syncAccount && <ModelSyncModal account={syncAccount} onClose={() => setSyncAccount(null)} onSynced={() => { void load(); setNotice({ kind: "success", message: "模型同步完成。" }); }} />}

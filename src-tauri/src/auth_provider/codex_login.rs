@@ -331,8 +331,8 @@ impl CodexLogin {
             .ok_or(ProviderError::Storage)
     }
 
-    /// Atomically replace a CLI auth file after backing it up. The destination's directory is
-    /// never created implicitly: an unexpected path must fail without touching another file.
+    /// Atomically export a Codex auth JSON file. The destination's directory is
+    /// never created implicitly; an existing destination is backed up first.
     pub fn write_auth_json(
         path: &Path,
         payload: &ProviderPayload,
@@ -417,7 +417,7 @@ fn oauth_http_client() -> Result<oauth_reqwest::Client, ProviderError> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthJsonWriteResult {
     pub path: PathBuf,
-    pub backup_path: PathBuf,
+    pub backup_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -636,14 +636,14 @@ where
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or(ProviderError::Storage)?;
-    let backup_path = parent.join(format!("{filename}.bak-{stamp}"));
+    let backup_path = path
+        .exists()
+        .then(|| parent.join(format!("{filename}.bak-{stamp}")));
     let temporary_path = parent.join(format!(".{filename}.tmp-{stamp}"));
 
-    if path.exists() {
-        fs::copy(path, &backup_path).map_err(|_| ProviderError::Storage)?;
-        set_private_permissions(&backup_path).map_err(|_| ProviderError::Storage)?;
-    } else {
-        return Err(ProviderError::Storage);
+    if let Some(backup_path) = &backup_path {
+        fs::copy(path, backup_path).map_err(|_| ProviderError::Storage)?;
+        set_private_permissions(backup_path).map_err(|_| ProviderError::Storage)?;
     }
     let write_result = (|| -> io::Result<()> {
         let mut temporary = OpenOptions::new()
@@ -999,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn write_back_is_nested_private_backed_up_and_preserves_old_file_if_rename_fails() {
+    fn export_is_nested_private_backed_up_and_preserves_old_file_if_rename_fails() {
         let directory =
             std::env::temp_dir().join(format!("waliapi-codex-login-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&directory).unwrap();
@@ -1013,7 +1013,7 @@ mod tests {
         let written: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(written["tokens"]["refresh_token"], REFRESH);
         assert_eq!(written["auth_mode"], "chatgpt");
-        assert_eq!(fs::read(&result.backup_path).unwrap(), old);
+        assert_eq!(fs::read(result.backup_path.as_ref().unwrap()).unwrap(), old);
         #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -1028,6 +1028,11 @@ mod tests {
             ProviderError::Storage
         );
         assert_eq!(fs::read(&path).unwrap(), bytes_before_failure);
+        let new_path = directory.join("exported-auth.json");
+        let result = CodexLogin::write_auth_json(&new_path, &payload).unwrap();
+        let written: Value = serde_json::from_slice(&fs::read(&new_path).unwrap()).unwrap();
+        assert_eq!(written["tokens"]["account_id"], "account-1");
+        assert!(result.backup_path.is_none());
         fs::remove_dir_all(&directory).unwrap();
     }
 }

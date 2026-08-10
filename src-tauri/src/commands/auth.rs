@@ -107,9 +107,9 @@ pub struct AuthLogoutResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct AuthWriteBackResult {
+pub struct AuthExportResult {
     pub path: String,
-    pub backup_path: String,
+    pub backup_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -611,11 +611,13 @@ pub async fn auth_sync_models(
 }
 
 #[tauri::command]
-pub async fn auth_write_back(
+pub async fn auth_export_json(
     id: String,
+    path: String,
     state: tauri::State<'_, Arc<AppState>>,
-) -> Result<AuthWriteBackResult, String> {
+) -> Result<AuthExportResult, String> {
     validate_account_id(&id)?;
+    let path = PathBuf::from(path);
     let repository = Repository::new(state.db.pool.clone());
     let account = repository
         .get_auth_account(&id)
@@ -625,15 +627,16 @@ pub async fn auth_write_back(
         return Err("Unsupported auth provider".to_owned());
     }
     // The raw credential JSON is decoded only in this native command and is
-    // handed immediately to the provider-specific atomic writer.
+    // handed immediately to the provider-specific atomic exporter.
     let payload = serde_json::from_str(&account.payload_json)
         .map(ProviderPayload::new)
         .map_err(|_| safe_error(ProviderError::InvalidPayload))?;
-    let path = CodexLogin::default_auth_json_path().map_err(safe_error)?;
     let result = CodexLogin::write_auth_json(&path, &payload).map_err(safe_error)?;
-    Ok(AuthWriteBackResult {
+    Ok(AuthExportResult {
         path: result.path.to_string_lossy().into_owned(),
-        backup_path: result.backup_path.to_string_lossy().into_owned(),
+        backup_path: result
+            .backup_path
+            .map(|path| path.to_string_lossy().into_owned()),
     })
 }
 
@@ -760,12 +763,12 @@ mod tests {
         })
         .unwrap();
         let logout = serde_json::to_string(&AuthLogoutResult { deleted: true }).unwrap();
-        let write_back = serde_json::to_string(&AuthWriteBackResult {
+        let export = serde_json::to_string(&AuthExportResult {
             path: "/tmp/auth.json".into(),
-            backup_path: "/tmp/auth.json.bak".into(),
+            backup_path: Some("/tmp/auth.json.bak".into()),
         })
         .unwrap();
-        for encoded in [list, mutation, logout, write_back] {
+        for encoded in [list, mutation, logout, export] {
             for forbidden in [
                 ACCESS,
                 REFRESH,
