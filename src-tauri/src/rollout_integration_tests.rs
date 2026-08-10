@@ -2216,7 +2216,7 @@ async fn codec_messages_to_chat_unknown_field_reject_zero_upstream() {
     let body = json!({
         "model": "m",
         "messages": [{"role": "user", "content": "u"}],
-        "metadata": {"user_id": "u1"}
+        "unknown": true
     });
     let audit = audited(
         DownstreamProtocol::Messages,

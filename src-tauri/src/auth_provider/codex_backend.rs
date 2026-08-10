@@ -291,6 +291,8 @@ pub fn validate_backend_request(body: &Value) -> Result<Value, ProviderError> {
         "instructions",
         "tools",
         "tool_choice",
+        "client_metadata",
+        "include",
         "stream",
         "store",
     ];
@@ -770,6 +772,74 @@ mod tests {
         assert!(body.get("max_output_tokens").is_none());
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn backend_request_preserves_client_metadata() {
+        let metadata = json!({
+            "x-codex-installation-id": "install-1",
+            "x-codex-window-id": "window-1",
+            "ws_request_header_x_openai_internal_codex_responses_lite": "true",
+            "future-field": {"nested": [1, 2, 3]}
+        });
+        let body = validate_backend_request(&json!({
+            "model": "gpt-5.6-luna",
+            "input": "hi",
+            "client_metadata": metadata,
+            "include": ["reasoning.encrypted_content"]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            body["client_metadata"]["x-codex-installation-id"],
+            "install-1"
+        );
+        assert_eq!(body["client_metadata"]["x-codex-window-id"], "window-1");
+        assert_eq!(
+            body["client_metadata"]["ws_request_header_x_openai_internal_codex_responses_lite"],
+            "true"
+        );
+        assert_eq!(
+            body["client_metadata"]["future-field"]["nested"],
+            json!([1, 2, 3])
+        );
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+    }
+
+    #[tokio::test]
+    async fn client_metadata_is_preserved_before_account_backend() {
+        let (provider, state) = provider(vec![]).await;
+        let account = account();
+        let payload = payload();
+        provider
+            .outbound(ProviderRequest {
+                account: &account,
+                payload: &payload,
+                body: &json!({
+                    "model": "gpt-5.6-luna",
+                    "input": "hi",
+                    "client_metadata": {
+                        "x-codex-window-id": "window-1",
+                        "future-field": {"enabled": true}
+                    }
+                }),
+                headers: &HeaderMap::new(),
+            })
+            .await
+            .unwrap();
+
+        let requests = state.requests.lock().await;
+        assert_eq!(
+            requests[0].1["client_metadata"]["x-codex-window-id"],
+            "window-1"
+        );
+        assert_eq!(
+            requests[0].1["client_metadata"]["future-field"]["enabled"],
+            true
+        );
+        assert!(requests[0].1.get("metadata").is_none());
     }
 
     #[tokio::test]
