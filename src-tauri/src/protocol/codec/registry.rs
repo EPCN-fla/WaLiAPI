@@ -121,11 +121,17 @@ impl CodecRegistry {
             non_stream: responses_codec::ResponsesMessagesNonStreamDecoder::boxed,
             streaming: responses_codec::ResponsesMessagesStreamDecoder::boxed,
         };
+        static V5: Direction = Direction {
+            encode: responses_codec::encode_responses_to_messages,
+            non_stream: responses_codec::MessagesResponsesNonStreamDecoder::boxed,
+            streaming: responses_codec::MessagesResponsesStreamDecoder::boxed,
+        };
         match (downstream, upstream) {
             (Downstream::ChatCompletions, Upstream::Messages) => Ok(&V1),
             (Downstream::Messages, Upstream::ChatCompletions) => Ok(&V2),
             (Downstream::ChatCompletions, Upstream::Responses) => Ok(&V3),
             (Downstream::Messages, Upstream::Responses) => Ok(&V4),
+            (Downstream::Responses, Upstream::Messages) => Ok(&V5),
             _ => Err(CodecError::new(format!(
                 "no codec registered for downstream {:?} -> upstream {:?}",
                 downstream, upstream
@@ -219,6 +225,21 @@ impl CodecRegistry {
         Self::prepare(
             Downstream::Messages,
             Upstream::Responses,
+            &Self::version(),
+            model,
+            request,
+        )
+    }
+
+    /// Prepare a Responses → Messages conversion (`responses_to_messages_v1`,
+    /// codex Responses downstream to an Anthropic Messages upstream).
+    pub fn responses_to_messages(
+        model: &str,
+        request: &serde_json::Value,
+    ) -> Result<PreparedConversion, UnsupportedFeatures> {
+        Self::prepare(
+            Downstream::Responses,
+            Upstream::Messages,
             &Self::version(),
             model,
             request,

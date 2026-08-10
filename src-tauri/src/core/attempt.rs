@@ -334,6 +334,11 @@ fn codec_direction(
             Upstream::Responses,
             "messages_to_responses_v1",
         )),
+        (EndpointKind::Responses, UpstreamProtocol::Anthropic) => Some((
+            Downstream::Responses,
+            Upstream::Messages,
+            "responses_to_messages_v1",
+        )),
         _ => None,
     }
 }

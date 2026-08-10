@@ -35,6 +35,9 @@ pub enum SseMode {
     ResponsesToChat,
     /// Responses SSE -> Chat SSE -> Messages SSE (composition only).
     ResponsesToMessages,
+    /// Messages SSE -> Chat SSE -> Responses SSE (downstream Responses, upstream
+    /// Messages — codex Responses routed to an Anthropic Messages upstream).
+    MessagesToResponses,
 }
 
 impl SseMode {
@@ -46,6 +49,7 @@ impl SseMode {
             SseMode::ResponsesViaChat => "responses_via_chat_v1",
             SseMode::ResponsesToChat => "responses_to_chat_v1",
             SseMode::ResponsesToMessages => "responses_to_messages_v1",
+            SseMode::MessagesToResponses => "messages_to_responses_v1",
         }
     }
 }
@@ -261,7 +265,8 @@ impl StreamPumpCore {
             SseMode::ChatToMessages
             | SseMode::MessagesToChat
             | SseMode::ResponsesToChat
-            | SseMode::ResponsesToMessages => {
+            | SseMode::ResponsesToMessages
+            | SseMode::MessagesToResponses => {
                 let mut out = Vec::new();
                 if !first_frame.is_empty() {
                     out.extend(core.encode_conversion_chunk(&first_frame)?);
@@ -408,7 +413,8 @@ impl StreamPumpCore {
             SseMode::ChatToMessages
             | SseMode::MessagesToChat
             | SseMode::ResponsesToChat
-            | SseMode::ResponsesToMessages => {
+            | SseMode::ResponsesToMessages
+            | SseMode::MessagesToResponses => {
                 out.extend_from_slice(&self.encode_conversion_chunk(bytes)?);
             }
             SseMode::ResponsesViaChat => {
@@ -436,7 +442,8 @@ impl StreamPumpCore {
             SseMode::ChatToMessages
             | SseMode::MessagesToChat
             | SseMode::ResponsesToChat
-            | SseMode::ResponsesToMessages => {
+            | SseMode::ResponsesToMessages
+            | SseMode::MessagesToResponses => {
                 let decoder = self.decoder.as_mut().ok_or_else(|| {
                     PumpError::Protocol("conversion stream is missing its decoder".to_string())
                 })?;
@@ -576,6 +583,14 @@ pub fn decoder_for(mode: SseMode, model: &str, message_id: &str) -> Option<Box<d
                 ),
             )
         }
+        SseMode::MessagesToResponses => {
+            let context = ConversionContext::new(message_id, model, true);
+            Some(
+                crate::protocol::codec::responses_codec::MessagesResponsesStreamDecoder::boxed(
+                    &context,
+                ),
+            )
+        }
         _ => None,
     }
 }
@@ -707,6 +722,62 @@ mod tests {
         let fin = core.finish().unwrap();
         let text = String::from_utf8_lossy(&fin);
         assert!(text.contains("message_stop"));
+        assert!(core.terminated());
+    }
+
+    #[test]
+    fn messages_to_responses_pump_converts_stream() {
+        // downstream Responses, upstream Messages: Messages SSE -> Responses SSE.
+        // The decoder itself emits the response.created preamble (exactly once);
+        // the pump must NOT add a second one.
+        let mut core = StreamPumpCore::new(
+            native_supervisor(),
+            SseMode::MessagesToResponses,
+            decoder_for(SseMode::MessagesToResponses, "up-model", ""),
+            Vec::new(),
+            Vec::new(),
+            "up-model".to_string(),
+        )
+        .unwrap();
+        let first = core.start().unwrap();
+        assert!(first.is_empty(), "no first frame until a chunk is fed");
+
+        let msg_start = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"up-model\",\"content\":[]}}\n\n";
+        let out = core.push(msg_start).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        // Count SSE event-header lines: the decoder emits response.created once;
+        // a handler-side preamble would push this to 2 (the JSON payload also
+        // carries "type":"response.created", hence line-based counting).
+        let created_events = text
+            .lines()
+            .filter(|l| l.trim() == "event: response.created")
+            .count();
+        assert_eq!(
+            created_events, 1,
+            "response.created must appear exactly once, no handler-side preamble"
+        );
+
+        let delta = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n";
+        let out = core.push(delta).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("response.output_text.delta"));
+
+        // A real Messages stream carries message_delta with stop_reason before
+        // message_stop; without it the codec fails closed (unknown finish reason).
+        let delta = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":2,\"output_tokens\":3}}\n\n";
+        let _ = core.push(delta).unwrap();
+        let stop = b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let _ = core.push(stop).unwrap();
+        let fin = core.finish().unwrap();
+        let fin_text = String::from_utf8_lossy(&fin);
+        let completed_events = fin_text
+            .lines()
+            .filter(|l| l.trim() == "event: response.completed")
+            .count();
+        assert_eq!(
+            completed_events, 1,
+            "response.completed must appear exactly once"
+        );
+        assert_eq!(fin_text.matches("[DONE]").count(), 1);
         assert!(core.terminated());
     }
 

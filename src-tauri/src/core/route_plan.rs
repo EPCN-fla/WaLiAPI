@@ -743,6 +743,13 @@ fn classify_channel(
                     UpstreamProtocol::OpenAI,
                     "responses".into(),
                 ))
+            } else if id.protocol == "anthropic" && has("messages") && flags.cross_protocol_codec {
+                // Codex Responses → Anthropic Messages conversion (design §4.3).
+                Some((
+                    GroupTier::Conversion,
+                    UpstreamProtocol::Anthropic,
+                    "messages".into(),
+                ))
             } else if debt && flags.cross_protocol_codec {
                 // Explicit legacy Responses→Chat debt.
                 Some((
@@ -1533,6 +1540,58 @@ mod tests {
         assert_eq!(plan.groups.len(), 1);
         assert_eq!(plan.groups[0].tier, GroupTier::Conversion);
         assert_eq!(plan.groups[0].upstream_endpoint, "chat_completions");
+    }
+
+    #[test]
+    fn responses_anthropic_channel_goes_to_conversion_messages() {
+        // A native anthropic channel (identity declares `messages`) serves a
+        // codex Responses request through the V5 Responses→Messages conversion
+        // (design §4.3): Conversion tier, Anthropic upstream, "messages" endpoint.
+        let anthropic = new_channel(
+            "a1",
+            "anthropic",
+            "anthropic",
+            "https://api.anthropic.com/v1",
+            &["messages"],
+            1,
+            1,
+        );
+        let key = api_key(&[], &[]);
+        let plan = authorize_and_plan(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            std::slice::from_ref(&anthropic),
+            &flags(true),
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap();
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].tier, GroupTier::Conversion);
+        assert_eq!(
+            plan.groups[0].upstream_protocol,
+            UpstreamProtocol::Anthropic
+        );
+        assert_eq!(plan.groups[0].upstream_endpoint, "messages");
+
+        // cross_protocol_codec OFF → the anthropic conversion group disappears
+        // and the Responses request fails with the 503 NoEndpointSupported.
+        let err = authorize_and_plan(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &[anthropic],
+            &flags(false),
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PlanError::NoEndpointSupported(EndpointKind::Responses, "m".into())
+        );
+        assert_eq!(err.http_status(), 503);
     }
 
     fn responses_debt_channel_goes_to_g2_not_g1() {

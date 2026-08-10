@@ -9,7 +9,7 @@
 use super::chat;
 use super::error::{FeatureKind, UnsupportedFeatures};
 use super::messages;
-use super::registry::CodecRegistry;
+use super::registry::{CodecRegistry, Downstream, Upstream};
 use serde_json::json;
 use serde_json::Value;
 
@@ -1434,4 +1434,73 @@ fn feature_kind_stable_codes() {
         "unsupported_feature.missing_tool_field"
     );
     assert_eq!(FeatureKind::Media.code(), "unsupported_media");
+}
+
+// ===========================================================================
+// responses_to_messages_v1 — V5 codex Responses → Anthropic Messages
+// ===========================================================================
+
+#[test]
+fn responses_to_messages_prepares_codex_request() {
+    // Real codex 0.147.0 request shape (§1.1) — must survive the V5 registry
+    // prepare path without a codex-field rejection.
+    let request = serde_json::json!({
+        "model": "deepseek-v4-flash-free",
+        "instructions": "You are a helpful assistant.",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+        ],
+        "tools": [
+            {"type": "function", "name": "list", "description": "list files", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "reasoning": {"effort": "high"},
+        "store": true,
+        "stream": true,
+        "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": "cache-key",
+        "client_metadata": {"turn": "1"}
+    });
+    let prepared = CodecRegistry::responses_to_messages("oc/deepseek-v4-flash-free", &request)
+        .expect("codex Responses request prepares through V5");
+    let out = &prepared.encoded_request;
+    assert_eq!(out["model"], "oc/deepseek-v4-flash-free");
+    assert_eq!(out["stream"], true);
+    assert_eq!(out["system"][0]["text"], "You are a helpful assistant.");
+    assert_eq!(out["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(out["thinking"], serde_json::json!({"type": "adaptive"}));
+    assert_eq!(out["max_tokens"], 32000);
+    assert_eq!(out["tools"][0]["name"], "list");
+    assert_eq!(out["tool_choice"], "auto");
+    // Dropped codex-only fields are recorded in the ConversionReport.
+    for pointer in ["/parallel_tool_calls", "/store", "/include"] {
+        assert!(
+            prepared.report.normalized.iter().any(|p| p == pointer),
+            "missing dropped-field record {pointer}"
+        );
+    }
+}
+
+#[test]
+fn responses_to_messages_unregistered_direction_still_errors() {
+    // (Responses, Responses) has no codec → fail closed, never a raw passthrough.
+    let e = CodecRegistry::prepare(
+        Downstream::Responses,
+        Upstream::Responses,
+        &CodecRegistry::version(),
+        "m",
+        &json!({ "model": "m", "input": [] }),
+    )
+    .unwrap_err();
+    // The top-level message is the fail-closed wrapper; the registry's
+    // "no codec registered" reason is carried on the single rejected field.
+    assert!(
+        e.fields
+            .first()
+            .map(|f| f.message.contains("no codec registered"))
+            .unwrap_or(false),
+        "unexpected error message: {}",
+        e.message
+    );
 }

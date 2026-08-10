@@ -59,6 +59,7 @@ fn sse_mode_for(attempt: &PreparedAttempt) -> SseMode {
         Some("chat_to_messages_v1") => SseMode::MessagesToChat,
         Some("messages_to_chat_v1") => SseMode::ChatToMessages,
         Some("responses_via_chat_v1") => SseMode::ResponsesViaChat,
+        Some("responses_to_messages_v1") => SseMode::MessagesToResponses,
         _ => SseMode::Native,
     }
 }
@@ -1380,6 +1381,33 @@ mod tests {
         assert_eq!(failure.status_code, Some(500));
         assert_eq!(failure.failure_class, FailureClass::CallerTerminal);
         assert!(!failure.message.is_empty());
+    }
+
+    #[test]
+    fn channel_codex_responses_uses_messages_to_responses_sse_mode() {
+        // Path ①: a codex Responses request routed to an Anthropic Messages
+        // channel carries codec_version "responses_to_messages_v1" and must map
+        // to the Messages→Responses SSE decode mode.
+        let base = PreparedAttempt {
+            channel_id: "ch-1".into(),
+            channel_name: "Claude".into(),
+            upstream_type: "channel".into(),
+            route_group: "responses_g1_conversion".into(),
+            upstream_protocol: "anthropic".into(),
+            upstream_endpoint: "messages".into(),
+            upstream_model: "m".into(),
+            native_base_url: "https://api.anthropic.com/v1".into(),
+            codec_version: None,
+            encoded_body: json!({"model":"m"}),
+            conversion_report: None,
+            is_retry: false,
+            attempt_no: 1,
+        };
+        assert_eq!(sse_mode_for(&base), SseMode::Native);
+
+        let mut v5 = base;
+        v5.codec_version = Some("responses_to_messages_v1".into());
+        assert_eq!(sse_mode_for(&v5), SseMode::MessagesToResponses);
     }
 
     fn now() -> String {
