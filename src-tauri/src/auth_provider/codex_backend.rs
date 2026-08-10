@@ -291,6 +291,12 @@ pub fn validate_backend_request(body: &Value) -> Result<Value, ProviderError> {
         "instructions",
         "tools",
         "tool_choice",
+        "parallel_tool_calls",
+        "reasoning",
+        "prompt_cache_key",
+        "stream_options",
+        "service_tier",
+        "text",
         "client_metadata",
         "include",
         "stream",
@@ -746,18 +752,65 @@ mod tests {
     }
 
     #[test]
-    fn backend_request_rejects_public_responses_controls() {
-        let error = validate_backend_request(&json!({
-            "model": "gpt-test",
-            "input": "hi",
+    fn backend_request_forwards_full_codex_request_body() {
+        // Real codex CLI 0.147.0 `wire_api = "responses"` top-level shape
+        // (spec §1.1): every field must pass through unchanged, with
+        // stream/store still forced.
+        let body = validate_backend_request(&json!({
+            "model": "gpt-5.6-luna",
+            "instructions": "You are a helpful assistant.",
+            "input": [
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "hi"}]}
+            ],
+            "tools": [
+                {"type": "function", "name": "f", "description": "f",
+                 "parameters": {"type": "object", "properties": {}}}
+            ],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
             "reasoning": {"effort": "high"},
-            "text": {"verbosity": "low"}
+            "store": true,
+            "stream": false,
+            "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": "cache-key-1",
+            "stream_options": {"include_usage": true},
+            "service_tier": "flex",
+            "text": {"verbosity": "low"},
+            "client_metadata": {"x-codex-installation-id": "install-1"}
         }))
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            ProviderError::UnsupportedFeatures { ref pointer } if pointer == "/reasoning"
-        ));
+        .unwrap();
+
+        // Newly-allowed codex fields are forwarded unchanged.
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(body["reasoning"], json!({"effort": "high"}));
+        assert_eq!(body["prompt_cache_key"], "cache-key-1");
+        assert_eq!(body["stream_options"], json!({"include_usage": true}));
+        assert_eq!(body["service_tier"], "flex");
+        assert_eq!(body["text"], json!({"verbosity": "low"}));
+
+        // Existing passthrough fields are retained too.
+        assert_eq!(body["instructions"], "You are a helpful assistant.");
+        assert_eq!(
+            body["input"],
+            json!([{"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}]}])
+        );
+        assert_eq!(
+            body["tools"],
+            json!([{"type": "function", "name": "f", "description": "f",
+                    "parameters": {"type": "object", "properties": {}}}])
+        );
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(
+            body["client_metadata"],
+            json!({"x-codex-installation-id": "install-1"})
+        );
+
+        // Stream/store are still forced regardless of what the client sent.
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
     }
 
     #[test]
