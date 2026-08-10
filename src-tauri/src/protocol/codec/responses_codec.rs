@@ -1445,14 +1445,14 @@ impl ChatToResponsesStreamDecoder {
             return Ok(Vec::new());
         }
         let json: Value = serde_json::from_str(&payload).map_err(|_| {
-            UnsupportedFeatures::single(
-                FeatureKind::UnknownEvent,
-                "/",
-                "Chat SSE data is not JSON",
-            )
+            UnsupportedFeatures::single(FeatureKind::UnknownEvent, "/", "Chat SSE data is not JSON")
         })?;
         // `codex.rate_limits` has no Chat/Responses representation — forward the
         // raw record so the downstream client still observes the quota signal.
+        // Forward-compatible defensive code: a standard Anthropic upstream never
+        // emits this OpenAI-specific event, and in the real Messages→Responses
+        // composition `MessagesSseState` rejects it before this branch could fire
+        // (only the direct unit tests below exercise it).
         if json.get("type").and_then(Value::as_str) == Some("codex.rate_limits") {
             return Ok(vec![String::from_utf8_lossy(record).into_owned()]);
         }
@@ -1526,14 +1526,16 @@ impl StreamDecoder for ChatToResponsesStreamDecoder {
             return Ok(Vec::new());
         }
         self.done = true;
-        output.extend(crate::protocol::responses::create_synthetic_completed_events(
-            &self.model,
-            &self.response_id,
-            &self.accumulated_content,
-            &self.state,
-            self.usage.input_tokens as i64,
-            self.usage.output_tokens as i64,
-        ));
+        output.extend(
+            crate::protocol::responses::create_synthetic_completed_events(
+                &self.model,
+                &self.response_id,
+                &self.accumulated_content,
+                &self.state,
+                self.usage.input_tokens as i64,
+                self.usage.output_tokens as i64,
+            ),
+        );
         output.push("data: [DONE]\n\n".to_string());
         Ok(output)
     }
@@ -1546,6 +1548,11 @@ impl StreamDecoder for ChatToResponsesStreamDecoder {
 /// Chat SSE → Responses SSE machine (mirror of `ResponsesMessagesStreamDecoder`
 /// in reverse).  There is intentionally no second direct Messages → Responses
 /// protocol machine.
+///
+/// The `codex.rate_limits` passthroughs in `feed`/`finish` are forward-compatible
+/// defensive code: a standard Anthropic upstream never emits this OpenAI-specific
+/// event, and `MessagesSseState` rejects it before the Messages leg could forward
+/// it here.
 pub struct MessagesResponsesStreamDecoder {
     messages: Box<dyn StreamDecoder + Send + Sync>,
     chat: ChatToResponsesStreamDecoder,
@@ -1613,10 +1620,14 @@ impl NonStreamDecoder for MessagesResponsesNonStreamDecoder {
 ///
 /// The request encoder stamps `chatcmpl_<uuid>` on the context; reusing that
 /// suffix keeps the Responses stream traceable to the request while retaining
-/// the `resp_` prefix the Responses API expects.
+/// the `resp_` prefix the Responses API expects.  When the streaming V5 path
+/// passes an empty request id, fall back to a fresh uuid so every stream gets
+/// unique, non-degenerate ids (mirrors the `resp_<uuid>` pattern used by the
+/// legacy ResponsesViaChat pump).
 fn responses_response_id(request_id: &str) -> String {
     match request_id.strip_prefix("chatcmpl_") {
         Some(suffix) if !suffix.is_empty() => format!("resp_{suffix}"),
+        _ if request_id.is_empty() => format!("resp_{}", uuid::Uuid::new_v4().simple()),
         _ => format!("resp_{request_id}"),
     }
 }
@@ -1681,6 +1692,20 @@ mod tests {
             decoder.feed(record.as_bytes()).unwrap(),
             vec![record.to_string()]
         );
+    }
+
+    #[test]
+    fn responses_response_id_falls_back_to_uuid_when_empty() {
+        // The streaming V5 path passes "" as the request id (driver.rs); this
+        // must not degenerate every stream to the same "resp_" / "msg_" / "rs_"
+        // ids.  Fall back to a fresh uuid so ids are unique and non-degenerate.
+        let id = responses_response_id("");
+        assert!(id.starts_with("resp_"), "unexpected id {id:?}");
+        assert!(id.len() > "resp_".len(), "degenerate id {id:?}");
+        assert_ne!(id, responses_response_id(""), "ids must be unique per call");
+        // A stamped request id keeps its existing behavior.
+        assert_eq!(responses_response_id("chatcmpl_abc"), "resp_abc");
+        assert_eq!(responses_response_id("other"), "resp_other");
     }
 
     #[test]
@@ -2120,7 +2145,9 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output
     fn messages_responses_stream_emits_full_event_sequence() {
         let context = ConversionContext::new("chatcmpl_1", "oc/m", true);
         let mut decoder = MessagesResponsesStreamDecoder::boxed(&context);
-        let mut events = decoder.feed(messages_responses_fixture_sse().as_bytes()).unwrap();
+        let mut events = decoder
+            .feed(messages_responses_fixture_sse().as_bytes())
+            .unwrap();
         events.extend(decoder.finish().unwrap());
         let joined = events.concat();
 
