@@ -814,6 +814,33 @@ mod tests {
     }
 
     #[test]
+    fn backend_request_rejects_non_null_unknown_fields() {
+        let error = validate_backend_request(&json!({
+            "model": "gpt-test",
+            "input": "hi",
+            "unknown_field": 1
+        }))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderError::UnsupportedFeatures { ref pointer } if pointer == "/unknown_field"
+        ));
+    }
+
+    #[test]
+    fn backend_request_discards_null_unknown_fields() {
+        let body = validate_backend_request(&json!({
+            "model": "gpt-test",
+            "input": "hi",
+            "unknown_null": null
+        }))
+        .unwrap();
+        assert!(body.get("unknown_null").is_none());
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+    }
+
+    #[test]
     fn backend_request_strips_max_output_tokens() {
         let body = validate_backend_request(&json!({
             "model": "gpt-test",
