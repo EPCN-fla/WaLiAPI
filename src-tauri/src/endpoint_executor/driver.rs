@@ -128,7 +128,7 @@ fn plan_error_response(status: u16, message: impl Into<String>) -> Response {
 
 /// Count Tokens is a planning probe rather than a billable/request-history
 /// event. All other routable endpoints retain normal observability logs.
-fn should_write_request_log(endpoint: EndpointKind) -> bool {
+pub(crate) fn should_write_request_log(endpoint: EndpointKind) -> bool {
     endpoint != EndpointKind::CountTokens
 }
 

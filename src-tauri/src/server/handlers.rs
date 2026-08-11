@@ -156,19 +156,22 @@ async fn maybe_route_plan(
         Err(e) => {
             let code = e.http_status();
             // I-3: a facade rejection (auth / no candidate / no endpoint)
-            // must be observable in the RequestLog on BOTH paths.
-            crate::endpoint_executor::driver::write_stream_precommit_failure_log(
-                repo,
-                key,
-                audited,
-                mode,
-                is_stream,
-                code,
-                &e.message(),
-                sanitized_log_body,
-                trace_id.as_deref(),
-            )
-            .await;
+            // must be observable in the RequestLog on BOTH paths, except for
+            // Count Tokens which is deliberately excluded from request history.
+            if crate::endpoint_executor::driver::should_write_request_log(endpoint) {
+                crate::endpoint_executor::driver::write_stream_precommit_failure_log(
+                    repo,
+                    key,
+                    audited,
+                    mode,
+                    is_stream,
+                    code,
+                    &e.message(),
+                    sanitized_log_body,
+                    trace_id.as_deref(),
+                )
+                .await;
+            }
             return Ok(Some(
                 (
                     StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),

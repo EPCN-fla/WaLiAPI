@@ -313,4 +313,32 @@ mod tests {
             .len()
             == 1);
     }
+
+    #[test]
+    fn native_chat_preserves_reasoning_text_in_assistant_history() {
+        let request = serde_json::json!({
+            "model": "client-model",
+            "stream": true,
+            "messages": [{
+                "role": "assistant",
+                "content": "answer",
+                "reasoning_text": "private reasoning to continue the tool loop",
+                "reasoning_content": "provider-compatible reasoning"
+            }]
+        });
+
+        let (encoded, _) = CHAT_IDENTITY
+            .encode_request(&request, "upstream-model")
+            .expect("native Chat request must be encodable");
+
+        assert_eq!(encoded["model"], "upstream-model");
+        assert_eq!(
+            encoded["messages"][0]["reasoning_text"],
+            "private reasoning to continue the tool loop"
+        );
+        assert_eq!(
+            encoded["messages"][0]["reasoning_content"],
+            "provider-compatible reasoning"
+        );
+    }
 }
