@@ -231,7 +231,11 @@ fn message_input(msg: &Value, p: &str) -> Result<Vec<Value>, UnsupportedFeatures
             }
             Some("thinking") if role == "assistant" => {
                 let text = b.get("thinking").and_then(Value::as_str).ok_or_else(|| bad(FeatureKind::UnknownBlock, format!("{bp}/thinking"), "thinking text is required"))?;
-                out.push(serde_json::json!({"type":"reasoning","summary":[{"type":"summary_text","text":text}]}));
+                // Responses reasoning replay uses `content/reasoning_text`.
+                // `summary` is a presentation summary and does not satisfy
+                // providers that require the original reasoning on the next
+                // thinking-mode turn.
+                out.push(serde_json::json!({"type":"reasoning","content":[{"type":"reasoning_text","text":text}]}));
             }
             Some("redacted_thinking") => {},
             Some(x)=>return Err(bad(FeatureKind::UnknownBlock,format!("{bp}/type"),format!("content type {x:?} has no direct mapping"))),
@@ -462,10 +466,20 @@ pub fn decode_response(
             }
             Some("reasoning") => {
                 let text = item
-                    .get("summary")
+                    // `content/reasoning_text` is the replayable Responses
+                    // reasoning representation. Retain `summary` only as a
+                    // compatibility fallback for older providers.
+                    .get("content")
+                    .or_else(|| item.get("summary"))
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
+                    .filter(|x| {
+                        matches!(
+                            x.get("type").and_then(Value::as_str),
+                            Some("reasoning_text" | "summary_text")
+                        )
+                    })
                     .filter_map(|x| x.get("text").and_then(Value::as_str))
                     .collect::<String>();
                 if !text.is_empty() {
@@ -643,6 +657,22 @@ impl ResponsesMessagesStream {
         })
     }
 
+    /// Resolve an event to an item index.  A present, parseable `output_index`
+    /// is authoritative; when omitted, the frame is mapped to the single open
+    /// block of the declared kind — the same inference the terminal `*.done`
+    /// frames already use.  `None` means the index is absent AND the target is
+    /// ambiguous or has no open matching block, so the caller must fail closed.
+    fn output_index_or_infer(&self, event: &Value, expected_kind: &str) -> Option<u64> {
+        if let Some(index) = Self::event_output_index(event) {
+            return Some(index);
+        }
+        let mut matching = self.blocks.iter().filter_map(|(index, block)| {
+            (block.kind == expected_kind && !block.closed).then_some(*index)
+        });
+        let first = matching.next()?;
+        matching.next().is_none().then_some(first)
+    }
+
     /// Resolve a terminal text/reasoning frame to its open block.  Omitting an
     /// index is unambiguous only when exactly one matching block is open.
     fn output_index_for_block(
@@ -813,7 +843,13 @@ impl ResponsesMessagesStream {
             }
             "response.output_text.delta" => {
                 self.start(&mut out);
-                let ix = Self::event_output_index(&e).unwrap_or(0);
+                let ix = self.output_index_or_infer(&e, "message").ok_or_else(|| {
+                    bad(
+                        FeatureKind::UnknownEvent,
+                        "/output_index",
+                        "text delta requires output_index or one open message item",
+                    )
+                })?;
                 let delta = e.get("delta").and_then(Value::as_str).ok_or_else(|| {
                     bad(
                         FeatureKind::UnknownEvent,
@@ -840,7 +876,13 @@ impl ResponsesMessagesStream {
             }
             "response.reasoning_summary_text.delta" => {
                 self.start(&mut out);
-                let ix = Self::event_output_index(&e).unwrap_or(0);
+                let ix = self.output_index_or_infer(&e, "reasoning").ok_or_else(|| {
+                    bad(
+                        FeatureKind::UnknownEvent,
+                        "/output_index",
+                        "reasoning delta requires output_index or one open reasoning item",
+                    )
+                })?;
                 let delta = e.get("delta").and_then(Value::as_str).ok_or_else(|| {
                     bad(
                         FeatureKind::UnknownEvent,
@@ -936,7 +978,15 @@ impl ResponsesMessagesStream {
                 self.emit_completed_text(ix, "reasoning", text, true, &mut out)?;
             }
             "response.function_call_arguments.delta" => {
-                let ix = Self::event_output_index(&e).unwrap_or(0);
+                let ix = self
+                    .output_index_or_infer(&e, "function_call")
+                    .ok_or_else(|| {
+                        bad(
+                            FeatureKind::UnknownEvent,
+                            "/output_index",
+                            "argument delta requires output_index or one open function item",
+                        )
+                    })?;
                 let delta = e.get("delta").and_then(Value::as_str).unwrap_or("");
                 let b = self.blocks.get_mut(&ix).ok_or_else(|| {
                     bad(
@@ -1152,13 +1202,15 @@ impl ResponsesMessagesStream {
         expected_part_type: &str,
         part_index_field: &str,
     ) -> Result<u64, UnsupportedFeatures> {
-        let ix = Self::event_output_index(event).ok_or_else(|| {
-            bad(
-                FeatureKind::UnknownEvent,
-                "/output_index",
-                "part lifecycle requires output_index",
-            )
-        })?;
+        let ix = self
+            .output_index_or_infer(event, expected_kind)
+            .ok_or_else(|| {
+                bad(
+                    FeatureKind::UnknownEvent,
+                    "/output_index",
+                    "part lifecycle requires output_index or one open matching item",
+                )
+            })?;
         if event.get(part_index_field).and_then(Value::as_u64) != Some(0) {
             return Err(bad(
                 FeatureKind::UnknownEvent,
@@ -1296,6 +1348,35 @@ mod tests {
             .iter()
             .any(|feature| feature == "unsupported_feature.unknown_block"));
     }
+
+    #[test]
+    fn request_replays_thinking_as_reasoning_text_content() {
+        let (out, _) = encode_request(
+            &serde_json::json!({"messages":[{
+                "role":"assistant",
+                "content":[{"type":"thinking","thinking":"replay me"}]
+            }]}),
+            "m",
+        )
+        .unwrap();
+        assert_eq!(out["input"][0]["type"], "reasoning");
+        assert_eq!(out["input"][0]["content"][0]["type"], "reasoning_text");
+        assert_eq!(out["input"][0]["content"][0]["text"], "replay me");
+
+        let context = ConversionContext::new("msg_1", "m", false);
+        let decoded = decode_response(
+            &serde_json::json!({
+                "status":"completed",
+                "output":[{"type":"reasoning","content":[{"type":"reasoning_text","text":"replay me"}]}],
+                "usage":{"input_tokens":1,"output_tokens":1}
+            }),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(decoded.body["content"][0]["type"], "thinking");
+        assert_eq!(decoded.body["content"][0]["thinking"], "replay me");
+    }
+
     #[test]
     fn response_preserves_function_id() {
         let c = ConversionContext::new("x", "m", false);
@@ -1398,6 +1479,55 @@ mod tests {
         events.extend(decoder.finish().unwrap());
         let output = events.concat();
         assert!(output.contains("\"index\":1"));
+        assert!(output.contains("message_stop"));
+    }
+
+    #[test]
+    fn stream_infers_delta_index_when_reasoning_precedes_message() {
+        // A reasoning item at index 0 and a message at index 1: a text delta
+        // that omits `output_index` must resolve to the open message block, not
+        // default to 0 and mis-target the reasoning block.
+        let source = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"think\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.done\",\"output_index\":0,\"text\":\"think\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"text\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n"
+        );
+        let context = ConversionContext::new("msg_1", "m", true);
+        let mut decoder = ResponsesMessagesStream::new(&context);
+        let mut events = decoder.feed(source.as_bytes()).unwrap();
+        events.extend(decoder.finish().unwrap());
+        let output = events.concat();
+        assert!(output.contains("hello"), "text must reach the message item:\n{output}");
+        assert!(output.contains("\"index\":1"), "text delta must target item 1:\n{output}");
+        assert!(output.contains("message_stop"));
+    }
+
+    #[test]
+    fn stream_infers_part_lifecycle_index_when_omitted() {
+        // A `content_part.done` frame that omits `output_index` after the item
+        // was identified by an earlier lifecycle frame must resolve to the open
+        // message item instead of failing closed.
+        let source = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.content_part.done\",\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"hi\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n"
+        );
+        let context = ConversionContext::new("msg_1", "m", true);
+        let mut decoder = ResponsesMessagesStream::new(&context);
+        let mut events = decoder.feed(source.as_bytes()).unwrap();
+        events.extend(decoder.finish().unwrap());
+        let output = events.concat();
+        assert!(output.contains("hi"), "part text must reach the message item:\n{output}");
         assert!(output.contains("message_stop"));
     }
 

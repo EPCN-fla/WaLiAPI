@@ -114,6 +114,9 @@ impl UnsupportedFeatures {
                     s.push_str("; ");
                 }
                 s.push_str(&format!("{} ({})", f.pointer, f.code));
+                if !f.message.is_empty() {
+                    s.push_str(&format!(": {}", f.message));
+                }
             }
             s
         };
