@@ -1754,7 +1754,10 @@ mod chat_downstream_via_responses_channel {
             text.contains(r#""finish_reason":"stop""#),
             "terminal finish_reason"
         );
-        assert!(text.contains(r#""prompt_tokens":12"#), "usage prompt tokens");
+        assert!(
+            text.contains(r#""prompt_tokens":12"#),
+            "usage prompt tokens"
+        );
         assert!(
             text.contains(r#""completion_tokens":15"#),
             "usage completion tokens"

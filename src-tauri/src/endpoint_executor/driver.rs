@@ -18,7 +18,7 @@ use crate::core::attempt::{
     build_prepared_attempt, AttemptFailure, AttemptFlow, FailureClass, FlowStep,
 };
 use crate::core::channel_identity::{resolve_channel_identity, ChannelIdentityRow};
-use crate::core::route_plan::{RouteCandidate, RoutePlan};
+use crate::core::route_plan::{EndpointKind, RouteCandidate, RoutePlan};
 use crate::db::models::{ApiKey, Channel, RequestLog};
 use crate::db::repository::Repository;
 use crate::endpoint_executor::sse::StreamPumpCore;
@@ -124,6 +124,12 @@ fn plan_error_response(status: u16, message: impl Into<String>) -> Response {
         })),
     )
         .into_response()
+}
+
+/// Count Tokens is a planning probe rather than a billable/request-history
+/// event. All other routable endpoints retain normal observability logs.
+fn should_write_request_log(endpoint: EndpointKind) -> bool {
+    endpoint != EndpointKind::CountTokens
 }
 
 /// Candidate context retained for failures that exhaust a streaming plan before
@@ -245,17 +251,22 @@ pub(crate) async fn route_plan_response_with_auth_service(
     .await;
     let duration_ms = started.elapsed().as_millis() as u64;
 
-    write_non_stream_log(
-        repo,
-        key,
-        audited,
-        mode,
-        &execution,
-        duration_ms,
-        sanitized_log_body,
-        trace_id,
-    )
-    .await;
+    // Count Tokens is a context-planning probe, not model usage. Keep it out
+    // of request history (including route-plan failures) while preserving the
+    // actual routing and response behavior.
+    if should_write_request_log(endpoint) {
+        write_non_stream_log(
+            repo,
+            key,
+            audited,
+            mode,
+            &execution,
+            duration_ms,
+            sanitized_log_body,
+            trace_id,
+        )
+        .await;
+    }
 
     let code = StatusCode::from_u16(execution.status).unwrap_or(StatusCode::BAD_GATEWAY);
     // T06 M-2: forward safely-passthrough upstream response headers (e.g.
@@ -1325,6 +1336,14 @@ mod tests {
         assert!(supports_count_tokens(&with));
         let without = channel(Some("anthropic"), &["messages"]);
         assert!(!supports_count_tokens(&without));
+    }
+
+    #[test]
+    fn count_tokens_is_excluded_from_request_logs() {
+        assert!(!should_write_request_log(EndpointKind::CountTokens));
+        assert!(should_write_request_log(EndpointKind::Messages));
+        assert!(should_write_request_log(EndpointKind::ChatCompletions));
+        assert!(should_write_request_log(EndpointKind::Responses));
     }
 
     /// T06 I-4 (leader adjudication): a legacy revision-0 `type == "claude"`

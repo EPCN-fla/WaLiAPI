@@ -2200,28 +2200,13 @@ pub async fn handle_messages_count_tokens(
         Ok(audited) => audited,
         Err(response) => return response,
     };
-    let security_result = audited.audit_result.clone();
     let forward_json = audited.forward_json.clone();
     let sanitized_log_json = audited.sanitized_log_json.clone();
-    if matches!(security_result.action, security::SecurityAction::Block) {
-        record_anthropic_outcome(
-            repo.clone(),
-            &key,
-            None,
-            model,
-            None,
-            &sanitized_log_json,
-            &security_result,
-            false,
-            451,
-            security_result.blocked_reason.clone(),
-            None,
-        )
-        .await;
+    if matches!(audited.audit_result.action, security::SecurityAction::Block) {
         return anthropic_error(
             StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
             "api_error",
-            security_result.summary,
+            audited.audit_result.summary.clone(),
         );
     }
     // T06: when `new_routeplan` is ON, route CountTokens through the facade
@@ -2289,23 +2274,6 @@ pub async fn handle_messages_count_tokens(
     if let Some(response) = last_error {
         return stored_native_response(response);
     }
-    record_anthropic_outcome(
-        repo,
-        &key,
-        None,
-        model,
-        None,
-        &sanitized_log_json,
-        &security_result,
-        false,
-        501,
-        Some(
-            "Exact Anthropic count_tokens is unavailable without a native Anthropic channel"
-                .to_string(),
-        ),
-        None,
-    )
-    .await;
     anthropic_error(
         StatusCode::NOT_IMPLEMENTED,
         "api_error",

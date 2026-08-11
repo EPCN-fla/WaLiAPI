@@ -166,26 +166,54 @@ impl IdentityStreamDecoder {
         }
         merged.usage_unknown = !(self.saw_input_usage && self.saw_output_usage);
     }
+
+    /// Once `[DONE]` has been forwarded, the downstream response is complete.
+    /// Some OpenAI-compatible upstreams nevertheless flush further records.
+    /// They cannot be delivered to the client, but a well-formed usage object
+    /// can still improve the audit log. Parsing failures are deliberately
+    /// ignored here: post-terminal bytes must not reverse a completed stream
+    /// into a gateway failure.
+    fn capture_trailing_usage(&mut self, record: &[u8]) {
+        let Ok(payload) = sse::parse_data_payload(record) else {
+            return;
+        };
+        let Ok(event) = serde_json::from_str::<Value>(&payload) else {
+            return;
+        };
+        self.merge_event_usage(&event);
+    }
 }
 
 impl StreamDecoder for IdentityStreamDecoder {
     fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, DecodeError> {
-        if self.done && !bytes.is_empty() {
-            return Err(DecodeError::new(
-                "/",
-                "SSE data arrived after terminal record",
-            ));
-        }
         self.pending.extend_from_slice(bytes);
         let mut output = Vec::new();
         while let Some(end) = sse::record_end(&self.pending) {
             let record: Vec<u8> = self.pending.drain(..end).collect();
+            // `[DONE]` is already on its way to the client, so no later record
+            // can be usefully or safely delivered. Discard any non-compliant
+            // trailing upstream event instead of reporting a 502 for a stream
+            // that was successfully completed downstream.
+            if self.done {
+                self.capture_trailing_usage(&record);
+                log::warn!("discarded an upstream SSE record after terminal [DONE]");
+                continue;
+            }
             self.consume_record(&record)?;
             output.push(
                 String::from_utf8(record).map_err(|_| {
                     DecodeError::new("/", "upstream SSE record was not valid UTF-8")
                 })?,
             );
+        }
+        if self.done && !self.pending.is_empty() {
+            // Do not retain an unterminated trailing fragment indefinitely, or
+            // turn a valid completed stream into `ended mid-record` at EOF.
+            log::warn!(
+                "discarded {} trailing upstream bytes after terminal [DONE]",
+                self.pending.len()
+            );
+            self.pending.clear();
         }
         Ok(output)
     }
@@ -235,3 +263,54 @@ pub(crate) fn parse_usage(protocol: Protocol, body: &Value) -> Option<Usage> {
 pub static CHAT_IDENTITY: IdentityDirection = IdentityDirection::new(Protocol::Chat);
 pub static MESSAGES_IDENTITY: IdentityDirection = IdentityDirection::new(Protocol::Messages);
 pub static RESPONSES_IDENTITY: IdentityDirection = IdentityDirection::new(Protocol::Responses);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decoder() -> IdentityStreamDecoder {
+        IdentityStreamDecoder {
+            protocol: Protocol::Chat,
+            pending: Vec::new(),
+            usage: None,
+            saw_input_usage: false,
+            saw_output_usage: false,
+            done: false,
+        }
+    }
+
+    #[test]
+    fn ignores_empty_sse_records_after_done() {
+        let mut decoder = decoder();
+        assert_eq!(decoder.feed(b"data: [DONE]\n\n").unwrap().len(), 1);
+
+        assert!(decoder.feed(b": keepalive\n\n").unwrap().is_empty());
+        assert!(decoder.feed(b"event: ping\n\n").unwrap().is_empty());
+        assert!(decoder.finish().is_ok());
+    }
+
+    #[test]
+    fn discards_any_trailing_record_after_done_but_preserves_its_usage() {
+        let mut decoder = decoder();
+        decoder.feed(b"data: [DONE]\n\n").unwrap();
+
+        assert!(decoder
+            .feed(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"extra\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n"
+            )
+            .unwrap()
+            .is_empty());
+        assert_eq!(decoder.usage().unwrap().input_tokens, 2);
+        assert_eq!(decoder.usage().unwrap().output_tokens, 3);
+    }
+
+    #[test]
+    fn discards_response_content_after_done_even_in_same_network_chunk() {
+        let mut decoder = decoder();
+        assert!(decoder
+            .feed(b"data: [DONE]\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"extra\"}}]}\n\n")
+            .unwrap()
+            .len()
+            == 1);
+    }
+}
