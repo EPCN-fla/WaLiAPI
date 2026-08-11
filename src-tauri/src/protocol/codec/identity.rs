@@ -47,6 +47,16 @@ impl CodecDirection for IdentityDirection {
             )
         })?;
         object.insert("model".to_owned(), Value::String(mapped_model.to_owned()));
+        // Downstream non-stream requests usually omit `stream` (false is the
+        // API default).  Some upstreams (e.g. anthropic proxies) stream by
+        // default when the field is absent, which desyncs the native non-stream
+        // facade into an "undecodable body" 502.  Pin the contract explicitly
+        // for every protocol: `stream: false` is semantically identical to
+        // omitting it on providers that respect the field, and forces
+        // default-streaming upstreams into non-stream mode.
+        if !object.contains_key("stream") {
+            object.insert("stream".to_owned(), Value::Bool(false));
+        }
         let request_id = request
             .get("id")
             .and_then(Value::as_str)
@@ -340,5 +350,39 @@ mod tests {
             encoded["messages"][0]["reasoning_content"],
             "provider-compatible reasoning"
         );
+    }
+
+    #[test]
+    fn native_messages_omitted_stream_is_pinned_false() {
+        // A downstream non-stream Messages request omits `stream`; the identity
+        // codec must pin `stream: false` so default-streaming upstreams (e.g.
+        // anthropic proxies) do not return SSE into the non-stream facade.
+        let request = serde_json::json!({
+            "model": "client-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let (encoded, _) = MESSAGES_IDENTITY
+            .encode_request(&request, "upstream-model")
+            .expect("native Messages request must be encodable");
+
+        assert_eq!(encoded["stream"], false);
+        assert_eq!(encoded["model"], "upstream-model");
+    }
+
+    #[test]
+    fn native_explicit_stream_true_is_preserved() {
+        let request = serde_json::json!({
+            "model": "client-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let (encoded, _) = MESSAGES_IDENTITY
+            .encode_request(&request, "upstream-model")
+            .expect("native Messages request must be encodable");
+
+        assert_eq!(encoded["stream"], true);
     }
 }
