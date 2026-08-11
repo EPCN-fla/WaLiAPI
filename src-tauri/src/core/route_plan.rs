@@ -722,6 +722,17 @@ fn classify_channel(
                     UpstreamProtocol::Anthropic,
                     "messages".into(),
                 ))
+            } else if id.protocol == "openai" && has("responses") && flags.cross_protocol_codec {
+                // opencode Chat → OpenAI Responses conversion.  This keeps
+                // OpenAI-compatible channels that expose only `/responses`
+                // reachable from Chat clients.  A channel that also declares
+                // `chat_completions` stays native (first branch), never
+                // silently downgraded to the Responses hop.
+                Some((
+                    GroupTier::Conversion,
+                    UpstreamProtocol::OpenAI,
+                    "responses".into(),
+                ))
             } else {
                 None
             }
@@ -2363,5 +2374,72 @@ mod tests {
         assert_eq!(plan.groups[0].tier, GroupTier::Conversion);
         assert_eq!(plan.groups[0].upstream_protocol, UpstreamProtocol::OpenAI);
         assert_eq!(plan.groups[0].upstream_endpoint, "responses");
+    }
+
+    /// An opencode Chat request must be able to use an OpenAI-compatible
+    /// channel that declares only a native `/responses` endpoint.  The codec
+    /// matrix already implements Chat→Responses; this guards the planner
+    /// branch that makes that conversion reachable.
+    #[test]
+    fn chat_request_serves_openai_responses_only_channel() {
+        let mut deepseek = new_channel(
+            "deepseek",
+            "openai",
+            "deepseek",
+            "https://api.deepseek.com",
+            &["responses"],
+            1,
+            1,
+        );
+        deepseek.models = json!(["deepseek-v4-flash"]).to_string();
+        let key = api_key(&[], &[]);
+        let plan = authorize_and_plan(
+            &key,
+            "deepseek-v4-flash",
+            EndpointKind::ChatCompletions,
+            std::slice::from_ref(&deepseek),
+            &flags(true),
+            &json!({}),
+            &mut seeded(),
+        )
+        .expect("chat request should route through the Chat→Responses codec");
+
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].tier, GroupTier::Conversion);
+        assert_eq!(plan.groups[0].upstream_protocol, UpstreamProtocol::OpenAI);
+        assert_eq!(plan.groups[0].upstream_endpoint, "responses");
+    }
+
+    /// A channel declaring both `chat_completions` and `responses` must stay
+    /// native for a Chat request; the Responses hop is only a conversion
+    /// fallback, never a silent downgrade.
+    #[test]
+    fn chat_request_prefers_native_chat_over_responses_conversion() {
+        let mut deepseek = new_channel(
+            "deepseek",
+            "openai",
+            "deepseek",
+            "https://api.deepseek.com",
+            &["chat_completions", "responses"],
+            1,
+            1,
+        );
+        deepseek.models = json!(["deepseek-v4-flash"]).to_string();
+        let key = api_key(&[], &[]);
+        let plan = authorize_and_plan(
+            &key,
+            "deepseek-v4-flash",
+            EndpointKind::ChatCompletions,
+            std::slice::from_ref(&deepseek),
+            &flags(true),
+            &json!({}),
+            &mut seeded(),
+        )
+        .expect("chat request should stay native on a dual-endpoint channel");
+
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].tier, GroupTier::Native);
+        assert_eq!(plan.groups[0].upstream_protocol, UpstreamProtocol::OpenAI);
+        assert_eq!(plan.groups[0].upstream_endpoint, "chat_completions");
     }
 }

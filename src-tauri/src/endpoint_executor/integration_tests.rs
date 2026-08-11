@@ -1583,3 +1583,182 @@ async fn stream_precommit_failure_writes_request_log() {
         "streaming pre-commit failure must be flagged is_stream=1"
     );
 }
+
+// ── chat_downstream_via_responses_channel ──────────────────────────────────
+
+/// End-to-end: an opencode Chat request routed to an OpenAI-compatible channel
+/// that exposes only a native `/responses` endpoint (conversion group
+/// `chat_to_responses_v1`).  Drives the REAL streaming facade
+/// (`authorize_and_plan` + `route_stream_plan`) against a local axum mock
+/// upstream speaking Responses SSE.  Asserts:
+///   * the planner forms a single Conversion group at the `responses` endpoint;
+///   * the mock received the codec-encoded Responses body (mapped upstream
+///     model, `input` array, `stream:true`);
+///   * the downstream body is Chat-completion SSE with the text deltas, the
+///     usage frame, `finish_reason:"stop"`, and a terminal `[DONE]`.
+mod chat_downstream_via_responses_channel {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::{
+        body::Bytes,
+        extract::State,
+        http::{header, StatusCode},
+        response::{IntoResponse, Response},
+        routing::post,
+        Router,
+    };
+    use serde_json::json;
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::endpoint_executor::driver::route_stream_plan;
+
+    #[derive(Clone)]
+    struct MockState {
+        hits: Arc<AtomicUsize>,
+        seen: Arc<Mutex<Vec<Value>>>,
+    }
+
+    /// Mock OpenAI Responses upstream: records the request body, then replies
+    /// with a text-only Responses SSE stream.
+    async fn responses(State(state): State<MockState>, body: Bytes) -> Response {
+        let req: Value = serde_json::from_slice(&body).unwrap();
+        state.hits.fetch_add(1, Ordering::SeqCst);
+        state.seen.lock().await.push(req.clone());
+        (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            responses_sse().to_string(),
+        )
+            .into_response()
+    }
+
+    fn responses_sse() -> &'static str {
+        concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"up/m\"}}\n\n",
+            "event: response.in_progress\n",
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_1\",\"model\":\"up/m\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hello\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\" world\"}\n\n",
+            "event: response.output_text.done\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"text\":\"Hello world\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"up/m\",\"status\":\"completed\",\"output\":[{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello world\"}]}],\"usage\":{\"input_tokens\":12,\"output_tokens\":15}}}\n\n",
+            "data: [DONE]\n\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn chat_downstream_via_responses_channel_upstream() {
+        let state = MockState {
+            hits: Arc::new(AtomicUsize::new(0)),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/responses", post(responses))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let pool = fresh_db().await;
+        let repo = Arc::new(Repository::new(pool.clone()));
+        let mut ch = channel("r1", "openai", "deepseek", &base, &["responses"], 1);
+        ch.model_mapping = json!({ "m": "up/m" }).to_string();
+        insert_channels(&pool, &[ch]).await;
+
+        let key = api_key();
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        });
+        let audited = audited(
+            DownstreamProtocol::ChatCompletions,
+            "chat_completions",
+            "m",
+            body.clone(),
+        );
+
+        let channels = repo.get_enabled_channels().await.unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let plan = authorize_and_plan(
+            &key,
+            "m",
+            EndpointKind::ChatCompletions,
+            &channels,
+            &flags(true),
+            &body,
+            &mut rng,
+        )
+        .expect("chat→responses conversion plan");
+
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].tier.as_str(), "conversion");
+        assert_eq!(plan.groups[0].candidates[0].candidate.id(), "r1");
+        assert_eq!(plan.groups[0].upstream_endpoint, "responses");
+
+        let resp = route_stream_plan(
+            plan,
+            &audited,
+            &key,
+            &[],
+            "chat",
+            &repo,
+            &serde_json::to_string(&audited.sanitized_log_json).unwrap_or_default(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "chat→responses stream must commit a 200"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+
+        // ── upstream body: codec-encoded Responses request ──────────────────
+        assert_eq!(
+            state.hits.load(Ordering::SeqCst),
+            1,
+            "exactly one upstream call"
+        );
+        let seen = state.seen.lock().await;
+        assert_eq!(seen.len(), 1);
+        let req = &seen[0];
+        assert_eq!(req["model"], "up/m", "mapped upstream model");
+        assert_eq!(req["stream"], true);
+        assert_eq!(req["input"][0]["type"], "message");
+        assert_eq!(req["input"][0]["role"], "user");
+        assert_eq!(req["input"][0]["content"][0]["text"], "hi");
+        drop(seen);
+
+        // ── downstream body: Chat-completion SSE ────────────────────────────
+        assert!(
+            text.contains(r#""content":"Hello""#),
+            "first text delta missing:\n{text}"
+        );
+        assert!(text.contains(r#""content":" world""#), "second text delta");
+        assert!(
+            text.contains(r#""finish_reason":"stop""#),
+            "terminal finish_reason"
+        );
+        assert!(text.contains(r#""prompt_tokens":12"#), "usage prompt tokens");
+        assert!(
+            text.contains(r#""completion_tokens":15"#),
+            "usage completion tokens"
+        );
+        assert!(text.contains("data: [DONE]"), "terminal [DONE]");
+    }
+}

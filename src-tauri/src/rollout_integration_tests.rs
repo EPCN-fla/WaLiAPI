@@ -2579,10 +2579,12 @@ async fn performance_100_channel_filter_and_grouping_bounded() {
     );
     // Every matching channel is present across groups.
     let total: usize = plan.groups.iter().map(|g| g.candidates.len()).sum();
-    // 100 channels, every third is Anthropic (conversion for Chat), the rest
-    // native (chat_completions) — responses-only channels are filtered out.
+    // 100 channels: every third Anthropic is chat→messages conversion, the
+    // next is native chat_completions, the last is an OpenAI responses-only
+    // channel served through the chat→responses conversion.  No channel is
+    // filtered out for a Chat request.
     let native_count = (0..100).filter(|i| i % 3 == 1).count();
-    let conv_count = (0..100).filter(|i| i % 3 == 0).count();
+    let conv_count = (0..100).filter(|i| i % 3 == 0 || i % 3 == 2).count();
     assert_eq!(total, native_count + conv_count);
     assert!(elapsed_ms > 0);
 }
