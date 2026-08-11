@@ -134,6 +134,31 @@ fn flags(codec_on: bool) -> FeatureFlags {
     }
 }
 
+/// Split a downstream SSE body into (event, data) frames.  A data-only
+/// `[DONE]` frame is labelled `"[DONE]"` so ordering assertions can treat it
+/// as an event; other data-only frames get an empty event name.
+fn sse_frames(text: &str) -> Vec<(String, String)> {
+    text.split("\n\n")
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(|f| {
+            let mut event = String::new();
+            let mut data = String::new();
+            for line in f.lines() {
+                if let Some(rest) = line.strip_prefix("event:").map(str::trim) {
+                    event = rest.to_string();
+                } else if let Some(rest) = line.strip_prefix("data:").map(str::trim) {
+                    data = rest.to_string();
+                }
+            }
+            if event.is_empty() && data == "[DONE]" {
+                event = "[DONE]".to_string();
+            }
+            (event, data)
+        })
+        .collect()
+}
+
 /// Insert the enabled channels into the pool so the facade's
 /// `get_enabled_channels` sees them.
 async fn insert_channels(pool: &sqlx::SqlitePool, channels: &[Channel]) {
@@ -897,31 +922,6 @@ mod codex_responses_anthropic {
         })
     }
 
-    /// Split a downstream SSE body into (event, data) frames.  A data-only
-    /// `[DONE]` frame is labelled `"[DONE]"` so ordering assertions can treat it
-    /// as an event; other data-only frames get an empty event name.
-    fn sse_frames(text: &str) -> Vec<(String, String)> {
-        text.split("\n\n")
-            .map(str::trim)
-            .filter(|f| !f.is_empty())
-            .map(|f| {
-                let mut event = String::new();
-                let mut data = String::new();
-                for line in f.lines() {
-                    if let Some(rest) = line.strip_prefix("event:").map(str::trim) {
-                        event = rest.to_string();
-                    } else if let Some(rest) = line.strip_prefix("data:").map(str::trim) {
-                        data = rest.to_string();
-                    }
-                }
-                if event.is_empty() && data == "[DONE]" {
-                    event = "[DONE]".to_string();
-                }
-                (event, data)
-            })
-            .collect()
-    }
-
     #[tokio::test]
     async fn responses_downstream_via_anthropic_messages_upstream() {
         let state = MockState {
@@ -1126,6 +1126,284 @@ mod codex_responses_anthropic {
         assert_eq!(out["output"][0]["content"][0]["text"], "Hello world");
         assert_eq!(out["usage"]["input_tokens"], 12);
         assert_eq!(out["usage"]["output_tokens"], 15);
+    }
+}
+
+// ── responses_via_chat (Cell 5) ────────────────────────────────────────────
+
+/// End-to-end Cell 5: a codex Responses request routed to a chat-only OpenAI
+/// channel (conversion group `responses_via_chat_v1`).  Drives the REAL
+/// streaming facade against a local axum mock upstream speaking OpenAI Chat
+/// Completions SSE.  This is the legacy Responses→Chat debt path that
+/// `attempt.rs:275` builds via `responses_to_openai` (not the codec registry),
+/// and had NO executor/facade coverage before these tests.
+mod responses_via_chat {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::{
+        body::Bytes,
+        extract::State,
+        http::{header, StatusCode},
+        response::{IntoResponse, Response},
+        routing::post,
+        Router,
+    };
+    use serde_json::json;
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::endpoint_executor::driver::route_stream_plan;
+
+    #[derive(Clone)]
+    struct MockState {
+        hits: Arc<AtomicUsize>,
+        seen: Arc<Mutex<Vec<Value>>>,
+    }
+
+    /// Mock OpenAI Chat Completions upstream: records the request body, then
+    /// replies with a small chat SSE stream when stream=true, or a single chat
+    /// JSON document otherwise.
+    async fn chat(State(state): State<MockState>, body: Bytes) -> Response {
+        let req: Value = serde_json::from_slice(&body).unwrap();
+        state.hits.fetch_add(1, Ordering::SeqCst);
+        state.seen.lock().await.push(req.clone());
+        if req.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+            return chat_sse().into_response();
+        }
+        (
+            [(header::CONTENT_TYPE, "application/json")],
+            chat_json().to_string(),
+        )
+            .into_response()
+    }
+
+    fn chat_sse() -> &'static str {
+        concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n",
+            "data: [DONE]\n\n"
+        )
+    }
+
+    /// Non-stream chat response matching the SSE fixture above.
+    fn chat_json() -> Value {
+        serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hello world"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+        })
+    }
+
+    fn chat_only_channel(base: &str) -> Channel {
+        // DeepSeek preset shape: protocol=openai, native [chat_completions] only.
+        let mut ch = channel("ds", "openai", "deepseek", base, &["chat_completions"], 1);
+        ch.model_mapping = json!({ "m": "deepseek-v4-flash" }).to_string();
+        ch
+    }
+
+    /// Stream Cell 5: a codex Responses request routed to a chat-only channel
+    /// must (a) send the chat-shaped body upstream (messages, stream, mapped
+    /// model — no `input`), and (b) decode the chat SSE into Responses SSE
+    /// events ending in response.completed + [DONE].
+    #[tokio::test]
+    async fn responses_via_chat_stream_e2e() {
+        let state = MockState {
+            hits: Arc::new(AtomicUsize::new(0)),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/chat/completions", post(chat))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let pool = fresh_db().await;
+        let repo = Arc::new(Repository::new(pool.clone()));
+        insert_channels(&pool, &[chat_only_channel(&base)]).await;
+
+        let key = api_key();
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "instructions": "You are a helpful assistant.",
+            "stream": true,
+        });
+        let audited = audited(DownstreamProtocol::Responses, "responses", "m", body.clone());
+
+        let channels = repo.get_enabled_channels().await.unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let plan = authorize_and_plan(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &channels,
+            &flags(true),
+            &body,
+            &mut rng,
+        )
+        .expect("responses_via_chat plan");
+
+        // The chat-only channel forms a single conversion group at chat_completions.
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].tier.as_str(), "conversion");
+        assert_eq!(plan.groups[0].candidates[0].candidate.id(), "ds");
+        assert_eq!(plan.groups[0].upstream_endpoint, "chat_completions");
+
+        let resp = route_stream_plan(
+            plan,
+            &audited,
+            &key,
+            &[],
+            "responses",
+            &repo,
+            &serde_json::to_string(&audited.sanitized_log_json).unwrap_or_default(),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "Cell 5 stream must commit a 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+
+        // ── upstream body: chat-shaped, not Responses-shaped ────────────────
+        assert_eq!(state.hits.load(Ordering::SeqCst), 1, "exactly one upstream call");
+        let seen = state.seen.lock().await;
+        assert_eq!(seen.len(), 1);
+        let req = &seen[0];
+        assert_eq!(req["model"], "deepseek-v4-flash", "mapped upstream model");
+        assert_eq!(
+            req["messages"][0]["role"], "system",
+            "instructions -> system message"
+        );
+        assert_eq!(
+            req["messages"][0]["content"], "You are a helpful assistant.",
+            "instructions content"
+        );
+        assert_eq!(
+            req["messages"][1]["content"], "hi",
+            "input -> user message"
+        );
+        assert_eq!(req["stream"], true);
+        assert!(req.get("input").is_none(), "no Responses `input` upstream");
+        drop(seen);
+
+        // ── downstream: Responses SSE event sequence ────────────────────────
+        let frames = super::sse_frames(&text);
+        assert!(!frames.is_empty(), "downstream body must not be empty");
+        let names: Vec<&str> = frames.iter().map(|(e, _)| e.as_str()).collect();
+
+        let find = |name: &str| names.iter().position(|&n| n == name);
+        let added = find("response.output_item.added").expect("output_item.added");
+        let delta = find("response.output_text.delta").expect("output_text.delta");
+        let completed = find("response.completed").expect("response.completed");
+        let done = find("[DONE]").expect("[DONE]");
+        assert!(
+            added < delta && delta < completed && completed < done,
+            "event order must be output_item.added -> output_text.delta -> completed -> [DONE]\n{names:?}"
+        );
+
+        // The text deltas carry "Hello" then " world".
+        let delta_datas: Vec<String> = frames
+            .iter()
+            .filter(|(e, _)| e == "response.output_text.delta")
+            .map(|(_, d)| d.clone())
+            .collect();
+        assert_eq!(delta_datas.len(), 2, "two text deltas");
+        let first: Value = serde_json::from_str(&delta_datas[0]).unwrap();
+        let second: Value = serde_json::from_str(&delta_datas[1]).unwrap();
+        assert_eq!(first["delta"], "Hello");
+        assert_eq!(second["delta"], " world");
+
+        // The completed event carries the usage observed upstream (5 in / 2 out).
+        let completed_data: Value =
+            serde_json::from_str(&frames[completed].1).expect("completed data JSON");
+        assert_eq!(completed_data["response"]["status"], "completed");
+        assert_eq!(completed_data["response"]["usage"]["input_tokens"], 5);
+        assert_eq!(completed_data["response"]["usage"]["output_tokens"], 2);
+    }
+
+    /// Non-stream Cell 5: `stream:false` Responses request to a chat-only channel
+    /// decodes the upstream chat JSON into a Responses JSON document
+    /// (`openai_to_responses`), never a 502 unknown-codec.
+    #[tokio::test]
+    async fn responses_via_chat_non_stream_e2e() {
+        let state = MockState {
+            hits: Arc::new(AtomicUsize::new(0)),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = Router::new()
+            .route("/chat/completions", post(chat))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let pool = fresh_db().await;
+        let repo = Arc::new(Repository::new(pool.clone()));
+        insert_channels(&pool, &[chat_only_channel(&base)]).await;
+
+        let key = api_key();
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "instructions": "You are a helpful assistant.",
+            "stream": false,
+        });
+        let audited = audited(DownstreamProtocol::Responses, "responses", "m", body.clone());
+
+        let channels = repo.get_enabled_channels().await.unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let plan = authorize_and_plan(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &channels,
+            &flags(true),
+            &body,
+            &mut rng,
+        )
+        .expect("responses_via_chat plan (non-stream)");
+
+        let resp = crate::endpoint_executor::driver::route_plan_response(
+            plan,
+            &audited,
+            &key,
+            &[],
+            "responses",
+            &repo,
+            &serde_json::to_string(&audited.sanitized_log_json).unwrap_or_default(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "non-stream Cell 5 must decode chat -> Responses (no 502 unknown-codec)"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(out["status"], "completed");
+        assert_eq!(out["finish_reason"], "stop");
+        assert_eq!(out["model"], "deepseek-v4-flash");
+        assert_eq!(out["output"][0]["type"], "message");
+        assert_eq!(out["output"][0]["content"][0]["text"], "Hello world");
+        assert_eq!(out["usage"]["input_tokens"], 5);
+        assert_eq!(out["usage"]["output_tokens"], 2);
     }
 }
 

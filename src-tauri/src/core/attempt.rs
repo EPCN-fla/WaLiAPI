@@ -643,6 +643,35 @@ mod tests {
         audit
     }
 
+    fn audited_responses(stream: bool) -> crate::security::gate::AuditedRequest {
+        use crate::security::gate::{DownstreamProtocol, RequestEnvelope, RequestFeatures};
+        use crate::security::SecurityScanResult;
+        let body = json!({
+            "model": "m",
+            "input": "hi",
+            "instructions": "You are a helpful assistant.",
+            "stream": stream,
+        });
+        crate::security::gate::AuditedRequest {
+            envelope: RequestEnvelope {
+                downstream_protocol: DownstreamProtocol::Responses,
+                endpoint: "responses".into(),
+                original_json: body.clone(),
+                safe_forward_headers: vec![],
+                query: None,
+                model: "m".into(),
+                stream,
+                trace_id: None,
+            },
+            forward_json: body.clone(),
+            sanitized_log_json: body,
+            body_hash: "h".into(),
+            body_len: 0,
+            audit_result: SecurityScanResult::default(),
+            request_features: RequestFeatures::default(),
+        }
+    }
+
     #[test]
     fn chat_conversion_failover_uses_each_candidate_codec_direction() {
         for stream in [false, true] {
@@ -790,6 +819,69 @@ mod tests {
                 Some("messages_to_responses_v1")
             );
             assert!(second_attempt.encoded_body.get("input").is_some());
+        }
+    }
+
+    /// Cell 5 (Responses → chat-only channel): the legacy Responses→Chat debt
+    /// conversion runs through `build_prepared_attempt`'s non-registry branch
+    /// (codec_direction returns None for Responses→OpenAI), encoding via
+    /// `responses_to_openai` with the sampled upstream model baked in.  This
+    /// branch had no attempt-level coverage.
+    #[test]
+    fn responses_via_chat_debt_attempt_encodes_openai_body() {
+        for stream in [false, true] {
+            let audit = audited_responses(stream);
+            let ch = channel(
+                "deepseek",
+                "openai",
+                "https://api.deepseek.com",
+                &["m"],
+                1,
+                1,
+            );
+            let plan = authorize_and_plan(
+                &api_key(),
+                "m",
+                EndpointKind::Responses,
+                std::slice::from_ref(&ch),
+                &flags(),
+                &audit.forward_json,
+                &mut StdRng::seed_from_u64(7),
+            )
+            .expect("responses_via_chat plan");
+            let group = &plan.groups[0];
+            assert_eq!(group.tier.as_str(), "conversion");
+            assert_eq!(group.upstream_endpoint, "chat_completions");
+
+            let mut rng = StdRng::seed_from_u64(7);
+            let attempt = build_prepared_attempt(
+                &audit,
+                group,
+                &group.candidates[0],
+                &mut rng,
+                1,
+            )
+            .expect("responses_via_chat encodes");
+            assert_eq!(
+                attempt.codec_version.as_deref(),
+                Some("responses_via_chat_v1")
+            );
+            // The encoded body is the OpenAI chat shape, not the Responses shape.
+            assert!(attempt.encoded_body.get("messages").is_some());
+            assert!(attempt.encoded_body.get("input").is_none());
+            assert_eq!(
+                attempt.encoded_body["stream"],
+                Value::Bool(stream),
+                "stream flag must be preserved into the chat body"
+            );
+            assert_eq!(
+                attempt.encoded_body["model"].as_str().unwrap_or(""),
+                attempt.upstream_model.as_str(),
+                "sampled upstream model must be baked into the encoded body"
+            );
+            // The codec version label makes this a conversion attempt.
+            assert_eq!(attempt.upstream_protocol, "openai");
+            assert_eq!(attempt.upstream_endpoint, "chat_completions");
         }
     }
 

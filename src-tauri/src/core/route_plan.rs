@@ -750,8 +750,20 @@ fn classify_channel(
                     UpstreamProtocol::Anthropic,
                     "messages".into(),
                 ))
-            } else if debt && flags.cross_protocol_codec {
-                // Explicit legacy Responses→Chat debt.
+            } else if (debt
+                || (id.protocol == "openai"
+                    && has("chat_completions")
+                    && !has("responses")))
+                && flags.cross_protocol_codec
+            {
+                // Responses→Chat conversion.  `debt` covers explicit
+                // legacy_capabilities and revision-0 inferred rows; the
+                // openai+chat_completions-without-native-responses arm restores
+                // the pre-refactor de facto behavior for NEW openai/custom
+                // channels (DeepSeek, Zhipu, Moonshot, Doubao, …) that only
+                // offer chat_completions upstream (product decision 2026-08-11).
+                // A channel that natively declares `responses` is never degraded
+                // this way (native_responses OFF → 503, not silent downgrade).
                 Some((
                     GroupTier::Conversion,
                     UpstreamProtocol::OpenAI,
@@ -1594,6 +1606,7 @@ mod tests {
         assert_eq!(err.http_status(), 503);
     }
 
+    #[test]
     fn responses_debt_channel_goes_to_g2_not_g1() {
         let debt = channel(
             "legacy",
@@ -2276,5 +2289,38 @@ mod tests {
         assert!(!snapshot.contains("route-secret"));
         assert!(!snapshot.contains("refresh-secret"));
         assert!(!snapshot.contains("payload_json"));
+    }
+
+    /// Repro: a newly-created preset OpenAI/DeepSeek channel (identity_revision
+    /// 1, native chat_completions only, no responses_via_chat debt) must not 503
+    /// on a codex Responses request — the upstream can serve it via the
+    /// Responses→Chat codec (design 11.2: "新建渠道是否允许该降级由产品预设明确").
+    #[test]
+    fn new_preset_openai_chat_only_channel_serves_responses_via_chat_debt() {
+        // Mirrors the DeepSeek preset: protocol=openai, native [chat_completions].
+        let mut deepseek = new_channel(
+            "deepseek",
+            "openai",
+            "deepseek",
+            "https://api.deepseek.com",
+            &["chat_completions"],
+            1,
+            1,
+        );
+        deepseek.models = json!(["deepseek-v4-flash"]).to_string();
+        let key = api_key(&[], &[]);
+        let plan = authorize_and_plan(
+            &key,
+            "deepseek-v4-flash",
+            EndpointKind::Responses,
+            std::slice::from_ref(&deepseek),
+            &flags(true),
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap();
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].tier, GroupTier::Conversion);
+        assert_eq!(plan.groups[0].upstream_endpoint, "chat_completions");
     }
 }
