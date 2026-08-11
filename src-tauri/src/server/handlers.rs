@@ -1187,6 +1187,7 @@ fn is_unsafe_proxy_header(name: &str) -> bool {
             | "content-length"
             | "content-type"
             | "expect"
+            | "accept-encoding"
             | "wali-trace-id"
     )
 }

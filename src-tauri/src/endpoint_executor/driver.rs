@@ -1182,7 +1182,16 @@ fn stream_response_body(
                 },
                 Some(Err(e)) => {
                     had_error = true;
-                    error_message = Some(format!("stream interrupted: {e}"));
+                    // The upstream body failed mid-stream.  `error decoding
+                    // response body` (reqwest Kind::Decode) hides the real cause
+                    // behind a generic message, so walk the source chain to
+                    // surface whether it was a corrupt content encoding (gzip
+                    // frame cut short) or a dropped connection (hyper reset).
+                    error_message = Some(format!(
+                        "stream interrupted: {} (root: {})",
+                        e,
+                        error_chain_root(&e)
+                    ));
                     break;
                 }
                 None => break,
@@ -1235,6 +1244,17 @@ fn stream_response_body(
             .write(false, had_error, error_message.as_deref(), usage_prompt, usage_completion, usage_total)
             .await;
     }
+}
+
+/// Walk an error's `source()` chain to its root and return it as a string.
+/// Used when a generic transport message (e.g. reqwest `Kind::Decode`'s
+/// "error decoding response body") hides the actual failure cause.
+fn error_chain_root(err: &dyn std::error::Error) -> String {
+    let mut deepest: &dyn std::error::Error = err;
+    while let Some(source) = deepest.source() {
+        deepest = source;
+    }
+    deepest.to_string()
 }
 
 /// Format a post-commit stream error event in the DOWNSTREAM protocol (I-2).
@@ -1479,6 +1499,21 @@ mod tests {
 
         // The SSE transform mode string must NEVER leak into error formatting.
         assert!(!format_stream_error("chat", "x").contains("chat_to_messages_v1"));
+    }
+
+    /// The root-cause walk must surface the innermost error even when a generic
+    /// transport message (reqwest `Kind::Decode`) wraps it.
+    #[test]
+    fn error_chain_root_walks_to_deepest_cause() {
+        // io::Error with no source → itself.
+        let plain = std::io::Error::other("boom");
+        assert_eq!(error_chain_root(&plain), "boom");
+
+        // io::Error wraps an inner error via .source(); chain to the root.
+        let root = std::io::Error::other("unexpected end of gzip file");
+        let nested = std::io::Error::new(std::io::ErrorKind::Other, root);
+        let chained = std::io::Error::new(std::io::ErrorKind::Other, nested);
+        assert_eq!(error_chain_root(&chained), "unexpected end of gzip file");
     }
 
     fn now() -> String {
