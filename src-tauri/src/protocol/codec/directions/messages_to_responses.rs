@@ -611,6 +611,8 @@ struct ResponsesMessagesStream {
     terminal: bool,
     usage: Usage,
     blocks: BTreeMap<u64, StreamBlock>,
+    /// A `refusal` part was seen; the stream terminates with a refusal stop.
+    refused: bool,
 }
 #[derive(Default)]
 struct StreamBlock {
@@ -634,6 +636,7 @@ impl ResponsesMessagesStream {
                 ..Usage::default()
             },
             blocks: BTreeMap::new(),
+            refused: false,
         }
     }
     fn frame(t: &str, v: Value) -> String {
@@ -911,22 +914,30 @@ impl ResponsesMessagesStream {
             // the incremental payload, while the `*.done` records verify (and
             // backfill for compatible backends) the final complete text.
             "response.content_part.added" => {
-                self.validate_part_lifecycle(&e, "message", "output_text", "content_index")?;
+                self.start(&mut out);
+                let (expected_kind, expected_part, ..) = Self::part_dispatch(&e)?;
+                self.validate_part_lifecycle(&e, &expected_kind, &[expected_part], "content_index")?;
             }
             "response.content_part.done" => {
-                let ix =
-                    self.validate_part_lifecycle(&e, "message", "output_text", "content_index")?;
-                let text = e
-                    .pointer("/part/text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        bad(
-                            FeatureKind::UnknownEvent,
-                            "/part/text",
-                            "completed output text is required",
-                        )
-                    })?;
-                self.emit_completed_text(ix, "message", text, false, &mut out)?;
+                let (expected_kind, expected_part, thinking, refusal) = Self::part_dispatch(&e)?;
+                let ix = self
+                    .validate_part_lifecycle(&e, &expected_kind, &[expected_part], "content_index")?;
+                let text_field = if refusal { "/part/refusal" } else { "/part/text" };
+                let text = e.pointer(text_field).and_then(Value::as_str).ok_or_else(|| {
+                    bad(
+                        FeatureKind::UnknownEvent,
+                        text_field,
+                        if refusal {
+                            "completed refusal text is required"
+                        } else {
+                            "completed output text is required"
+                        },
+                    )
+                })?;
+                if refusal {
+                    self.refused = true;
+                }
+                self.emit_completed_text(ix, &expected_kind, text, thinking, &mut out)?;
             }
             "response.output_text.done" => {
                 let ix = self.output_index_for_block(&e, "message")?;
@@ -940,10 +951,13 @@ impl ResponsesMessagesStream {
                 self.emit_completed_text(ix, "message", text, false, &mut out)?;
             }
             "response.reasoning_summary_part.added" => {
+                // The standard summary part type is `summary_text`;
+                // `reasoning_summary_text` is retained for older compatible
+                // providers that predate the canonical name.
                 self.validate_part_lifecycle(
                     &e,
                     "reasoning",
-                    "reasoning_summary_text",
+                    &["summary_text", "reasoning_summary_text"],
                     "summary_index",
                 )?;
             }
@@ -951,7 +965,7 @@ impl ResponsesMessagesStream {
                 let ix = self.validate_part_lifecycle(
                     &e,
                     "reasoning",
-                    "reasoning_summary_text",
+                    &["summary_text", "reasoning_summary_text"],
                     "summary_index",
                 )?;
                 let text = e
@@ -967,6 +981,55 @@ impl ResponsesMessagesStream {
                 self.emit_completed_text(ix, "reasoning", text, true, &mut out)?;
             }
             "response.reasoning_summary_text.done" => {
+                let ix = self.output_index_for_block(&e, "reasoning")?;
+                let text = e.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    bad(
+                        FeatureKind::UnknownEvent,
+                        "/text",
+                        "completed reasoning text is required",
+                    )
+                })?;
+                self.emit_completed_text(ix, "reasoning", text, true, &mut out)?;
+            }
+            // Raw chain-of-thought text (the reasoning item's `content`
+            // array).  Compatible providers that opt out of reasoning
+            // summaries stream this through `reasoning_text.delta/done`
+            // indexed by `content_index`, plus `content_part.added/done`
+            // with `part.type = "reasoning_text"`.
+            "response.reasoning_text.delta" => {
+                self.start(&mut out);
+                let ix = self.output_index_or_infer(&e, "reasoning").ok_or_else(|| {
+                    bad(
+                        FeatureKind::UnknownEvent,
+                        "/output_index",
+                        "reasoning text delta requires output_index or one open reasoning item",
+                    )
+                })?;
+                let delta = e.get("delta").and_then(Value::as_str).ok_or_else(|| {
+                    bad(
+                        FeatureKind::UnknownEvent,
+                        "/delta",
+                        "reasoning text delta is required",
+                    )
+                })?;
+                let block = self.blocks.get_mut(&ix).ok_or_else(|| {
+                    bad(
+                        FeatureKind::UnknownEvent,
+                        "/output_index",
+                        "reasoning text delta before reasoning item",
+                    )
+                })?;
+                if block.kind != "reasoning" {
+                    return Err(bad(
+                        FeatureKind::UnknownEvent,
+                        "/output_index",
+                        "reasoning text delta targets a non-reasoning item",
+                    ));
+                }
+                block.text.push_str(delta);
+                out.push(Self::frame("content_block_delta",serde_json::json!({"type":"content_block_delta","index":ix,"delta":{"type":"thinking_delta","thinking":delta}})))
+            }
+            "response.reasoning_text.done" => {
                 let ix = self.output_index_for_block(&e, "reasoning")?;
                 let text = e.get("text").and_then(Value::as_str).ok_or_else(|| {
                     bad(
@@ -1134,48 +1197,22 @@ impl ResponsesMessagesStream {
                 ))
             }
             "response.completed" => {
-                if self.terminal {
-                    return Err(bad(
-                        FeatureKind::UnknownEvent,
-                        "/type",
-                        "duplicate response.completed",
-                    ));
-                }
-                if self.blocks.values().any(|b| !b.closed) {
-                    return Err(bad(
-                        FeatureKind::UnknownEvent,
-                        "/output",
-                        "response completed with open content block",
-                    ));
-                }
                 let response = e.get("response").unwrap_or(&e);
-                self.usage = usage(response);
-                self.start(&mut out);
-                let stop = match response.get("status").and_then(Value::as_str) {
-                    Some("incomplete") => "max_tokens",
-                    Some("completed") | None => {
-                        if self.blocks.values().any(|b| b.kind == "function_call") {
-                            "tool_use"
-                        } else {
-                            "end_turn"
-                        }
-                    }
-                    Some(x) => {
-                        return Err(bad(
-                            FeatureKind::UnknownFinishReason,
-                            "/status",
-                            format!("unsupported final status {x:?}"),
-                        ))
-                    }
-                };
-                out.push(Self::frame("message_delta",serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":null},"usage":{"input_tokens":self.usage.input_tokens,"output_tokens":self.usage.output_tokens}})));
-                out.push(Self::frame(
-                    "message_stop",
-                    serde_json::json!({"type":"message_stop"}),
-                ));
-                self.terminal = true
+                let status = response
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed");
+                self.emit_terminal(status, response, &mut out)?;
             }
-            "response.failed" | "response.incomplete" => {
+            // A standalone `response.incomplete` event terminates a stream
+            // truncated at max_output_tokens (DeepSeek's documented terminal
+            // for truncation).  Unlike `response.failed` this is a normal
+            // completion with a `max_tokens` stop reason, not an error.
+            "response.incomplete" => {
+                let response = e.get("response").unwrap_or(&e);
+                self.emit_terminal("incomplete", response, &mut out)?;
+            }
+            "response.failed" => {
                 return Err(bad(
                     FeatureKind::UnknownEvent,
                     "/type",
@@ -1195,11 +1232,104 @@ impl ResponsesMessagesStream {
 }
 
 impl ResponsesMessagesStream {
+    /// Emit the downstream terminal frames for a finished Responses stream.
+    ///
+    /// `status` is the upstream final status (`completed`/`incomplete`); both
+    /// terminal event forms (`response.completed` and the standalone
+    /// `response.incomplete`) converge here so truncation maps to a
+    /// `max_tokens` stop reason rather than a gateway error.
+    fn emit_terminal(
+        &mut self,
+        status: &str,
+        response: &Value,
+        out: &mut Vec<String>,
+    ) -> Result<(), UnsupportedFeatures> {
+        if self.terminal {
+            return Err(bad(
+                FeatureKind::UnknownEvent,
+                "/type",
+                "duplicate terminal Responses event",
+            ));
+        }
+        if self.blocks.values().any(|b| !b.closed) {
+            return Err(bad(
+                FeatureKind::UnknownEvent,
+                "/output",
+                "response completed with open content block",
+            ));
+        }
+        self.usage = usage(response);
+        self.start(out);
+        let stop = if self.refused {
+            "refusal"
+        } else {
+            match status {
+                "incomplete" => "max_tokens",
+                "completed" => {
+                    if self.blocks.values().any(|b| b.kind == "function_call") {
+                        "tool_use"
+                    } else {
+                        "end_turn"
+                    }
+                }
+                x => {
+                    return Err(bad(
+                        FeatureKind::UnknownFinishReason,
+                        "/status",
+                        format!("unsupported final status {x:?}"),
+                    ))
+                }
+            }
+        };
+        out.push(Self::frame("message_delta",serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":null},"usage":{"input_tokens":self.usage.input_tokens,"output_tokens":self.usage.output_tokens}})));
+        out.push(Self::frame(
+            "message_stop",
+            serde_json::json!({"type":"message_stop"}),
+        ));
+        self.terminal = true;
+        Ok(())
+    }
+
+    /// Map a `content_part.*` event's `part.type` to the target block kind,
+    /// canonical part type, stream semantics, and refusal flag.
+    ///
+    /// `content_part.*` is *not* message-only: the part union also carries
+    /// `reasoning_text` (a reasoning item's raw chain-of-thought content) and
+    /// `refusal`.  Compatible providers that opt out of reasoning summaries
+    /// (e.g. DeepSeek) stream raw CoT through this exact channel, so the
+    /// dispatch must follow `part.type`, not the event name.
+    fn part_dispatch(
+        event: &Value,
+    ) -> Result<(&'static str, &'static str, bool, bool), UnsupportedFeatures> {
+        let part = event.get("part").ok_or_else(|| {
+            bad(
+                FeatureKind::UnknownEvent,
+                "/part",
+                "part lifecycle requires part",
+            )
+        })?;
+        match part.get("type").and_then(Value::as_str) {
+            Some("output_text") => Ok(("message", "output_text", false, false)),
+            Some("reasoning_text") => Ok(("reasoning", "reasoning_text", true, false)),
+            Some("refusal") => Ok(("message", "refusal", false, true)),
+            Some(x) => Err(bad(
+                FeatureKind::UnknownBlock,
+                "/part/type",
+                format!("unexpected Responses part type {x:?}"),
+            )),
+            None => Err(bad(
+                FeatureKind::UnknownBlock,
+                "/part/type",
+                "part type is required",
+            )),
+        }
+    }
+
     fn validate_part_lifecycle(
         &self,
         event: &Value,
         expected_kind: &str,
-        expected_part_type: &str,
+        allowed_part_types: &[&str],
         part_index_field: &str,
     ) -> Result<u64, UnsupportedFeatures> {
         let ix = self
@@ -1239,7 +1369,14 @@ impl ResponsesMessagesStream {
                 "part lifecycle requires part",
             )
         })?;
-        if part.get("type").and_then(Value::as_str) != Some(expected_part_type) {
+        let part_type = part.get("type").and_then(Value::as_str).ok_or_else(|| {
+            bad(
+                FeatureKind::UnknownEvent,
+                "/part/type",
+                "part type is required",
+            )
+        })?;
+        if !allowed_part_types.contains(&part_type) {
             return Err(bad(
                 FeatureKind::UnknownEvent,
                 "/part/type",
@@ -1504,8 +1641,14 @@ mod tests {
         let mut events = decoder.feed(source.as_bytes()).unwrap();
         events.extend(decoder.finish().unwrap());
         let output = events.concat();
-        assert!(output.contains("hello"), "text must reach the message item:\n{output}");
-        assert!(output.contains("\"index\":1"), "text delta must target item 1:\n{output}");
+        assert!(
+            output.contains("hello"),
+            "text must reach the message item:\n{output}"
+        );
+        assert!(
+            output.contains("\"index\":1"),
+            "text delta must target item 1:\n{output}"
+        );
         assert!(output.contains("message_stop"));
     }
 
@@ -1527,7 +1670,10 @@ mod tests {
         let mut events = decoder.feed(source.as_bytes()).unwrap();
         events.extend(decoder.finish().unwrap());
         let output = events.concat();
-        assert!(output.contains("hi"), "part text must reach the message item:\n{output}");
+        assert!(
+            output.contains("hi"),
+            "part text must reach the message item:\n{output}"
+        );
         assert!(output.contains("message_stop"));
     }
 
@@ -1569,5 +1715,151 @@ mod tests {
         }
         let output = expected.unwrap().join("");
         assert!(output.contains("hello") && output.contains("think") && output.contains("call_1"));
+    }
+
+    #[test]
+    fn stream_accepts_deepseek_raw_cot_reasoning_content_parts() {
+        // DeepSeek opts out of reasoning summaries and streams raw
+        // chain-of-thought through the reasoning item's `content` array:
+        // `content_part.*` with `part.type = "reasoning_text"` plus
+        // `reasoning_text.delta/done`, indexed by `content_index`.  This
+        // used to fail closed on `content_part.done` because the decoder
+        // hard-assumed every `content_part` belonged to a message item.
+        let source = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs\",\"type\":\"reasoning\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"reasoning_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"let me\"}\n\n",
+            "data: {\"type\":\"response.reasoning_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\" think\"}\n\n",
+            "data: {\"type\":\"response.reasoning_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"let me think\"}\n\n",
+            "data: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"reasoning_text\",\"text\":\"let me think\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs\",\"type\":\"reasoning\",\"content\":[{\"type\":\"reasoning_text\",\"text\":\"let me think\"}],\"status\":\"completed\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"m1\",\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":1,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"answer\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":1,\"text\":\"answer\"}\n\n",
+            "data: {\"type\":\"response.content_part.done\",\"output_index\":1,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"answer\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"m1\",\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n"
+        );
+        let context = ConversionContext::new("msg_1", "m", true);
+        let mut decoder = ResponsesMessagesStream::new(&context);
+        let mut events = decoder.feed(source.as_bytes()).unwrap();
+        events.extend(decoder.finish().unwrap());
+        let output = events.concat();
+        // reasoning_text must land in an Anthropic thinking block, not text.
+        assert!(
+            output.contains("\"thinking\":\"let me\"")
+                && output.contains("\"thinking\":\" think\"")
+                && output.contains("content_block_start")
+                && output.contains("\"thinking\":\"\"") // empty thinking start block
+                && output.contains("\"type\":\"thinking_delta\"")
+                && output.contains("content_block_stop"),
+            "raw CoT must stream as thinking:\n{output}"
+        );
+        // The message item still streams as text at a distinct index.
+        assert!(
+            output.contains("\"text\":\"answer\"")
+                && output.contains("\"type\":\"text_delta\""),
+            "message item must stream as text:\n{output}"
+        );
+        assert!(output.contains("message_stop"));
+    }
+
+    #[test]
+    fn stream_maps_refusal_part_to_refusal_stop() {
+        let source = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"m\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"refusal\",\"refusal\":\"\"}}\n\n",
+            "data: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"refusal\",\"refusal\":\"I cannot help\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+        );
+        let context = ConversionContext::new("r", "m", true);
+        let mut decoder = ResponsesMessagesStream::new(&context);
+        let mut events = decoder.feed(source.as_bytes()).unwrap();
+        events.extend(decoder.finish().unwrap());
+        let output = events.concat();
+        // refusal text reaches the user as a text block.
+        assert!(
+            output.contains("\"text\":\"I cannot help\"")
+                && output.contains("\"type\":\"text_delta\""),
+            "refusal text must stream as text:\n{output}"
+        );
+        // and the terminal stop reason carries the refusal semantic.
+        assert!(
+            output.contains("\"stop_reason\":\"refusal\""),
+            "refusal must terminate with stop_reason refusal:\n{output}"
+        );
+        assert!(output.contains("message_stop"));
+    }
+
+    #[test]
+    fn stream_accepts_official_summary_text_part_type() {
+        // The canonical summary part type is `summary_text` (not
+        // `reasoning_summary_text`); both must be accepted.
+        let source = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"m\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"output_index\":0,\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"think\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.done\",\"output_index\":0,\"text\":\"think\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.done\",\"output_index\":0,\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"think\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n"
+        );
+        let context = ConversionContext::new("r", "m", true);
+        let mut decoder = ResponsesMessagesStream::new(&context);
+        let mut events = decoder.feed(source.as_bytes()).unwrap();
+        events.extend(decoder.finish().unwrap());
+        let output = events.concat();
+        assert!(
+            output.contains("\"thinking\":\"think\"")
+                && output.contains("\"type\":\"thinking_delta\""),
+            "summary must stream as thinking:\n{output}"
+        );
+        assert!(output.contains("message_stop"));
+    }
+
+    #[test]
+    fn stream_standalone_incomplete_is_max_tokens_not_failure() {
+        // DeepSeek terminates truncated streams with a standalone
+        // `response.incomplete` event.  That is a normal completion with a
+        // `max_tokens` stop reason, not an upstream failure.
+        let source = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"m\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"partial\"}\n\n",
+            "data: {\"type\":\"response.content_part.done\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"partial\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"r\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n"
+        );
+        let context = ConversionContext::new("r", "m", true);
+        let mut decoder = ResponsesMessagesStream::new(&context);
+        let mut events = decoder.feed(source.as_bytes()).unwrap();
+        events.extend(decoder.finish().unwrap());
+        let output = events.concat();
+        assert!(
+            output.contains("\"stop_reason\":\"max_tokens\"")
+                && output.contains("message_stop"),
+            "standalone incomplete must terminate with max_tokens:\n{output}"
+        );
+    }
+
+    #[test]
+    fn stream_standalone_failed_remains_error() {
+        let source = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"m\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"r\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n\n"
+        );
+        let context = ConversionContext::new("r", "m", true);
+        let mut decoder = ResponsesMessagesStream::new(&context);
+        let err = decoder.feed(source.as_bytes()).unwrap_err();
+        assert!(
+            err.to_string().contains("upstream reported failure"),
+            "failed must surface as an upstream error, got: {err}"
+        );
     }
 }
