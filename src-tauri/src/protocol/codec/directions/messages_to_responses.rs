@@ -189,12 +189,12 @@ fn message_input(msg: &Value, p: &str) -> Result<Vec<Value>, UnsupportedFeatures
     let role = msg
         .get("role")
         .and_then(Value::as_str)
-        .filter(|r| matches!(*r, "user" | "assistant"))
+        .filter(|r| matches!(*r, "user" | "assistant" | "system"))
         .ok_or_else(|| {
             bad(
                 FeatureKind::UnknownRole,
                 format!("{p}/role"),
-                "role must be user or assistant",
+                "role must be user, assistant, or system",
             )
         })?;
     let parts = match msg.get("content") {
@@ -213,7 +213,7 @@ fn message_input(msg: &Value, p: &str) -> Result<Vec<Value>, UnsupportedFeatures
         let bp = format!("{p}/content/{i}");
         match b.get("type").and_then(Value::as_str) {
             Some("text") => out.push(serde_json::json!({
-                "type":"message", "role":role,
+                "type":"message", "role":if role == "system" { "developer" } else { role },
                 "content":[{"type":if role=="assistant"{"output_text"}else{"input_text"},"text":b.get("text").and_then(Value::as_str).unwrap_or("")}]
             })),
             Some("image") if role == "user" => out.push(serde_json::json!({
@@ -631,6 +631,84 @@ impl ResponsesMessagesStream {
             out.push(Self::frame("message_start",serde_json::json!({"type":"message_start","message":{"id":self.id,"type":"message","role":"assistant","model":self.model,"content":[],"usage":{"input_tokens":0,"output_tokens":0}}})))
         }
     }
+
+    /// Some OpenAI-compatible Responses backends serialize `output_index` as a
+    /// JSON string, while others omit it from a terminal `*.done` frame after
+    /// having identified the item in earlier lifecycle frames.
+    fn event_output_index(event: &Value) -> Option<u64> {
+        event.get("output_index").and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+    }
+
+    /// Resolve a terminal text/reasoning frame to its open block.  Omitting an
+    /// index is unambiguous only when exactly one matching block is open.
+    fn output_index_for_block(
+        &self,
+        event: &Value,
+        expected_kind: &str,
+    ) -> Result<u64, UnsupportedFeatures> {
+        if let Some(index) = Self::event_output_index(event) {
+            return Ok(index);
+        }
+        let mut matching = self.blocks.iter().filter_map(|(index, block)| {
+            (block.kind == expected_kind && !block.closed).then_some(*index)
+        });
+        let Some(index) = matching.next() else {
+            return Err(bad(
+                FeatureKind::UnknownEvent,
+                "/output_index",
+                "completion requires output_index or an open matching output item",
+            ));
+        };
+        if matching.next().is_some() {
+            return Err(bad(
+                FeatureKind::UnknownEvent,
+                "/output_index",
+                "completion without output_index is ambiguous",
+            ));
+        }
+        Ok(index)
+    }
+
+    /// Resolve an output-item completion. Compatible Responses providers may
+    /// omit `output_index` on the terminal item frame; it is safe to infer only
+    /// when one unclosed block has the type declared by `item.type`.
+    fn output_index_for_item_done(&self, event: &Value) -> Result<u64, UnsupportedFeatures> {
+        if let Some(index) = Self::event_output_index(event) {
+            return Ok(index);
+        }
+        let expected_kind = event
+            .pointer("/item/type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                bad(
+                    FeatureKind::UnknownEvent,
+                    "/output_index",
+                    "item completion requires output_index or item.type",
+                )
+            })?;
+        let mut matching = self.blocks.iter().filter_map(|(index, block)| {
+            (block.kind == expected_kind && !block.closed).then_some(*index)
+        });
+        let Some(index) = matching.next() else {
+            return Err(bad(
+                FeatureKind::UnknownEvent,
+                "/output_index",
+                "item completion requires output_index or an open matching output item",
+            ));
+        };
+        if matching.next().is_some() {
+            return Err(bad(
+                FeatureKind::UnknownEvent,
+                "/output_index",
+                "item completion without output_index is ambiguous",
+            ));
+        }
+        Ok(index)
+    }
 }
 impl StreamDecoder for ResponsesMessagesStream {
     fn feed(&mut self, b: &[u8]) -> Result<Vec<String>, DecodeError> {
@@ -705,7 +783,7 @@ impl ResponsesMessagesStream {
             }
             "response.output_item.added" => {
                 self.start(&mut out);
-                let ix = e.get("output_index").and_then(Value::as_u64).unwrap_or(0);
+                let ix = Self::event_output_index(&e).unwrap_or(0);
                 let item = e.get("item").unwrap_or(&Value::Null);
                 let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
                 let mut b = StreamBlock {
@@ -735,7 +813,7 @@ impl ResponsesMessagesStream {
             }
             "response.output_text.delta" => {
                 self.start(&mut out);
-                let ix = e.get("output_index").and_then(Value::as_u64).unwrap_or(0);
+                let ix = Self::event_output_index(&e).unwrap_or(0);
                 let delta = e.get("delta").and_then(Value::as_str).ok_or_else(|| {
                     bad(
                         FeatureKind::UnknownEvent,
@@ -762,7 +840,7 @@ impl ResponsesMessagesStream {
             }
             "response.reasoning_summary_text.delta" => {
                 self.start(&mut out);
-                let ix = e.get("output_index").and_then(Value::as_u64).unwrap_or(0);
+                let ix = Self::event_output_index(&e).unwrap_or(0);
                 let delta = e.get("delta").and_then(Value::as_str).ok_or_else(|| {
                     bad(
                         FeatureKind::UnknownEvent,
@@ -809,16 +887,7 @@ impl ResponsesMessagesStream {
                 self.emit_completed_text(ix, "message", text, false, &mut out)?;
             }
             "response.output_text.done" => {
-                let ix = e
-                    .get("output_index")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| {
-                        bad(
-                            FeatureKind::UnknownEvent,
-                            "/output_index",
-                            "output text completion requires output_index",
-                        )
-                    })?;
+                let ix = self.output_index_for_block(&e, "message")?;
                 let text = e.get("text").and_then(Value::as_str).ok_or_else(|| {
                     bad(
                         FeatureKind::UnknownEvent,
@@ -856,16 +925,7 @@ impl ResponsesMessagesStream {
                 self.emit_completed_text(ix, "reasoning", text, true, &mut out)?;
             }
             "response.reasoning_summary_text.done" => {
-                let ix = e
-                    .get("output_index")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| {
-                        bad(
-                            FeatureKind::UnknownEvent,
-                            "/output_index",
-                            "reasoning completion requires output_index",
-                        )
-                    })?;
+                let ix = self.output_index_for_block(&e, "reasoning")?;
                 let text = e.get("text").and_then(Value::as_str).ok_or_else(|| {
                     bad(
                         FeatureKind::UnknownEvent,
@@ -876,7 +936,7 @@ impl ResponsesMessagesStream {
                 self.emit_completed_text(ix, "reasoning", text, true, &mut out)?;
             }
             "response.function_call_arguments.delta" => {
-                let ix = e.get("output_index").and_then(Value::as_u64).unwrap_or(0);
+                let ix = Self::event_output_index(&e).unwrap_or(0);
                 let delta = e.get("delta").and_then(Value::as_str).unwrap_or("");
                 let b = self.blocks.get_mut(&ix).ok_or_else(|| {
                     bad(
@@ -889,7 +949,7 @@ impl ResponsesMessagesStream {
                 out.push(Self::frame("content_block_delta",serde_json::json!({"type":"content_block_delta","index":ix,"delta":{"type":"input_json_delta","partial_json":delta}})))
             }
             "response.function_call_arguments.done" => {
-                let ix = e.get("output_index").and_then(Value::as_u64).unwrap_or(0);
+                let ix = Self::event_output_index(&e).unwrap_or(0);
                 let a = e.get("arguments").and_then(Value::as_str).ok_or_else(|| {
                     bad(
                         FeatureKind::InvalidToolArguments,
@@ -916,7 +976,10 @@ impl ResponsesMessagesStream {
                 }
             }
             "response.output_item.done" => {
-                let ix = e.get("output_index").and_then(Value::as_u64).unwrap_or(0);
+                // Keep terminal item indexing consistent with all prior
+                // lifecycle frames. Some OpenAI-compatible Responses servers
+                // serialize this final index as a numeric string.
+                let ix = self.output_index_for_item_done(&e)?;
                 // Some compatible Responses backends emit only the terminal
                 // item record.  It is still a complete source item, so create
                 // the corresponding target block instead of treating this as
@@ -1089,16 +1152,13 @@ impl ResponsesMessagesStream {
         expected_part_type: &str,
         part_index_field: &str,
     ) -> Result<u64, UnsupportedFeatures> {
-        let ix = event
-            .get("output_index")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                bad(
-                    FeatureKind::UnknownEvent,
-                    "/output_index",
-                    "part lifecycle requires output_index",
-                )
-            })?;
+        let ix = Self::event_output_index(event).ok_or_else(|| {
+            bad(
+                FeatureKind::UnknownEvent,
+                "/output_index",
+                "part lifecycle requires output_index",
+            )
+        })?;
         if event.get(part_index_field).and_then(Value::as_u64) != Some(0) {
             return Err(bad(
                 FeatureKind::UnknownEvent,
@@ -1187,6 +1247,25 @@ mod tests {
     }
 
     #[test]
+    fn request_maps_in_band_system_message_to_developer() {
+        let (out, _) = encode_request(
+            &serde_json::json!({"messages":[
+                {"role":"user","content":"before"},
+                {"role":"system","content":[{"type":"text","text":"hook context","cache_control":{"type":"ephemeral"}}]},
+                {"role":"user","content":"after"}
+            ]}),
+            "m",
+        )
+        .unwrap();
+
+        let input = out["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[1]["role"], "developer");
+        assert_eq!(input[1]["content"][0]["type"], "input_text");
+        assert_eq!(input[1]["content"][0]["text"], "hook context");
+    }
+
+    #[test]
     fn request_preserves_interleaved_message_content_order_and_rejects_non_text_tool_output() {
         let (out, _) = encode_request(
             &serde_json::json!({"messages":[{
@@ -1261,6 +1340,65 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn stream_accepts_terminal_text_without_numeric_output_index() {
+        let source = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"text\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":\"0\",\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n"
+        );
+        let context = ConversionContext::new("msg_1", "m", true);
+        let mut decoder = ResponsesMessagesStream::new(&context);
+        let mut events = decoder.feed(source.as_bytes()).unwrap();
+        events.extend(decoder.finish().unwrap());
+        let output = events.concat();
+        assert!(output.contains("hello"));
+        assert!(output.contains("message_stop"));
+    }
+
+    #[test]
+    fn stream_accepts_string_index_on_second_output_item_done() {
+        let source = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"answer\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"reasoning\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":1,\"delta\":\"thought\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":\"1\",\"item\":{\"type\":\"reasoning\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":2}}}\n\n"
+        );
+        let context = ConversionContext::new("msg_1", "m", true);
+        let mut decoder = ResponsesMessagesStream::new(&context);
+        let mut events = decoder.feed(source.as_bytes()).unwrap();
+        events.extend(decoder.finish().unwrap());
+        let output = events.concat();
+        assert!(output.contains("\"index\":1"));
+        assert!(output.contains("thought"));
+        assert!(output.contains("message_stop"));
+    }
+
+    #[test]
+    fn stream_resolves_omitted_index_on_unique_item_completion() {
+        let source = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"reasoning\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":1,\"delta\":\"thought\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n"
+        );
+        let context = ConversionContext::new("msg_1", "m", true);
+        let mut decoder = ResponsesMessagesStream::new(&context);
+        let mut events = decoder.feed(source.as_bytes()).unwrap();
+        events.extend(decoder.finish().unwrap());
+        let output = events.concat();
+        assert!(output.contains("\"index\":1"));
+        assert!(output.contains("message_stop"));
     }
 
     #[test]

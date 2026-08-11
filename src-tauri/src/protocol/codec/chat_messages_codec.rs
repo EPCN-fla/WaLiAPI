@@ -648,6 +648,25 @@ fn messages_request_system_text_and_sampling() {
 }
 
 #[test]
+fn messages_request_preserves_empty_thinking_as_reasoning_content() {
+    let body = json!({
+        "model": "m",
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "messages": [{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": ""},
+                {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}}
+            ]
+        }]
+    });
+    let prepared = CodecRegistry::messages_to_chat("m", &body).unwrap();
+    let assistant = &prepared.encoded_request["messages"][0];
+    assert_eq!(assistant["reasoning_content"], "");
+    assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
+}
+
+#[test]
 fn messages_request_stream_options_are_allowed_and_force_usage() {
     let body = json!({
         "model": "m",

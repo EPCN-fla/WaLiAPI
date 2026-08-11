@@ -787,6 +787,15 @@ fn classify_channel(
                     UpstreamProtocol::OpenAI,
                     "chat_completions".into(),
                 ))
+            } else if id.protocol == "openai" && has("responses") && flags.cross_protocol_codec {
+                // Claude Messages → OpenAI Responses conversion.  This keeps
+                // OpenAI-compatible channels that expose only `/responses`
+                // reachable from Claude clients.
+                Some((
+                    GroupTier::Conversion,
+                    UpstreamProtocol::OpenAI,
+                    "responses".into(),
+                ))
             } else {
                 None
             }
@@ -2320,5 +2329,39 @@ mod tests {
         assert_eq!(plan.groups.len(), 1);
         assert_eq!(plan.groups[0].tier, GroupTier::Conversion);
         assert_eq!(plan.groups[0].upstream_endpoint, "chat_completions");
+    }
+
+    /// A Claude Messages request must be able to use an OpenAI-compatible
+    /// channel that declares only a native `/responses` endpoint.  The codec
+    /// matrix already implements Messages→Responses; this guards the planner
+    /// branch that makes that conversion reachable.
+    #[test]
+    fn messages_request_serves_openai_responses_only_channel() {
+        let mut deepseek = new_channel(
+            "deepseek",
+            "openai",
+            "deepseek",
+            "https://api.deepseek.com",
+            &["responses"],
+            1,
+            1,
+        );
+        deepseek.models = json!(["deepseek-v4-flash"]).to_string();
+        let key = api_key(&[], &[]);
+        let plan = authorize_and_plan(
+            &key,
+            "deepseek-v4-flash",
+            EndpointKind::Messages,
+            std::slice::from_ref(&deepseek),
+            &flags(true),
+            &json!({}),
+            &mut seeded(),
+        )
+        .expect("messages request should route through the Messages→Responses codec");
+
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].tier, GroupTier::Conversion);
+        assert_eq!(plan.groups[0].upstream_protocol, UpstreamProtocol::OpenAI);
+        assert_eq!(plan.groups[0].upstream_endpoint, "responses");
     }
 }

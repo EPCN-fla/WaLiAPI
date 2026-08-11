@@ -343,6 +343,11 @@ fn convert_anthropic_message_to_chat(
         };
         let mut assistant_text: Vec<String> = Vec::new();
         let mut assistant_reasoning = String::new();
+        // Preserve the distinction between no thinking block and an explicitly
+        // empty thinking block. Strict OpenAI-compatible thinking providers
+        // validate the presence of `reasoning_content` on historical assistant
+        // tool turns, even when the source block contains no readable text.
+        let mut assistant_had_thinking = false;
         let mut tool_calls: Vec<Value> = Vec::new();
         for (bi, block) in items.iter().enumerate() {
             let bp = format!("{pointer}/content/{bi}");
@@ -476,6 +481,7 @@ fn convert_anthropic_message_to_chat(
                     // thinking into a user/system channel.  `redacted_thinking`
                     // has no readable text and is ignored.
                     if role == "assistant" {
+                        assistant_had_thinking = true;
                         if let Some(t) = block.get("thinking").and_then(Value::as_str) {
                             if !t.is_empty() {
                                 assistant_reasoning.push_str(t);
@@ -512,11 +518,7 @@ fn convert_anthropic_message_to_chat(
             };
             // Reasoning content extracted from assistant `thinking` blocks
             // (fail-open mapping to OpenAI's non-stream reasoning_content).
-            let reasoning = if assistant_reasoning.is_empty() {
-                None
-            } else {
-                Some(assistant_reasoning)
-            };
+            let reasoning = assistant_had_thinking.then_some(assistant_reasoning);
             if tool_calls.is_empty() && content.is_null() && reasoning.is_none() {
                 return Err(UnsupportedFeatures::single(
                     FeatureKind::UnknownBlock,
