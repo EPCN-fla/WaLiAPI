@@ -13,11 +13,11 @@
 //! halt immediately; `ChannelAuthTerminal` / `UpstreamProtocolError` continue
 //! to the next candidate WITHIN the group but never cross groups.
 
+use crate::core::protocol_boundary::downstream_protocol;
 use crate::core::route_plan::{
-    resolve_upstream_model, EndpointKind, GroupTier, RouteGroup, RouteGroupCandidate, RoutePlan,
-    UpstreamProtocol,
+    resolve_upstream_model, GroupTier, RouteGroup, RouteGroupCandidate, RoutePlan,
 };
-use crate::protocol::codec::registry::{CodecRegistry, Downstream, Upstream};
+use crate::protocol::codec::{CodecRegistry, PreparedCodec};
 use crate::security::gate::AuditedRequest;
 use rand::Rng;
 use serde::Serialize;
@@ -125,7 +125,15 @@ pub struct PreparedAttempt {
     /// Single source of truth for body / logs / stats (design 11.4).
     pub upstream_model: String,
     pub native_base_url: String,
+    /// Compatibility label for persisted observability.  Runtime consumers use
+    /// `prepared_codec` exclusively; this label is derived once at prepare time
+    /// and is never used to select a decoder.
     pub codec_version: Option<String>,
+    /// Immutable request-scoped codec plan.  Every response consumer creates a
+    /// fresh decoder through this factory, retaining the exact conversion
+    /// context (notably request id and mapped model) that encoded the request.
+    /// `None` is the explicit CountTokens/Embeddings bypass only.
+    pub prepared_codec: Option<PreparedCodec>,
     pub encoded_body: Value,
     pub conversion_report: Option<Value>,
     pub is_retry: bool,
@@ -205,12 +213,61 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
     let upstream_endpoint = candidate.upstream_endpoint.clone();
     let native_base_url = candidate.candidate.native_base_url();
 
-    match group.tier {
-        GroupTier::Native => {
-            let mut body = audit.forward_json.clone();
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert("model".into(), Value::String(upstream_model.clone()));
+    // The typed matrix owns every route-plan protocol pair it understands,
+    // including identity pairs.  A route-plan-approved Native candidate such
+    // as Ollama `api_chat` is deliberately outside that matrix and must retain
+    // its wire body; forcing it through a synthetic protocol pair would turn a
+    // valid native route into a local 400.
+    match downstream_protocol(group.downstream) {
+        Some(downstream) => {
+            let upstream = crate::core::protocol_boundary::upstream_protocol(
+                candidate.upstream_protocol,
+                &upstream_endpoint,
+            );
+            if upstream.is_none() && group.tier == GroupTier::Native {
+                return Ok(native_attempt(
+                    audit,
+                    channel_id,
+                    channel_name,
+                    upstream_type,
+                    route_group,
+                    upstream_protocol,
+                    upstream_endpoint,
+                    upstream_model,
+                    native_base_url,
+                    is_retry,
+                    attempt_no,
+                ));
             }
+            let upstream = upstream.ok_or_else(|| AttemptFailure {
+                failure_class: FailureClass::CallerTerminal,
+                message: format!(
+                    "route candidate {} / {} is not a valid upstream protocol endpoint for {}",
+                    candidate.upstream_protocol.as_str(),
+                    upstream_endpoint,
+                    group.downstream.as_str(),
+                ),
+                status_code: Some(400),
+                retry_after: None,
+            })?;
+            let prepared = CodecRegistry::prepare_pair(
+                downstream,
+                upstream,
+                &upstream_model,
+                &audit.forward_json,
+            )
+            .map_err(|e| AttemptFailure {
+                failure_class: FailureClass::CallerTerminal,
+                message: format!(
+                    "request cannot be converted to {}: {}",
+                    candidate.upstream_protocol.as_str(),
+                    e
+                ),
+                status_code: Some(400),
+                retry_after: None,
+            })?;
+            let report = serde_json::to_value(&prepared.report).unwrap_or(json!({}));
+            let codec_version = Some(prepared.codec.label().to_string());
             Ok(PreparedAttempt {
                 channel_id,
                 channel_name,
@@ -220,126 +277,63 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
                 upstream_endpoint,
                 upstream_model,
                 native_base_url,
-                codec_version: None,
-                encoded_body: body,
-                conversion_report: None,
+                codec_version,
+                prepared_codec: Some(prepared.codec),
+                encoded_body: prepared.encoded_request,
+                conversion_report: Some(report),
                 is_retry,
                 attempt_no,
             })
         }
-        GroupTier::Conversion => {
-            // A conversion group intentionally pools candidates by tier, not
-            // by wire protocol.  Its summary protocol mirrors the first
-            // candidate only, so every attempt must derive its codec from the
-            // candidate it is about to contact.
-            let codec_version = codec_direction(group.downstream, candidate.upstream_protocol);
-            if let Some((downstream, upstream, version_label)) = codec_version {
-                let prepared = CodecRegistry::prepare(
-                    downstream,
-                    upstream,
-                    &CodecRegistry::version(),
-                    &upstream_model,
-                    &audit.forward_json,
-                )
-                .map_err(
-                    |e: crate::protocol::codec::error::UnsupportedFeatures| AttemptFailure {
-                        failure_class: FailureClass::CallerTerminal,
-                        message: format!(
-                            "request cannot be converted to {}: {}",
-                            candidate.upstream_protocol.as_str(),
-                            e.message
-                        ),
-                        status_code: Some(400),
-                        retry_after: None,
-                    },
-                )?;
-                let report = serde_json::to_value(&prepared.report).unwrap_or(json!({}));
-                Ok(PreparedAttempt {
-                    channel_id,
-                    channel_name,
-                    upstream_type,
-                    route_group,
-                    upstream_protocol,
-                    upstream_endpoint,
-                    upstream_model,
-                    native_base_url,
-                    codec_version: Some(version_label.to_string()),
-                    encoded_body: prepared.encoded_request,
-                    conversion_report: Some(report),
-                    is_retry,
-                    attempt_no,
-                })
-            } else {
-                // Legacy Responses→Chat debt conversion (not in the codec
-                // registry; handled by the existing protocol helpers).
-                let mut encoded = crate::protocol::responses_to_openai(&audit.forward_json)
-                    .map_err(|e| AttemptFailure {
-                        failure_class: FailureClass::CallerTerminal,
-                        message: format!(
-                            "request cannot be converted to {}: {}",
-                            candidate.upstream_protocol.as_str(),
-                            e.message
-                        ),
-                        status_code: Some(400),
-                        retry_after: None,
-                    })?;
-                // The sampled upstream model must be baked into the encoded body
-                // (matching the native and codec paths) so the actual request,
-                // logs and statistics all use the SAME model (§11.4).
-                if let Some(obj) = encoded.as_object_mut() {
-                    obj.insert("model".into(), Value::String(upstream_model.clone()));
-                }
-                Ok(PreparedAttempt {
-                    channel_id,
-                    channel_name,
-                    upstream_type,
-                    route_group,
-                    upstream_protocol,
-                    upstream_endpoint,
-                    upstream_model,
-                    native_base_url,
-                    codec_version: Some("responses_via_chat_v1".to_string()),
-                    encoded_body: encoded,
-                    conversion_report: None,
-                    is_retry,
-                    attempt_no,
-                })
-            }
-        }
+        None => Ok(native_attempt(
+            audit,
+            channel_id,
+            channel_name,
+            upstream_type,
+            route_group,
+            upstream_protocol,
+            upstream_endpoint,
+            upstream_model,
+            native_base_url,
+            is_retry,
+            attempt_no,
+        )),
     }
 }
 
-fn codec_direction(
-    downstream: EndpointKind,
-    upstream_protocol: UpstreamProtocol,
-) -> Option<(Downstream, Upstream, &'static str)> {
-    match (downstream, upstream_protocol) {
-        (EndpointKind::ChatCompletions, UpstreamProtocol::Anthropic) => Some((
-            Downstream::ChatCompletions,
-            Upstream::Messages,
-            "chat_to_messages_v1",
-        )),
-        (EndpointKind::Messages, UpstreamProtocol::OpenAI) => Some((
-            Downstream::Messages,
-            Upstream::ChatCompletions,
-            "messages_to_chat_v1",
-        )),
-        (EndpointKind::ChatCompletions, UpstreamProtocol::Responses) => Some((
-            Downstream::ChatCompletions,
-            Upstream::Responses,
-            "chat_to_responses_v1",
-        )),
-        (EndpointKind::Messages, UpstreamProtocol::Responses) => Some((
-            Downstream::Messages,
-            Upstream::Responses,
-            "messages_to_responses_v1",
-        )),
-        (EndpointKind::Responses, UpstreamProtocol::Anthropic) => Some((
-            Downstream::Responses,
-            Upstream::Messages,
-            "responses_to_messages_v1",
-        )),
-        _ => None,
+#[allow(clippy::too_many_arguments)]
+fn native_attempt(
+    audit: &AuditedRequest,
+    channel_id: String,
+    channel_name: String,
+    upstream_type: String,
+    route_group: String,
+    upstream_protocol: String,
+    upstream_endpoint: String,
+    upstream_model: String,
+    native_base_url: String,
+    is_retry: bool,
+    attempt_no: usize,
+) -> PreparedAttempt {
+    let mut body = audit.forward_json.clone();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("model".into(), Value::String(upstream_model.clone()));
+    }
+    PreparedAttempt {
+        channel_id,
+        channel_name,
+        upstream_type,
+        route_group,
+        upstream_protocol,
+        upstream_endpoint,
+        upstream_model,
+        native_base_url,
+        codec_version: None,
+        prepared_codec: None,
+        encoded_body: body,
+        conversion_report: None,
+        is_retry,
+        attempt_no,
     }
 }
 
@@ -816,19 +810,23 @@ mod tests {
             assert_eq!(second_attempt.upstream_type, "auth_account");
             assert_eq!(
                 second_attempt.codec_version.as_deref(),
-                Some("messages_to_responses_v1")
+                Some("messages_to_responses_v2")
+            );
+            assert_eq!(
+                second_attempt
+                    .prepared_codec
+                    .as_ref()
+                    .map(PreparedCodec::label),
+                Some("messages_to_responses_v2")
             );
             assert!(second_attempt.encoded_body.get("input").is_some());
         }
     }
 
-    /// Cell 5 (Responses → chat-only channel): the legacy Responses→Chat debt
-    /// conversion runs through `build_prepared_attempt`'s non-registry branch
-    /// (codec_direction returns None for Responses→OpenAI), encoding via
-    /// `responses_to_openai` with the sampled upstream model baked in.  This
-    /// branch had no attempt-level coverage.
+    /// Responses → Chat uses the typed matrix entry and retains the prepared
+    /// codec that must later create the inverse response decoder.
     #[test]
-    fn responses_via_chat_debt_attempt_encodes_openai_body() {
+    fn responses_to_chat_attempt_encodes_openai_body() {
         for stream in [false, true] {
             let audit = audited_responses(stream);
             let ch = channel(
@@ -848,23 +846,21 @@ mod tests {
                 &audit.forward_json,
                 &mut StdRng::seed_from_u64(7),
             )
-            .expect("responses_via_chat plan");
+            .expect("responses_to_chat plan");
             let group = &plan.groups[0];
             assert_eq!(group.tier.as_str(), "conversion");
             assert_eq!(group.upstream_endpoint, "chat_completions");
 
             let mut rng = StdRng::seed_from_u64(7);
-            let attempt = build_prepared_attempt(
-                &audit,
-                group,
-                &group.candidates[0],
-                &mut rng,
-                1,
-            )
-            .expect("responses_via_chat encodes");
+            let attempt = build_prepared_attempt(&audit, group, &group.candidates[0], &mut rng, 1)
+                .expect("responses_to_chat encodes");
             assert_eq!(
                 attempt.codec_version.as_deref(),
-                Some("responses_via_chat_v1")
+                Some("responses_to_chat_v1")
+            );
+            assert_eq!(
+                attempt.prepared_codec.as_ref().map(PreparedCodec::label),
+                Some("responses_to_chat_v1")
             );
             // The encoded body is the OpenAI chat shape, not the Responses shape.
             assert!(attempt.encoded_body.get("messages").is_some());
@@ -908,6 +904,43 @@ mod tests {
         let mut rng2 = StdRng::seed_from_u64(1);
         let attempt2 = build_prepared_attempt(&audited(), group, candidate, &mut rng2, 1).unwrap();
         assert_eq!(attempt.upstream_model, attempt2.upstream_model);
+    }
+
+    #[test]
+    fn approved_ollama_api_chat_native_route_bypasses_codec_matrix() {
+        let mut ollama = channel("ollama", "ollama", "http://localhost:11434", &["m"], 1, 1);
+        ollama.protocol = Some("ollama".into());
+        ollama.provider = Some("ollama".into());
+        ollama.native_base_url = Some("http://localhost:11434".into());
+        ollama.native_endpoints = Some(serde_json::json!(["api_chat"]).to_string());
+        let plan = authorize_and_plan(
+            &api_key(),
+            "m",
+            EndpointKind::ChatCompletions,
+            &[ollama],
+            &flags(),
+            &audited().forward_json,
+            &mut StdRng::seed_from_u64(7),
+        )
+        .expect("route-plan-approved native Ollama chat");
+        assert_eq!(plan.groups[0].tier, GroupTier::Native);
+        assert_eq!(plan.groups[0].upstream_endpoint, "api_chat");
+        let mut rng = StdRng::seed_from_u64(7);
+        let attempt = build_prepared_attempt(
+            &audited(),
+            &plan.groups[0],
+            &plan.groups[0].candidates[0],
+            &mut rng,
+            1,
+        )
+        .expect("native Ollama attempt must not be matrix-rejected");
+        assert!(attempt.prepared_codec.is_none());
+        assert_eq!(attempt.codec_version, None);
+        assert_eq!(attempt.encoded_body["model"], attempt.upstream_model);
+        assert_eq!(
+            attempt.encoded_body["messages"],
+            audited().forward_json["messages"]
+        );
     }
 
     #[test]

@@ -15,13 +15,13 @@
 //! emit a protocol-representable error, never a retry.
 
 use crate::core::attempt::{
-    build_prepared_attempt, AttemptFailure, AttemptFlow, FailureClass, FlowStep, PreparedAttempt,
+    build_prepared_attempt, AttemptFailure, AttemptFlow, FailureClass, FlowStep,
 };
 use crate::core::channel_identity::{resolve_channel_identity, ChannelIdentityRow};
 use crate::core::route_plan::{RouteCandidate, RoutePlan};
 use crate::db::models::{ApiKey, Channel, RequestLog};
 use crate::db::repository::Repository;
-use crate::endpoint_executor::sse::{decoder_for, SseMode, StreamPumpCore};
+use crate::endpoint_executor::sse::StreamPumpCore;
 use crate::endpoint_executor::{
     dispatch_auth_account_executor, dispatch_auth_account_stream_executor, dispatch_executor,
     dispatch_stream_executor, StreamAttemptResult, UpstreamStream,
@@ -31,38 +31,13 @@ use crate::utils;
 use axum::body::Body;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use chrono::{Duration, SecondsFormat, Utc};
 use futures_util::StreamExt;
 use rand::SeedableRng;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-
-/// Map an attempt to its streaming transform mode.
-///
-/// The label names the REQUEST encoding direction (`chat_to_messages_v1` =
-/// downstream Chat request encoded as an upstream Messages request), but the
-/// SSE mode names the RESPONSE decoding direction (what the upstream SSE must
-/// be transformed INTO for the downstream client).  The two are inverse, so the
-/// mapping is deliberately crossed:
-///   * `chat_to_messages_v1`  → upstream Messages SSE → downstream Chat SSE  (`MessagesToChat`)
-///   * `messages_to_chat_v1`  → upstream Chat SSE     → downstream Messages SSE (`ChatToMessages`)
-fn sse_mode_for(attempt: &PreparedAttempt) -> SseMode {
-    if attempt.upstream_type == "auth_account" {
-        return match attempt.codec_version.as_deref() {
-            Some("chat_to_responses_v1") => SseMode::ResponsesToChat,
-            Some("messages_to_responses_v1") => SseMode::ResponsesToMessages,
-            _ => SseMode::Native,
-        };
-    }
-    match attempt.codec_version.as_deref() {
-        Some("chat_to_messages_v1") => SseMode::MessagesToChat,
-        Some("messages_to_chat_v1") => SseMode::ChatToMessages,
-        Some("responses_via_chat_v1") => SseMode::ResponsesViaChat,
-        Some("responses_to_messages_v1") => SseMode::MessagesToResponses,
-        _ => SseMode::Native,
-    }
-}
 
 fn candidate_lookup(plan: &RoutePlan) -> HashMap<String, RouteCandidate> {
     plan.groups
@@ -83,6 +58,60 @@ fn missing_candidate_failure(candidate_id: &str) -> AttemptFailure {
         message: format!("route plan candidate lookup failed for {candidate_id}"),
         status_code: Some(500),
         retry_after: None,
+    }
+}
+
+const MODE_FAILURE_COOLDOWN_MINUTES: i64 = 5;
+
+/// Only transport/protocol failures demonstrate that a particular endpoint and
+/// transport mode is unhealthy. Caller errors, auth errors, and rate limits
+/// must never poison a channel's capability state.
+fn affects_mode_health(failure: &AttemptFailure) -> bool {
+    failure.failure_class == FailureClass::UpstreamProtocolError
+        && (failure
+            .message
+            .starts_with("upstream returned an undecodable body")
+            || failure
+                .message
+                .starts_with("upstream response could not be decoded:")
+            || failure
+                .message
+                .starts_with("upstream stream ended before a valid first SSE record")
+            || failure
+                .message
+                .starts_with("upstream first frame could not be converted"))
+}
+
+async fn record_channel_mode_outcome(
+    repo: &Arc<Repository>,
+    channel_id: &str,
+    endpoint: &str,
+    is_stream: bool,
+    result: &crate::core::attempt::AttemptResult,
+) {
+    let outcome = match result {
+        crate::core::attempt::AttemptResult::Success(_) => {
+            repo.record_channel_mode_success(channel_id, endpoint, is_stream)
+                .await
+        }
+        crate::core::attempt::AttemptResult::Failure(failure) if affects_mode_health(failure) => {
+            let now = crate::utils::time::now_iso();
+            let cooldown_until = (Utc::now() + Duration::minutes(MODE_FAILURE_COOLDOWN_MINUTES))
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            repo.record_channel_mode_failure(
+                channel_id,
+                endpoint,
+                is_stream,
+                &now,
+                &cooldown_until,
+                &failure.message,
+            )
+            .await
+        }
+        _ => return,
+    };
+    if let Err(error) = outcome {
+        eprintln!("[WARN] channel mode health update failed: {error}");
     }
 }
 
@@ -165,6 +194,7 @@ pub(crate) async fn route_plan_response_with_auth_service(
     let lookup = candidate_lookup(&plan);
     let endpoint = plan.endpoint;
     let query = audited.envelope.query.clone();
+    let mode_health_repo = repo.clone();
     let started = Instant::now();
     let execution = crate::core::plan_executor::execute_plan(
         plan,
@@ -175,13 +205,14 @@ pub(crate) async fn route_plan_response_with_auth_service(
             let query = query.clone();
             let candidate = lookup.get(&attempt.channel_id).cloned();
             let auth_service = auth_service.clone();
+            let mode_health_repo = mode_health_repo.clone();
             // Clone the attempt so the returned future does not borrow it
             // (execute_plan requires a `'static`-capable executor future).
             let attempt = attempt.clone();
             async move {
                 match candidate {
                     Some(RouteCandidate::Channel { channel, identity }) => {
-                        dispatch_executor(
+                        let result = dispatch_executor(
                             endpoint,
                             &attempt,
                             &channel,
@@ -189,7 +220,16 @@ pub(crate) async fn route_plan_response_with_auth_service(
                             &safe,
                             query.as_deref(),
                         )
-                        .await
+                        .await;
+                        record_channel_mode_outcome(
+                            &mode_health_repo,
+                            &channel.id,
+                            endpoint.as_str(),
+                            false,
+                            &result,
+                        )
+                        .await;
+                        result
                     }
                     Some(RouteCandidate::AuthAccount(_)) => {
                         dispatch_auth_account_executor(endpoint, &attempt, &auth_service, &safe)
@@ -592,6 +632,10 @@ pub(crate) async fn route_stream_plan_with_auth_service(
                 }
                 let candidate = lookup.get(&attempt.channel_id).cloned();
                 let query = audited.envelope.query.clone();
+                let health_channel_id = candidate.as_ref().and_then(|candidate| match candidate {
+                    RouteCandidate::Channel { channel, .. } => Some(channel.id.clone()),
+                    RouteCandidate::AuthAccount(_) => None,
+                });
 
                 let dispatched = match candidate {
                     Some(RouteCandidate::Channel { channel, identity }) => {
@@ -616,6 +660,16 @@ pub(crate) async fn route_stream_plan_with_auth_service(
 
                 match dispatched {
                     StreamAttemptResult::Failure(f) => {
+                        if let Some(channel_id) = health_channel_id.as_deref() {
+                            record_channel_mode_outcome(
+                                repo,
+                                channel_id,
+                                endpoint.as_str(),
+                                true,
+                                &crate::core::attempt::AttemptResult::Failure(f.clone()),
+                            )
+                            .await;
+                        }
                         flow.record_failure(&f);
                         if f.failure_class == FailureClass::CallerTerminal
                             || f.failure_class == FailureClass::CommittedStreamError
@@ -645,14 +699,27 @@ pub(crate) async fn route_stream_plan_with_auth_service(
                             Some(x) => x,
                             None => {
                                 // Empty / undecodable upstream: pre-commit failover.
-                                flow.record_failure(&AttemptFailure {
+                                let failure = AttemptFailure {
                                     failure_class: FailureClass::UpstreamProtocolError,
                                     message:
                                         "upstream stream ended before a valid first SSE record"
                                             .to_string(),
                                     status_code: Some(502),
                                     retry_after: None,
-                                });
+                                };
+                                if let Some(channel_id) = health_channel_id.as_deref() {
+                                    record_channel_mode_outcome(
+                                        repo,
+                                        channel_id,
+                                        endpoint.as_str(),
+                                        true,
+                                        &crate::core::attempt::AttemptResult::Failure(
+                                            failure.clone(),
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                flow.record_failure(&failure);
                                 continue;
                             }
                         };
@@ -668,37 +735,79 @@ pub(crate) async fn route_stream_plan_with_auth_service(
                         if supervisor.on_first_frame_validated().is_err() {
                             unreachable!()
                         }
-
-                        let sse_mode = sse_mode_for(&attempt);
-                        let decoder = decoder_for(sse_mode, &attempt.upstream_model, "");
-                        // C-1: conversion modes encode the first record AND the
-                        // carry (records 2..N of the same upstream chunk) through
-                        // the decoder BEFORE commit; a codec rejection of any
-                        // first-chunk record is a pre-commit failover (never
-                        // committed, never raw).
+                        let Some(codec) = attempt.prepared_codec.as_ref() else {
+                            let failure = AttemptFailure {
+                                failure_class: FailureClass::CallerTerminal,
+                                message:
+                                    "three-protocol streaming attempt is missing its prepared codec"
+                                        .to_string(),
+                                status_code: Some(500),
+                                retry_after: None,
+                            };
+                            flow.record_failure(&failure);
+                            continue;
+                        };
+                        let codec_label = codec.label();
+                        let is_identity = codec.is_identity();
+                        // A fresh decoder is created for this particular
+                        // attempt/retry and receives the same context that
+                        // encoded its request. No string label is reinterpreted.
                         let pump = match StreamPumpCore::new(
                             supervisor,
-                            sse_mode,
-                            decoder,
+                            codec.new_stream_decoder(),
                             first_frame.clone(),
                             carry.clone(),
-                            attempt.upstream_model.clone(),
                         ) {
                             Ok(p) => p,
                             Err(e) => {
-                                flow.record_failure(&AttemptFailure {
+                                let failure = AttemptFailure {
                                     failure_class: FailureClass::UpstreamProtocolError,
                                     message: format!(
                                         "upstream first frame could not be converted ({}): {}",
-                                        sse_mode.as_str(),
+                                        codec_label,
                                         e.message()
                                     ),
                                     status_code: Some(502),
                                     retry_after: None,
-                                });
+                                };
+                                if let Some(channel_id) = health_channel_id.as_deref() {
+                                    record_channel_mode_outcome(
+                                        repo,
+                                        channel_id,
+                                        endpoint.as_str(),
+                                        true,
+                                        &crate::core::attempt::AttemptResult::Failure(
+                                            failure.clone(),
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                flow.record_failure(&failure);
                                 continue;
                             }
                         };
+                        if let Some(channel_id) = health_channel_id.as_deref() {
+                            // A first record which has passed both SSE and codec
+                            // validation proves this channel's stream mode is
+                            // healthy, even if the client later disconnects.
+                            record_channel_mode_outcome(
+                                repo,
+                                channel_id,
+                                endpoint.as_str(),
+                                true,
+                                &crate::core::attempt::AttemptResult::Success(
+                                    crate::core::attempt::AttemptSuccess {
+                                        status: 200,
+                                        body: serde_json::Value::Null,
+                                        usage: None,
+                                        downstream_events: None,
+                                        upstream_model: None,
+                                        response_headers: vec![],
+                                    },
+                                ),
+                            )
+                            .await;
+                        }
 
                         let channel_id = attempt.channel_id.clone();
                         let channel_name = attempt.channel_name.clone();
@@ -761,7 +870,7 @@ pub(crate) async fn route_stream_plan_with_auth_service(
                             .status(StatusCode::OK)
                             .header(
                                 header::CONTENT_TYPE,
-                                if sse_mode == SseMode::Native {
+                                if is_identity {
                                     upstream_content_type
                                 } else {
                                     "text/event-stream".to_string()
@@ -1277,15 +1386,18 @@ mod tests {
         sup.begin_connect().unwrap();
         sup.on_upstream_headers().unwrap();
         sup.on_first_frame_validated().unwrap();
-        let mode = SseMode::MessagesToChat;
-        let decoder = decoder_for(mode, "up-model", "");
+        let prepared = crate::protocol::codec::CodecRegistry::prepare_pair(
+            crate::protocol::codec::Protocol::Chat,
+            crate::protocol::codec::Protocol::Messages,
+            "up-model",
+            &json!({"model":"up-model", "messages":[{"role":"user","content":"hi"}]}),
+        )
+        .unwrap();
         let mut pump = StreamPumpCore::new(
             sup,
-            mode,
-            decoder,
+            prepared.codec.new_stream_decoder(),
             first_frame.clone(),
             carry.clone(),
-            "up-model".to_string(),
         )
         .unwrap();
 
@@ -1350,66 +1462,6 @@ mod tests {
         assert!(!format_stream_error("chat", "x").contains("chat_to_messages_v1"));
     }
 
-    #[test]
-    fn auth_account_uses_responses_sse_modes_and_lookup_failure_is_terminal() {
-        let base = PreparedAttempt {
-            channel_id: "account-1".into(),
-            channel_name: "Codex".into(),
-            upstream_type: "auth_account".into(),
-            route_group: "responses_g1_native".into(),
-            upstream_protocol: "responses".into(),
-            upstream_endpoint: "responses".into(),
-            upstream_model: "m".into(),
-            native_base_url: "ignored".into(),
-            codec_version: None,
-            encoded_body: json!({"model":"m"}),
-            conversion_report: None,
-            is_retry: false,
-            attempt_no: 1,
-        };
-        assert_eq!(sse_mode_for(&base), SseMode::Native);
-
-        let mut chat = base.clone();
-        chat.codec_version = Some("chat_to_responses_v1".into());
-        assert_eq!(sse_mode_for(&chat), SseMode::ResponsesToChat);
-
-        let mut messages = base;
-        messages.codec_version = Some("messages_to_responses_v1".into());
-        assert_eq!(sse_mode_for(&messages), SseMode::ResponsesToMessages);
-
-        let failure = missing_candidate_failure("gone");
-        assert_eq!(failure.status_code, Some(500));
-        assert_eq!(failure.failure_class, FailureClass::CallerTerminal);
-        assert!(!failure.message.is_empty());
-    }
-
-    #[test]
-    fn channel_codex_responses_uses_messages_to_responses_sse_mode() {
-        // Path ①: a codex Responses request routed to an Anthropic Messages
-        // channel carries codec_version "responses_to_messages_v1" and must map
-        // to the Messages→Responses SSE decode mode.
-        let base = PreparedAttempt {
-            channel_id: "ch-1".into(),
-            channel_name: "Claude".into(),
-            upstream_type: "channel".into(),
-            route_group: "responses_g1_conversion".into(),
-            upstream_protocol: "anthropic".into(),
-            upstream_endpoint: "messages".into(),
-            upstream_model: "m".into(),
-            native_base_url: "https://api.anthropic.com/v1".into(),
-            codec_version: None,
-            encoded_body: json!({"model":"m"}),
-            conversion_report: None,
-            is_retry: false,
-            attempt_no: 1,
-        };
-        assert_eq!(sse_mode_for(&base), SseMode::Native);
-
-        let mut v5 = base;
-        v5.codec_version = Some("responses_to_messages_v1".into());
-        assert_eq!(sse_mode_for(&v5), SseMode::MessagesToResponses);
-    }
-
     fn now() -> String {
         crate::utils::time::now_iso()
     }
@@ -1422,6 +1474,63 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn channel_mode_health_cools_down_only_the_failing_transport_mode() {
+        use crate::db::models::CreateChannelInput;
+
+        let repo = Repository::new(fresh_db().await);
+        let channel = repo
+            .create_channel(&CreateChannelInput {
+                name: "mode-health".into(),
+                channel_type: "openai".into(),
+                base_url: "https://example.test/v1".into(),
+                api_key: "sk-test".into(),
+                models: vec!["gpt-4o".into()],
+                protocol: Some("openai".into()),
+                provider: Some("custom".into()),
+                native_base_url: Some("https://example.test/v1".into()),
+                native_endpoints: Some(vec!["chat_completions".into()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let failure_at = "2026-08-11T00:00:00.000Z";
+        let cooldown_until = "2099-08-11T00:00:00.000Z";
+
+        for _ in 0..2 {
+            repo.record_channel_mode_failure(
+                &channel.id,
+                "chat_completions",
+                false,
+                failure_at,
+                cooldown_until,
+                "upstream returned an undecodable body (HTTP 200, 0 bytes)",
+            )
+            .await
+            .unwrap();
+        }
+
+        let available_non_stream = repo
+            .get_enabled_channels_for_mode("chat_completions", false, failure_at)
+            .await
+            .unwrap();
+        let available_stream = repo
+            .get_enabled_channels_for_mode("chat_completions", true, failure_at)
+            .await
+            .unwrap();
+        assert!(available_non_stream.is_empty());
+        assert_eq!(available_stream.len(), 1);
+
+        repo.record_channel_mode_success(&channel.id, "chat_completions", false)
+            .await
+            .unwrap();
+        let recovered = repo
+            .get_enabled_channels_for_mode("chat_completions", false, failure_at)
+            .await
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
     }
 
     fn audited_request() -> AuditedRequest {
@@ -1495,16 +1604,16 @@ mod tests {
         sup.begin_connect().unwrap();
         sup.on_upstream_headers().unwrap();
         sup.on_first_frame_validated().unwrap();
-        let mode = SseMode::MessagesToChat;
-        let pump = StreamPumpCore::new(
-            sup,
-            mode,
-            decoder_for(mode, "up-model", ""),
-            first_frame,
-            carry,
-            "up-model".to_string(),
+        let prepared = crate::protocol::codec::CodecRegistry::prepare_pair(
+            crate::protocol::codec::Protocol::Chat,
+            crate::protocol::codec::Protocol::Messages,
+            "up-model",
+            &json!({"model":"up-model", "messages":[{"role":"user","content":"hi"}]}),
         )
         .unwrap();
+        let pump =
+            StreamPumpCore::new(sup, prepared.codec.new_stream_decoder(), first_frame, carry)
+                .unwrap();
 
         let stream = stream_response_body(
             pump,

@@ -131,13 +131,16 @@ async fn maybe_route_plan(
     if !auth_routeplan_rollout_enabled(&flags, has_request_scoped_auth_candidate) {
         return Ok(None);
     }
-    let channels = repo.get_enabled_channels().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
-        )
-            .into_response()
-    })?;
+    let channels = repo
+        .get_enabled_channels_for_mode(endpoint.as_str(), is_stream, &crate::utils::time::now_iso())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+                .into_response()
+        })?;
     let mut plan_rng = rand::rngs::StdRng::from_os_rng();
     let plan = match route_plan::authorize_and_plan_with_accounts(
         key,

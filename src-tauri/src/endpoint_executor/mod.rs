@@ -93,8 +93,7 @@ pub async fn dispatch_auth_account_executor(
     }
     let response_headers = safe_response_headers(response.headers());
     let bytes = response.bytes().await.unwrap_or_default();
-    let mut accumulator =
-        crate::protocol::codec::responses_codec::ResponsesEventAccumulator::default();
+    let mut accumulator = crate::protocol::codec::ResponsesEventAccumulator::default();
     if let Err(error) = accumulator.push(&bytes) {
         return AttemptResult::Failure(responses_protocol_failure(error.message));
     }
@@ -391,10 +390,18 @@ fn transport_failure(e: reqwest::Error) -> AttemptFailure {
     }
 }
 
-fn undecodable_body(e: impl std::fmt::Display) -> AttemptFailure {
+fn undecodable_body(
+    status: u16,
+    body_len: usize,
+    content_type: Option<&str>,
+    e: impl std::fmt::Display,
+) -> AttemptFailure {
+    let content_type = content_type.unwrap_or("unknown");
     AttemptFailure {
         failure_class: FailureClass::UpstreamProtocolError,
-        message: format!("upstream returned an undecodable body: {e}"),
+        message: format!(
+            "upstream returned an undecodable body (HTTP {status}, {body_len} bytes, content-type {content_type}): {e}"
+        ),
         status_code: Some(502),
         retry_after: None,
     }
@@ -686,10 +693,22 @@ pub async fn dispatch_executor(
             if attempt.route_group.starts_with("draft_test/") {
                 match first_sse_data_json(&bytes) {
                     Some(v) => v,
-                    None => return AttemptResult::Failure(undecodable_body(e)),
+                    None => {
+                        return AttemptResult::Failure(undecodable_body(
+                            status,
+                            bytes.len(),
+                            content_type.as_deref(),
+                            e,
+                        ))
+                    }
                 }
             } else {
-                return AttemptResult::Failure(undecodable_body(e));
+                return AttemptResult::Failure(undecodable_body(
+                    status,
+                    bytes.len(),
+                    content_type.as_deref(),
+                    e,
+                ));
             }
         }
     };
@@ -720,152 +739,55 @@ pub async fn dispatch_executor(
     }
 }
 
-/// Decode a non-stream upstream body into the downstream protocol.
-/// Native groups pass the body through unchanged; conversion groups decode
-/// through the correct codec direction (the registry's response-decoder wiring
-/// is intentionally NOT used — its orientation is the encoder's, see T04 note).
+/// Decode one upstream body through the request-scoped codec plan.
+///
+/// The factory preserves the exact `ConversionContext` created while encoding
+/// this attempt.  It also returns observed usage as part of the same decode,
+/// avoiding a second protocol-specific pass for quota accounting.
 fn decode_non_stream(
-    _downstream: EndpointKind,
+    downstream: EndpointKind,
     attempt: &PreparedAttempt,
     body: &Value,
 ) -> Result<(Value, Option<TokenUsage>), AttemptFailure> {
-    let usage = extract_usage(&attempt.upstream_protocol, &attempt.upstream_endpoint, body);
-
-    match attempt.codec_version.as_deref() {
-        None => Ok((body.clone(), usage)),
-        Some("chat_to_messages_v1") => {
-            // downstream Chat, upstream Messages: Messages body -> Chat body.
-            let context = crate::protocol::codec::report::ConversionContext::new(
-                format!("chatcmpl_{}", uuid::Uuid::new_v4().simple()),
-                attempt.upstream_model.clone(),
-                false,
-            );
-            let out =
-                crate::protocol::codec::messages::decode_messages_response_to_chat(body, &context)
-                    .map_err(|e| AttemptFailure {
-                        failure_class: FailureClass::UpstreamProtocolError,
-                        message: format!(
-                            "Messages response cannot be decoded to Chat: {}",
-                            e.message
-                        ),
-                        status_code: Some(502),
-                        retry_after: None,
-                    })?;
-            Ok((out, usage))
-        }
-        Some("messages_to_chat_v1") => {
-            // downstream Messages, upstream Chat: Chat body -> Messages body.
-            let context = crate::protocol::codec::report::ConversionContext::new(
-                format!("msg_{}", uuid::Uuid::new_v4().simple()),
-                attempt.upstream_model.clone(),
-                false,
-            );
-            let out =
-                crate::protocol::codec::chat::decode_chat_response_to_messages(body, &context)
-                    .map_err(|e| AttemptFailure {
-                        failure_class: FailureClass::UpstreamProtocolError,
-                        message: format!(
-                            "Chat response cannot be decoded to Messages: {}",
-                            e.message
-                        ),
-                        status_code: Some(502),
-                        retry_after: None,
-                    })?;
-            Ok((out, usage))
-        }
-        Some("chat_to_responses_v1") => {
-            let context = crate::protocol::codec::report::ConversionContext::new(
-                format!("chatcmpl_{}", uuid::Uuid::new_v4().simple()),
-                attempt.upstream_model.clone(),
-                false,
-            );
-            let out = crate::protocol::codec::responses_codec::decode_responses_response_to_chat(
-                body, &context,
-            )
-            .map_err(|error| AttemptFailure {
+    let Some(codec) = attempt.prepared_codec.as_ref() else {
+        return match downstream {
+            EndpointKind::CountTokens | EndpointKind::Embeddings => Ok((
+                body.clone(),
+                extract_usage(&attempt.upstream_protocol, &attempt.upstream_endpoint, body),
+            )),
+            // Endpoint draft probes intentionally construct a minimal attempt
+            // without request preparation.  They exercise upstream reachability
+            // only and never serve a client response, so retain their historical
+            // raw-body inspection path while production remains fail-closed.
+            _ if attempt.route_group.starts_with("draft_test/") => Ok((
+                body.clone(),
+                extract_usage(&attempt.upstream_protocol, &attempt.upstream_endpoint, body),
+            )),
+            _ => Err(AttemptFailure {
                 failure_class: FailureClass::UpstreamProtocolError,
-                message: format!(
-                    "Responses response cannot be decoded to Chat: {}",
-                    error.message
-                ),
+                message: "three-protocol attempt is missing its prepared codec".to_string(),
                 status_code: Some(502),
                 retry_after: None,
-            })?;
-            Ok((out, usage))
-        }
-        Some("messages_to_responses_v1") => {
-            let context = crate::protocol::codec::report::ConversionContext::new(
-                format!("msg_{}", uuid::Uuid::new_v4().simple()),
-                attempt.upstream_model.clone(),
-                false,
-            );
-            let chat = crate::protocol::codec::responses_codec::decode_responses_response_to_chat(
-                body, &context,
-            )
-            .map_err(|error| AttemptFailure {
-                failure_class: FailureClass::UpstreamProtocolError,
-                message: format!(
-                    "Responses response cannot be decoded to Chat: {}",
-                    error.message
-                ),
-                status_code: Some(502),
-                retry_after: None,
-            })?;
-            let messages_context = crate::protocol::codec::report::ConversionContext::new(
-                format!("msg_{}", uuid::Uuid::new_v4().simple()),
-                attempt.upstream_model.clone(),
-                false,
-            );
-            let out = crate::protocol::codec::chat::decode_chat_response_to_messages(
-                &chat,
-                &messages_context,
-            )
-            .map_err(|error| AttemptFailure {
-                failure_class: FailureClass::UpstreamProtocolError,
-                message: format!(
-                    "Responses response cannot be decoded to Messages: {}",
-                    error.message
-                ),
-                status_code: Some(502),
-                retry_after: None,
-            })?;
-            Ok((out, usage))
-        }
-        Some("responses_to_messages_v1") => {
-            // downstream Responses, upstream Messages: Messages body -> Responses
-            // body.  Mirror of `MessagesResponsesNonStreamDecoder` (V5 codec).
-            let context = crate::protocol::codec::report::ConversionContext::new(
-                format!("chatcmpl_{}", uuid::Uuid::new_v4().simple()),
-                attempt.upstream_model.clone(),
-                false,
-            );
-            let chat = crate::protocol::codec::messages::decode_messages_response_to_chat(
-                body, &context,
-            )
-            .map_err(|error| AttemptFailure {
-                failure_class: FailureClass::UpstreamProtocolError,
-                message: format!(
-                    "Messages response cannot be decoded to Responses: {}",
-                    error.message
-                ),
-                status_code: Some(502),
-                retry_after: None,
-            })?;
-            let out = crate::protocol::openai_to_responses(&chat, &attempt.upstream_model);
-            Ok((out, usage))
-        }
-        Some("responses_via_chat_v1") => {
-            // downstream Responses, upstream Chat: Chat body -> Responses body.
-            let out = crate::protocol::openai_to_responses(body, &attempt.upstream_model);
-            Ok((out, usage))
-        }
-        Some(other) => Err(AttemptFailure {
+            }),
+        };
+    };
+    let decoded = codec
+        .new_non_stream_decoder()
+        .decode(body)
+        .map_err(|error| AttemptFailure {
             failure_class: FailureClass::UpstreamProtocolError,
-            message: format!("unknown codec version on a conversion attempt: {other}"),
+            message: format!("upstream response could not be decoded: {error}"),
             status_code: Some(502),
             retry_after: None,
+        })?;
+    Ok((
+        decoded.body,
+        decoded.usage.map(|usage| TokenUsage {
+            prompt_tokens: usage.input_tokens,
+            completion_tokens: usage.output_tokens,
+            total_tokens: usage.input_tokens + usage.output_tokens,
         }),
-    }
+    ))
 }
 
 /// Extract token usage from the RAW upstream body (before any response decode).

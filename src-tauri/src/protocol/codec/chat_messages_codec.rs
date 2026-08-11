@@ -537,18 +537,26 @@ fn chat_stream_incomplete_tool_arguments_are_rejected() {
 }
 
 #[test]
-fn chat_stream_unknown_finish_reason_rejected_at_finalize() {
+fn chat_stream_unknown_finish_reason_completes_as_end_turn() {
+    // A provider-specific terminal finish reason after an otherwise valid Chat
+    // stream is conservatively mapped to Anthropic `end_turn` rather than
+    // aborting a committed stream (CPA compatibility).
     let mut state = chat::ChatSseState::default();
-    state
-        .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
-        .unwrap();
-    state
-        .feed(b"data: {\"choices\":[{\"finish_reason\":\"bizarre\"}]}\n\n")
-        .unwrap();
-    let e = state.finish().unwrap_err();
-    assert!(reject_features(&e)
-        .iter()
-        .any(|c| c.contains("finish_reason")));
+    let mut output = Vec::new();
+    output.extend(
+        state
+            .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
+            .unwrap(),
+    );
+    output.extend(
+        state
+            .feed(b"data: {\"choices\":[{\"finish_reason\":\"bizarre\"}]}\n\n")
+            .unwrap(),
+    );
+    output.extend(state.finish().unwrap());
+    let output = output.join("");
+    assert!(output.contains("\"stop_reason\":\"end_turn\""));
+    assert!(output.contains("event: message_stop"));
 }
 
 #[test]
@@ -1456,7 +1464,9 @@ fn responses_to_messages_prepares_codex_request() {
         "tool_choice": "auto",
         "parallel_tool_calls": false,
         "reasoning": {"effort": "high"},
-        "store": true,
+        // The provider-owned preflight forces this control to false before
+        // transport; the codec rejects the side-effecting value itself.
+        "store": false,
         "stream": true,
         "include": ["reasoning.encrypted_content"],
         "prompt_cache_key": "cache-key",
@@ -1469,10 +1479,16 @@ fn responses_to_messages_prepares_codex_request() {
     assert_eq!(out["stream"], true);
     assert_eq!(out["system"][0]["text"], "You are a helpful assistant.");
     assert_eq!(out["messages"].as_array().unwrap().len(), 1);
-    assert_eq!(out["thinking"], serde_json::json!({"type": "adaptive"}));
+    assert_eq!(
+        out["thinking"],
+        serde_json::json!({"type": "enabled", "budget_tokens": 24576})
+    );
     assert_eq!(out["max_tokens"], 32000);
     assert_eq!(out["tools"][0]["name"], "list");
-    assert_eq!(out["tool_choice"], "auto");
+    assert_eq!(
+        out["tool_choice"],
+        serde_json::json!({"type": "auto", "disable_parallel_tool_use": true})
+    );
     // Dropped codex-only fields are recorded in the ConversionReport.
     for pointer in ["/parallel_tool_calls", "/store", "/include"] {
         assert!(
@@ -1483,24 +1499,15 @@ fn responses_to_messages_prepares_codex_request() {
 }
 
 #[test]
-fn responses_to_messages_unregistered_direction_still_errors() {
-    // (Responses, Responses) has no codec → fail closed, never a raw passthrough.
-    let e = CodecRegistry::prepare(
+fn responses_identity_direction_prepares_native_codec() {
+    let prepared = CodecRegistry::prepare_legacy(
         Downstream::Responses,
         Upstream::Responses,
         &CodecRegistry::version(),
         "m",
         &json!({ "model": "m", "input": [] }),
     )
-    .unwrap_err();
-    // The top-level message is the fail-closed wrapper; the registry's
-    // "no codec registered" reason is carried on the single rejected field.
-    assert!(
-        e.fields
-            .first()
-            .map(|f| f.message.contains("no codec registered"))
-            .unwrap_or(false),
-        "unexpected error message: {}",
-        e.message
-    );
+    .unwrap();
+    assert!(prepared.codec.is_identity());
+    assert_eq!(prepared.codec.label(), "native");
 }

@@ -46,6 +46,95 @@ impl Repository {
         .await
     }
 
+    /// Return channels that are enabled and not cooling down for this exact
+    /// endpoint + transport mode. Stream and non-stream health are deliberately
+    /// independent: a broken JSON response must not disable an otherwise healthy
+    /// SSE route.
+    pub async fn get_enabled_channels_for_mode(
+        &self,
+        endpoint: &str,
+        is_stream: bool,
+        now: &str,
+    ) -> Result<Vec<Channel>, sqlx::Error> {
+        sqlx::query_as::<_, Channel>(
+            "SELECT c.*
+             FROM channels c
+             LEFT JOIN channel_mode_health h
+               ON h.channel_id = c.id
+              AND h.endpoint = ?
+              AND h.is_stream = ?
+             WHERE c.status = 1
+               AND (h.cooldown_until IS NULL OR h.cooldown_until <= ?)
+             ORDER BY c.priority DESC, c.weight DESC",
+        )
+        .bind(endpoint)
+        .bind(i64::from(is_stream))
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Clear a mode-specific cooldown after that mode successfully serves a
+    /// request. The row is retained as a lightweight recovery audit record.
+    pub async fn record_channel_mode_success(
+        &self,
+        channel_id: &str,
+        endpoint: &str,
+        is_stream: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO channel_mode_health
+                (channel_id, endpoint, is_stream, consecutive_failures, cooldown_until, last_failure_at, last_failure_reason)
+             VALUES (?, ?, ?, 0, NULL, NULL, NULL)
+             ON CONFLICT(channel_id, endpoint,is_stream) DO UPDATE SET
+                consecutive_failures = 0,
+                cooldown_until = NULL,
+                last_failure_at = NULL,
+                last_failure_reason = NULL",
+        )
+        .bind(channel_id)
+        .bind(endpoint)
+        .bind(i64::from(is_stream))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// A second consecutive transport/protocol failure temporarily removes only
+    /// this mode from routing. The caller supplies a short, redacted reason.
+    pub async fn record_channel_mode_failure(
+        &self,
+        channel_id: &str,
+        endpoint: &str,
+        is_stream: bool,
+        failure_at: &str,
+        cooldown_until: &str,
+        reason: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO channel_mode_health
+                (channel_id, endpoint, is_stream, consecutive_failures, cooldown_until, last_failure_at, last_failure_reason)
+             VALUES (?, ?, ?, 1, NULL, ?, ?)
+             ON CONFLICT(channel_id, endpoint,is_stream) DO UPDATE SET
+                consecutive_failures = channel_mode_health.consecutive_failures + 1,
+                cooldown_until = CASE
+                    WHEN channel_mode_health.consecutive_failures + 1 >= 2 THEN ?
+                    ELSE NULL
+                END,
+                last_failure_at = excluded.last_failure_at,
+                last_failure_reason = excluded.last_failure_reason",
+        )
+        .bind(channel_id)
+        .bind(endpoint)
+        .bind(i64::from(is_stream))
+        .bind(failure_at)
+        .bind(reason)
+        .bind(cooldown_until)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Resolve the full identity to persist for a create/update, and the
     /// legacy dual-write pair (type, base_url).
     ///

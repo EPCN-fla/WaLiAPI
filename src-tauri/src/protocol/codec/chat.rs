@@ -3,11 +3,13 @@
 //! Covers request encoding, non-stream response decoding, and the streaming
 //! (SSE) response decoding.  Every conversion is fail-closed: unsupported
 //! features are rejected with a stable code + JSON pointer before any upstream
-//! access; invalid tool arguments are never rewritten to `{}`; an unknown
-//! finish reason is never downgraded to a normal stop/end_turn.
+//! access; invalid tool arguments are never rewritten to `{}`.  OpenAI-compatible
+//! gateways occasionally emit provider-specific terminal finish reasons; once a
+//! response has otherwise completed, those are conservatively represented as an
+//! Anthropic `end_turn` rather than aborting a committed Claude Code stream.
 
-use super::error::{FeatureKind, UnsupportedFeatures};
-use super::registry::{NonStreamDecoder, StreamDecoder};
+use super::error::{DecodeError, FeatureKind, UnsupportedFeatures};
+use super::ports::{DecodedResponse, NonStreamDecoder, StreamDecoder};
 use super::report::{ConversionContext, Usage};
 use super::request;
 use super::sse;
@@ -714,8 +716,11 @@ impl NonStreamResponseDecoder {
 }
 
 impl NonStreamDecoder for NonStreamResponseDecoder {
-    fn decode(&self, body: &Value) -> Result<Value, UnsupportedFeatures> {
+    fn decode(&self, body: &Value) -> Result<DecodedResponse, DecodeError> {
+        let usage = super::identity::parse_usage(super::types::Protocol::Chat, body);
         decode_chat_response_to_messages(body, &self.context)
+            .map(|body| DecodedResponse { body, usage })
+            .map_err(DecodeError::from)
     }
 }
 
@@ -1306,11 +1311,17 @@ impl ChatSseState {
             Some("tool_calls") | Some("function_call") => "tool_use",
             Some("content_filter") | Some("refusal") => "refusal",
             Some(other) => {
-                return Err(UnsupportedFeatures::single(
-                    FeatureKind::UnknownFinishReason,
-                    "/choices/0/finish_reason",
-                    format!("unknown Chat finish_reason {other:?}"),
-                ))
+                // CPA-compatible terminal fallback: the upstream has already
+                // completed a valid Chat stream, but this gateway supplied a
+                // provider-specific finish reason.  Anthropic has no lossless
+                // representation for it, so finish the Message normally and
+                // retain the original value in structured logs.
+                tracing::warn!(
+                    finish_reason = other,
+                    fallback_stop_reason = "end_turn",
+                    "unknown OpenAI Chat stream finish_reason mapped for Anthropic compatibility"
+                );
+                "end_turn"
             }
             None => {
                 if !self.tools.is_empty() {
@@ -1358,14 +1369,37 @@ impl ChatStreamDecoder {
     }
 }
 
-impl super::registry::StreamDecoder for ChatStreamDecoder {
-    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
-        self.state.feed(bytes)
+impl StreamDecoder for ChatStreamDecoder {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, DecodeError> {
+        self.state.feed(bytes).map_err(DecodeError::from)
     }
-    fn finish(&mut self) -> Result<Vec<String>, UnsupportedFeatures> {
-        self.state.finish()
+    fn finish(&mut self) -> Result<Vec<String>, DecodeError> {
+        self.state.finish().map_err(DecodeError::from)
     }
     fn usage(&self) -> Option<Usage> {
         Some(self.state.usage)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatSseState;
+
+    #[test]
+    fn stream_unknown_finish_reason_completes_as_end_turn() {
+        let mut state = ChatSseState::new("go-model", "msg_test");
+        let events = state
+            .feed(
+                br#"data: {"id":"chatcmpl_test","model":"go-model","choices":[{"delta":{"role":"assistant","content":"ok"},"finish_reason":"completed"}]}
+
+"#,
+            )
+            .expect("provider-specific finish reason must not abort the stream");
+        let final_events = state.finish().expect("stream finalizes");
+        let all = events.into_iter().chain(final_events).collect::<String>();
+
+        assert!(all.contains("\"text\":\"ok\""));
+        assert!(all.contains("\"stop_reason\":\"end_turn\""));
+        assert!(all.contains("event: message_stop"));
     }
 }

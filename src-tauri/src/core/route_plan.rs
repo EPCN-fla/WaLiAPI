@@ -751,9 +751,7 @@ fn classify_channel(
                     "messages".into(),
                 ))
             } else if (debt
-                || (id.protocol == "openai"
-                    && has("chat_completions")
-                    && !has("responses")))
+                || (id.protocol == "openai" && has("chat_completions") && !has("responses")))
                 && flags.cross_protocol_codec
             {
                 // Responses→Chat conversion.  `debt` covers explicit

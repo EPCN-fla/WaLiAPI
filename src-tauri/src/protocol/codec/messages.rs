@@ -7,8 +7,8 @@
 //! are stripped only when lossless, and usage is taken from real upstream
 //! values.
 
-use super::error::{FeatureKind, UnsupportedFeatures};
-use super::registry::{NonStreamDecoder, StreamDecoder};
+use super::error::{DecodeError, FeatureKind, UnsupportedFeatures};
+use super::ports::{DecodedResponse, NonStreamDecoder, StreamDecoder};
 use super::report::{ConversionContext, Usage};
 use super::request;
 use super::sse;
@@ -727,8 +727,11 @@ impl NonStreamResponseDecoder {
 }
 
 impl NonStreamDecoder for NonStreamResponseDecoder {
-    fn decode(&self, body: &Value) -> Result<Value, UnsupportedFeatures> {
+    fn decode(&self, body: &Value) -> Result<DecodedResponse, DecodeError> {
+        let usage = super::identity::parse_usage(super::types::Protocol::Messages, body);
         decode_messages_response_to_chat(body, &self.context)
+            .map(|body| DecodedResponse { body, usage })
+            .map_err(DecodeError::from)
     }
 }
 
@@ -1346,12 +1349,12 @@ impl MessagesStreamDecoder {
     }
 }
 
-impl super::registry::StreamDecoder for MessagesStreamDecoder {
-    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
-        self.state.feed(bytes)
+impl StreamDecoder for MessagesStreamDecoder {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, DecodeError> {
+        self.state.feed(bytes).map_err(DecodeError::from)
     }
-    fn finish(&mut self) -> Result<Vec<String>, UnsupportedFeatures> {
-        self.state.finish()
+    fn finish(&mut self) -> Result<Vec<String>, DecodeError> {
+        self.state.finish().map_err(DecodeError::from)
     }
     fn usage(&self) -> Option<Usage> {
         Some(self.state.usage)

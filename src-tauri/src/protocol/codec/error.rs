@@ -218,3 +218,40 @@ impl fmt::Display for ResponseDecodeError {
 }
 
 impl std::error::Error for ResponseDecodeError {}
+
+/// Errors discovered while decoding an upstream response.
+///
+/// Preparation errors are deliberately kept separate: they describe caller
+/// input and are returned before any upstream request.  A decode failure
+/// instead describes an upstream protocol violation and must be classified by
+/// callers as a retryable upstream failure (until a stream is committed).
+pub type DecodeError = ResponseDecodeError;
+
+/// Errors returned while preparing an upstream request.
+///
+/// This alias preserves the stable unsupported-feature payload used by the
+/// existing HTTP boundary while making the phase distinction explicit at new
+/// codec call sites.
+pub type PrepareError = UnsupportedFeatures;
+
+impl ResponseDecodeError {
+    /// Convert a strict parser rejection into an upstream decode error without
+    /// exposing it as a caller-side unsupported-feature response.
+    pub fn from_unsupported(error: UnsupportedFeatures) -> Self {
+        Self {
+            code: "response_decode_error".to_string(),
+            pointer: error
+                .json_pointers
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "/".to_string()),
+            message: error.message,
+        }
+    }
+}
+
+impl From<UnsupportedFeatures> for ResponseDecodeError {
+    fn from(value: UnsupportedFeatures) -> Self {
+        Self::from_unsupported(value)
+    }
+}

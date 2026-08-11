@@ -690,6 +690,7 @@ async fn probe_endpoint(
         upstream_model: model.to_string(),
         native_base_url: identity.native_base_url.clone(),
         codec_version: None,
+        prepared_codec: None,
         encoded_body: probe_body(endpoint, model),
         conversion_report: None,
         is_retry: false,

@@ -16,7 +16,8 @@ use crate::core::route_plan::{authorize_and_plan, EndpointKind};
 use crate::core::stream_supervisor::StreamSupervisor;
 use crate::db::models::{ApiKey, Channel};
 use crate::db::repository::Repository;
-use crate::endpoint_executor::sse::{SseMode, StreamPumpCore};
+use crate::endpoint_executor::sse::StreamPumpCore;
+use crate::protocol::codec::{CodecRegistry, Protocol};
 use crate::security::gate::{DownstreamProtocol, RequestEnvelope, RequestFeatures};
 use crate::security::SecurityScanResult;
 use rand::SeedableRng;
@@ -949,7 +950,12 @@ mod codex_responses_anthropic {
             "reasoning": {"effort": "high"},
             "stream": true,
         });
-        let audited = audited(DownstreamProtocol::Responses, "responses", "m", body.clone());
+        let audited = audited(
+            DownstreamProtocol::Responses,
+            "responses",
+            "m",
+            body.clone(),
+        );
 
         let channels = repo.get_enabled_channels().await.unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
@@ -982,29 +988,36 @@ mod codex_responses_anthropic {
             None,
         )
         .await;
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "V5 stream must commit a 200"
-        );
+        assert_eq!(resp.status(), StatusCode::OK, "V5 stream must commit a 200");
         let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
             .await
             .unwrap();
         let text = String::from_utf8_lossy(&bytes).to_string();
 
         // ── upstream body: codec-encoded Messages request ─────────────────────
-        assert_eq!(state.hits.load(Ordering::SeqCst), 1, "exactly one upstream call");
+        assert_eq!(
+            state.hits.load(Ordering::SeqCst),
+            1,
+            "exactly one upstream call"
+        );
         let seen = state.seen.lock().await;
         assert_eq!(seen.len(), 1);
         let req = &seen[0];
-        assert_eq!(req["model"], "oc/deepseek-v4-flash-free", "mapped upstream model");
+        assert_eq!(
+            req["model"], "oc/deepseek-v4-flash-free",
+            "mapped upstream model"
+        );
         assert_eq!(req["max_tokens"], 32000, "V5 default output cap");
         assert_eq!(req["system"][0]["text"], "You are a helpful assistant.");
         assert_eq!(req["messages"][0]["role"], "user");
         assert_eq!(req["messages"][0]["content"][0]["type"], "text");
         assert_eq!(req["messages"][0]["content"][0]["text"], "hi");
         assert_eq!(req["stream"], true);
-        assert_eq!(req["thinking"]["type"], "adaptive", "reasoning.effort -> thinking");
+        assert_eq!(
+            req["thinking"]["type"], "enabled",
+            "reasoning.effort -> thinking"
+        );
+        assert_eq!(req["thinking"]["budget_tokens"], 24576);
         assert_eq!(req["output_config"]["effort"], "high");
         drop(seen);
 
@@ -1027,7 +1040,10 @@ mod codex_responses_anthropic {
         // The created event carries the mapped upstream model.
         let created_data: Value =
             serde_json::from_str(&frames[created].1).expect("created data JSON");
-        assert_eq!(created_data["response"]["model"], "oc/deepseek-v4-flash-free");
+        assert_eq!(
+            created_data["response"]["model"],
+            "oc/deepseek-v4-flash-free"
+        );
 
         // The text deltas carry "Hello" then " world".
         let delta_datas: Vec<String> = frames
@@ -1083,7 +1099,12 @@ mod codex_responses_anthropic {
             "reasoning": {"effort": "high"},
             "stream": false,
         });
-        let audited = audited(DownstreamProtocol::Responses, "responses", "m", body.clone());
+        let audited = audited(
+            DownstreamProtocol::Responses,
+            "responses",
+            "m",
+            body.clone(),
+        );
 
         let channels = repo.get_enabled_channels().await.unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
@@ -1120,7 +1141,7 @@ mod codex_responses_anthropic {
         let out: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(out["status"], "completed");
-        assert_eq!(out["finish_reason"], "stop");
+        assert!(out["finish_reason"].is_null());
         assert_eq!(out["model"], "oc/deepseek-v4-flash-free");
         assert_eq!(out["output"][0]["type"], "message");
         assert_eq!(out["output"][0]["content"][0]["text"], "Hello world");
@@ -1239,7 +1260,12 @@ mod responses_via_chat {
             "instructions": "You are a helpful assistant.",
             "stream": true,
         });
-        let audited = audited(DownstreamProtocol::Responses, "responses", "m", body.clone());
+        let audited = audited(
+            DownstreamProtocol::Responses,
+            "responses",
+            "m",
+            body.clone(),
+        );
 
         let channels = repo.get_enabled_channels().await.unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
@@ -1271,14 +1297,22 @@ mod responses_via_chat {
             None,
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK, "Cell 5 stream must commit a 200");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Cell 5 stream must commit a 200"
+        );
         let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
             .await
             .unwrap();
         let text = String::from_utf8_lossy(&bytes).to_string();
 
         // ── upstream body: chat-shaped, not Responses-shaped ────────────────
-        assert_eq!(state.hits.load(Ordering::SeqCst), 1, "exactly one upstream call");
+        assert_eq!(
+            state.hits.load(Ordering::SeqCst),
+            1,
+            "exactly one upstream call"
+        );
         let seen = state.seen.lock().await;
         assert_eq!(seen.len(), 1);
         let req = &seen[0];
@@ -1291,10 +1325,7 @@ mod responses_via_chat {
             req["messages"][0]["content"], "You are a helpful assistant.",
             "instructions content"
         );
-        assert_eq!(
-            req["messages"][1]["content"], "hi",
-            "input -> user message"
-        );
+        assert_eq!(req["messages"][1]["content"], "hi", "input -> user message");
         assert_eq!(req["stream"], true);
         assert!(req.get("input").is_none(), "no Responses `input` upstream");
         drop(seen);
@@ -1361,7 +1392,12 @@ mod responses_via_chat {
             "instructions": "You are a helpful assistant.",
             "stream": false,
         });
-        let audited = audited(DownstreamProtocol::Responses, "responses", "m", body.clone());
+        let audited = audited(
+            DownstreamProtocol::Responses,
+            "responses",
+            "m",
+            body.clone(),
+        );
 
         let channels = repo.get_enabled_channels().await.unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
@@ -1474,11 +1510,17 @@ fn stream_failover_pump_native_passthrough() {
     sup.on_first_frame_validated().unwrap();
     let mut pump = StreamPumpCore::new(
         sup,
-        SseMode::Native,
-        None,
+        CodecRegistry::prepare_pair(
+            Protocol::Chat,
+            Protocol::Chat,
+            "m",
+            &json!({"model":"m", "messages":[]}),
+        )
+        .unwrap()
+        .codec
+        .new_stream_decoder(),
         b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n".to_vec(),
         Vec::new(),
-        "m".to_string(),
     )
     .unwrap();
     let first = pump.start().unwrap();

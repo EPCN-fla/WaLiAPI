@@ -4,9 +4,9 @@
 //! the request representation and the small, byte-framed Responses SSE state
 //! machine used to express that stream as Chat (and, by composition, Messages).
 
-use super::error::{FeatureKind, UnsupportedFeatures};
+use super::error::{DecodeError, FeatureKind, UnsupportedFeatures};
 use super::messages;
-use super::registry::{NonStreamDecoder, StreamDecoder};
+use super::ports::{DecodedResponse, NonStreamDecoder, StreamDecoder};
 use super::report::{ConversionContext, Usage};
 use super::{request, sse};
 use serde_json::{Map, Value};
@@ -863,8 +863,11 @@ impl ResponsesNonStreamDecoder {
     }
 }
 impl NonStreamDecoder for ResponsesNonStreamDecoder {
-    fn decode(&self, body: &Value) -> Result<Value, UnsupportedFeatures> {
+    fn decode(&self, body: &Value) -> Result<DecodedResponse, DecodeError> {
+        let usage = super::identity::parse_usage(super::types::Protocol::Responses, body);
         decode_responses_response_to_chat(body, &self.context)
+            .map(|body| DecodedResponse { body, usage })
+            .map_err(DecodeError::from)
     }
 }
 
@@ -1305,11 +1308,11 @@ impl ResponsesStreamDecoder {
     }
 }
 impl StreamDecoder for ResponsesStreamDecoder {
-    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
-        self.state.feed(bytes)
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, DecodeError> {
+        self.state.feed(bytes).map_err(DecodeError::from)
     }
-    fn finish(&mut self) -> Result<Vec<String>, UnsupportedFeatures> {
-        self.state.finish()
+    fn finish(&mut self) -> Result<Vec<String>, DecodeError> {
+        self.state.finish().map_err(DecodeError::from)
     }
     fn usage(&self) -> Option<Usage> {
         Some(self.state.usage)
@@ -1334,7 +1337,7 @@ impl ResponsesMessagesStreamDecoder {
     }
 }
 impl StreamDecoder for ResponsesMessagesStreamDecoder {
-    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, DecodeError> {
         let events = self.chat.feed(bytes)?;
         let mut output = Vec::new();
         for event in events {
@@ -1346,7 +1349,7 @@ impl StreamDecoder for ResponsesMessagesStreamDecoder {
         }
         Ok(output)
     }
-    fn finish(&mut self) -> Result<Vec<String>, UnsupportedFeatures> {
+    fn finish(&mut self) -> Result<Vec<String>, DecodeError> {
         let events = self.chat.finish()?;
         let mut output = Vec::new();
         for event in events {
@@ -1375,9 +1378,13 @@ impl ResponsesMessagesNonStreamDecoder {
     }
 }
 impl NonStreamDecoder for ResponsesMessagesNonStreamDecoder {
-    fn decode(&self, body: &Value) -> Result<Value, UnsupportedFeatures> {
-        let chat = decode_responses_response_to_chat(body, &self.context)?;
+    fn decode(&self, body: &Value) -> Result<DecodedResponse, DecodeError> {
+        let usage = super::identity::parse_usage(super::types::Protocol::Responses, body);
+        let chat =
+            decode_responses_response_to_chat(body, &self.context).map_err(DecodeError::from)?;
         super::chat::decode_chat_response_to_messages(&chat, &self.context)
+            .map(|body| DecodedResponse { body, usage })
+            .map_err(DecodeError::from)
     }
 }
 
@@ -1495,32 +1502,32 @@ impl ChatToResponsesStreamDecoder {
 }
 
 impl StreamDecoder for ChatToResponsesStreamDecoder {
-    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, DecodeError> {
         self.pending.extend_from_slice(bytes);
         let mut output = Vec::new();
         while let Some(end) = sse::record_end(&self.pending) {
             self.ensure_created(&mut output);
             let record: Vec<u8> = self.pending.drain(..end).collect();
-            output.extend(self.record(&record)?);
+            output.extend(self.record(&record).map_err(DecodeError::from)?);
         }
         Ok(output)
     }
-    fn finish(&mut self) -> Result<Vec<String>, UnsupportedFeatures> {
+    fn finish(&mut self) -> Result<Vec<String>, DecodeError> {
         let mut output = Vec::new();
         self.ensure_created(&mut output);
         if !self.pending.is_empty() {
-            return Err(UnsupportedFeatures::single(
+            return Err(DecodeError::from(UnsupportedFeatures::single(
                 FeatureKind::UnknownEvent,
                 "/",
                 "Chat SSE ended mid-record",
-            ));
+            )));
         }
         if !self.terminal_seen {
-            return Err(UnsupportedFeatures::single(
+            return Err(DecodeError::from(UnsupportedFeatures::single(
                 FeatureKind::UnknownEvent,
                 "/",
                 "Chat SSE ended without a terminal finish_reason",
-            ));
+            )));
         }
         if self.done {
             return Ok(Vec::new());
@@ -1566,7 +1573,7 @@ impl MessagesResponsesStreamDecoder {
     }
 }
 impl StreamDecoder for MessagesResponsesStreamDecoder {
-    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, DecodeError> {
         let events = self.messages.feed(bytes)?;
         let mut output = Vec::new();
         for event in events {
@@ -1578,7 +1585,7 @@ impl StreamDecoder for MessagesResponsesStreamDecoder {
         }
         Ok(output)
     }
-    fn finish(&mut self) -> Result<Vec<String>, UnsupportedFeatures> {
+    fn finish(&mut self) -> Result<Vec<String>, DecodeError> {
         let events = self.messages.finish()?;
         let mut output = Vec::new();
         for event in events {
@@ -1607,12 +1614,14 @@ impl MessagesResponsesNonStreamDecoder {
     }
 }
 impl NonStreamDecoder for MessagesResponsesNonStreamDecoder {
-    fn decode(&self, body: &Value) -> Result<Value, UnsupportedFeatures> {
-        let chat = messages::decode_messages_response_to_chat(body, &self.context)?;
-        Ok(crate::protocol::openai_to_responses(
-            &chat,
-            &self.context.upstream_model,
-        ))
+    fn decode(&self, body: &Value) -> Result<DecodedResponse, DecodeError> {
+        let usage = super::identity::parse_usage(super::types::Protocol::Messages, body);
+        let chat = messages::decode_messages_response_to_chat(body, &self.context)
+            .map_err(DecodeError::from)?;
+        Ok(DecodedResponse {
+            body: crate::protocol::openai_to_responses(&chat, &self.context.upstream_model),
+            usage,
+        })
     }
 }
 
