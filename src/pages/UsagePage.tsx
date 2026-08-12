@@ -124,45 +124,56 @@ export function UsagePage() {
   const modelGroups = useMemo(() => {
     const groups: ModelGroup[] = [];
 
-    // Channel models grouped by provider label
-    const channelByProvider = new Map<string, { real: Set<string>; mapped: Set<string> }>();
-    channels.filter(c => c.status === 1).forEach(c => {
-      const providerLabel = getChannelProviderLabel(c.provider);
-      if (!channelByProvider.has(providerLabel)) {
-        channelByProvider.set(providerLabel, { real: new Set(), mapped: new Set() });
-      }
-      const entry = channelByProvider.get(providerLabel)!;
-      c.models.forEach(m => entry.real.add(m));
-      if (c.model_mapping) {
-        Object.keys(c.model_mapping).forEach(from => entry.mapped.add(from));
-      }
-    });
-    channelByProvider.forEach((models, label) => {
-      const real = [...models.real];
-      const mapped = [...models.mapped];
-      if (real.length > 0 || mapped.length > 0) groups.push({ label: `渠道 · ${label}`, real, mapped });
-    });
-
-    // Auth account models grouped by provider label
-    const authByProvider = new Map<string, { real: Set<string>; mapped: Set<string> }>();
-    authAccounts.filter(a => !a.disabled).forEach(a => {
-      const providerLabel = getChannelProviderLabel(a.provider);
-      if (!authByProvider.has(providerLabel)) {
-        authByProvider.set(providerLabel, { real: new Set(), mapped: new Set() });
-      }
-      const entry = authByProvider.get(providerLabel)!;
-      a.models.forEach(m => {
-        if (!m.unavailable) entry.real.add(m.id);
+    // Shared collector: works for both channels and auth accounts
+    type MappingSource = {
+      provider: string;
+      models: string[];
+      model_mapping?: Record<string, string | string[]> | null;
+    };
+    function collectMappingModels<T extends MappingSource>(
+      sources: T[],
+      prefix: string,
+    ): ModelGroup[] {
+      const byProvider = new Map<string, { real: Set<string>; mapped: Set<string> }>();
+      sources.forEach(s => {
+        const providerLabel = getChannelProviderLabel(s.provider);
+        if (!byProvider.has(providerLabel)) {
+          byProvider.set(providerLabel, { real: new Set(), mapped: new Set() });
+        }
+        const entry = byProvider.get(providerLabel)!;
+        s.models.forEach(m => entry.real.add(m));
+        if (s.model_mapping) {
+          Object.keys(s.model_mapping).forEach(from => entry.mapped.add(from));
+        }
       });
-      if (a.model_mapping) {
-        Object.keys(a.model_mapping).forEach(from => entry.mapped.add(from));
-      }
-    });
-    authByProvider.forEach((models, label) => {
-      const real = [...models.real];
-      const mapped = [...models.mapped];
-      if (real.length > 0 || mapped.length > 0) groups.push({ label: `Auth · ${label}`, real, mapped });
-    });
+      const result: ModelGroup[] = [];
+      byProvider.forEach((models, label) => {
+        const real = [...models.real];
+        const mapped = [...models.mapped];
+        if (real.length > 0 || mapped.length > 0) result.push({ label: `${prefix} · ${label}`, real, mapped });
+      });
+      return result;
+    }
+
+    // Channel models
+    groups.push(...collectMappingModels(
+      channels.filter(c => c.status === 1).map(c => ({
+        provider: c.provider,
+        models: c.models,
+        model_mapping: c.model_mapping,
+      })),
+      "渠道",
+    ));
+
+    // Auth account models
+    groups.push(...collectMappingModels(
+      authAccounts.filter(a => !a.disabled).map(a => ({
+        provider: a.provider,
+        models: a.models.filter(m => !m.unavailable).map(m => m.id),
+        model_mapping: a.model_mapping,
+      })),
+      "Auth",
+    ));
 
     return groups;
   }, [channels, authAccounts]);

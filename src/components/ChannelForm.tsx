@@ -11,7 +11,7 @@ import {
   PROTOCOL_LABELS, ENDPOINT_LABELS, ENDPOINT_PATHS,
 } from "../lib/constants";
 import { X, Plus, Check, RefreshCw, KeyRound, Undo, Loader2 } from "lucide-react";
-import { MappingRow } from "./channel-form/MappingRow";
+import { MappingSection } from "./MappingSection";
 import { DraftTestModal } from "./channel-form/DraftTestModal";
 import { ModelSyncModal } from "./channel-form/ModelSyncModal";
 import { ProviderDropdown } from "./channel-form/ProviderDropdown";
@@ -138,18 +138,6 @@ function initForm(editing: Channel | null): FormState {
   };
 }
 
-function initMappings(editing: Channel | null): { from: string; to: string }[] {
-  const raw = editing?.model_mapping || {};
-  const result: { from: string; to: string }[] = [];
-  for (const [from, val] of Object.entries(raw)) {
-    if (Array.isArray(val)) {
-      for (const to of val) result.push({ from, to });
-    } else {
-      result.push({ from, to: val });
-    }
-  }
-  return result;
-}
 
 export function ChannelForm({ editing, onClose, onSaved }: {
   editing: Channel | null;
@@ -158,22 +146,6 @@ export function ChannelForm({ editing, onClose, onSaved }: {
 }) {
   const [form, setForm] = useState<FormState>(() => initForm(editing));
   const [modelInput, setModelInput] = useState("");
-  const [mappings, setMappings] = useState<{ from: string; to: string }[]>(() => initMappings(editing));
-
-  // Global mapping names from all channels (for from dropdown suggestions)
-  const [globalFroms, setGlobalFroms] = useState<string[]>([]);
-  useEffect(() => {
-    channelApi.getAll().then(channels => {
-      const names = new Set<string>();
-      for (const ch of channels) {
-        const mm = ch.model_mapping;
-        if (mm && typeof mm === "object") {
-          for (const key of Object.keys(mm)) if (key) names.add(key);
-        }
-      }
-      setGlobalFroms(Array.from(names).sort());
-    }).catch(() => {});
-  }, []);
 
   // ── presets（T01）────────────────────────────────────────────────────────
   const [presetGroups, setPresetGroups] = useState<ChannelProtocolPresetGroup[]>([]);
@@ -218,23 +190,6 @@ export function ChannelForm({ editing, onClose, onSaved }: {
 
   const authScheme: ChannelAuthScheme = currentPreset?.auth_scheme ?? PROTOCOL_DEFAULT_AUTH[form.protocol];
   const keyRequired = authScheme !== "optional_bearer";
-
-  // Sync mappings back to form.model_mapping whenever they change
-  useEffect(() => {
-    const obj: Record<string, string | string[]> = {};
-    mappings.forEach(m => {
-      if (m.from && m.to) {
-        if (obj[m.from] !== undefined) {
-          const existing = obj[m.from];
-          if (Array.isArray(existing)) existing.push(m.to);
-          else obj[m.from] = [existing, m.to];
-        } else {
-          obj[m.from] = m.to;
-        }
-      }
-    });
-    setForm(prev => ({ ...prev, model_mapping: obj }));
-  }, [mappings]);
 
   // ── receipt 失效规则（T07）：protocol/provider/URL/Key/模型/端点/timeout 变更即失效；
   //    name/priority/weight/映射 变更不失效。 ───────────────────────────────
@@ -347,18 +302,6 @@ export function ChannelForm({ editing, onClose, onSaved }: {
   }
   function removeModel(m: string) {
     onModelListChange(form.models.filter(x => x !== m));
-    setMappings(prev => prev.filter(map => map.from !== m));
-  }
-
-  // ── 模型映射 ────────────────────────────────────────────────────────────
-  function addMapping() {
-    if (form.models.length > 0) setMappings(prev => [...prev, { from: "", to: form.models[0] }]);
-  }
-  function updateMapping(idx: number, field: "from" | "to", value: string) {
-    setMappings(prev => prev.map((m, i) => i === idx ? { ...m, [field]: value } : m));
-  }
-  function removeMapping(idx: number) {
-    setMappings(prev => prev.filter((_, i) => i !== idx));
   }
 
   // ── legacy type/base_url 兼容字段 ────────────────────────────────────────
@@ -804,37 +747,11 @@ export function ChannelForm({ editing, onClose, onSaved }: {
           </div>
 
           {/* 模型映射 */}
-          <div>
-            <div className="mb-2 flex items-center justify-between">
-              <label className="text-sm font-medium">模型映射</label>
-              <span className="text-xs text-muted-foreground">左侧填映射名（客户端请求用），右侧选渠道实际模型</span>
-            </div>
-            {mappings.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-border bg-background/40 px-4 py-6 text-center">
-                <p className="text-sm text-muted-foreground mb-3">尚未配置模型映射</p>
-                <button type="button" onClick={addMapping} disabled={form.models.length === 0} className="action-secondary inline-flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
-                  <Plus size={14} /> 添加映射
-                </button>
-              </div>
-            ) : (
-              <div className="space-y-2.5">
-                {mappings.map((map, idx) => (
-                  <MappingRow
-                    key={idx}
-                    from={map.from}
-                    to={map.to}
-                    availableTargets={form.models}
-                    existingFroms={Array.from(new Set([...globalFroms, ...mappings.map(m => m.from).filter(Boolean)])).sort()}
-                    onRemove={() => removeMapping(idx)}
-                    onChange={(field, value) => updateMapping(idx, field, value)}
-                  />
-                ))}
-                <button type="button" onClick={addMapping} disabled={form.models.length === 0} className="action-secondary inline-flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed">
-                  <Plus size={14} /> 添加映射
-                </button>
-              </div>
-            )}
-          </div>
+          <MappingSection
+            value={form.model_mapping}
+            availableTargets={form.models}
+            onChange={(mapping) => setForm(prev => ({ ...prev, model_mapping: mapping }))}
+          />
 
           {/* 优先级 + 权重 */}
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">

@@ -206,6 +206,19 @@ impl RouteCandidate {
             Self::AuthAccount(account) => Some(account),
         }
     }
+
+    /// Unified accessor: returns the candidate's `model_mapping` as a JSON Value.
+    /// Works for both channels and auth accounts.
+    pub fn mapping_json(&self) -> Value {
+        match self {
+            Self::Channel { channel, .. } => {
+                serde_json::from_str(&channel.model_mapping).unwrap_or_default()
+            }
+            Self::AuthAccount(account) => {
+                account.model_mapping().unwrap_or_default()
+            }
+        }
+    }
 }
 
 /// One candidate that survived model matching and endpoint-capability filtering.
@@ -600,6 +613,16 @@ pub fn resolve_route_candidates(
     candidates
 }
 
+/// Check if a model name matches any source key in a mapping JSON.
+/// Used by both `channel_accepts_model` and `auth_account_accepts_model`.
+fn mapping_contains_source(mapping_json: &str, model: &str) -> bool {
+    let mapping: Value = serde_json::from_str(mapping_json).unwrap_or_default();
+    mapping
+        .as_object()
+        .map(|o| o.contains_key(model))
+        .unwrap_or(false)
+}
+
 fn channel_accepts_model(channel: &Channel, model: &str) -> bool {
     let models: Vec<String> = serde_json::from_str(&channel.models).unwrap_or_default();
     if models.is_empty() {
@@ -610,11 +633,7 @@ fn channel_accepts_model(channel: &Channel, model: &str) -> bool {
         return true;
     }
     // Mapping source names also count as hits.
-    let mapping: Value = serde_json::from_str(&channel.model_mapping).unwrap_or_default();
-    mapping
-        .as_object()
-        .map(|o| o.contains_key(model))
-        .unwrap_or(false)
+    mapping_contains_source(&channel.model_mapping, model)
 }
 
 fn auth_account_accepts_model(account: &AuthAccount, model: &str) -> bool {
@@ -638,12 +657,8 @@ fn auth_account_accepts_model(account: &AuthAccount, model: &str) -> bool {
     if direct_hit {
         return true;
     }
-    // Mapping source names also count as hits (same logic as channels).
-    account
-        .model_mapping()
-        .ok()
-        .and_then(|v| v.as_object().map(|o| o.contains_key(model)))
-        .unwrap_or(false)
+    // Mapping source names also count as hits (shared helper).
+    mapping_contains_source(&account.model_mapping_json, model)
 }
 
 /// The repository clears expired quota before returning route accounts.  This
