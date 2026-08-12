@@ -96,6 +96,8 @@ export interface ApiKey {
   status: number;
   allowed_models: string[];
   allowed_channels: string[];
+  denied_models: string[];
+  denied_channels: string[];
   quota_limit: number;
   quota_used: number;
   expires_at: string | null;
@@ -107,6 +109,8 @@ export interface CreateApiKeyInput {
   name: string;
   allowed_models?: string[];
   allowed_channels?: string[];
+  denied_models?: string[];
+  denied_channels?: string[];
   quota_limit?: number;
   expires_at?: string;
 }

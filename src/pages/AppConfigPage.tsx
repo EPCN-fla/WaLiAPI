@@ -2,9 +2,9 @@ import { useEffect, useState, useCallback, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { appConfigApi, serverApi, apiKeyApi, channelApi } from "../lib/api";
+import { appConfigApi, serverApi, apiKeyApi, channelApi, authApi } from "../lib/api";
 import type { AppInfo, ConfigContent } from "../lib/api";
-import type { ServerStatus, Channel, ApiKey } from "../types";
+import type { ServerStatus, Channel, ApiKey, AuthAccount } from "../types";
 import {
   Terminal,
   Code2,
@@ -53,6 +53,7 @@ export function AppConfigPanel({ appName }: { appName: string }) {
   const [ss, setSs] = useState<ServerStatus | null>(null);
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
+  const [authAccounts, setAuthAccounts] = useState<AuthAccount[]>([]);
   const [selKey, setSelKey] = useState("");
   const [selModel, setSelModel] = useState("");
   const [loading, setLoading] = useState(true);
@@ -66,12 +67,13 @@ export function AppConfigPanel({ appName }: { appName: string }) {
 
   const load = useCallback(async () => {
     try {
-      const [appList, content, status, ks, chs] = await Promise.all([
+      const [appList, content, status, ks, chs, accts] = await Promise.all([
         appConfigApi.getApps(),
         appConfigApi.getContent(appName),
         serverApi.getStatus().catch(() => null),
         apiKeyApi.getAll().catch(() => []),
         channelApi.getAll().catch(() => []),
+        authApi.accountsList().catch(() => []),
       ]);
       const info = appList.find(a => a.name === appName);
       setAppInfo(info || null);
@@ -79,8 +81,10 @@ export function AppConfigPanel({ appName }: { appName: string }) {
       setSs(status as ServerStatus | null);
       const keyList = ks as ApiKey[];
       const chList = chs as Channel[];
+      const acctList = accts as AuthAccount[];
       setKeys(keyList);
       setChannels(chList);
+      setAuthAccounts(acctList);
 
       // Restore persisted key selection, fallback to first key
       const savedKey = localStorage.getItem(keyStorageKey);
@@ -90,11 +94,33 @@ export function AppConfigPanel({ appName }: { appName: string }) {
       }
 
       // Restore persisted model selection, fallback to first model
+      // (filtered by selected key's allowed/denied lists)
+      const selectedKeyObj = keyList.find(k => k.key === (savedKeyValid ? savedKey! : keyList[0]?.key));
+      const modelAllowed = (model: string) => {
+        if (!selectedKeyObj) return true;
+        if (selectedKeyObj.allowed_models.length > 0 && !selectedKeyObj.allowed_models.includes(model)) return false;
+        if (selectedKeyObj.denied_models.includes(model)) return false;
+        return true;
+      };
+      const channelAllowed = (chId: string) => {
+        if (!selectedKeyObj) return true;
+        if (selectedKeyObj.allowed_channels.length > 0 && !selectedKeyObj.allowed_channels.includes(chId)) return false;
+        if (selectedKeyObj.denied_channels.includes(chId)) return false;
+        return true;
+      };
       const ms: string[] = [];
       chList.forEach(c => {
-        c.models.forEach(m => { if (!ms.includes(m)) ms.push(m); });
+        if (!channelAllowed(c.id)) return;
+        c.models.forEach(m => { if (modelAllowed(m) && !ms.includes(m)) ms.push(m); });
         if (c.model_mapping) {
-          Object.keys(c.model_mapping).forEach(from => { if (!ms.includes(from)) ms.push(from); });
+          Object.keys(c.model_mapping).forEach(from => { if (modelAllowed(from) && !ms.includes(from)) ms.push(from); });
+        }
+      });
+      acctList.forEach(a => {
+        if (a.disabled) return;
+        a.models.forEach(m => { if (!m.unavailable && modelAllowed(m.id) && !ms.includes(m.id)) ms.push(m.id); });
+        if (a.model_mapping) {
+          Object.keys(a.model_mapping).forEach(from => { if (modelAllowed(from) && !ms.includes(from)) ms.push(from); });
         }
       });
       if (ms.length > 0 && !selModel) {
@@ -110,26 +136,67 @@ export function AppConfigPanel({ appName }: { appName: string }) {
 
   useEffect(() => { load(); }, [load]);
 
-  // 模型列表
+  // Find the currently selected API key object.
+  const selectedApiKey = useMemo(
+    () => keys.find(k => k.key === selKey),
+    [keys, selKey],
+  );
+
+  // 模型列表 — filtered by selected API key's allowed/denied lists
   const modelList = useMemo(() => {
+    const key = selectedApiKey;
+    const channelAllowed = (chId: string) => {
+      if (!key) return true;
+      if (key.allowed_channels.length > 0 && !key.allowed_channels.includes(chId)) return false;
+      if (key.denied_channels.includes(chId)) return false;
+      return true;
+    };
+    const modelAllowed = (model: string) => {
+      if (!key) return true;
+      if (key.allowed_models.length > 0 && !key.allowed_models.includes(model)) return false;
+      if (key.denied_models.includes(model)) return false;
+      return true;
+    };
     const realSeen = new Set<string>();
     const mappedSeen = new Set<string>();
     const real: string[] = [];
     const mapped: string[] = [];
     channels.forEach(c => {
+      if (!channelAllowed(c.id)) return;
       c.models.forEach(m => {
-        if (!realSeen.has(m)) { realSeen.add(m); real.push(m); }
+        if (modelAllowed(m) && !realSeen.has(m)) { realSeen.add(m); real.push(m); }
       });
       if (c.model_mapping) {
         Object.keys(c.model_mapping).forEach(from => {
-          if (!mappedSeen.has(from)) { mappedSeen.add(from); mapped.push(from); }
+          if (modelAllowed(from) && !mappedSeen.has(from)) { mappedSeen.add(from); mapped.push(from); }
+        });
+      }
+    });
+    // Auth accounts: exempt from channel-level restrictions
+    authAccounts.forEach(a => {
+      if (a.disabled) return;
+      a.models.forEach(m => {
+        if (!m.unavailable && modelAllowed(m.id) && !realSeen.has(m.id)) { realSeen.add(m.id); real.push(m.id); }
+      });
+      if (a.model_mapping) {
+        Object.keys(a.model_mapping).forEach(from => {
+          if (modelAllowed(from) && !mappedSeen.has(from)) { mappedSeen.add(from); mapped.push(from); }
         });
       }
     });
     return { real, mapped };
-  }, [channels]);
+  }, [channels, authAccounts, selectedApiKey]);
 
   const allModels = useMemo(() => [...modelList.real, ...modelList.mapped], [modelList]);
+
+  // Reset selModel if it's no longer in the filtered list after switching API Key.
+  useEffect(() => {
+    if (allModels.length > 0 && !allModels.includes(selModel)) {
+      const fallback = allModels[0];
+      setSelModel(fallback);
+      localStorage.setItem(modelStorageKey, fallback);
+    }
+  }, [allModels, selModel]);
 
   const handleApply = async () => {
     if (!selKey || !selModel) return;

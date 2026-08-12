@@ -570,16 +570,24 @@ impl Repository {
         let allowed_channels =
             serde_json::to_string(&input.allowed_channels.clone().unwrap_or_default())
                 .unwrap_or_else(|_| "[]".to_string());
+        let denied_models =
+            serde_json::to_string(&input.denied_models.clone().unwrap_or_default())
+                .unwrap_or_else(|_| "[]".to_string());
+        let denied_channels =
+            serde_json::to_string(&input.denied_channels.clone().unwrap_or_default())
+                .unwrap_or_else(|_| "[]".to_string());
 
         sqlx::query(
-            "INSERT INTO api_keys (id, name, key, status, allowed_models, allowed_channels, quota_limit, quota_used, created_at, updated_at)
-             VALUES (?, ?, ?, 1, ?, ?, ?, 0, ?, ?)"
+            "INSERT INTO api_keys (id, name, key, status, allowed_models, allowed_channels, denied_models, denied_channels, quota_limit, quota_used, created_at, updated_at)
+             VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, ?)"
         )
         .bind(&id)
         .bind(&input.name)
         .bind(&key)
         .bind(&allowed_models)
         .bind(&allowed_channels)
+        .bind(&denied_models)
+        .bind(&denied_channels)
         .bind(input.quota_limit.unwrap_or(-1))
         .bind(&now)
         .bind(&now)
@@ -596,6 +604,76 @@ impl Repository {
         let now = now_iso();
         sqlx::query("UPDATE api_keys SET status = ?, updated_at = ? WHERE id = ?")
             .bind(status)
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_api_key_allowed_models(&self, id: &str, models: &[String]) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        let json = serde_json::to_string(models).unwrap_or_else(|_| "[]".to_string());
+        sqlx::query("UPDATE api_keys SET allowed_models = ?, updated_at = ? WHERE id = ?")
+            .bind(&json)
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_api_key_allowed_channels(&self, id: &str, channels: &[String]) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        let json = serde_json::to_string(channels).unwrap_or_else(|_| "[]".to_string());
+        sqlx::query("UPDATE api_keys SET allowed_channels = ?, updated_at = ? WHERE id = ?")
+            .bind(&json)
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_api_key_denied_models(&self, id: &str, models: &[String]) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        let json = serde_json::to_string(models).unwrap_or_else(|_| "[]".to_string());
+        sqlx::query("UPDATE api_keys SET denied_models = ?, updated_at = ? WHERE id = ?")
+            .bind(&json)
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_api_key_denied_channels(&self, id: &str, channels: &[String]) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        let json = serde_json::to_string(channels).unwrap_or_else(|_| "[]".to_string());
+        sqlx::query("UPDATE api_keys SET denied_channels = ?, updated_at = ? WHERE id = ?")
+            .bind(&json)
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_api_key_name(&self, id: &str, name: &str) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        sqlx::query("UPDATE api_keys SET name = ?, updated_at = ? WHERE id = ?")
+            .bind(name)
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_api_key_quota(&self, id: &str, quota_limit: i64) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        sqlx::query("UPDATE api_keys SET quota_limit = ?, updated_at = ? WHERE id = ?")
+            .bind(quota_limit)
             .bind(&now)
             .bind(id)
             .execute(&self.pool)

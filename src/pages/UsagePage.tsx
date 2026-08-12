@@ -116,19 +116,45 @@ export function UsagePage() {
 
   const baseUrl = ss?.running ? `${ss.url}/v1` : "http://127.0.0.1:8777/v1";
 
+  // Find the currently selected API key object.
+  const selectedApiKey = useMemo(
+    () => keys.find(k => k.key === selKey),
+    [keys, selKey],
+  );
+
   // Three categories: API channel models, Auth account models, mapping aliases (unified).
+  // Filtered by the selected API key's allowed/denied lists.
   const modelCategories = useMemo(() => {
+    const key = selectedApiKey;
+    // Check if a channel id is allowed by the key's channel rules.
+    const channelAllowed = (chId: string) => {
+      if (!key) return true;
+      if (key.allowed_channels.length > 0 && !key.allowed_channels.includes(chId)) return false;
+      if (key.denied_channels.includes(chId)) return false;
+      return true;
+    };
+    // Check if a model name is allowed by the key's model rules.
+    const modelAllowed = (model: string) => {
+      if (!key) return true;
+      if (key.allowed_models.length > 0 && !key.allowed_models.includes(model)) return false;
+      if (key.denied_models.includes(model)) return false;
+      return true;
+    };
+
     const channelSet = new Set<string>();
     const authSet = new Set<string>();
     const mappingSet = new Set<string>();
 
     channels.filter(c => c.status === 1).forEach(c => {
-      c.models.forEach(m => channelSet.add(m));
-      if (c.model_mapping) Object.keys(c.model_mapping).forEach(from => mappingSet.add(from));
+      if (!channelAllowed(c.id)) return;
+      c.models.forEach(m => { if (modelAllowed(m)) channelSet.add(m); });
+      if (c.model_mapping) Object.keys(c.model_mapping).forEach(from => { if (modelAllowed(from)) mappingSet.add(from); });
     });
+    // Auth accounts are exempt from channel-level restrictions (no channel id).
+    // Model-level restrictions still apply.
     authAccounts.filter(a => !a.disabled).forEach(a => {
-      a.models.filter(m => !m.unavailable).forEach(m => authSet.add(m.id));
-      if (a.model_mapping) Object.keys(a.model_mapping).forEach(from => mappingSet.add(from));
+      a.models.filter(m => !m.unavailable).forEach(m => { if (modelAllowed(m.id)) authSet.add(m.id); });
+      if (a.model_mapping) Object.keys(a.model_mapping).forEach(from => { if (modelAllowed(from)) mappingSet.add(from); });
     });
 
     return {
@@ -136,7 +162,7 @@ export function UsagePage() {
       auth: [...authSet],
       mapping: [...mappingSet],
     };
-  }, [channels, authAccounts]);
+  }, [channels, authAccounts, selectedApiKey]);
 
   // Flat deduplicated list for localStorage validation.
   const models = useMemo(() => {
@@ -147,6 +173,15 @@ export function UsagePage() {
     });
     return all;
   }, [modelCategories]);
+
+  // Reset selModel if it's no longer in the filtered list (e.g. after switching API Key).
+  useEffect(() => {
+    if (models.length > 0 && !models.includes(selModel)) {
+      const fallback = models[0];
+      setSelModel(fallback);
+      localStorage.setItem(modelStorageKey, fallback);
+    }
+  }, [models, selModel]);
 
   const showToast = (msg: string) => {
     setToastMsg(msg);
@@ -572,6 +607,7 @@ public class AnthropicTest {
                     onChange={e => {
                       setSelKey(e.target.value);
                       localStorage.setItem(keyStorageKey, e.target.value);
+                      // selModel validity will be checked by the models useMemo + effect below.
                     }}
                     className="w-full appearance-none rounded-xl border border-slate-200 bg-white px-3 py-2.5 pr-8 text-sm font-mono text-slate-900 shadow-sm cursor-pointer"
                   >

@@ -258,6 +258,8 @@ mod auth_routeplan_rollout_tests {
             status: 1,
             allowed_models: "[]".into(),
             allowed_channels: "[]".into(),
+            denied_models: "[]".into(),
+            denied_channels: "[]".into(),
             quota_limit: 0,
             quota_used: 0,
             expires_at: None,
@@ -3919,6 +3921,8 @@ mod list_models_tests {
                 name: "test-key".to_string(),
                 allowed_models: None,
                 allowed_channels: None,
+                denied_models: None,
+                denied_channels: None,
                 quota_limit: Some(1000),
                 expires_at: None,
             })

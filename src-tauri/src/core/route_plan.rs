@@ -540,6 +540,10 @@ pub fn authorize_request(api_key: &ApiKey, model: &str) -> Result<(), PlanError>
     if !allowed.is_empty() && !allowed.iter().any(|m| m == model) {
         return Err(PlanError::ModelNotAllowed(model.to_string()));
     }
+    let denied_models: Vec<String> = serde_json::from_str(&api_key.denied_models).unwrap_or_default();
+    if denied_models.iter().any(|m| m == model) {
+        return Err(PlanError::ModelNotAllowed(model.to_string()));
+    }
     Ok(())
 }
 
@@ -576,11 +580,14 @@ pub fn resolve_model_candidates<'a>(
 ) -> Vec<&'a Channel> {
     let allowed_channels: Vec<String> =
         serde_json::from_str(&api_key.allowed_channels).unwrap_or_default();
+    let denied_channels: Vec<String> =
+        serde_json::from_str(&api_key.denied_channels).unwrap_or_default();
     channels
         .iter()
         .filter(|c| c.status == 1)
         // allowed_channels filter happens BEFORE model matching (design 11.3).
         .filter(|c| allowed_channels.is_empty() || allowed_channels.contains(&c.id))
+        .filter(|c| !denied_channels.contains(&c.id))
         .filter(|c| channel_accepts_model(c, model))
         .collect()
 }
@@ -1057,6 +1064,8 @@ mod tests {
             status: 1,
             allowed_models: serde_json::to_string(allowed_models).unwrap(),
             allowed_channels: serde_json::to_string(allowed_channels).unwrap(),
+            denied_models: "[]".into(),
+            denied_channels: "[]".into(),
             quota_limit: 0,
             quota_used: 0,
             expires_at: None,

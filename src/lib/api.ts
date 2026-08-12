@@ -62,7 +62,7 @@ export const channelApi = {
 export const apiKeyApi = {
   getAll: () => invoke<ApiKey[]>("get_api_keys"),
   create: (input: CreateApiKeyInput) => invoke<ApiKey>("create_api_key", { input }),
-  update: (id: string, status?: number) => invoke<void>("update_api_key", { input: { id, status } }),
+  update: (input: { id: string; name?: string; quota_limit?: number; status?: number; allowed_models?: string[]; allowed_channels?: string[]; denied_models?: string[]; denied_channels?: string[] }) => invoke<void>("update_api_key", { input }),
   delete: (id: string) => invoke<void>("delete_api_key", { id }),
   getStats: () => invoke<ApiKeyStats[]>("get_api_key_stats"),
 };

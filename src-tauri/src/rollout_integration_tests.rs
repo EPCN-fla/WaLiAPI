@@ -309,6 +309,8 @@ fn api_key() -> ApiKey {
         status: 1,
         allowed_models: "[]".into(),
         allowed_channels: "[]".into(),
+            denied_models: "[]".into(),
+            denied_channels: "[]".into(),
         quota_limit: 0,
         quota_used: 0,
         expires_at: None,

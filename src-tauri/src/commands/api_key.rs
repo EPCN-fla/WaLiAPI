@@ -11,6 +11,8 @@ pub struct ApiKeyDto {
     pub status: i64,
     pub allowed_models: Vec<String>,
     pub allowed_channels: Vec<String>,
+    pub denied_models: Vec<String>,
+    pub denied_channels: Vec<String>,
     pub quota_limit: i64,
     pub quota_used: i64,
     pub expires_at: Option<String>,
@@ -27,6 +29,8 @@ impl From<ApiKey> for ApiKeyDto {
             status: k.status,
             allowed_models: serde_json::from_str(&k.allowed_models).unwrap_or_default(),
             allowed_channels: serde_json::from_str(&k.allowed_channels).unwrap_or_default(),
+            denied_models: serde_json::from_str(&k.denied_models).unwrap_or_default(),
+            denied_channels: serde_json::from_str(&k.denied_channels).unwrap_or_default(),
             quota_limit: k.quota_limit,
             quota_used: k.quota_used,
             expires_at: k.expires_at,
@@ -62,7 +66,13 @@ pub async fn create_api_key(
 #[derive(Debug, Deserialize)]
 pub struct UpdateApiKeyInput {
     pub id: String,
+    pub name: Option<String>,
+    pub quota_limit: Option<i64>,
     pub status: Option<i64>,
+    pub allowed_models: Option<Vec<String>>,
+    pub allowed_channels: Option<Vec<String>>,
+    pub denied_models: Option<Vec<String>>,
+    pub denied_channels: Option<Vec<String>>,
 }
 
 #[tauri::command]
@@ -71,8 +81,38 @@ pub async fn update_api_key(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<(), String> {
     let repo = Repository::new(state.db.pool.clone());
+    if let Some(name) = &input.name {
+        repo.update_api_key_name(&input.id, name)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(quota_limit) = input.quota_limit {
+        repo.update_api_key_quota(&input.id, quota_limit)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     if let Some(status) = input.status {
         repo.update_api_key_status(&input.id, status)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(models) = &input.allowed_models {
+        repo.update_api_key_allowed_models(&input.id, models)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(channels) = &input.allowed_channels {
+        repo.update_api_key_allowed_channels(&input.id, channels)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(models) = &input.denied_models {
+        repo.update_api_key_denied_models(&input.id, models)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(channels) = &input.denied_channels {
+        repo.update_api_key_denied_channels(&input.id, channels)
             .await
             .map_err(|e| e.to_string())?;
     }

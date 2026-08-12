@@ -163,6 +163,8 @@ pub struct ApiKey {
     pub status: i64,
     pub allowed_models: String,
     pub allowed_channels: String,
+    pub denied_models: String,
+    pub denied_channels: String,
     pub quota_limit: i64,
     pub quota_used: i64,
     pub expires_at: Option<String>,
@@ -175,6 +177,8 @@ pub struct CreateApiKeyInput {
     pub name: String,
     pub allowed_models: Option<Vec<String>>,
     pub allowed_channels: Option<Vec<String>>,
+    pub denied_models: Option<Vec<String>>,
+    pub denied_channels: Option<Vec<String>>,
     pub quota_limit: Option<i64>,
     pub expires_at: Option<String>,
 }
