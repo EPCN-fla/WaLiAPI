@@ -90,6 +90,7 @@ pub struct AuthAccountSummary {
     pub weight: i64,
     pub quota: Option<QuotaState>,
     pub models: ModelStates,
+    pub model_mapping: serde_json::Value,
     pub attributes: Value,
     pub expires_at: Option<String>,
     pub has_refresh_token: bool,
@@ -113,6 +114,8 @@ impl AuthAccountSummary {
             .map_err(|_| ProviderError::InvalidPayload)?;
         let attributes = serde_json::from_str(&account.attributes_json)
             .map_err(|_| ProviderError::InvalidPayload)?;
+        let model_mapping = account.model_mapping()
+            .map_err(|_| ProviderError::InvalidPayload)?;
         Ok(Self {
             id: account.id.clone(),
             provider: account.provider.clone(),
@@ -124,6 +127,7 @@ impl AuthAccountSummary {
             weight: account.weight,
             quota,
             models,
+            model_mapping,
             attributes,
             expires_at: payload
                 .get("expires_at")

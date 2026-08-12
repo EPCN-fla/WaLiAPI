@@ -61,6 +61,7 @@ fn account(id: &str, priority: i64, models: ModelStates) -> AuthAccount {
         weight: 1,
         quota_json: None,
         model_states_json: serde_json::to_string(&models).unwrap(),
+        model_mapping_json: "{}".into(),
         attributes_json: "{}".into(),
         payload_json: json!({
             "access_token": ACCESS,

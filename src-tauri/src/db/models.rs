@@ -257,6 +257,7 @@ pub struct AuthAccount {
     pub weight: i64,
     pub quota_json: Option<String>,
     pub model_states_json: String,
+    pub model_mapping_json: String,
     pub attributes_json: String,
     pub payload_json: String,
     pub last_refreshed_at: Option<String>,
@@ -277,6 +278,13 @@ impl AuthAccount {
             .as_deref()
             .map(serde_json::from_str)
             .transpose()
+    }
+
+    pub fn model_mapping(&self) -> Result<serde_json::Value, serde_json::Error> {
+        if self.model_mapping_json.is_empty() {
+            return Ok(serde_json::json!({}));
+        }
+        serde_json::from_str(&self.model_mapping_json)
     }
 }
 

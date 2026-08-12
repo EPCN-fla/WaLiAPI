@@ -288,6 +288,7 @@ mod auth_routeplan_rollout_tests {
                 }]
             })
             .to_string(),
+            model_mapping_json: "{}".into(),
             attributes_json: "{}".into(),
             payload_json: "{}".into(),
             last_refreshed_at: None,

@@ -2,9 +2,10 @@ import { useEffect, useState, useMemo, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
-import { channelApi, apiKeyApi, serverApi } from "../lib/api";
-import type { Channel, ApiKey, ServerStatus } from "../types";
+import { channelApi, apiKeyApi, serverApi, authApi } from "../lib/api";
+import type { Channel, ApiKey, ServerStatus, AuthAccount } from "../types";
 import { AppConfigPanel, getAppIcon } from "./AppConfigPage";
+import { getChannelProviderLabel } from "../lib/constants";
 import {
   BookOpen, Copy, Check, Play, Loader2, Link2, KeyRound, Bot,
   ChevronDown, Terminal, Code2, Coffee, Zap, ArrowRight,
@@ -53,6 +54,7 @@ const accentClasses: Record<string, { bg: string; border: string; text: string; 
 export function UsagePage() {
   const navigate = useNavigate();
   const [channels, setChannels] = useState<Channel[]>([]);
+  const [authAccounts, setAuthAccounts] = useState<AuthAccount[]>([]);
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const [ss, setSs] = useState<ServerStatus | null>(null);
   const [selKey, setSelKey] = useState("");
@@ -75,8 +77,10 @@ export function UsagePage() {
     Promise.all([
       channelApi.getAll().catch(() => []), apiKeyApi.getAll().catch(() => []),
       serverApi.getStatus().catch(() => null),
-    ]).then(([ch, ks, s]) => {
+      authApi.accountsList().catch(() => []),
+    ]).then(([ch, ks, s, accts]) => {
       setChannels(ch as Channel[]); setKeys(ks as ApiKey[]); setSs(s as ServerStatus | null);
+      setAuthAccounts(accts as AuthAccount[]);
 
       // Restore persisted key, fallback to first
       const savedKey = localStorage.getItem(keyStorageKey);
@@ -86,13 +90,18 @@ export function UsagePage() {
         setSelKey(keyValid ? savedKey! : keyList[0].key);
       }
 
-      // Restore persisted model, fallback to first
+      // Build model list from active channels + active auth accounts
       const ms: string[] = [];
       (ch as Channel[]).forEach(c => {
+        if (c.status !== 1) return; // skip inactive channels
         c.models.forEach(m => { if (!ms.includes(m)) ms.push(m); });
         if (c.model_mapping) {
           Object.keys(c.model_mapping).forEach(from => { if (!ms.includes(from)) ms.push(from); });
         }
+      });
+      (accts as AuthAccount[]).forEach(a => {
+        if (a.disabled) return; // skip disabled auth accounts
+        a.models.forEach(m => { if (!ms.includes(m.id)) ms.push(m.id); });
       });
       if (ms.length > 0) {
         const savedModel = localStorage.getItem(modelStorageKey);
@@ -105,25 +114,68 @@ export function UsagePage() {
 
   const baseUrl = ss?.running ? `${ss.url}/v1` : "http://127.0.0.1:8777/v1";
 
-  const modelList = useMemo(() => {
-    const realSeen = new Set<string>();
-    const mappedSeen = new Set<string>();
-    const real: string[] = [];
-    const mapped: string[] = [];
-    channels.forEach(c => {
-      c.models.forEach(m => {
-        if (!realSeen.has(m)) { realSeen.add(m); real.push(m); }
-      });
+  // Group models by source: active channels (grouped by provider) + active auth accounts
+  interface ModelGroup {
+    label: string;
+    real: string[];
+    mapped: string[];
+  }
+
+  const modelGroups = useMemo(() => {
+    const groups: ModelGroup[] = [];
+
+    // Channel models grouped by provider label
+    const channelByProvider = new Map<string, { real: Set<string>; mapped: Set<string> }>();
+    channels.filter(c => c.status === 1).forEach(c => {
+      const providerLabel = getChannelProviderLabel(c.provider);
+      if (!channelByProvider.has(providerLabel)) {
+        channelByProvider.set(providerLabel, { real: new Set(), mapped: new Set() });
+      }
+      const entry = channelByProvider.get(providerLabel)!;
+      c.models.forEach(m => entry.real.add(m));
       if (c.model_mapping) {
-        Object.keys(c.model_mapping).forEach(from => {
-          if (!mappedSeen.has(from)) { mappedSeen.add(from); mapped.push(from); }
-        });
+        Object.keys(c.model_mapping).forEach(from => entry.mapped.add(from));
       }
     });
-    return { real, mapped };
-  }, [channels]);
+    channelByProvider.forEach((models, label) => {
+      const real = [...models.real];
+      const mapped = [...models.mapped];
+      if (real.length > 0 || mapped.length > 0) groups.push({ label: `渠道 · ${label}`, real, mapped });
+    });
 
-  const models = useMemo(() => [...modelList.real, ...modelList.mapped], [modelList]);
+    // Auth account models grouped by provider label
+    const authByProvider = new Map<string, { real: Set<string>; mapped: Set<string> }>();
+    authAccounts.filter(a => !a.disabled).forEach(a => {
+      const providerLabel = getChannelProviderLabel(a.provider);
+      if (!authByProvider.has(providerLabel)) {
+        authByProvider.set(providerLabel, { real: new Set(), mapped: new Set() });
+      }
+      const entry = authByProvider.get(providerLabel)!;
+      a.models.forEach(m => {
+        if (!m.unavailable) entry.real.add(m.id);
+      });
+      if (a.model_mapping) {
+        Object.keys(a.model_mapping).forEach(from => entry.mapped.add(from));
+      }
+    });
+    authByProvider.forEach((models, label) => {
+      const real = [...models.real];
+      const mapped = [...models.mapped];
+      if (real.length > 0 || mapped.length > 0) groups.push({ label: `Auth · ${label}`, real, mapped });
+    });
+
+    return groups;
+  }, [channels, authAccounts]);
+
+  const models = useMemo(() => {
+    const seen = new Set<string>();
+    const all: string[] = [];
+    modelGroups.forEach(g => {
+      g.real.forEach(m => { if (!seen.has(m)) { seen.add(m); all.push(m); } });
+      g.mapped.forEach(m => { if (!seen.has(m)) { seen.add(m); all.push(m); } });
+    });
+    return all;
+  }, [modelGroups]);
 
   const showToast = (msg: string) => {
     setToastMsg(msg);
@@ -586,17 +638,13 @@ public class AnthropicTest {
                     }}
                     className="w-full appearance-none rounded-xl border border-slate-200 bg-white px-3 py-2.5 pr-8 text-sm font-mono text-slate-900 shadow-sm cursor-pointer"
                   >
-                    {models.length === 0 && <option value="">请先配置渠道</option>}
-                    {modelList.real.length > 0 && (
-                      <optgroup label="实际模型">
-                        {modelList.real.map(m => <option key={m} value={m}>{m}</option>)}
-                      </optgroup>
-                    )}
-                    {modelList.mapped.length > 0 && (
-                      <optgroup label="映射模型">
-                        {modelList.mapped.map(m => <option key={m} value={m}>{m}</option>)}
-                      </optgroup>
-                    )}
+                    {models.length === 0 && <option value="">请先配置渠道或登录账号</option>}
+                    {modelGroups.flatMap((g, gi) => {
+                      const groups: React.ReactElement[] = [];
+                      if (g.real.length > 0) groups.push(<optgroup key={`${gi}-real`} label={`${g.label} · 实际模型`}>{g.real.map(m => <option key={m} value={m}>{m}</option>)}</optgroup>);
+                      if (g.mapped.length > 0) groups.push(<optgroup key={`${gi}-mapped`} label={`${g.label} · 映射模型`}>{g.mapped.map(m => <option key={m} value={m}>{m}</option>)}</optgroup>);
+                      return groups;
+                    })}
                   </select>
                   <ChevronDown size={14} className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
                 </div>
@@ -607,7 +655,7 @@ public class AnthropicTest {
               {models.length === 0 && (
                 <div className="mt-2 flex items-center gap-1.5 text-xs text-rose-500">
                   <AlertCircle size={12} />
-                  <span>尚未配置渠道，</span>
+                  <span>尚未配置可用渠道或登录账号，</span>
                   <button onClick={() => navigate("/channels")} className="font-medium text-rose-600 underline hover:text-rose-700">
                     去配置 →
                   </button>

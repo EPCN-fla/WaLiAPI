@@ -211,6 +211,7 @@ export interface AuthAccount {
   plan_type: string | null;
   models: AuthModelState[];
   quota: AuthQuotaState | null;
+  model_mapping?: Record<string, string | string[]>;
   expires_at: string | null;
   hasRefreshToken: boolean;
   last_refreshed_at: string | null;
@@ -259,6 +260,7 @@ export interface AuthUpdateInput {
   label: string;
   priority: number;
   weight: number;
+  model_mapping?: Record<string, string | string[]>;
 }
 
 export interface SecurityFinding {

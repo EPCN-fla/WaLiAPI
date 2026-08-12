@@ -624,7 +624,8 @@ fn auth_account_accepts_model(account: &AuthAccount, model: &str) -> bool {
     if account_quota_unavailable(account) {
         return false;
     }
-    account
+    // Direct model hit in the account's synced model snapshot.
+    let direct_hit = account
         .model_states()
         .ok()
         .map(|states| {
@@ -633,6 +634,15 @@ fn auth_account_accepts_model(account: &AuthAccount, model: &str) -> bool {
                 .iter()
                 .any(|state| state.id == model && state.status == "available" && !state.unavailable)
         })
+        .unwrap_or(false);
+    if direct_hit {
+        return true;
+    }
+    // Mapping source names also count as hits (same logic as channels).
+    account
+        .model_mapping()
+        .ok()
+        .and_then(|v| v.as_object().map(|o| o.contains_key(model)))
         .unwrap_or(false)
 }
 
@@ -1151,6 +1161,7 @@ mod tests {
                 }]
             })
             .to_string(),
+            model_mapping_json: "{}".into(),
             attributes_json: "{}".into(),
             payload_json:
                 "{\"access_token\":\"route-secret\",\"refresh_token\":\"refresh-secret\"}".into(),
@@ -2441,5 +2452,24 @@ mod tests {
         assert_eq!(plan.groups[0].tier, GroupTier::Native);
         assert_eq!(plan.groups[0].upstream_protocol, UpstreamProtocol::OpenAI);
         assert_eq!(plan.groups[0].upstream_endpoint, "chat_completions");
+    }
+
+    #[test]
+    fn auth_account_model_mapping_source_name_hits() {
+        let key = api_key(&[], &[]);
+        let mut account = auth_account("auth-1", "gpt-4o", 1, 1);
+        account.model_mapping_json = json!({"auto": "gpt-4o"}).to_string();
+        let candidates = resolve_route_candidates(&[], &[account], "auto", &key);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id(), "auth-1");
+    }
+
+    #[test]
+    fn auth_account_model_mapping_does_not_match_unknown_alias() {
+        let key = api_key(&[], &[]);
+        let mut account = auth_account("auth-1", "gpt-4o", 1, 1);
+        account.model_mapping_json = json!({"auto": "gpt-4o"}).to_string();
+        let candidates = resolve_route_candidates(&[], &[account], "unknown-alias", &key);
+        assert_eq!(candidates.len(), 0);
     }
 }

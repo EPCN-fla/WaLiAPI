@@ -708,6 +708,7 @@ impl Repository {
         label: &str,
         priority: i64,
         weight: i64,
+        model_mapping_json: &str,
     ) -> Result<(), sqlx::Error> {
         if label.trim().is_empty() || priority < 0 || weight < 1 {
             return Err(sqlx::Error::Protocol(
@@ -715,11 +716,12 @@ impl Repository {
             ));
         }
         sqlx::query(
-            "UPDATE auth_accounts SET label = ?, priority = ?, weight = ?, updated_at = ? WHERE id = ?",
+            "UPDATE auth_accounts SET label = ?, priority = ?, weight = ?, model_mapping_json = ?, updated_at = ? WHERE id = ?",
         )
         .bind(label)
         .bind(priority)
         .bind(weight)
+        .bind(model_mapping_json)
         .bind(now_iso())
         .bind(id)
         .execute(&self.pool)

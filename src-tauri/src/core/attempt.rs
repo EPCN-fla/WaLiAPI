@@ -198,6 +198,12 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
         .candidate
         .channel()
         .and_then(|channel| serde_json::from_str(&channel.model_mapping).ok())
+        .or_else(|| {
+            candidate
+                .candidate
+                .auth_account()
+                .and_then(|account| account.model_mapping().ok())
+        })
         .unwrap_or_default();
     let upstream_model = resolve_upstream_model(&mapping, &audit.envelope.model, rng);
     let is_retry = attempt_no > 1;
@@ -535,6 +541,7 @@ mod tests {
                 }]
             })
             .to_string(),
+            model_mapping_json: "{}".into(),
             attributes_json: "{}".into(),
             payload_json: "{}".into(),
             last_refreshed_at: None,
