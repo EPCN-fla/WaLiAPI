@@ -10,6 +10,8 @@ import type {
   ChannelProtocolPresetGroup,
   DraftChannelTestInput, DraftChannelTestResult,
   UpstreamModelsResult,
+  AuthAccount, AuthLoginSessionStatus, AuthLoginStart, AuthMutationResult, AuthLogoutResult, AuthExportResult,
+  AuthQuotaStatus, AuthUpdateInput,
 } from "../types";
 
 /**
@@ -75,6 +77,7 @@ export interface GetLogsInput {
   date_from?: string;
   date_to?: string;
   trace_id?: string;
+  upstream_type?: "channel" | "auth_account";
 }
 
 // Log commands
@@ -88,6 +91,26 @@ export const logApi = {
   deleteAll: () => invoke<number>("delete_all_logs"),
 };
 
+// Auth account commands. All result contracts are safe summaries; credential
+// payloads remain inside the native command layer.
+export const authApi = {
+  accountsList: () => invoke<AuthAccount[]>("auth_accounts_list"),
+  login: (provider: string) => invoke<AuthMutationResult>("auth_login", { provider }),
+  loginStart: (provider: string) => invoke<AuthLoginStart>("auth_login_start", { provider }),
+  loginStatus: (sessionId: string) => invoke<AuthLoginSessionStatus>("auth_login_status", { sessionId }),
+  loginCancel: (sessionId: string) => invoke<AuthLoginSessionStatus>("auth_login_cancel", { sessionId }),
+  loginImport: (provider?: string, path?: string) =>
+    invoke<AuthMutationResult>("auth_login_import", { provider, path }),
+  defaultImportPath: () => invoke<string>("auth_default_import_path"),
+  logout: (id: string) => invoke<AuthLogoutResult>("auth_logout", { id }),
+  refreshToken: (id: string) => invoke<AuthAccount>("auth_refresh_token", { id }),
+  syncModels: (id: string) => invoke<AuthAccount>("auth_sync_models", { id }),
+  exportJson: (id: string, path: string) => invoke<AuthExportResult>("auth_export_json", { id, path }),
+  toggle: (id: string, disabled: boolean) => invoke<AuthAccount>("auth_toggle", { id, disabled }),
+  quotaStatus: (id: string) => invoke<AuthQuotaStatus>("auth_quota_status", { id }),
+  update: (input: AuthUpdateInput) => invoke<AuthAccount>("auth_update", { input }),
+};
+
 // Stats commands
 export const statsApi = {
   getDashboard: () => invoke<DashboardStats>("get_dashboard_stats"),
@@ -99,6 +122,8 @@ export interface FeatureFlagsDto {
   cross_protocol_codec: boolean;
   native_responses: boolean;
   ollama_native: boolean;
+  prefer_auth_accounts: boolean;
+  prefer_same_protocol: boolean;
 }
 
 export const settingsApi = {

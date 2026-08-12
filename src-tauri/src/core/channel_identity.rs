@@ -625,7 +625,8 @@ mod tests {
     #[test]
     fn claude_deepseek_compat_maps_to_deepseek() {
         // main 约定：deepseek anthropic 兼容 base 带 /v1 才命中预设。
-        let id = resolve_channel_identity(&row("claude", "https://api.deepseek.com/anthropic/v1", 0));
+        let id =
+            resolve_channel_identity(&row("claude", "https://api.deepseek.com/anthropic/v1", 0));
         assert_eq!(id.protocol, "anthropic");
         assert_eq!(id.provider, "deepseek");
     }

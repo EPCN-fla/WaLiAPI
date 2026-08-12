@@ -42,6 +42,7 @@ pub struct LogDto {
     pub identity_revision: Option<i64>,
     pub client_cancelled: Option<bool>,
     pub stream_committed: Option<bool>,
+    pub upstream_type: String,
 }
 
 impl From<RequestLog> for LogDto {
@@ -83,6 +84,7 @@ impl From<RequestLog> for LogDto {
             identity_revision: l.identity_revision,
             client_cancelled: l.client_cancelled.map(|v| v == 1),
             stream_committed: l.stream_committed.map(|v| v == 1),
+            upstream_type: l.upstream_type,
         }
     }
 }
@@ -133,6 +135,7 @@ pub struct GetLogsInput {
     pub date_from: Option<String>,
     pub date_to: Option<String>,
     pub trace_id: Option<String>,
+    pub upstream_type: Option<String>,
 }
 
 #[tauri::command]
@@ -150,10 +153,11 @@ pub async fn get_logs(
         || input.model.is_some()
         || input.date_from.is_some()
         || input.date_to.is_some()
-        || input.trace_id.is_some();
+        || input.trace_id.is_some()
+        || input.upstream_type.is_some();
 
     let logs = if has_search {
-        repo.search_logs(
+        repo.search_logs_by_upstream_type(
             input.keyword.as_deref(),
             input.api_key_name.as_deref(),
             input.channel_name.as_deref(),
@@ -161,6 +165,7 @@ pub async fn get_logs(
             input.date_from.as_deref(),
             input.date_to.as_deref(),
             input.trace_id.as_deref(),
+            input.upstream_type.as_deref(),
             limit,
             offset,
         )

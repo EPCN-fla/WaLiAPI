@@ -440,6 +440,8 @@ fn flags(codec: bool, responses: bool, ollama: bool) -> FeatureFlags {
         cross_protocol_codec: codec,
         native_responses: responses,
         ollama_native: ollama,
+        prefer_auth_accounts: false,
+        prefer_same_protocol: true,
     }
 }
 
@@ -760,7 +762,7 @@ async fn routing_native_g1_before_conversion_g2_priority() {
     .expect("plan");
     // Native group first, conversion second, regardless of priority.
     assert_eq!(plan.groups[0].tier.as_str(), "native");
-    assert_eq!(plan.groups[0].candidates[0].channel.id, "n1");
+    assert_eq!(plan.groups[0].candidates[0].candidate.id(), "n1");
     assert_eq!(plan.groups[1].tier.as_str(), "conversion");
 
     let resp = run_non_stream(&pool, &key, &audit, plan, "chat").await;
@@ -827,7 +829,7 @@ async fn routing_same_group_priority_tier_and_weight() {
     let ids: Vec<&str> = plan.groups[0]
         .candidates
         .iter()
-        .map(|c| c.channel.id.as_str())
+        .map(|c| c.candidate.id())
         .collect();
     assert_eq!(ids, vec!["hi", "mid", "lo"]);
 }
@@ -2214,7 +2216,7 @@ async fn codec_messages_to_chat_unknown_field_reject_zero_upstream() {
     let body = json!({
         "model": "m",
         "messages": [{"role": "user", "content": "u"}],
-        "metadata": {"user_id": "u1"}
+        "unknown": true
     });
     let audit = audited(
         DownstreamProtocol::Messages,
@@ -2577,10 +2579,12 @@ async fn performance_100_channel_filter_and_grouping_bounded() {
     );
     // Every matching channel is present across groups.
     let total: usize = plan.groups.iter().map(|g| g.candidates.len()).sum();
-    // 100 channels, every third is Anthropic (conversion for Chat), the rest
-    // native (chat_completions) — responses-only channels are filtered out.
+    // 100 channels: every third Anthropic is chat→messages conversion, the
+    // next is native chat_completions, the last is an OpenAI responses-only
+    // channel served through the chat→responses conversion.  No channel is
+    // filtered out for a Chat request.
     let native_count = (0..100).filter(|i| i % 3 == 1).count();
-    let conv_count = (0..100).filter(|i| i % 3 == 0).count();
+    let conv_count = (0..100).filter(|i| i % 3 == 0 || i % 3 == 2).count();
     assert_eq!(total, native_count + conv_count);
     assert!(elapsed_ms > 0);
 }

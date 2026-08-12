@@ -249,17 +249,22 @@ pub async fn handle_request(
                 let (prompt_tokens, completion_tokens, total_tokens) = {
                     let (p, c, t) = (
                         usage.as_ref().map(|u| u.prompt_tokens as i64).unwrap_or(0),
-                        usage.as_ref().map(|u| u.completion_tokens as i64).unwrap_or(0),
+                        usage
+                            .as_ref()
+                            .map(|u| u.completion_tokens as i64)
+                            .unwrap_or(0),
                         usage.as_ref().map(|u| u.total_tokens as i64).unwrap_or(0),
                     );
                     // Fallback: estimate tokens when upstream didn't return usage.
                     if t == 0 && p == 0 && c == 0 && status >= 200 && status < 300 {
-                        let req_body: serde_json::Value = serde_json::from_str(
-                            sanitized_request_body.as_deref().unwrap_or("{}")
-                        ).unwrap_or(serde_json::Value::Null);
+                        let req_body: serde_json::Value =
+                            serde_json::from_str(sanitized_request_body.as_deref().unwrap_or("{}"))
+                                .unwrap_or(serde_json::Value::Null);
                         let resp_text = response_choices.as_deref().unwrap_or("");
                         let (ep, ec, et) = crate::endpoint_executor::estimate_usage::estimate_usage(
-                            &req_body, Some(resp_text), &model
+                            &req_body,
+                            Some(resp_text),
+                            &model,
                         );
                         if et > 0 {
                             eprintln!("[INFO] token usage estimated (proxy.rs): prompt={}, completion={}, total={}", ep, ec, et);

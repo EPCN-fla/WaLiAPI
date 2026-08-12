@@ -114,8 +114,9 @@ mod tests {
             .unwrap();
         // role frame first
         assert_eq!(out.len(), 1);
-        let role = serde_json::from_str::<serde_json::Value>(out[0].trim_start_matches("data:").trim())
-            .unwrap();
+        let role =
+            serde_json::from_str::<serde_json::Value>(out[0].trim_start_matches("data:").trim())
+                .unwrap();
         assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
 
         let out = bridge
@@ -125,8 +126,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.len(), 1);
-        let delta = serde_json::from_str::<serde_json::Value>(out[0].trim_start_matches("data:").trim())
-            .unwrap();
+        let delta =
+            serde_json::from_str::<serde_json::Value>(out[0].trim_start_matches("data:").trim())
+                .unwrap();
         assert_eq!(delta["choices"][0]["delta"]["content"], "你");
 
         let out = bridge
@@ -186,7 +188,11 @@ mod tests {
             .unwrap();
         let out = bridge.finish().unwrap();
         // Exactly the finish_reason+usage frame, then [DONE] — no extra frames.
-        assert_eq!(out.len(), 2, "final sequence must be [finish+usage, DONE], got: {out:?}");
+        assert_eq!(
+            out.len(),
+            2,
+            "final sequence must be [finish+usage, DONE], got: {out:?}"
+        );
         let last = out[0].trim_start_matches("data:").trim();
         let json: serde_json::Value = serde_json::from_str(last).unwrap();
         // Every non-[DONE] frame must carry `choices`.
@@ -262,8 +268,9 @@ mod tests {
         assert!(bridge.push(c.as_bytes()).unwrap().is_empty());
         let out = bridge.push(d.as_bytes()).unwrap();
         assert_eq!(out.len(), 1);
-        let delta = serde_json::from_str::<serde_json::Value>(out[0].trim_start_matches("data:").trim())
-            .unwrap();
+        let delta =
+            serde_json::from_str::<serde_json::Value>(out[0].trim_start_matches("data:").trim())
+                .unwrap();
         assert_eq!(delta["choices"][0]["delta"]["content"], "hello");
 
         bridge
@@ -341,7 +348,10 @@ mod tests {
                 }
             }
         }
-        assert!(saw_delta, "converted Anthropic frames must produce output_text.delta");
+        assert!(
+            saw_delta,
+            "converted Anthropic frames must produce output_text.delta"
+        );
         assert_eq!(accumulated, "hello");
         let _ = saw_completed;
     }
@@ -388,7 +398,11 @@ mod tests {
         records.extend(bridge.finish().unwrap());
 
         // First: the bridge must have produced an OpenAI tool_calls record.
-        let all: String = records.iter().map(|r| r.as_str()).collect::<Vec<_>>().join("\n");
+        let all: String = records
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             all.contains("\"tool_calls\"") && all.contains("exec_command"),
             "bridge must emit an OpenAI tool_calls record, got: {all}"
@@ -440,7 +454,10 @@ mod tests {
                 }
             }
         }
-        assert!(saw_function_call_added, "must emit function_call output_item.added");
+        assert!(
+            saw_function_call_added,
+            "must emit function_call output_item.added"
+        );
         assert!(saw_args_delta, "must emit function_call_arguments.delta");
         assert!(saw_args_done, "must emit function_call_arguments.done");
         assert!(saw_fc_done, "must emit function_call output_item.done");

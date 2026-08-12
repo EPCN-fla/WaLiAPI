@@ -7,8 +7,8 @@
 //! are stripped only when lossless, and usage is taken from real upstream
 //! values.
 
-use super::error::{FeatureKind, UnsupportedFeatures};
-use super::registry::{NonStreamDecoder, StreamDecoder};
+use super::error::{DecodeError, FeatureKind, UnsupportedFeatures};
+use super::ports::{DecodedResponse, NonStreamDecoder, StreamDecoder};
 use super::report::{ConversionContext, Usage};
 use super::request;
 use super::sse;
@@ -50,8 +50,9 @@ pub fn encode_messages_to_chat(
     // both fail-open by decision (T13):
     //   - `thinking`/`output_config` are *mapped* to `reasoning_effort` below
     //     (CLIProxyAPI semantics); they are never rejected.
-    //   - `container`/`context_management`/`context_management_config` have no
-    //     Chat equivalent and are dropped, recorded on the report's
+    //   - `metadata` and `container`/`context_management`/
+    //     `context_management_config` have no Chat equivalent and are dropped,
+    //     recorded on the report's
     //     `normalized` list rather than rejected.
     if let Some(obj) = body.as_object() {
         for (key, value) in obj.iter() {
@@ -61,7 +62,10 @@ pub fn encode_messages_to_chat(
                         // Mapped to `reasoning_effort` in the assembly section.
                         let _ = value;
                     }
-                    "container" | "context_management" | "context_management_config" => {
+                    "metadata"
+                    | "container"
+                    | "context_management"
+                    | "context_management_config" => {
                         normalized.push(format!("/{key}"));
                         let _ = value;
                     }
@@ -240,7 +244,9 @@ fn anthropic_thinking_to_reasoning_effort(body: &Value) -> Option<String> {
         "enabled" => {
             // budget_tokens present -> ConvertBudgetToLevel; absent -> auto.
             match thinking.get("budget_tokens").and_then(Value::as_i64) {
-                Some(budget) => crate::protocol::thinking::budget_to_level(budget).map(String::from),
+                Some(budget) => {
+                    crate::protocol::thinking::budget_to_level(budget).map(String::from)
+                }
                 None => Some("auto".to_string()),
             }
         }
@@ -337,6 +343,11 @@ fn convert_anthropic_message_to_chat(
         };
         let mut assistant_text: Vec<String> = Vec::new();
         let mut assistant_reasoning = String::new();
+        // Preserve the distinction between no thinking block and an explicitly
+        // empty thinking block. Strict OpenAI-compatible thinking providers
+        // validate the presence of `reasoning_content` on historical assistant
+        // tool turns, even when the source block contains no readable text.
+        let mut assistant_had_thinking = false;
         let mut tool_calls: Vec<Value> = Vec::new();
         for (bi, block) in items.iter().enumerate() {
             let bp = format!("{pointer}/content/{bi}");
@@ -470,6 +481,7 @@ fn convert_anthropic_message_to_chat(
                     // thinking into a user/system channel.  `redacted_thinking`
                     // has no readable text and is ignored.
                     if role == "assistant" {
+                        assistant_had_thinking = true;
                         if let Some(t) = block.get("thinking").and_then(Value::as_str) {
                             if !t.is_empty() {
                                 assistant_reasoning.push_str(t);
@@ -506,11 +518,7 @@ fn convert_anthropic_message_to_chat(
             };
             // Reasoning content extracted from assistant `thinking` blocks
             // (fail-open mapping to OpenAI's non-stream reasoning_content).
-            let reasoning = if assistant_reasoning.is_empty() {
-                None
-            } else {
-                Some(assistant_reasoning)
-            };
+            let reasoning = assistant_had_thinking.then_some(assistant_reasoning);
             if tool_calls.is_empty() && content.is_null() && reasoning.is_none() {
                 return Err(UnsupportedFeatures::single(
                     FeatureKind::UnknownBlock,
@@ -721,8 +729,11 @@ impl NonStreamResponseDecoder {
 }
 
 impl NonStreamDecoder for NonStreamResponseDecoder {
-    fn decode(&self, body: &Value) -> Result<Value, UnsupportedFeatures> {
+    fn decode(&self, body: &Value) -> Result<DecodedResponse, DecodeError> {
+        let usage = super::identity::parse_usage(super::types::Protocol::Messages, body);
         decode_messages_response_to_chat(body, &self.context)
+            .map(|body| DecodedResponse { body, usage })
+            .map_err(DecodeError::from)
     }
 }
 
@@ -1148,10 +1159,7 @@ impl MessagesSseState {
                         }
                     }
                     Some("thinking_delta") => {
-                        let reasoning = delta
-                            .get("thinking")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
+                        let reasoning = delta.get("thinking").and_then(Value::as_str).unwrap_or("");
                         if !reasoning.is_empty() {
                             events.push(sse::data_frame(serde_json::json!({
                                 "choices": [{"index": 0, "delta": {"reasoning_content": reasoning}, "finish_reason": null}]
@@ -1291,7 +1299,9 @@ impl MessagesSseState {
             // Same normalization as the non-streaming path: stop-like reasons
             // (refusal / stop_sequence / pause_turn) collapse to `stop`, and a
             // context-window overrun behaves like `length` — never a hard error.
-            Some("end_turn") | Some("refusal") | Some("stop_sequence") | Some("pause_turn") => "stop",
+            Some("end_turn") | Some("refusal") | Some("stop_sequence") | Some("pause_turn") => {
+                "stop"
+            }
             Some("max_tokens") | Some("model_context_window_exceeded") => "length",
             Some("tool_use") => "tool_calls",
             Some(other) => {
@@ -1341,12 +1351,12 @@ impl MessagesStreamDecoder {
     }
 }
 
-impl super::registry::StreamDecoder for MessagesStreamDecoder {
-    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
-        self.state.feed(bytes)
+impl StreamDecoder for MessagesStreamDecoder {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, DecodeError> {
+        self.state.feed(bytes).map_err(DecodeError::from)
     }
-    fn finish(&mut self) -> Result<Vec<String>, UnsupportedFeatures> {
-        self.state.finish()
+    fn finish(&mut self) -> Result<Vec<String>, DecodeError> {
+        self.state.finish().map_err(DecodeError::from)
     }
     fn usage(&self) -> Option<Usage> {
         Some(self.state.usage)

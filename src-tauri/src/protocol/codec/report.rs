@@ -1,5 +1,6 @@
 //! Conversion report produced by every codec direction.
 
+use super::types::CodecId;
 use serde::Serialize;
 
 /// Stable, versioned identifier of the codec implementation.
@@ -58,7 +59,8 @@ pub struct ConversionReport {
     pub rejected: Vec<RejectedReportEntry>,
     /// Fields that were normalized (kept semantically, changed representation).
     pub normalized: Vec<String>,
-    pub codec_version: CodecVersion,
+    /// The exact directed codec selected for this conversion.
+    pub codec_id: CodecId,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,16 +70,26 @@ pub struct RejectedReportEntry {
 }
 
 impl ConversionReport {
+    /// Legacy constructor. New preparation code must record its selected codec
+    /// with [`Self::for_codec`].
     pub fn new(rejected: Vec<RejectedReportEntry>, normalized: Vec<String>) -> Self {
+        Self::for_codec(CodecId::Native, rejected, normalized)
+    }
+
+    pub fn for_codec(
+        codec_id: CodecId,
+        rejected: Vec<RejectedReportEntry>,
+        normalized: Vec<String>,
+    ) -> Self {
         Self {
             rejected,
             normalized,
-            codec_version: CodecVersion::new(1, 0),
+            codec_id,
         }
     }
 
     pub fn ok() -> Self {
-        Self::new(vec![], vec![])
+        Self::for_codec(CodecId::Native, vec![], vec![])
     }
 }
 
@@ -90,7 +102,7 @@ pub struct ConvertedRequest {
 }
 /// Context handed to the response decoder so the response can be expressed in
 /// the downstream protocol (message ids, mapped upstream model, stream flag).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ConversionContext {
     /// Downstream request id (message id for the messages side, `chatcmpl-` for chat).
     pub request_id: String,

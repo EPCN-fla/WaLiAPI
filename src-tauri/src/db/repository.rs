@@ -46,6 +46,95 @@ impl Repository {
         .await
     }
 
+    /// Return channels that are enabled and not cooling down for this exact
+    /// endpoint + transport mode. Stream and non-stream health are deliberately
+    /// independent: a broken JSON response must not disable an otherwise healthy
+    /// SSE route.
+    pub async fn get_enabled_channels_for_mode(
+        &self,
+        endpoint: &str,
+        is_stream: bool,
+        now: &str,
+    ) -> Result<Vec<Channel>, sqlx::Error> {
+        sqlx::query_as::<_, Channel>(
+            "SELECT c.*
+             FROM channels c
+             LEFT JOIN channel_mode_health h
+               ON h.channel_id = c.id
+              AND h.endpoint = ?
+              AND h.is_stream = ?
+             WHERE c.status = 1
+               AND (h.cooldown_until IS NULL OR h.cooldown_until <= ?)
+             ORDER BY c.priority DESC, c.weight DESC",
+        )
+        .bind(endpoint)
+        .bind(i64::from(is_stream))
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Clear a mode-specific cooldown after that mode successfully serves a
+    /// request. The row is retained as a lightweight recovery audit record.
+    pub async fn record_channel_mode_success(
+        &self,
+        channel_id: &str,
+        endpoint: &str,
+        is_stream: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO channel_mode_health
+                (channel_id, endpoint, is_stream, consecutive_failures, cooldown_until, last_failure_at, last_failure_reason)
+             VALUES (?, ?, ?, 0, NULL, NULL, NULL)
+             ON CONFLICT(channel_id, endpoint,is_stream) DO UPDATE SET
+                consecutive_failures = 0,
+                cooldown_until = NULL,
+                last_failure_at = NULL,
+                last_failure_reason = NULL",
+        )
+        .bind(channel_id)
+        .bind(endpoint)
+        .bind(i64::from(is_stream))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// A second consecutive transport/protocol failure temporarily removes only
+    /// this mode from routing. The caller supplies a short, redacted reason.
+    pub async fn record_channel_mode_failure(
+        &self,
+        channel_id: &str,
+        endpoint: &str,
+        is_stream: bool,
+        failure_at: &str,
+        cooldown_until: &str,
+        reason: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO channel_mode_health
+                (channel_id, endpoint, is_stream, consecutive_failures, cooldown_until, last_failure_at, last_failure_reason)
+             VALUES (?, ?, ?, 1, NULL, ?, ?)
+             ON CONFLICT(channel_id, endpoint,is_stream) DO UPDATE SET
+                consecutive_failures = channel_mode_health.consecutive_failures + 1,
+                cooldown_until = CASE
+                    WHEN channel_mode_health.consecutive_failures + 1 >= 2 THEN ?
+                    ELSE NULL
+                END,
+                last_failure_at = excluded.last_failure_at,
+                last_failure_reason = excluded.last_failure_reason",
+        )
+        .bind(channel_id)
+        .bind(endpoint)
+        .bind(i64::from(is_stream))
+        .bind(failure_at)
+        .bind(reason)
+        .bind(cooldown_until)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Resolve the full identity to persist for a create/update, and the
     /// legacy dual-write pair (type, base_url).
     ///
@@ -531,6 +620,267 @@ impl Repository {
         Ok(())
     }
 
+    // ==================== Auth Account ====================
+
+    pub async fn list_auth_accounts(&self) -> Result<Vec<AuthAccount>, sqlx::Error> {
+        sqlx::query_as::<_, AuthAccount>(
+            "SELECT * FROM auth_accounts ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn get_auth_account(&self, id: &str) -> Result<AuthAccount, sqlx::Error> {
+        sqlx::query_as::<_, AuthAccount>("SELECT * FROM auth_accounts WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    pub async fn delete_auth_account(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM auth_accounts WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Atomically save a login/import result. On a `(provider, account_id)`
+    /// conflict, credential/display attributes are refreshed while user-owned
+    /// route settings (`id`, label, priority, weight, disabled) stay intact.
+    pub async fn upsert_by_provider_account_id(
+        &self,
+        input: &AuthAccountUpsert,
+    ) -> Result<AuthAccount, sqlx::Error> {
+        if input.provider.trim().is_empty()
+            || input.account_id.trim().is_empty()
+            || input.label.trim().is_empty()
+        {
+            return Err(sqlx::Error::Protocol(
+                "provider, account_id, and label must not be empty".into(),
+            ));
+        }
+        let now = now_iso();
+        let attributes_json = serde_json::to_string(&input.attributes)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let payload_json = serde_json::to_string(&input.payload)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let id = crate::utils::id::new_id();
+
+        sqlx::query(
+            "INSERT INTO auth_accounts (id, provider, label, account_id, payload_json, attributes_json, last_refreshed_at, next_refresh_after, next_retry_after, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(provider, account_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                attributes_json = excluded.attributes_json,
+                last_refreshed_at = excluded.last_refreshed_at,
+                next_refresh_after = excluded.next_refresh_after,
+                next_retry_after = excluded.next_retry_after,
+                status = 'active',
+                updated_at = excluded.updated_at",
+        )
+        .bind(id)
+        .bind(&input.provider)
+        .bind(&input.label)
+        .bind(&input.account_id)
+        .bind(payload_json)
+        .bind(attributes_json)
+        .bind(&input.last_refreshed_at)
+        .bind(&input.next_refresh_after)
+        .bind(&input.next_retry_after)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query_as::<_, AuthAccount>(
+            "SELECT * FROM auth_accounts WHERE provider = ? AND account_id = ?",
+        )
+        .bind(&input.provider)
+        .bind(&input.account_id)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    pub async fn update_auth_account(
+        &self,
+        id: &str,
+        label: &str,
+        priority: i64,
+        weight: i64,
+    ) -> Result<(), sqlx::Error> {
+        if label.trim().is_empty() || priority < 0 || weight < 1 {
+            return Err(sqlx::Error::Protocol(
+                "label must be non-empty, priority >= 0, and weight >= 1".into(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE auth_accounts SET label = ?, priority = ?, weight = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(label)
+        .bind(priority)
+        .bind(weight)
+        .bind(now_iso())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_auth_account_disabled(
+        &self,
+        id: &str,
+        disabled: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE auth_accounts SET disabled = ?, updated_at = ? WHERE id = ?")
+            .bind(i64::from(disabled))
+            .bind(now_iso())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_tokens(
+        &self,
+        id: &str,
+        payload: &serde_json::Value,
+        last_refreshed_at: Option<&str>,
+        next_refresh_after: Option<&str>,
+        next_retry_after: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let payload_json = serde_json::to_string(payload)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        sqlx::query(
+            "UPDATE auth_accounts
+             SET payload_json = ?, last_refreshed_at = ?, next_refresh_after = ?, next_retry_after = ?, status = 'active', updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(payload_json)
+        .bind(last_refreshed_at)
+        .bind(next_refresh_after)
+        .bind(next_retry_after)
+        .bind(now_iso())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// This is only called after a successful provider sync. Keeping the
+    /// update separate makes failures naturally preserve the old snapshot and
+    /// its timestamp.
+    pub async fn update_models_if_success(
+        &self,
+        id: &str,
+        models: &ModelStates,
+        synced_at: &str,
+    ) -> Result<(), sqlx::Error> {
+        let model_states_json = serde_json::to_string(models)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        sqlx::query(
+            "UPDATE auth_accounts SET model_states_json = ?, last_models_sync_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(model_states_json)
+        .bind(synced_at)
+        .bind(now_iso())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_quota(
+        &self,
+        id: &str,
+        quota: Option<&QuotaState>,
+    ) -> Result<(), sqlx::Error> {
+        let quota_json = quota
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        sqlx::query("UPDATE auth_accounts SET quota_json = ?, updated_at = ? WHERE id = ?")
+            .bind(quota_json)
+            .bind(now_iso())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_invalid(
+        &self,
+        id: &str,
+        next_retry_after: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE auth_accounts SET status = 'invalid', next_retry_after = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(next_retry_after)
+        .bind(now_iso())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load candidates safe for the route planner. Quota JSON is deliberately
+    /// parsed here: corrupt persisted data fail-closes rather than admitting an
+    /// account with unknown quota state. A passed recovery deadline clears only
+    /// the quota exclusion, so recovery is not delayed until maintenance.
+    pub async fn list_route_accounts(&self, now: &str) -> Result<Vec<AuthAccount>, sqlx::Error> {
+        let accounts = sqlx::query_as::<_, AuthAccount>(
+            "SELECT * FROM auth_accounts WHERE disabled = 0 AND status = 'active' ORDER BY priority ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let now_time = chrono::DateTime::parse_from_rfc3339(now)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let mut routeable = Vec::new();
+
+        for mut account in accounts {
+            match account.model_states() {
+                Ok(models) if !models.models.is_empty() => {}
+                _ => continue,
+            }
+            let Some(raw_quota) = account.quota_json.as_deref() else {
+                routeable.push(account);
+                continue;
+            };
+            let mut quota: QuotaState = match serde_json::from_str(raw_quota) {
+                Ok(quota) => quota,
+                Err(_) => continue,
+            };
+            if !quota.exceeded {
+                routeable.push(account);
+                continue;
+            }
+            let recovered = quota
+                .next_recover_at
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .is_some_and(|recover_at| recover_at <= now_time);
+            if !recovered {
+                continue;
+            }
+
+            quota.exceeded = false;
+            quota.reason = None;
+            quota.next_recover_at = None;
+            let quota_json = serde_json::to_string(&quota)
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+            sqlx::query("UPDATE auth_accounts SET quota_json = ?, updated_at = ? WHERE id = ?")
+                .bind(&quota_json)
+                .bind(now_iso())
+                .bind(&account.id)
+                .execute(&self.pool)
+                .await?;
+            account.quota_json = Some(quota_json);
+            routeable.push(account);
+        }
+        Ok(routeable)
+    }
+
     // ==================== Request Log ====================
 
     pub async fn create_log(&self, log: &RequestLog) -> Result<(), sqlx::Error> {
@@ -538,8 +888,8 @@ impl Repository {
         // The 11 T09 observability columns (migration 016) are bound as Option<> so
         // legacy callers using `..Default::default()` persist NULLs for them.
         sqlx::query(
-            "INSERT INTO request_logs (id, seq, api_key_id, api_key_name, channel_id, channel_name, model, upstream_model, mode, status_code, prompt_tokens, completion_tokens, total_tokens, duration_ms, error_message, is_stream, is_retry, created_at, request_body, response_choices, risk_level, risk_score, risk_summary, security_action, sanitized, blocked_reason, trace_id, downstream_protocol, downstream_endpoint, route_group, upstream_protocol, upstream_endpoint, provider, codec_version, failure_class, identity_revision, client_cancelled, stream_committed)
-             VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM request_logs), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO request_logs (id, seq, api_key_id, api_key_name, channel_id, channel_name, model, upstream_model, mode, status_code, prompt_tokens, completion_tokens, total_tokens, duration_ms, error_message, is_stream, is_retry, created_at, request_body, response_choices, risk_level, risk_score, risk_summary, security_action, sanitized, blocked_reason, trace_id, downstream_protocol, downstream_endpoint, route_group, upstream_protocol, upstream_endpoint, provider, codec_version, failure_class, identity_revision, client_cancelled, stream_committed, upstream_type)
+             VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM request_logs), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&log.id)
         .bind(&log.api_key_id)
@@ -578,6 +928,7 @@ impl Repository {
         .bind(log.identity_revision)
         .bind(log.client_cancelled)
         .bind(log.stream_committed)
+        .bind(&log.upstream_type)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -677,6 +1028,34 @@ impl Repository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<RequestLog>, sqlx::Error> {
+        self.search_logs_by_upstream_type(
+            keyword,
+            api_key_name,
+            channel_name,
+            model,
+            date_from,
+            date_to,
+            trace_id,
+            None,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_logs_by_upstream_type(
+        &self,
+        keyword: Option<&str>,
+        api_key_name: Option<&str>,
+        channel_name: Option<&str>,
+        model: Option<&str>,
+        date_from: Option<&str>,
+        date_to: Option<&str>,
+        trace_id: Option<&str>,
+        upstream_type: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<RequestLog>, sqlx::Error> {
         let mut q = sqlx::QueryBuilder::new("SELECT * FROM request_logs WHERE 1=1");
 
         if let Some(kw) = keyword {
@@ -720,6 +1099,10 @@ impl Repository {
         if let Some(tid) = trace_id {
             let pattern = format!("%{}%", tid);
             q.push(" AND trace_id LIKE ").push_bind(pattern);
+        }
+
+        if let Some(kind) = upstream_type {
+            q.push(" AND upstream_type = ").push_bind(kind);
         }
 
         q.push(" ORDER BY created_at DESC LIMIT ").push_bind(limit);
@@ -798,17 +1181,15 @@ impl Repository {
             .await
             .unwrap_or(0);
 
-        let total_wiki_projects: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM wiki_projects")
-                .fetch_one(&self.pool)
-                .await
-                .unwrap_or(0);
+        let total_wiki_projects: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wiki_projects")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
-        let total_wiki_pages: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM wiki_pages")
-                .fetch_one(&self.pool)
-                .await
-                .unwrap_or(0);
+        let total_wiki_pages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wiki_pages")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
         Ok(DashboardStats {
             today_requests,

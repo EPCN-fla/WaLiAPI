@@ -65,13 +65,12 @@ fn migration_max_version() -> i64 {
 /// 数据库当前迁移版本：`_sqlx_migrations` 中最大的已成功版本。
 /// 表不存在或为空时返回 0（全新数据库）。
 async fn current_db_version(pool: &SqlitePool) -> i64 {
-    let max: Option<i64> = sqlx::query_scalar(
-        "SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1",
-    )
-    .fetch_one(pool)
-    .await
-    .ok()
-    .flatten();
+    let max: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+            .fetch_one(pool)
+            .await
+            .ok()
+            .flatten();
     max.unwrap_or(0)
 }
 

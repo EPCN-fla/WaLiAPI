@@ -1251,7 +1251,10 @@ mod tests {
         // The final function_call output_item.done must carry full arguments.
         let done = events
             .iter()
-            .filter(|e| extract_event_types(&[(*e).clone()]) == vec!["response.output_item.done".to_string()])
+            .filter(|e| {
+                extract_event_types(&[(*e).clone()])
+                    == vec!["response.output_item.done".to_string()]
+            })
             .map(|e| extract_event_data(e))
             .find(|d| d["item"]["type"] == "function_call")
             .expect("a function_call output_item.done must be emitted");
@@ -1386,7 +1389,10 @@ mod tests {
             events4
         );
         // The stray arguments must not leak into the accumulated result either.
-        assert_eq!(state.tool_calls[&0].accumulated_arguments, "{\"city\":\"SF\"}");
+        assert_eq!(
+            state.tool_calls[&0].accumulated_arguments,
+            "{\"city\":\"SF\"}"
+        );
     }
 
     #[test]
@@ -1463,7 +1469,10 @@ mod tests {
 
         // function_call_arguments.done carries the required `name`
         let fc_args_done = extract_event_data(&events4[3]);
-        assert_eq!(fc_args_done["type"], "response.function_call_arguments.done");
+        assert_eq!(
+            fc_args_done["type"],
+            "response.function_call_arguments.done"
+        );
         assert_eq!(fc_args_done["name"], "search");
 
         // Verify function_call done uses index 1
@@ -1484,7 +1493,13 @@ mod tests {
 
         // Chunk 1: reasoning delta
         let chunk1 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"Let me"},"finish_reason":null}]}"#;
-        let events1 = convert_openai_sse_to_responses(chunk1, "deepseek-v4-flash", response_id, "", &mut state);
+        let events1 = convert_openai_sse_to_responses(
+            chunk1,
+            "deepseek-v4-flash",
+            response_id,
+            "",
+            &mut state,
+        );
         let types1 = extract_event_types(&events1);
         assert_eq!(
             types1,
@@ -1512,13 +1527,25 @@ mod tests {
 
         // Chunk 2: more reasoning
         let chunk2 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":" think."},"finish_reason":null}]}"#;
-        let events2 = convert_openai_sse_to_responses(chunk2, "deepseek-v4-flash", response_id, "", &mut state);
+        let events2 = convert_openai_sse_to_responses(
+            chunk2,
+            "deepseek-v4-flash",
+            response_id,
+            "",
+            &mut state,
+        );
         let types2 = extract_event_types(&events2);
         assert_eq!(types2, vec!["response.reasoning_summary_text.delta"]);
 
         // Chunk 3: content text
         let chunk3 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Answer"},"finish_reason":null}]}"#;
-        let events3 = convert_openai_sse_to_responses(chunk3, "deepseek-v4-flash", response_id, "Answer", &mut state);
+        let events3 = convert_openai_sse_to_responses(
+            chunk3,
+            "deepseek-v4-flash",
+            response_id,
+            "Answer",
+            &mut state,
+        );
         let types3 = extract_event_types(&events3);
         assert_eq!(
             types3,
@@ -1534,8 +1561,15 @@ mod tests {
         assert_eq!(text_added["item"]["type"], "message");
 
         // Chunk 4: finish
-        let chunk4 = r#"data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
-        let events4 = convert_openai_sse_to_responses(chunk4, "deepseek-v4-flash", response_id, "Answer", &mut state);
+        let chunk4 =
+            r#"data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+        let events4 = convert_openai_sse_to_responses(
+            chunk4,
+            "deepseek-v4-flash",
+            response_id,
+            "Answer",
+            &mut state,
+        );
         let types4 = extract_event_types(&events4);
         assert_eq!(
             types4,
@@ -1572,9 +1606,15 @@ mod tests {
             10,
             5,
         );
-        let completed_event = synthetic.iter().find(|e| {
-            e.lines().next().map(|l| l == "event: response.completed").unwrap_or(false)
-        }).unwrap();
+        let completed_event = synthetic
+            .iter()
+            .find(|e| {
+                e.lines()
+                    .next()
+                    .map(|l| l == "event: response.completed")
+                    .unwrap_or(false)
+            })
+            .unwrap();
         let completed = extract_event_data(completed_event);
         let output = completed["response"]["output"].as_array().unwrap();
         assert_eq!(output.len(), 2);
@@ -1626,9 +1666,6 @@ mod tests {
             completed_data["response"]["usage"]["input_tokens_details"]["cached_tokens"],
             0
         );
-        assert_eq!(
-            completed_data["response"]["usage"]["total_tokens"],
-            30
-        );
+        assert_eq!(completed_data["response"]["usage"]["total_tokens"], 30);
     }
 }

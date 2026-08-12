@@ -44,6 +44,7 @@ use crate::core::channel_identity::ChannelIdentity;
 use crate::core::route_plan::EndpointKind;
 use crate::db::models::Channel;
 use futures_util::StreamExt;
+use reqwest::header;
 use serde_json::Value;
 
 /// A connected upstream stream response (2xx, content still flowing).
@@ -62,6 +63,141 @@ pub enum StreamAttemptResult {
     Connected(UpstreamStream),
     /// Failed before any downstream bytes were committed (classified).
     Failure(AttemptFailure),
+}
+
+/// Dispatch an Auth Account attempt.  Account providers intentionally own their
+/// request policy (including the forced `stream: true` backend contract,
+/// credential headers, 401 refresh/retry, and quota persistence); this module
+/// only converts the provider result into the executor's common attempt shape.
+pub async fn dispatch_auth_account_executor(
+    downstream: EndpointKind,
+    attempt: &PreparedAttempt,
+    auth_service: &crate::auth_provider::service::AuthService,
+    safe_headers: &[(String, String)],
+) -> AttemptResult {
+    let response = match auth_service
+        .outbound(
+            &attempt.channel_id,
+            &force_responses_stream(&attempt.encoded_body),
+            &header_map(safe_headers),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return AttemptResult::Failure(provider_failure(error)),
+    };
+    let status = response.status().as_u16();
+    if status >= 400 {
+        let text = response.text().await.unwrap_or_default();
+        return AttemptResult::Failure(failure_from_upstream(status, &text));
+    }
+    let response_headers = safe_response_headers(response.headers());
+    let bytes = response.bytes().await.unwrap_or_default();
+    let mut accumulator = crate::protocol::codec::ResponsesEventAccumulator::default();
+    if let Err(error) = accumulator.push(&bytes) {
+        return AttemptResult::Failure(responses_protocol_failure(error.message));
+    }
+    let body = match accumulator.finish() {
+        Ok(body) => body,
+        Err(error) => return AttemptResult::Failure(responses_protocol_failure(error.message)),
+    };
+    match decode_non_stream(downstream, attempt, &body) {
+        Ok((body, usage)) => AttemptResult::Success(AttemptSuccess {
+            status,
+            body,
+            usage,
+            downstream_events: None,
+            upstream_model: Some(attempt.upstream_model.clone()),
+            response_headers,
+        }),
+        Err(failure) => AttemptResult::Failure(failure),
+    }
+}
+
+/// Connect an Auth Account's forced Responses SSE stream without committing
+/// downstream bytes.  The driver retains the same first-frame commit barrier
+/// used for Channels, so a malformed first event can still fail over.
+pub async fn dispatch_auth_account_stream_executor(
+    attempt: &PreparedAttempt,
+    auth_service: &crate::auth_provider::service::AuthService,
+    safe_headers: &[(String, String)],
+) -> StreamAttemptResult {
+    let response = match auth_service
+        .outbound(
+            &attempt.channel_id,
+            &force_responses_stream(&attempt.encoded_body),
+            &header_map(safe_headers),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return StreamAttemptResult::Failure(provider_failure(error)),
+    };
+    let status = response.status().as_u16();
+    if status >= 400 {
+        let text = response.text().await.unwrap_or_default();
+        return StreamAttemptResult::Failure(failure_from_upstream(status, &text));
+    }
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("text/event-stream")
+        .to_owned();
+    let headers = safe_response_headers(response.headers());
+    StreamAttemptResult::Connected(UpstreamStream {
+        content_type,
+        headers,
+        body: response
+            .bytes_stream()
+            .map(|result| result.map_err(std::io::Error::other))
+            .boxed(),
+    })
+}
+
+fn force_responses_stream(body: &Value) -> Value {
+    let mut body = body.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.insert("stream".to_owned(), Value::Bool(true));
+    }
+    body
+}
+
+fn header_map(headers: &[(String, String)]) -> reqwest::header::HeaderMap {
+    let mut map = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = reqwest::header::HeaderValue::from_str(value) else {
+            continue;
+        };
+        map.insert(name, value);
+    }
+    map
+}
+
+fn provider_failure(error: crate::auth_provider::ProviderError) -> AttemptFailure {
+    let failure_class = error.failure_class();
+    AttemptFailure {
+        status_code: Some(match failure_class {
+            FailureClass::CallerTerminal => 400,
+            FailureClass::ChannelAuthTerminal => 502,
+            _ => 502,
+        }),
+        failure_class,
+        message: error.to_string(),
+        retry_after: None,
+    }
+}
+
+fn responses_protocol_failure(message: String) -> AttemptFailure {
+    AttemptFailure {
+        failure_class: FailureClass::UpstreamProtocolError,
+        message: format!("Responses SSE aggregation failed: {message}"),
+        status_code: Some(502),
+        retry_after: None,
+    }
 }
 
 /// RFC 9110 hop-by-hop fields and credentials belonging to the *client* must
@@ -87,6 +223,7 @@ pub fn is_unsafe_proxy_header(name: &str) -> bool {
             | "content-length"
             | "content-type"
             | "expect"
+            | "accept-encoding"
             | "wali-trace-id"
     )
 }
@@ -254,10 +391,18 @@ fn transport_failure(e: reqwest::Error) -> AttemptFailure {
     }
 }
 
-fn undecodable_body(e: impl std::fmt::Display) -> AttemptFailure {
+fn undecodable_body(
+    status: u16,
+    body_len: usize,
+    content_type: Option<&str>,
+    e: impl std::fmt::Display,
+) -> AttemptFailure {
+    let content_type = content_type.unwrap_or("unknown");
     AttemptFailure {
         failure_class: FailureClass::UpstreamProtocolError,
-        message: format!("upstream returned an undecodable body: {e}"),
+        message: format!(
+            "upstream returned an undecodable body (HTTP {status}, {body_len} bytes, content-type {content_type}): {e}"
+        ),
         status_code: Some(502),
         retry_after: None,
     }
@@ -549,10 +694,22 @@ pub async fn dispatch_executor(
             if attempt.route_group.starts_with("draft_test/") {
                 match first_sse_data_json(&bytes) {
                     Some(v) => v,
-                    None => return AttemptResult::Failure(undecodable_body(e)),
+                    None => {
+                        return AttemptResult::Failure(undecodable_body(
+                            status,
+                            bytes.len(),
+                            content_type.as_deref(),
+                            e,
+                        ))
+                    }
                 }
             } else {
-                return AttemptResult::Failure(undecodable_body(e));
+                return AttemptResult::Failure(undecodable_body(
+                    status,
+                    bytes.len(),
+                    content_type.as_deref(),
+                    e,
+                ));
             }
         }
     };
@@ -583,71 +740,55 @@ pub async fn dispatch_executor(
     }
 }
 
-/// Decode a non-stream upstream body into the downstream protocol.
-/// Native groups pass the body through unchanged; conversion groups decode
-/// through the correct codec direction (the registry's response-decoder wiring
-/// is intentionally NOT used — its orientation is the encoder's, see T04 note).
+/// Decode one upstream body through the request-scoped codec plan.
+///
+/// The factory preserves the exact `ConversionContext` created while encoding
+/// this attempt.  It also returns observed usage as part of the same decode,
+/// avoiding a second protocol-specific pass for quota accounting.
 fn decode_non_stream(
-    _downstream: EndpointKind,
+    downstream: EndpointKind,
     attempt: &PreparedAttempt,
     body: &Value,
 ) -> Result<(Value, Option<TokenUsage>), AttemptFailure> {
-    let usage = extract_usage(&attempt.upstream_protocol, &attempt.upstream_endpoint, body);
-
-    match attempt.codec_version.as_deref() {
-        None => Ok((body.clone(), usage)),
-        Some("chat_to_messages_v1") => {
-            // downstream Chat, upstream Messages: Messages body -> Chat body.
-            let context = crate::protocol::codec::report::ConversionContext::new(
-                format!("chatcmpl_{}", uuid::Uuid::new_v4().simple()),
-                attempt.upstream_model.clone(),
-                false,
-            );
-            let out =
-                crate::protocol::codec::messages::decode_messages_response_to_chat(body, &context)
-                    .map_err(|e| AttemptFailure {
-                        failure_class: FailureClass::UpstreamProtocolError,
-                        message: format!(
-                            "Messages response cannot be decoded to Chat: {}",
-                            e.message
-                        ),
-                        status_code: Some(502),
-                        retry_after: None,
-                    })?;
-            Ok((out, usage))
-        }
-        Some("messages_to_chat_v1") => {
-            // downstream Messages, upstream Chat: Chat body -> Messages body.
-            let context = crate::protocol::codec::report::ConversionContext::new(
-                format!("msg_{}", uuid::Uuid::new_v4().simple()),
-                attempt.upstream_model.clone(),
-                false,
-            );
-            let out =
-                crate::protocol::codec::chat::decode_chat_response_to_messages(body, &context)
-                    .map_err(|e| AttemptFailure {
-                        failure_class: FailureClass::UpstreamProtocolError,
-                        message: format!(
-                            "Chat response cannot be decoded to Messages: {}",
-                            e.message
-                        ),
-                        status_code: Some(502),
-                        retry_after: None,
-                    })?;
-            Ok((out, usage))
-        }
-        Some("responses_via_chat_v1") => {
-            // downstream Responses, upstream Chat: Chat body -> Responses body.
-            let out = crate::protocol::openai_to_responses(body, &attempt.upstream_model);
-            Ok((out, usage))
-        }
-        Some(other) => Err(AttemptFailure {
+    let Some(codec) = attempt.prepared_codec.as_ref() else {
+        return match downstream {
+            EndpointKind::CountTokens | EndpointKind::Embeddings => Ok((
+                body.clone(),
+                extract_usage(&attempt.upstream_protocol, &attempt.upstream_endpoint, body),
+            )),
+            // Endpoint draft probes intentionally construct a minimal attempt
+            // without request preparation.  They exercise upstream reachability
+            // only and never serve a client response, so retain their historical
+            // raw-body inspection path while production remains fail-closed.
+            _ if attempt.route_group.starts_with("draft_test/") => Ok((
+                body.clone(),
+                extract_usage(&attempt.upstream_protocol, &attempt.upstream_endpoint, body),
+            )),
+            _ => Err(AttemptFailure {
+                failure_class: FailureClass::UpstreamProtocolError,
+                message: "three-protocol attempt is missing its prepared codec".to_string(),
+                status_code: Some(502),
+                retry_after: None,
+            }),
+        };
+    };
+    let decoded = codec
+        .new_non_stream_decoder()
+        .decode(body)
+        .map_err(|error| AttemptFailure {
             failure_class: FailureClass::UpstreamProtocolError,
-            message: format!("unknown codec version on a conversion attempt: {other}"),
+            message: format!("upstream response could not be decoded: {error}"),
             status_code: Some(502),
             retry_after: None,
+        })?;
+    Ok((
+        decoded.body,
+        decoded.usage.map(|usage| TokenUsage {
+            prompt_tokens: usage.input_tokens,
+            completion_tokens: usage.output_tokens,
+            total_tokens: usage.input_tokens + usage.output_tokens,
         }),
-    }
+    ))
 }
 
 /// Extract token usage from the RAW upstream body (before any response decode).
@@ -762,6 +903,12 @@ mod tests {
             final_url("http://localhost:11434/", "/api/chat", None),
             "http://localhost:11434/api/chat"
         );
+    }
+
+    #[test]
+    fn auth_account_body_always_forces_responses_streaming() {
+        let forced = force_responses_stream(&serde_json::json!({"model":"m","stream":false}));
+        assert_eq!(forced["stream"], true);
     }
 
     #[test]

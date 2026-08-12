@@ -193,15 +193,47 @@ fn prepared(
     body: Value,
     codec_version: Option<&str>,
 ) -> crate::core::attempt::PreparedAttempt {
+    use crate::protocol::codec::{CodecRegistry, Protocol};
+
+    // These executor tests construct attempts directly, bypassing route-plan
+    // preparation. Mirror the production prepared handle so they exercise the
+    // same decoder-factory path instead of an obsolete string dispatch.
+    let protocol_codec = match endpoint {
+        "embeddings" | "count_tokens" => None,
+        _ => {
+            let (downstream, upstream) = match codec_version {
+                Some("chat_to_messages_v1") => (Protocol::Chat, Protocol::Messages),
+                Some("messages_to_chat_v1") => (Protocol::Messages, Protocol::Chat),
+                Some("chat_to_responses_v1") => (Protocol::Chat, Protocol::Responses),
+                Some("messages_to_responses_v2") => (Protocol::Messages, Protocol::Responses),
+                Some("responses_to_messages_v2") => (Protocol::Responses, Protocol::Messages),
+                Some("responses_to_chat_v1") => (Protocol::Responses, Protocol::Chat),
+                _ => match endpoint {
+                    "messages" => (Protocol::Messages, Protocol::Messages),
+                    "responses" => (Protocol::Responses, Protocol::Responses),
+                    // Chat-compatible OpenAI and Ollama test endpoints share
+                    // the typed identity decoder.
+                    _ => (Protocol::Chat, Protocol::Chat),
+                },
+            };
+            Some(
+                CodecRegistry::prepare_pair(downstream, upstream, model, &body)
+                    .expect("test attempt request must prepare")
+                    .codec,
+            )
+        }
+    };
     crate::core::attempt::PreparedAttempt {
         channel_id: "ch-test".into(),
         channel_name: "test".into(),
+        upstream_type: "channel".into(),
         route_group: format!("{}_g1_native", endpoint),
         upstream_protocol: protocol.to_string(),
         upstream_endpoint: endpoint.to_string(),
         upstream_model: model.to_string(),
         native_base_url: base.to_string(),
         codec_version: codec_version.map(|s| s.to_string()),
+        prepared_codec: protocol_codec,
         encoded_body: body,
         conversion_report: None,
         is_retry: false,
@@ -248,6 +280,43 @@ async fn openai_chat_url_auth_body() {
             assert_eq!(s.usage.as_ref().unwrap().total_tokens, 7);
         }
         _ => panic!("expected success"),
+    }
+}
+
+/// A 2xx status alone is not a successful non-stream response.  Providers
+/// occasionally close a fallback request without writing a body; retain that
+/// as a retryable protocol failure and include enough transport context in the
+/// persisted diagnostic to identify the upstream behaviour.
+#[tokio::test]
+async fn openai_chat_empty_2xx_body_is_diagnostic_protocol_failure() {
+    let mock = MockUpstream::start(Vec::new(), 200).await;
+    let base = format!("http://{}/v1", mock.addr);
+    let attempt = prepared(
+        &base,
+        "openai",
+        "chat_completions",
+        "gpt-4o",
+        json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":false}),
+        Some("messages_to_chat_v1"),
+    );
+    let id = identity("openai", &["chat_completions"], None);
+    let ch = channel(&base, "sk-123");
+
+    let result =
+        dispatch_executor(EndpointKind::ChatCompletions, &attempt, &ch, &id, &[], None).await;
+    match result {
+        crate::core::attempt::AttemptResult::Failure(failure) => {
+            assert_eq!(
+                failure.failure_class,
+                crate::core::attempt::FailureClass::UpstreamProtocolError
+            );
+            assert!(failure.message.contains("HTTP 200, 0 bytes"));
+            assert!(failure.message.contains("content-type application/json"));
+            assert!(failure
+                .message
+                .contains("upstream returned an undecodable body"));
+        }
+        _ => panic!("an empty 2xx body must not become a successful response"),
     }
 }
 

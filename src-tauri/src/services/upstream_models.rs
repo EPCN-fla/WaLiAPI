@@ -81,9 +81,10 @@ pub async fn fetch_upstream_models(
         req = req.header(k, v);
     }
 
-    let resp = req.send().await.map_err(|e| {
-        format!("连接上游失败（{url}）：{e}（不会覆盖已有模型列表）")
-    })?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("连接上游失败（{url}）：{e}（不会覆盖已有模型列表）"))?;
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
         let body = resp.text().await.unwrap_or_default();
@@ -92,9 +93,10 @@ pub async fn fetch_upstream_models(
             concise_error(&body)
         ));
     }
-    let body: Value = resp.json().await.map_err(|e| {
-        format!("上游返回无法解析的 JSON（{url}）：{e}（不会覆盖已有模型列表）")
-    })?;
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("上游返回无法解析的 JSON（{url}）：{e}（不会覆盖已有模型列表）"))?;
 
     let models = parse(&body);
     if models.is_empty() {
@@ -243,7 +245,10 @@ mod tests {
         Mock { addr, received }
     }
 
-    async fn write_all_response(socket: &mut tokio::net::TcpStream, body: &[u8]) -> std::io::Result<()> {
+    async fn write_all_response(
+        socket: &mut tokio::net::TcpStream,
+        body: &[u8],
+    ) -> std::io::Result<()> {
         let head = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -255,7 +260,8 @@ mod tests {
 
     #[tokio::test]
     async fn openai_parses_data_ids_and_bearer() {
-        let m = start_mock(json!({"data": [{"id": "oc/gpt-5"}, {"id": "oc/deepseek-v4-flash"}]})).await;
+        let m =
+            start_mock(json!({"data": [{"id": "oc/gpt-5"}, {"id": "oc/deepseek-v4-flash"}]})).await;
         let input = draft("openai", &m.addr);
         let r = fetch_upstream_models(&input, "secret", 5).await.unwrap();
         assert_eq!(r.models, vec!["oc/gpt-5", "oc/deepseek-v4-flash"]);
@@ -281,7 +287,8 @@ mod tests {
 
     #[tokio::test]
     async fn ollama_parses_tags_names() {
-        let m = start_mock(json!({"models": [{"name": "qwen3:32b"}, {"name": "llama3.3:70b"}]})).await;
+        let m =
+            start_mock(json!({"models": [{"name": "qwen3:32b"}, {"name": "llama3.3:70b"}]})).await;
         let input = draft("ollama", &m.addr);
         let r = fetch_upstream_models(&input, "", 5).await.unwrap();
         assert_eq!(r.models, vec!["qwen3:32b", "llama3.3:70b"]);

@@ -961,7 +961,10 @@ mod tests {
         );
         // Anthropic / 智谱
         let p = f(ChannelProtocol::Anthropic, ChannelProvider::Zhipu);
-        assert_eq!(p.native_base_url, "https://open.bigmodel.cn/api/anthropic/v1");
+        assert_eq!(
+            p.native_base_url,
+            "https://open.bigmodel.cn/api/anthropic/v1"
+        );
         assert_eq!(
             join(&p.native_base_url, "messages"),
             "https://open.bigmodel.cn/api/anthropic/v1/messages"

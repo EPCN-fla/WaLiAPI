@@ -1,16 +1,15 @@
 //! Feature-flag entry points for the channel-protocol refactor (T00 decision 10).
 //!
-//! Four independent switches gate the new routing/codec paths.  They default to
-//! OFF so the legacy flat Dispatcher path remains the active behavior; the
-//! leader does not flip them on.  T06 is responsible for wiring the real
-//! executors behind these flags.
+//! Routing capability switches for the channel-protocol refactor.
 //!
 //! | Flag                    | Gates                                                     |
 //! |-------------------------|-----------------------------------------------------------|
-//! | `features.new_routeplan`    | The model-first RoutePlan path in the HTTP handlers. T06 wires it for EVERY routed endpoint (Chat / Responses / Messages / CountTokens / Embeddings) on BOTH stream and non-stream paths via `handlers::maybe_route_plan` → `executor::driver::{route_plan_response, route_stream_plan}`. OFF → legacy flat Dispatcher path unchanged. |
-//! | `features.cross_protocol_codec` | G2 conversion groups (Chat→Anthropic, Messages→Chat, Responses→Chat). |
-//! | `features.native_responses` | Responses G1 native `/responses` group.                  |
+//! | `features.new_routeplan`    | Model-first RoutePlan path in the HTTP handlers. Enabled by default in production. |
+//! | `features.cross_protocol_codec` | G2 conversion groups (Chat→Anthropic, Messages→Chat, Responses→Chat). Enabled by default in production. |
+//! | `features.native_responses` | Responses G1 native `/responses` group. Enabled by default in production. |
 //! | `features.ollama_native`    | Native Ollama `/api/chat` group (added by T06 to the Chat matrix; OFF until the executor + downstream Chat chain pass their tests). |
+//! | `routing.prefer_auth_accounts` | Sort auth-account candidates before channel candidates within the same route group. |
+//! | `routing.prefer_same_protocol` | Prefer candidates that can serve the request without protocol conversion. |
 
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
@@ -22,6 +21,8 @@ pub struct FeatureFlags {
     pub cross_protocol_codec: bool,
     pub native_responses: bool,
     pub ollama_native: bool,
+    pub prefer_auth_accounts: bool,
+    pub prefer_same_protocol: bool,
 }
 
 impl FeatureFlags {
@@ -37,6 +38,8 @@ impl FeatureFlags {
             cross_protocol_codec: true,
             native_responses: true,
             ollama_native: true,
+            prefer_auth_accounts: false,
+            prefer_same_protocol: true,
         }
     }
 
@@ -46,32 +49,39 @@ impl FeatureFlags {
     }
 }
 
-/// Read the four flags from the Tauri settings store (`settings.json`).
+/// Read the routing flags from the Tauri settings store (`settings.json`).
 ///
-/// Keys are namespaced under `features.*`.  Missing values are treated as
-/// OFF.  The planner never reads the store itself — handlers read it once and
-/// pass a snapshot so the planner stays pure and deterministic in tests.
+/// Core routing capabilities are no longer user-facing rollout switches:
+/// protocol conversion and native Responses are baseline compatibility features.
+/// The planner never reads the store itself — handlers read it once and pass a
+/// snapshot so the planner stays pure and deterministic in tests.
 pub fn read_feature_flags(app: &AppHandle) -> FeatureFlags {
     let Ok(store) = app.store("settings.json") else {
-        return FeatureFlags::default();
+        return FeatureFlags {
+            new_routeplan: true,
+            cross_protocol_codec: true,
+            native_responses: true,
+            ollama_native: false,
+            prefer_auth_accounts: true,
+            prefer_same_protocol: true,
+        };
     };
     FeatureFlags {
-        new_routeplan: store
-            .get("features.new_routeplan")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        cross_protocol_codec: store
-            .get("features.cross_protocol_codec")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        native_responses: store
-            .get("features.native_responses")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        new_routeplan: true,
+        cross_protocol_codec: true,
+        native_responses: true,
         ollama_native: store
             .get("features.ollama_native")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        prefer_auth_accounts: store
+            .get("routing.prefer_auth_accounts")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        prefer_same_protocol: store
+            .get("routing.prefer_same_protocol")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
     }
 }
 
@@ -86,6 +96,8 @@ mod tests {
         assert!(!f.cross_protocol_codec);
         assert!(!f.native_responses);
         assert!(!f.ollama_native);
+        assert!(!f.prefer_auth_accounts);
+        assert!(!f.prefer_same_protocol);
         assert!(!f.conversions_enabled());
     }
 

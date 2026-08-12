@@ -336,10 +336,7 @@ fn is_blocked_ip(ip: IpAddr, allow_loopback: bool, allow_private: bool) -> bool 
                 return !allow_loopback;
             }
             // RFC1918 私网段：仅 custom/ollama 放行，其他渠道仍拦截（SSRF）。
-            if a == 10
-                || (a == 172 && (16..=31).contains(&b))
-                || (a == 192 && b == 168)
-            {
+            if a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168) {
                 return !allow_private;
             }
             // 云元数据 / 链路本地、0/8、广播、组播、保留段：始终拦截。
@@ -686,12 +683,14 @@ async fn probe_endpoint(
     let attempt = PreparedAttempt {
         channel_id: channel.id.clone(),
         channel_name: channel.name.clone(),
+        upstream_type: "channel".to_string(),
         route_group: format!("draft_test/{endpoint}"),
         upstream_protocol: identity.protocol.clone(),
         upstream_endpoint: endpoint.to_string(),
         upstream_model: model.to_string(),
         native_base_url: identity.native_base_url.clone(),
         codec_version: None,
+        prepared_codec: None,
         encoded_body: probe_body(endpoint, model),
         conversion_report: None,
         is_retry: false,
@@ -1297,11 +1296,7 @@ mod channel_draft_test {
         let result = run_draft_test(&input, "sk-ant-xyz", &store(), &cfg())
             .await
             .unwrap();
-        assert_eq!(
-            result.results.len(),
-            1,
-            "count_tokens 必须被排除出探测列表"
-        );
+        assert_eq!(result.results.len(), 1, "count_tokens 必须被排除出探测列表");
         assert_eq!(result.results[0].endpoint, "messages");
         let captured = mock.captured().await;
         assert_eq!(captured.len(), 1, "count_tokens must not be probed");
@@ -1325,12 +1320,7 @@ mod channel_draft_test {
         // 空 body 或未解压的 gzip 字节），必须归类为 protocol 错误，且诊断
         // 日志要能抓到 Content-Type / body 摘要，而不是只显示一行通用错误。
         let mock = start_mock(|_path: &str| {
-            Box::pin(async move {
-                (
-                    200,
-                    b"<html><body>Bad Gateway</body></html>".to_vec(),
-                )
-            })
+            Box::pin(async move { (200, b"<html><body>Bad Gateway</body></html>".to_vec()) })
         })
         .await;
         let base = format!("http://{}", mock.addr);
@@ -1706,11 +1696,9 @@ data: {"type":"message_stop"}
                 .await
                 .is_ok()
         );
-        assert!(
-            validate_draft_url("http://10.0.0.5/v1", "openai", "custom")
-                .await
-                .is_ok()
-        );
+        assert!(validate_draft_url("http://10.0.0.5/v1", "openai", "custom")
+            .await
+            .is_ok());
         assert!(
             validate_draft_url("http://172.16.3.7/v1", "openai", "ollama")
                 .await
@@ -1728,11 +1716,13 @@ data: {"type":"message_stop"}
                 .await
                 .is_err()
         );
-        assert!(
-            validate_draft_url("http://169.254.169.254/latest/meta-data", "openai", "custom")
-                .await
-                .is_err()
-        );
+        assert!(validate_draft_url(
+            "http://169.254.169.254/latest/meta-data",
+            "openai",
+            "custom"
+        )
+        .await
+        .is_err());
         assert!(
             validate_draft_url("http://224.0.0.1/v1", "openai", "custom")
                 .await

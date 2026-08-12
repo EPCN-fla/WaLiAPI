@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { settingsApi, serverApi, securityApi } from "../lib/api";
 import type { Settings, BuiltinRule, CustomRule } from "../types";
-import { Save, RotateCcw, Check, Server, SlidersHorizontal, Palette, RefreshCw, ShieldAlert, Plus, Trash2, ListChecks, Pencil, X, AlertCircle } from "lucide-react";
+import { Save, RotateCcw, Check, Server, SlidersHorizontal, Palette, RefreshCw, ShieldAlert, Plus, Trash2, ListChecks, Pencil, X, AlertCircle, HelpCircle } from "lucide-react";
 
 const SEVERITY_BADGE: Record<string, string> = {
   critical: "bg-red-50 text-red-700 border-red-200",
@@ -166,6 +166,7 @@ export function SettingsPage() {
   // 统一 select 样式
   const selectCls = "w-full appearance-none rounded-2xl border border-border bg-background/70 px-4 py-3 pr-10 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary bg-[url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 20 20%22 fill=%22%2366758a%22><path d=%22M5.23 7.21a.75.75 0 011.06.02L10 11.06l3.71-3.83a.75.75 0 111.08 1.04l-4.25 4.39a.75.75 0 01-1.08 0L5.21 8.27a.75.75 0 01.02-1.06z%22/></svg>')] bg-[length:20px_20px] bg-[right_0.75rem_center] bg-no-repeat";
   const inputCls = "w-full rounded-2xl border border-border bg-background/70 px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary";
+  const helpTooltipCls = "pointer-events-none absolute left-1/2 top-full z-50 mt-2 w-64 max-w-[calc(100vw-3rem)] -translate-x-1/2 rounded-xl border border-border bg-background px-3 py-2 text-xs leading-relaxed text-foreground opacity-0 shadow-lg transition-opacity group-hover/help:opacity-100";
 
   // Tab 配置
   const TABS = [
@@ -514,6 +515,8 @@ export function SettingsPage() {
               <p className="text-sm text-muted-foreground">桌面端交互习惯与启动行为</p>
             </div>
           </div>
+          <div>
+            <h3 className="mb-3 text-sm font-medium text-muted-foreground">桌面行为</h3>
           <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
             {([
               ["最小化到托盘", "minimize_to_tray"],
@@ -530,6 +533,46 @@ export function SettingsPage() {
                 />
               </label>
             ))}
+          </div>
+          </div>
+          <div>
+            <h3 className="mb-3 text-sm font-medium text-muted-foreground">路由设置</h3>
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+              <label className="surface-soft flex items-center justify-between rounded-2xl px-4 py-4">
+                <span className="flex items-center gap-1.5 text-sm">
+                  Auth 账号优先
+                  <span className="group/help relative inline-flex">
+                    <HelpCircle size={14} className="shrink-0 text-muted-foreground" aria-label="Auth 账号优先说明" />
+                    <span className={helpTooltipCls}>
+                      开启后，支持该模型的 Auth 账号会优先于普通渠道；若同时开启同协议优先，则同协议 Auth 账号最优先。
+                    </span>
+                  </span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={settings.routing_prefer_auth_accounts}
+                  onChange={e => setSettings({ ...settings, routing_prefer_auth_accounts: e.target.checked })}
+                  className="h-5 w-5"
+                />
+              </label>
+              <label className="surface-soft flex items-center justify-between rounded-2xl px-4 py-4">
+                <span className="flex items-center gap-1.5 text-sm">
+                  同协议优先
+                  <span className="group/help relative inline-flex">
+                    <HelpCircle size={14} className="shrink-0 text-muted-foreground" aria-label="同协议优先说明" />
+                    <span className={helpTooltipCls}>
+                      开启后，优先选择无需协议转换的候选；没有同协议候选时再使用跨协议转换候选。
+                    </span>
+                  </span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={settings.routing_prefer_same_protocol}
+                  onChange={e => setSettings({ ...settings, routing_prefer_same_protocol: e.target.checked })}
+                  className="h-5 w-5"
+                />
+              </label>
+            </div>
           </div>
         </div>
       )}

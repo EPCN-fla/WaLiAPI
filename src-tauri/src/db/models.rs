@@ -179,11 +179,124 @@ pub struct CreateApiKeyInput {
     pub expires_at: Option<String>,
 }
 
+/// A single model in an Auth Account's provider-synchronized snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelState {
+    pub id: String,
+    pub status: String,
+    pub unavailable: bool,
+    pub next_retry_after: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelStates {
+    pub version: i64,
+    pub models: Vec<ModelState>,
+}
+
+impl Default for ModelStates {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            models: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuotaWindow {
+    pub used_percent: Option<f64>,
+    pub window_minutes: Option<i64>,
+    pub reset_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuotaLimit {
+    pub limit_id: String,
+    pub limit_name: Option<String>,
+    pub primary: Option<QuotaWindow>,
+    pub secondary: Option<QuotaWindow>,
+    pub credits: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuotaState {
+    pub version: i64,
+    pub exceeded: bool,
+    pub reason: Option<String>,
+    pub next_recover_at: Option<String>,
+    pub backoff_level: i64,
+    pub limits: Vec<QuotaLimit>,
+}
+
+impl Default for QuotaState {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            exceeded: false,
+            reason: None,
+            next_recover_at: None,
+            backoff_level: 0,
+            limits: Vec::new(),
+        }
+    }
+}
+
+/// Persisted generic provider account. `payload_json` is intentionally kept in
+/// the database model only; command DTOs must expose a redacted summary.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AuthAccount {
+    pub id: String,
+    pub provider: String,
+    pub label: String,
+    pub account_id: String,
+    pub status: String,
+    pub disabled: i64,
+    pub priority: i64,
+    pub weight: i64,
+    pub quota_json: Option<String>,
+    pub model_states_json: String,
+    pub attributes_json: String,
+    pub payload_json: String,
+    pub last_refreshed_at: Option<String>,
+    pub last_models_sync_at: Option<String>,
+    pub next_refresh_after: Option<String>,
+    pub next_retry_after: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl AuthAccount {
+    pub fn model_states(&self) -> Result<ModelStates, serde_json::Error> {
+        serde_json::from_str(&self.model_states_json)
+    }
+
+    pub fn quota_state(&self) -> Result<Option<QuotaState>, serde_json::Error> {
+        self.quota_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+    }
+}
+
+/// Login/import input used for an atomic provider/account-id upsert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthAccountUpsert {
+    pub provider: String,
+    pub label: String,
+    pub account_id: String,
+    pub attributes: serde_json::Value,
+    pub payload: serde_json::Value,
+    pub last_refreshed_at: Option<String>,
+    pub next_refresh_after: Option<String>,
+    pub next_retry_after: Option<String>,
+}
+
 /// A persisted request-log row.  All T09 observability columns are NULLABLE
-/// (migration 016) so legacy rows and old queries keep working; `Default` is
-/// derived so a struct literal can use `..Default::default()` for the fields a
-/// given code path does not produce yet.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, sqlx::FromRow)]
+/// (migration 016) so legacy rows and old queries keep working. Its manual
+/// `Default` supplies `upstream_type = "channel"` for legacy write paths.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RequestLog {
     pub id: String,
     pub seq: Option<i64>,
@@ -224,6 +337,55 @@ pub struct RequestLog {
     pub identity_revision: Option<i64>,
     pub client_cancelled: Option<i64>,
     pub stream_committed: Option<i64>,
+    /// `channel` for legacy API channels and `auth_account` for provider
+    /// accounts. The database default makes upgraded historical rows channel.
+    pub upstream_type: String,
+}
+
+impl Default for RequestLog {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            seq: None,
+            api_key_id: None,
+            api_key_name: None,
+            channel_id: None,
+            channel_name: None,
+            model: String::new(),
+            upstream_model: None,
+            mode: String::new(),
+            status_code: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            duration_ms: 0,
+            error_message: None,
+            is_stream: 0,
+            is_retry: 0,
+            created_at: String::new(),
+            request_body: None,
+            response_choices: None,
+            risk_level: String::new(),
+            risk_score: 0,
+            risk_summary: None,
+            security_action: String::new(),
+            sanitized: 0,
+            blocked_reason: None,
+            trace_id: None,
+            downstream_protocol: None,
+            downstream_endpoint: None,
+            route_group: None,
+            upstream_protocol: None,
+            upstream_endpoint: None,
+            provider: None,
+            codec_version: None,
+            failure_class: None,
+            identity_revision: None,
+            client_cancelled: None,
+            stream_committed: None,
+            upstream_type: "channel".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -5,6 +5,7 @@ import { Layout } from "./components/layout/Layout";
 import { UpdateChecker } from "./components/UpdateChecker";
 import { DashboardPage } from "./pages/DashboardPage";
 import { ChannelsPage } from "./pages/ChannelsPage";
+import { AuthChannelsPage } from "./pages/AuthChannelsPage";
 import { ApiKeysPage } from "./pages/ApiKeysPage";
 import { LogsPage } from "./pages/LogsPage";
 import { SettingsPage } from "./pages/SettingsPage";
@@ -46,6 +47,7 @@ function App() {
           <Route path="/" element={<DashboardPage />} />
           <Route path="/usage" element={<UsagePage />} />
           <Route path="/channels" element={<ChannelsPage />} />
+          <Route path="/channels/auth" element={<AuthChannelsPage />} />
           <Route path="/api-keys" element={<ApiKeysPage />} />
           <Route path="/logs" element={<LogsPage />} />
           <Route path="/settings" element={<SettingsPage />} />

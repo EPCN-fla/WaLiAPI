@@ -9,7 +9,7 @@
 use super::chat;
 use super::error::{FeatureKind, UnsupportedFeatures};
 use super::messages;
-use super::registry::CodecRegistry;
+use super::registry::{CodecRegistry, Downstream, Upstream};
 use serde_json::json;
 use serde_json::Value;
 
@@ -226,7 +226,9 @@ fn chat_request_reasoning_effort_maps_to_thinking() {
         "messages": [{"role": "user", "content": "u"}],
         "reasoning_effort": "none"
     });
-    let out = &CodecRegistry::chat_to_messages("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::chat_to_messages("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["thinking"], json!({"type": "disabled"}));
     assert!(out.get("output_config").is_none());
 
@@ -236,7 +238,9 @@ fn chat_request_reasoning_effort_maps_to_thinking() {
         "messages": [{"role": "user", "content": "u"}],
         "reasoning_effort": "auto"
     });
-    let out = &CodecRegistry::chat_to_messages("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::chat_to_messages("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["thinking"], json!({"type": "adaptive"}));
     assert!(out.get("output_config").is_none());
 
@@ -246,7 +250,9 @@ fn chat_request_reasoning_effort_maps_to_thinking() {
         "messages": [{"role": "user", "content": "u"}],
         "reasoning_effort": "medium"
     });
-    let out = &CodecRegistry::chat_to_messages("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::chat_to_messages("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["thinking"], json!({"type": "adaptive"}));
     assert_eq!(out["output_config"], json!({"effort": "medium"}));
 
@@ -256,7 +262,9 @@ fn chat_request_reasoning_effort_maps_to_thinking() {
         "messages": [{"role": "user", "content": "u"}],
         "reasoning_effort": "xhigh"
     });
-    let out = &CodecRegistry::chat_to_messages("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::chat_to_messages("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["output_config"], json!({"effort": "high"}));
 }
 
@@ -475,6 +483,50 @@ fn chat_stream_arbitrary_fragmentation_and_tool_accumulation() {
 }
 
 #[test]
+fn chat_stream_tool_call_without_upstream_id_gets_generated_id() {
+    let mut state = chat::ChatSseState::default();
+    let mut output = Vec::new();
+    output.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"a\\\":\"}}]}}]}\n\n").unwrap());
+    output.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n").unwrap());
+    output.extend(state.finish().unwrap());
+    let output = output.join("");
+    assert!(output.contains("\"type\":\"tool_use\""));
+    assert!(output.contains("\"name\":\"run\""));
+    assert!(output.contains("\"id\":\"call_"));
+    assert!(output.contains("\"partial_json\":\"{\\\"a\\\":1}\""));
+    assert!(output.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[test]
+fn chat_stream_tool_arguments_can_arrive_before_name() {
+    let mut state = chat::ChatSseState::default();
+    let mut output = Vec::new();
+    output.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"a\\\":\"}}]}}]}\n\n").unwrap());
+    output.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"run\",\"arguments\":\"1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n").unwrap());
+    output.extend(state.finish().unwrap());
+    let output = output.join("");
+    assert!(output.contains("\"id\":\"call_1\""));
+    assert!(output.contains("\"name\":\"run\""));
+    assert!(output.contains("\"partial_json\":\"{\\\"a\\\":1}\""));
+    assert!(output.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[test]
+fn chat_stream_empty_tool_name_delta_does_not_clear_name() {
+    let mut state = chat::ChatSseState::default();
+    let mut output = Vec::new();
+    output.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\n").unwrap());
+    output.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"{\\\"path\\\":\\\"/tmp/x\\\"}\"}}]}}]}\n\n").unwrap());
+    output.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"tool_calls\"}]}\n\n").unwrap());
+    output.extend(state.finish().unwrap());
+    let output = output.join("");
+    assert!(output.contains("\"id\":\"call_1\""));
+    assert!(output.contains("\"name\":\"read\""));
+    assert!(output.contains("\"partial_json\":\"{\\\"path\\\":\\\"/tmp/x\\\"}\""));
+    assert!(output.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[test]
 fn chat_stream_incomplete_tool_arguments_are_rejected() {
     let mut state = chat::ChatSseState::default();
     state.feed(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"run\",\"arguments\":\"{bad\"}}]}}]}\n\n").unwrap();
@@ -485,18 +537,26 @@ fn chat_stream_incomplete_tool_arguments_are_rejected() {
 }
 
 #[test]
-fn chat_stream_unknown_finish_reason_rejected_at_finalize() {
+fn chat_stream_unknown_finish_reason_completes_as_end_turn() {
+    // A provider-specific terminal finish reason after an otherwise valid Chat
+    // stream is conservatively mapped to Anthropic `end_turn` rather than
+    // aborting a committed stream (CPA compatibility).
     let mut state = chat::ChatSseState::default();
-    state
-        .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
-        .unwrap();
-    state
-        .feed(b"data: {\"choices\":[{\"finish_reason\":\"bizarre\"}]}\n\n")
-        .unwrap();
-    let e = state.finish().unwrap_err();
-    assert!(reject_features(&e)
-        .iter()
-        .any(|c| c.contains("finish_reason")));
+    let mut output = Vec::new();
+    output.extend(
+        state
+            .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
+            .unwrap(),
+    );
+    output.extend(
+        state
+            .feed(b"data: {\"choices\":[{\"finish_reason\":\"bizarre\"}]}\n\n")
+            .unwrap(),
+    );
+    output.extend(state.finish().unwrap());
+    let output = output.join("");
+    assert!(output.contains("\"stop_reason\":\"end_turn\""));
+    assert!(output.contains("event: message_stop"));
 }
 
 #[test]
@@ -588,6 +648,25 @@ fn messages_request_system_text_and_sampling() {
 }
 
 #[test]
+fn messages_request_preserves_empty_thinking_as_reasoning_content() {
+    let body = json!({
+        "model": "m",
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "messages": [{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": ""},
+                {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}}
+            ]
+        }]
+    });
+    let prepared = CodecRegistry::messages_to_chat("m", &body).unwrap();
+    let assistant = &prepared.encoded_request["messages"][0];
+    assert_eq!(assistant["reasoning_content"], "");
+    assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
+}
+
+#[test]
 fn messages_request_stream_options_are_allowed_and_force_usage() {
     let body = json!({
         "model": "m",
@@ -660,7 +739,9 @@ fn messages_request_thinking_variants_map_reasoning_effort() {
         "messages": [{"role": "user", "content": "u"}],
         "thinking": {"type": "enabled", "budget_tokens": 1024}
     });
-    let out = &CodecRegistry::messages_to_chat("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::messages_to_chat("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["reasoning_effort"], "low", "1024 -> low");
 
     // enabled without budget -> auto
@@ -669,7 +750,9 @@ fn messages_request_thinking_variants_map_reasoning_effort() {
         "messages": [{"role": "user", "content": "u"}],
         "thinking": {"type": "enabled"}
     });
-    let out = &CodecRegistry::messages_to_chat("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::messages_to_chat("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["reasoning_effort"], "auto");
 
     // adaptive + output_config.effort -> passthrough (lowercased)
@@ -679,8 +762,13 @@ fn messages_request_thinking_variants_map_reasoning_effort() {
         "thinking": {"type": "adaptive"},
         "output_config": {"effort": "MEDIUM"}
     });
-    let out = &CodecRegistry::messages_to_chat("m", &body).unwrap().encoded_request;
-    assert_eq!(out["reasoning_effort"], "medium", "effort lowercased passthrough");
+    let out = &CodecRegistry::messages_to_chat("m", &body)
+        .unwrap()
+        .encoded_request;
+    assert_eq!(
+        out["reasoning_effort"], "medium",
+        "effort lowercased passthrough"
+    );
 
     // adaptive without effort -> xhigh
     let body = json!({
@@ -688,7 +776,9 @@ fn messages_request_thinking_variants_map_reasoning_effort() {
         "messages": [{"role": "user", "content": "u"}],
         "thinking": {"type": "adaptive"}
     });
-    let out = &CodecRegistry::messages_to_chat("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::messages_to_chat("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["reasoning_effort"], "xhigh");
 
     // disabled -> none
@@ -697,7 +787,9 @@ fn messages_request_thinking_variants_map_reasoning_effort() {
         "messages": [{"role": "user", "content": "u"}],
         "thinking": {"type": "disabled"}
     });
-    let out = &CodecRegistry::messages_to_chat("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::messages_to_chat("m", &body)
+        .unwrap()
+        .encoded_request;
     assert_eq!(out["reasoning_effort"], "none");
 }
 
@@ -720,12 +812,10 @@ fn messages_request_container_dropped_fail_open() {
     // The report surfaces the drop pointers.
     let report = &prepared.report;
     assert!(report.normalized.iter().any(|p| p.contains("container")));
-    assert!(
-        report
-            .normalized
-            .iter()
-            .any(|p| p.contains("context_management"))
-    );
+    assert!(report
+        .normalized
+        .iter()
+        .any(|p| p.contains("context_management")));
 }
 
 #[test]
@@ -743,7 +833,9 @@ fn messages_request_assistant_thinking_becomes_reasoning_content() {
             ]}
         ]
     });
-    let out = &CodecRegistry::messages_to_chat("m", &body).unwrap().encoded_request;
+    let out = &CodecRegistry::messages_to_chat("m", &body)
+        .unwrap()
+        .encoded_request;
     let assistant = &out["messages"][1];
     assert_eq!(assistant["reasoning_content"], "chain");
     assert_eq!(assistant["content"], "answer");
@@ -827,13 +919,28 @@ fn messages_request_rejects_unknown_top_level_fields() {
     let body = json!({
         "model": "m",
         "messages": [{"role": "user", "content": "u"}],
-        "metadata": {"user_id": "u1"}
+        "unknown": true
     });
     let e = CodecRegistry::messages_to_chat("m", &body).unwrap_err();
     assert!(reject_features(&e)
         .iter()
         .any(|c| c.contains("unsupported_feature.field")));
-    assert!(e.json_pointers.iter().any(|p| p == "/metadata"));
+    assert!(e.json_pointers.iter().any(|p| p == "/unknown"));
+}
+
+#[test]
+fn messages_request_drops_metadata_annotation() {
+    let body = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "u"}],
+        "metadata": {"user_id": "u1"}
+    });
+    let prepared = CodecRegistry::messages_to_chat("m", &body).unwrap();
+    assert!(prepared.encoded_request.get("metadata").is_none());
+    assert!(prepared
+        .report
+        .normalized
+        .contains(&"/metadata".to_string()));
 }
 
 #[test]
@@ -1003,8 +1110,8 @@ fn messages_response_maps_stop_reasons() {
     // Stop-like reasons collapse to `stop` (refusal text rides in content).
     for stop in ["refusal", "stop_sequence", "pause_turn"] {
         assert_eq!(
-            messages::decode_messages_response_to_chat(&base(stop), &Default::default())
-                .unwrap()["choices"][0]["finish_reason"],
+            messages::decode_messages_response_to_chat(&base(stop), &Default::default()).unwrap()
+                ["choices"][0]["finish_reason"],
             "stop",
             "stop_reason {stop:?} should map to stop, not error"
         );
@@ -1124,9 +1231,7 @@ fn messages_stream_stop_like_reasons_normalize_not_error() {
     assert!(stream("refusal").contains("\"finish_reason\":\"stop\""));
     assert!(stream("pause_turn").contains("\"finish_reason\":\"stop\""));
     assert!(stream("stop_sequence").contains("\"finish_reason\":\"stop\""));
-    assert!(
-        stream("model_context_window_exceeded").contains("\"finish_reason\":\"length\"")
-    );
+    assert!(stream("model_context_window_exceeded").contains("\"finish_reason\":\"length\""));
 }
 
 #[test]
@@ -1143,7 +1248,11 @@ fn messages_stream_thinking_fail_open_to_reasoning_content() {
     events.extend(state.feed(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"abc\"}}\n\n").unwrap());
     events.extend(state.feed(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").unwrap());
     events.extend(state.feed(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n").unwrap());
-    events.extend(state.feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n").unwrap());
+    events.extend(
+        state
+            .feed(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+            .unwrap(),
+    );
     events.extend(state.finish().unwrap());
     let joined = events.join("");
     assert!(joined.contains("\"reasoning_content\":\"se\""));
@@ -1158,9 +1267,21 @@ fn chat_stream_reasoning_fail_open_to_thinking_block() {
     // emitted as a Messages `thinking` block, never rejected.
     let mut state = chat::ChatSseState::new("up-model", "msg_1");
     let mut events = Vec::new();
-    events.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"se\"}}]}\n\n").unwrap());
-    events.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"cret\"}}]}\n\n").unwrap());
-    events.extend(state.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n").unwrap());
+    events.extend(
+        state
+            .feed(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"se\"}}]}\n\n")
+            .unwrap(),
+    );
+    events.extend(
+        state
+            .feed(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"cret\"}}]}\n\n")
+            .unwrap(),
+    );
+    events.extend(
+        state
+            .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+            .unwrap(),
+    );
     events.extend(state.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n").unwrap());
     events.extend(state.finish().unwrap());
     let joined = events.join("");
@@ -1172,7 +1293,10 @@ fn chat_stream_reasoning_fail_open_to_thinking_block() {
     assert!(joined.contains("\"text\":\"hi\""));
     // both blocks are stopped exactly once.
     assert_eq!(
-        events.iter().filter(|e| e.contains("content_block_stop")).count(),
+        events
+            .iter()
+            .filter(|e| e.contains("content_block_stop"))
+            .count(),
         2,
         "thinking + text blocks both stop"
     );
@@ -1337,4 +1461,72 @@ fn feature_kind_stable_codes() {
         "unsupported_feature.missing_tool_field"
     );
     assert_eq!(FeatureKind::Media.code(), "unsupported_media");
+}
+
+// ===========================================================================
+// responses_to_messages_v1 — V5 codex Responses → Anthropic Messages
+// ===========================================================================
+
+#[test]
+fn responses_to_messages_prepares_codex_request() {
+    // Real codex 0.147.0 request shape (§1.1) — must survive the V5 registry
+    // prepare path without a codex-field rejection.
+    let request = serde_json::json!({
+        "model": "deepseek-v4-flash-free",
+        "instructions": "You are a helpful assistant.",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+        ],
+        "tools": [
+            {"type": "function", "name": "list", "description": "list files", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "reasoning": {"effort": "high"},
+        // The provider-owned preflight forces this control to false before
+        // transport; the codec rejects the side-effecting value itself.
+        "store": false,
+        "stream": true,
+        "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": "cache-key",
+        "client_metadata": {"turn": "1"}
+    });
+    let prepared = CodecRegistry::responses_to_messages("oc/deepseek-v4-flash-free", &request)
+        .expect("codex Responses request prepares through V5");
+    let out = &prepared.encoded_request;
+    assert_eq!(out["model"], "oc/deepseek-v4-flash-free");
+    assert_eq!(out["stream"], true);
+    assert_eq!(out["system"][0]["text"], "You are a helpful assistant.");
+    assert_eq!(out["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        out["thinking"],
+        serde_json::json!({"type": "enabled", "budget_tokens": 24576})
+    );
+    assert_eq!(out["max_tokens"], 32000);
+    assert_eq!(out["tools"][0]["name"], "list");
+    assert_eq!(
+        out["tool_choice"],
+        serde_json::json!({"type": "auto", "disable_parallel_tool_use": true})
+    );
+    // Dropped codex-only fields are recorded in the ConversionReport.
+    for pointer in ["/parallel_tool_calls", "/store", "/include"] {
+        assert!(
+            prepared.report.normalized.iter().any(|p| p == pointer),
+            "missing dropped-field record {pointer}"
+        );
+    }
+}
+
+#[test]
+fn responses_identity_direction_prepares_native_codec() {
+    let prepared = CodecRegistry::prepare_legacy(
+        Downstream::Responses,
+        Upstream::Responses,
+        &CodecRegistry::version(),
+        "m",
+        &json!({ "model": "m", "input": [] }),
+    )
+    .unwrap();
+    assert!(prepared.codec.is_identity());
+    assert_eq!(prepared.codec.label(), "native");
 }

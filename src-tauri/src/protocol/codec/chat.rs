@@ -3,11 +3,13 @@
 //! Covers request encoding, non-stream response decoding, and the streaming
 //! (SSE) response decoding.  Every conversion is fail-closed: unsupported
 //! features are rejected with a stable code + JSON pointer before any upstream
-//! access; invalid tool arguments are never rewritten to `{}`; an unknown
-//! finish reason is never downgraded to a normal stop/end_turn.
+//! access; invalid tool arguments are never rewritten to `{}`.  OpenAI-compatible
+//! gateways occasionally emit provider-specific terminal finish reasons; once a
+//! response has otherwise completed, those are conservatively represented as an
+//! Anthropic `end_turn` rather than aborting a committed Claude Code stream.
 
-use super::error::{FeatureKind, UnsupportedFeatures};
-use super::registry::{NonStreamDecoder, StreamDecoder};
+use super::error::{DecodeError, FeatureKind, UnsupportedFeatures};
+use super::ports::{DecodedResponse, NonStreamDecoder, StreamDecoder};
 use super::report::{ConversionContext, Usage};
 use super::request;
 use super::sse;
@@ -190,14 +192,23 @@ pub fn encode_chat_to_messages(
         let e = effort.to_ascii_lowercase();
         match e.as_str() {
             "none" | "off" => {
-                claude.insert("thinking".to_string(), serde_json::json!({"type": "disabled"}));
+                claude.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({"type": "disabled"}),
+                );
             }
             "auto" => {
-                claude.insert("thinking".to_string(), serde_json::json!({"type": "adaptive"}));
+                claude.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({"type": "adaptive"}),
+                );
             }
             _ => {
                 let mapped = crate::protocol::thinking::map_effort_to_claude(&e);
-                claude.insert("thinking".to_string(), serde_json::json!({"type": "adaptive"}));
+                claude.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({"type": "adaptive"}),
+                );
                 claude.insert(
                     "output_config".to_string(),
                     serde_json::json!({"effort": mapped}),
@@ -705,8 +716,11 @@ impl NonStreamResponseDecoder {
 }
 
 impl NonStreamDecoder for NonStreamResponseDecoder {
-    fn decode(&self, body: &Value) -> Result<Value, UnsupportedFeatures> {
+    fn decode(&self, body: &Value) -> Result<DecodedResponse, DecodeError> {
+        let usage = super::identity::parse_usage(super::types::Protocol::Chat, body);
         decode_chat_response_to_messages(body, &self.context)
+            .map(|body| DecodedResponse { body, usage })
+            .map_err(DecodeError::from)
     }
 }
 
@@ -944,6 +958,14 @@ pub struct ChatSseState {
     pending: Vec<u8>,
     started: bool,
     ended: bool,
+    /// OpenAI-compatible providers commonly use this sentinel as the only
+    /// terminal marker, omitting `choices[].finish_reason` entirely.
+    saw_done: bool,
+    /// A clean transport EOF after real assistant output is also a usable
+    /// terminal signal for some OpenAI-compatible streaming providers.  Keep
+    /// this separate from `started`: a role-only or usage-only frame must not
+    /// turn a truncated response into a successful completion.
+    saw_assistant_output: bool,
     finish_reason: Option<String>,
     usage: Usage,
     next_content_index: usize,
@@ -977,7 +999,11 @@ impl ChatSseState {
         while let Some(end) = sse::record_end(&self.pending) {
             let record: Vec<u8> = self.pending.drain(..end).collect();
             let payload = sse::parse_data_payload(&record)?;
-            if payload.is_empty() || payload == "[DONE]" {
+            if payload.is_empty() {
+                continue;
+            }
+            if payload == "[DONE]" {
+                self.saw_done = true;
                 continue;
             }
             let json: Value = serde_json::from_str(&payload).map_err(|e| {
@@ -997,7 +1023,9 @@ impl ChatSseState {
         if !self.pending.is_empty() {
             let record = std::mem::take(&mut self.pending);
             let payload = sse::parse_data_payload(&record)?;
-            if !payload.is_empty() && payload != "[DONE]" {
+            if payload == "[DONE]" {
+                self.saw_done = true;
+            } else if !payload.is_empty() {
                 let json: Value = serde_json::from_str(&payload).map_err(|e| {
                     UnsupportedFeatures::single(
                         FeatureKind::UnknownEvent,
@@ -1071,6 +1099,7 @@ impl ChatSseState {
                     _ => None,
                 });
             if let Some(text) = reasoning_text {
+                self.saw_assistant_output = true;
                 let index = self.ensure_thinking(events);
                 events.push(sse::event(
                     "content_block_delta",
@@ -1086,6 +1115,7 @@ impl ChatSseState {
                 .and_then(Value::as_str)
                 .filter(|t| !t.is_empty())
             {
+                self.saw_assistant_output = true;
                 let index = self.ensure_text(events);
                 events.push(sse::event(
                     "content_block_delta",
@@ -1097,6 +1127,9 @@ impl ChatSseState {
                 ));
             }
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                if !calls.is_empty() {
+                    self.saw_assistant_output = true;
+                }
                 for call in calls {
                     self.consume_tool_call(call)?;
                 }
@@ -1179,13 +1212,19 @@ impl ChatSseState {
 
     fn consume_tool_call(&mut self, call: &Value) -> Result<(), UnsupportedFeatures> {
         let source_index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-        if let Some(id) = call.get("id").and_then(Value::as_str) {
+        if let Some(id) = call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
             self.tools.entry(source_index).or_default().id = id.to_string();
         }
         if let Some(name) = call
             .get("function")
             .and_then(|f| f.get("name"))
             .and_then(Value::as_str)
+            .or_else(|| call.get("name").and_then(Value::as_str))
+            .filter(|name| !name.is_empty())
         {
             self.tools.entry(source_index).or_default().name = name.to_string();
         }
@@ -1193,6 +1232,7 @@ impl ChatSseState {
             .get("function")
             .and_then(|f| f.get("arguments"))
             .and_then(Value::as_str)
+            .or_else(|| call.get("arguments").and_then(Value::as_str))
         {
             self.tools
                 .entry(source_index)
@@ -1236,12 +1276,15 @@ impl ChatSseState {
             ));
         }
         for tool in self.tools.values_mut() {
-            if tool.id.is_empty() || tool.name.is_empty() {
+            if tool.name.is_empty() {
                 return Err(UnsupportedFeatures::single(
                     FeatureKind::MissingToolField,
                     "/choices/0/delta/tool_calls",
                     "OpenAI stream ended with an incomplete tool call",
                 ));
+            }
+            if tool.id.is_empty() {
+                tool.id = format!("call_{}", uuid::Uuid::new_v4().simple());
             }
             let input: Value = serde_json::from_str(&tool.arguments).map_err(|e| {
                 UnsupportedFeatures::single(
@@ -1287,15 +1330,36 @@ impl ChatSseState {
             Some("tool_calls") | Some("function_call") => "tool_use",
             Some("content_filter") | Some("refusal") => "refusal",
             Some(other) => {
-                return Err(UnsupportedFeatures::single(
-                    FeatureKind::UnknownFinishReason,
-                    "/choices/0/finish_reason",
-                    format!("unknown Chat finish_reason {other:?}"),
-                ))
+                // CPA-compatible terminal fallback: the upstream has already
+                // completed a valid Chat stream, but this gateway supplied a
+                // provider-specific finish reason.  Anthropic has no lossless
+                // representation for it, so finish the Message normally and
+                // retain the original value in structured logs.
+                tracing::warn!(
+                    finish_reason = other,
+                    fallback_stop_reason = "end_turn",
+                    "unknown OpenAI Chat stream finish_reason mapped for Anthropic compatibility"
+                );
+                "end_turn"
             }
             None => {
                 if !self.tools.is_empty() {
                     "tool_use"
+                } else if self.saw_done || self.saw_assistant_output {
+                    // `[DONE]` is the preferred positive terminal signal.
+                    // Some OpenAI-compatible providers instead close a clean
+                    // SSE response after sending real assistant output, but
+                    // omit both `[DONE]` and the final choice frame.  There is
+                    // no lossless Chat finish_reason to map, so complete as
+                    // Anthropic `end_turn`. A network error, malformed final
+                    // record, or role/usage-only EOF still remains an error.
+                    tracing::warn!(
+                        saw_done = self.saw_done,
+                        saw_assistant_output = self.saw_assistant_output,
+                        fallback_stop_reason = "end_turn",
+                        "OpenAI Chat stream ended without finish_reason; accepting a valid terminal signal"
+                    );
+                    "end_turn"
                 } else {
                     return Err(UnsupportedFeatures::single(
                         FeatureKind::UnknownFinishReason,
@@ -1339,14 +1403,81 @@ impl ChatStreamDecoder {
     }
 }
 
-impl super::registry::StreamDecoder for ChatStreamDecoder {
-    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, UnsupportedFeatures> {
-        self.state.feed(bytes)
+impl StreamDecoder for ChatStreamDecoder {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, DecodeError> {
+        self.state.feed(bytes).map_err(DecodeError::from)
     }
-    fn finish(&mut self) -> Result<Vec<String>, UnsupportedFeatures> {
-        self.state.finish()
+    fn finish(&mut self) -> Result<Vec<String>, DecodeError> {
+        self.state.finish().map_err(DecodeError::from)
     }
     fn usage(&self) -> Option<Usage> {
         Some(self.state.usage)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatSseState;
+
+    #[test]
+    fn stream_unknown_finish_reason_completes_as_end_turn() {
+        let mut state = ChatSseState::new("go-model", "msg_test");
+        let events = state
+            .feed(
+                br#"data: {"id":"chatcmpl_test","model":"go-model","choices":[{"delta":{"role":"assistant","content":"ok"},"finish_reason":"completed"}]}
+
+"#,
+            )
+            .expect("provider-specific finish reason must not abort the stream");
+        let final_events = state.finish().expect("stream finalizes");
+        let all = events.into_iter().chain(final_events).collect::<String>();
+
+        assert!(all.contains("\"text\":\"ok\""));
+        assert!(all.contains("\"stop_reason\":\"end_turn\""));
+        assert!(all.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn stream_done_without_finish_reason_completes_as_end_turn() {
+        let mut state = ChatSseState::new("go-model", "msg_test");
+        let events = state
+            .feed(
+                b"data: {\"id\":\"chatcmpl_test\",\"model\":\"go-model\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+            )
+            .expect("a [DONE]-terminated stream must be accepted");
+        let final_events = state.finish().expect("stream finalizes");
+        let all = events.into_iter().chain(final_events).collect::<String>();
+        assert!(all.contains("\"text\":\"ok\""));
+        assert!(all.contains("\"stop_reason\":\"end_turn\""));
+        assert!(all.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn stream_output_without_terminal_marker_completes_as_end_turn() {
+        let mut state = ChatSseState::new("go-model", "msg_test");
+        let events = state
+            .feed(
+                b"data: {\"id\":\"chatcmpl_test\",\"model\":\"go-model\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+            )
+            .expect("a content frame must decode");
+        let final_events = state
+            .finish()
+            .expect("clean EOF after assistant output must finalize");
+        let all = events.into_iter().chain(final_events).collect::<String>();
+        assert!(all.contains("\"text\":\"ok\""));
+        assert!(all.contains("\"stop_reason\":\"end_turn\""));
+        assert!(all.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn stream_role_only_without_terminal_marker_is_rejected() {
+        let mut state = ChatSseState::new("go-model", "msg_test");
+        state
+            .feed(
+                b"data: {\"id\":\"chatcmpl_test\",\"model\":\"go-model\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            )
+            .expect("a role frame must decode");
+        let error = state.finish().expect_err("role-only EOF must fail closed");
+        assert_eq!(error.json_pointers, vec!["/choices/0/finish_reason"]);
     }
 }
