@@ -17,15 +17,46 @@
 
 ## 📑 目录
 
+- [贡献者](#-贡献者)
 - [工作原理](#-工作原理)
 - [核心功能](#-核心功能)
 - [多协议接入](#-多协议接入)
 - [技术栈](#-技术栈)
 - [安装使用](#-安装使用)
 - [项目结构](#-项目结构)
-- [贡献者](#-贡献者)
 - [版本历史](#-版本历史)
 - [许可证](#-许可证)
+
+---
+
+## 👥 贡献者
+
+> WaLiAPI 由一个热情的开源社区共同构建。感谢以下开发者的代码贡献（按贡献量排序）。
+
+<div align="center">
+
+| | 贡献者 | GitHub | 提交 | 代码变更 | 主要贡献 |
+|:---:|:---|:---|:---:|:---|:---|
+| 🏆 | **小傅哥** | [@fuzhengwei](https://github.com/fuzhengwei) | 217 | `+73,838 / -15,280` | 项目创建者 · 核心架构 · 多渠道网关 · 协议转换 · 安全审计 · 知识库引擎 · Wiki 知识引擎 · MCP Server |
+| ⚡ | **xian** | [@zsxink](https://github.com/zsxink) | 95 | `+70,112 / -9,074` | Anthropic Messages 协议兼容 · 渠道协议重构（T01-T14）· codec 加固 · SSRF 防护 · SSE 帧重组 · models 接口 |
+| 🔧 | **mw** | [@maowei0427](https://github.com/maowei0427) | 6 | `+1,105 / -197` | 日志响应内容记录 · Trace ID 追踪 · 详情页体验优化 · 知识库 embedding 批次配置 |
+| 🐛 | **lianggq** | [@GQingL](https://github.com/GQingL) | 1 | `+91 / -9` | 日志日期筛选修复 · macOS 渠道删除按钮修复 |
+
+</div>
+
+### 📊 代码规模
+
+<div align="center">
+
+| 模块 | 语言 | 代码行数 |
+|:---|:---|:---:|
+| 后端（src-tauri/src） | Rust | ~66,600 |
+| 前端（src） | TypeScript / TSX | ~14,500 |
+| **合计** | — | **~81,100** |
+
+</div>
+
+> 💡 欢迎通过 PR / Issue 参与项目共建，详见 [贡献指南](./CONTRIBUTING.md)。
 
 ---
 
@@ -422,37 +453,6 @@ WaLiAPI/
 │   └── tauri.conf.json               # Tauri 配置
 └── package.json
 ```
-
----
-
-## 👥 贡献者
-
-> WaLiAPI 由一个热情的开源社区共同构建。感谢以下开发者的代码贡献（按贡献量排序）。
-
-<div align="center">
-
-| | 贡献者 | GitHub | 提交 | 代码变更 | 主要贡献 |
-|:---:|:---|:---|:---:|:---|:---|
-| 🏆 | **小傅哥** | [@fuzhengwei](https://github.com/fuzhengwei) | 217 | `+73,838 / -15,280` | 项目创建者 · 核心架构 · 多渠道网关 · 协议转换 · 安全审计 · 知识库引擎 · Wiki 知识引擎 · MCP Server |
-| ⚡ | **xian** | [@zsxink](https://github.com/zsxink) | 95 | `+70,112 / -9,074` | Anthropic Messages 协议兼容 · 渠道协议重构（T01-T14）· codec 加固 · SSRF 防护 · SSE 帧重组 · models 接口 |
-| 🔧 | **mw** | [@maowei0427](https://github.com/maowei0427) | 6 | `+1,105 / -197` | 日志响应内容记录 · Trace ID 追踪 · 详情页体验优化 · 知识库 embedding 批次配置 |
-| 🐛 | **lianggq** | [@GQingL](https://github.com/GQingL) | 1 | `+91 / -9` | 日志日期筛选修复 · macOS 渠道删除按钮修复 |
-
-</div>
-
-### 📊 代码规模
-
-<div align="center">
-
-| 模块 | 语言 | 代码行数 |
-|:---|:---|:---:|
-| 后端（src-tauri/src） | Rust | ~66,600 |
-| 前端（src） | TypeScript / TSX | ~14,500 |
-| **合计** | — | **~81,100** |
-
-</div>
-
-> 💡 欢迎通过 PR / Issue 参与项目共建，详见 [贡献指南](./CONTRIBUTING.md)。
 
 ---
 
