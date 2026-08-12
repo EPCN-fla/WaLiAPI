@@ -4,7 +4,7 @@
 
 ### 本地 LLM API 网关 · 多协议接入 · 知识库 RAG · MCP 工具服务
 
-[![Version](https://img.shields.io/badge/version-0.1.7-blue.svg)](./src-tauri/tauri.conf.json)
+[![Version](https://img.shields.io/badge/version-0.1.8-blue.svg)](./src-tauri/tauri.conf.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)](#-安装使用)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app)
@@ -23,8 +23,8 @@
 - [技术栈](#-技术栈)
 - [安装使用](#-安装使用)
 - [项目结构](#-项目结构)
-- [版本历史](#-版本历史)
 - [贡献者](#-贡献者)
+- [版本历史](#-版本历史)
 - [许可证](#-许可证)
 
 ---
@@ -425,7 +425,59 @@ WaLiAPI/
 
 ---
 
+## 👥 贡献者
+
+> WaLiAPI 由一个热情的开源社区共同构建。感谢以下开发者的代码贡献（按贡献量排序）。
+
+<div align="center">
+
+| | 贡献者 | GitHub | 提交 | 代码变更 | 主要贡献 |
+|:---:|:---|:---|:---:|:---|:---|
+| 🏆 | **小傅哥** | [@fuzhengwei](https://github.com/fuzhengwei) | 217 | `+73,838 / -15,280` | 项目创建者 · 核心架构 · 多渠道网关 · 协议转换 · 安全审计 · 知识库引擎 · Wiki 知识引擎 · MCP Server |
+| ⚡ | **xian** | [@zsxink](https://github.com/zsxink) | 95 | `+70,112 / -9,074` | Anthropic Messages 协议兼容 · 渠道协议重构（T01-T14）· codec 加固 · SSRF 防护 · SSE 帧重组 · models 接口 |
+| 🔧 | **mw** | [@maowei0427](https://github.com/maowei0427) | 6 | `+1,105 / -197` | 日志响应内容记录 · Trace ID 追踪 · 详情页体验优化 · 知识库 embedding 批次配置 |
+| 🐛 | **lianggq** | [@GQingL](https://github.com/GQingL) | 1 | `+91 / -9` | 日志日期筛选修复 · macOS 渠道删除按钮修复 |
+
+</div>
+
+### 📊 代码规模
+
+<div align="center">
+
+| 模块 | 语言 | 代码行数 |
+|:---|:---|:---:|
+| 后端（src-tauri/src） | Rust | ~66,600 |
+| 前端（src） | TypeScript / TSX | ~14,500 |
+| **合计** | — | **~81,100** |
+
+</div>
+
+> 💡 欢迎通过 PR / Issue 参与项目共建，详见 [贡献指南](./CONTRIBUTING.md)。
+
+---
+
 ## 📌 版本历史
+
+### v0.1.8 (2026-08-12)
+
+#### API 密钥管理增强
+
+- ✨ **密钥编辑功能**：支持编辑密钥名称、配额、白/黑名单规则（key 不可编辑）
+- ✨ **白名单/黑名单规则**：密钥级别渠道+模型访问控制，交互式下拉多选 + 笛卡尔积规则生成 + 去重
+- ✨ **密钥编辑入口**：卡片操作栏新增编辑按钮，复用 ApiKeyForm 组件编辑模式
+
+#### 路由与映射优化
+
+- 🐛 **路由优先级修复**：关闭 `prefer_auth_accounts` 与 `prefer_same_protocol`，所有候选混同按 priority → weight 排序
+- ✨ **Auth 账号模型映射**：`auth_accounts` 新增 `model_mapping_json` 列（migration 021），全链路支持映射名→实际模型名转换
+- ✨ **映射逻辑统一重构**：前端抽取 `useModelMappings`/`MappingSection` 共用组件，后端抽取 `mapping_contains_source` 通用函数
+
+#### Usage 页面与 LLM 应用
+
+- ✨ **MODEL 下拉按密钥过滤**：选中 API Key 后，MODEL 列表自动按白/黑名单过滤（UsagePage + AppConfigPanel）
+- ✨ **MODEL 下拉三分类**：API 渠道模型 / Auth 账号模型 / 映射模型三个 optgroup 分组展示
+- ✨ **Auth 账号豁免渠道限制**：Auth 账号无 channel id，豁免渠道级白/黑名单，模型级限制仍生效
+- ✨ **priority/weight 中文化**：AccountCard 与 EditModal 标签改为「优先级」「权重」
 
 ### v0.1.7 (2026-08-09)
 
@@ -530,21 +582,6 @@ WaLiAPI/
 - 安全审计中心（25+ 规则，5 种策略模式）
 - 设置中心（主题/托盘/自启/重试）
 - SSE 流式响应转发
-
----
-
-## 👥 贡献者
-
-感谢以下开发者对 WaLiAPI 项目的代码贡献（按贡献量排序）：
-
-| 贡献者 | GitHub | 提交 | 代码行数 | 主要贡献 |
-|:---|:---|:---|:---|:---|
-| 小傅哥 | [@fuzhengwei](https://github.com/fuzhengwei) | 874 | +71,627 / -14,466 | 项目创建者，核心架构、多渠道管理、协议网关、安全审计、知识库引擎、Wiki 知识引擎、MCP Server、渠道协议重构 |
-| xian | [@zsxink](https://github.com/zsxink) | 241 | +41,373 / -5,119 | Anthropic Messages 协议兼容、渠道协议重构（T01-T14）、codec 加固、SSRF 防护、models 接口、SSE 帧重组、协议修复 |
-| mw | [@maowei0427](https://github.com/maowei0427) | 35 | +1,105 / -197 | 日志模块响应内容记录、Trace ID 追踪、详情页体验优化、知识库 embedding 批次大小配置 |
-| lianggq | [@GQingL](https://github.com/GQingL) | 2 | +91 / -9 | 日志结束日期筛选修复、macOS 渠道删除按钮无响应修复 |
-
-> 欢迎通过 PR / Issue 参与项目共建。
 
 ---
 
