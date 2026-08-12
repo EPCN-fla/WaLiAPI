@@ -39,7 +39,7 @@ impl FeatureFlags {
             native_responses: true,
             ollama_native: true,
             prefer_auth_accounts: false,
-            prefer_same_protocol: true,
+            prefer_same_protocol: false,
         }
     }
 
@@ -62,8 +62,8 @@ pub fn read_feature_flags(app: &AppHandle) -> FeatureFlags {
             cross_protocol_codec: true,
             native_responses: true,
             ollama_native: false,
-            prefer_auth_accounts: true,
-            prefer_same_protocol: true,
+            prefer_auth_accounts: false,
+            prefer_same_protocol: false,
         };
     };
     FeatureFlags {
@@ -77,11 +77,11 @@ pub fn read_feature_flags(app: &AppHandle) -> FeatureFlags {
         prefer_auth_accounts: store
             .get("routing.prefer_auth_accounts")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true),
+            .unwrap_or(false),
         prefer_same_protocol: store
             .get("routing.prefer_same_protocol")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true),
+            .unwrap_or(false),
     }
 }
 

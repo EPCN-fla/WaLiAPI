@@ -5,7 +5,6 @@ import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { channelApi, apiKeyApi, serverApi, authApi } from "../lib/api";
 import type { Channel, ApiKey, ServerStatus, AuthAccount } from "../types";
 import { AppConfigPanel, getAppIcon } from "./AppConfigPage";
-import { getChannelProviderLabel } from "../lib/constants";
 import {
   BookOpen, Copy, Check, Play, Loader2, Link2, KeyRound, Bot,
   ChevronDown, Terminal, Code2, Coffee, Zap, ArrowRight,
@@ -102,6 +101,9 @@ export function UsagePage() {
       (accts as AuthAccount[]).forEach(a => {
         if (a.disabled) return; // skip disabled auth accounts
         a.models.forEach(m => { if (!ms.includes(m.id)) ms.push(m.id); });
+        if (a.model_mapping) {
+          Object.keys(a.model_mapping).forEach(from => { if (!ms.includes(from)) ms.push(from); });
+        }
       });
       if (ms.length > 0) {
         const savedModel = localStorage.getItem(modelStorageKey);
@@ -114,79 +116,37 @@ export function UsagePage() {
 
   const baseUrl = ss?.running ? `${ss.url}/v1` : "http://127.0.0.1:8777/v1";
 
-  // Group models by source: active channels (grouped by provider) + active auth accounts
-  interface ModelGroup {
-    label: string;
-    real: string[];
-    mapped: string[];
-  }
+  // Three categories: API channel models, Auth account models, mapping aliases (unified).
+  const modelCategories = useMemo(() => {
+    const channelSet = new Set<string>();
+    const authSet = new Set<string>();
+    const mappingSet = new Set<string>();
 
-  const modelGroups = useMemo(() => {
-    const groups: ModelGroup[] = [];
+    channels.filter(c => c.status === 1).forEach(c => {
+      c.models.forEach(m => channelSet.add(m));
+      if (c.model_mapping) Object.keys(c.model_mapping).forEach(from => mappingSet.add(from));
+    });
+    authAccounts.filter(a => !a.disabled).forEach(a => {
+      a.models.filter(m => !m.unavailable).forEach(m => authSet.add(m.id));
+      if (a.model_mapping) Object.keys(a.model_mapping).forEach(from => mappingSet.add(from));
+    });
 
-    // Shared collector: works for both channels and auth accounts
-    type MappingSource = {
-      provider: string;
-      models: string[];
-      model_mapping?: Record<string, string | string[]> | null;
+    return {
+      channel: [...channelSet],
+      auth: [...authSet],
+      mapping: [...mappingSet],
     };
-    function collectMappingModels<T extends MappingSource>(
-      sources: T[],
-      prefix: string,
-    ): ModelGroup[] {
-      const byProvider = new Map<string, { real: Set<string>; mapped: Set<string> }>();
-      sources.forEach(s => {
-        const providerLabel = getChannelProviderLabel(s.provider);
-        if (!byProvider.has(providerLabel)) {
-          byProvider.set(providerLabel, { real: new Set(), mapped: new Set() });
-        }
-        const entry = byProvider.get(providerLabel)!;
-        s.models.forEach(m => entry.real.add(m));
-        if (s.model_mapping) {
-          Object.keys(s.model_mapping).forEach(from => entry.mapped.add(from));
-        }
-      });
-      const result: ModelGroup[] = [];
-      byProvider.forEach((models, label) => {
-        const real = [...models.real];
-        const mapped = [...models.mapped];
-        if (real.length > 0 || mapped.length > 0) result.push({ label: `${prefix} · ${label}`, real, mapped });
-      });
-      return result;
-    }
-
-    // Channel models
-    groups.push(...collectMappingModels(
-      channels.filter(c => c.status === 1).map(c => ({
-        provider: c.provider,
-        models: c.models,
-        model_mapping: c.model_mapping,
-      })),
-      "渠道",
-    ));
-
-    // Auth account models
-    groups.push(...collectMappingModels(
-      authAccounts.filter(a => !a.disabled).map(a => ({
-        provider: a.provider,
-        models: a.models.filter(m => !m.unavailable).map(m => m.id),
-        model_mapping: a.model_mapping,
-      })),
-      "Auth",
-    ));
-
-    return groups;
   }, [channels, authAccounts]);
 
+  // Flat deduplicated list for localStorage validation.
   const models = useMemo(() => {
     const seen = new Set<string>();
     const all: string[] = [];
-    modelGroups.forEach(g => {
-      g.real.forEach(m => { if (!seen.has(m)) { seen.add(m); all.push(m); } });
-      g.mapped.forEach(m => { if (!seen.has(m)) { seen.add(m); all.push(m); } });
+    [...modelCategories.channel, ...modelCategories.auth, ...modelCategories.mapping].forEach(m => {
+      if (!seen.has(m)) { seen.add(m); all.push(m); }
     });
     return all;
-  }, [modelGroups]);
+  }, [modelCategories]);
 
   const showToast = (msg: string) => {
     setToastMsg(msg);
@@ -650,12 +610,15 @@ public class AnthropicTest {
                     className="w-full appearance-none rounded-xl border border-slate-200 bg-white px-3 py-2.5 pr-8 text-sm font-mono text-slate-900 shadow-sm cursor-pointer"
                   >
                     {models.length === 0 && <option value="">请先配置渠道或登录账号</option>}
-                    {modelGroups.flatMap((g, gi) => {
-                      const groups: React.ReactElement[] = [];
-                      if (g.real.length > 0) groups.push(<optgroup key={`${gi}-real`} label={`${g.label} · 实际模型`}>{g.real.map(m => <option key={m} value={m}>{m}</option>)}</optgroup>);
-                      if (g.mapped.length > 0) groups.push(<optgroup key={`${gi}-mapped`} label={`${g.label} · 映射模型`}>{g.mapped.map(m => <option key={m} value={m}>{m}</option>)}</optgroup>);
-                      return groups;
-                    })}
+                    {modelCategories.channel.length > 0 && (
+                      <optgroup label="API 渠道模型">{modelCategories.channel.map(m => <option key={m} value={m}>{m}</option>)}</optgroup>
+                    )}
+                    {modelCategories.auth.length > 0 && (
+                      <optgroup label="Auth 账号模型">{modelCategories.auth.map(m => <option key={m} value={m}>{m}</option>)}</optgroup>
+                    )}
+                    {modelCategories.mapping.length > 0 && (
+                      <optgroup label="映射模型">{modelCategories.mapping.map(m => <option key={m} value={m}>{m}</option>)}</optgroup>
+                    )}
                   </select>
                   <ChevronDown size={14} className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
                 </div>
