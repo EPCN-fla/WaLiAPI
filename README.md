@@ -4,7 +4,7 @@
 
 ### 本地 LLM API 网关 · 多协议接入 · 知识库 RAG · MCP 工具服务
 
-[![Version](https://img.shields.io/badge/version-0.1.8-blue.svg)](./src-tauri/tauri.conf.json)
+[![Version](https://img.shields.io/badge/version-0.1.9-blue.svg)](./src-tauri/tauri.conf.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)](#-安装使用)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app)
@@ -191,6 +191,7 @@ flowchart LR
 - 支持按关键词、密钥、渠道、模型、日期范围、Trace ID 搜索筛选
 - 请求/响应 JSON 标签页切换，Trace ID 默认折叠可展开
 - 日志编号自增，方便定位与引用
+- **自动刷新**：页面可见时每 5 秒静默轮询，新日志自动出现，无需手动刷新
 - 日志清理：按日期删除 / 一键清空
 
 ### 🛡️ 安全审计中心
@@ -357,6 +358,7 @@ WaLiAPI/
 │   ├── pages/
 │   │   ├── DashboardPage.tsx         # 仪表盘
 │   │   ├── ChannelsPage.tsx          # 渠道管理
+│   │   ├── AuthChannelsPage.tsx      # Auth 账号管理
 │   │   ├── ApiKeysPage.tsx           # 密钥管理
 │   │   ├── LogsPage.tsx              # 审计日志
 │   │   ├── KnowledgeBasePage.tsx     # 知识库 + Wiki + MCP 服务
@@ -364,6 +366,14 @@ WaLiAPI/
 │   │   ├── SettingsPage.tsx          # 设置中心
 │   │   └── AppConfigPage.tsx        # 应用配置
 │   ├── components/                   # 通用组件
+│   │   ├── ChannelForm.tsx           # 渠道表单
+│   │   ├── ImportDialog.tsx          # 导入对话框
+│   │   ├── MappingSection.tsx        # 模型映射组件
+│   │   ├── UpdateChecker.tsx         # 应用更新检查
+│   │   ├── auth/                     # Auth 账号组件
+│   │   ├── channel-form/             # 渠道表单子组件
+│   │   └── layout/                   # 布局组件
+│   ├── hooks/                        # 自定义 Hooks
 │   ├── lib/                          # 工具库 (api.ts, constants.ts)
 │   └── types/                        # TypeScript 类型定义
 ├── src-tauri/                        # 后端源码
@@ -387,7 +397,16 @@ WaLiAPI/
 │   │   │   └── responses.rs          # Responses SSE 流式
 │   │   ├── core/                     # 核心逻辑
 │   │   │   ├── proxy.rs              # 代理转发 + 安全扫描 + 重试
-│   │   │   └── dispatcher.rs         # 渠道调度 (优先级/权重/故障切换)
+│   │   │   ├── dispatcher.rs         # 渠道调度 (优先级/权重/故障切换)
+│   │   │   ├── endpoint_executor/    # 端点执行器
+│   │   │   │   ├── driver.rs         # 请求驱动 (日志写入/重试/流式)
+│   │   │   │   ├── sse.rs            # SSE 流处理
+│   │   │   │   └── estimate_usage.rs # Token 用量估算
+│   │   │   └── auth_provider/        # Auth 账号管理
+│   │   │       ├── service.rs        # Auth 服务
+│   │   │       ├── maintenance.rs    # Token 维护/刷新
+│   │   │       ├── codex_login.rs    # Codex 登录流程
+│   │   │       └── codex_backend.rs  # Codex 后端对接
 │   │   ├── security/                 # 安全审计
 │   │   │   ├── scanner.rs            # 风险扫描引擎
 │   │   │   ├── rules.rs              # 规则定义
@@ -421,6 +440,7 @@ WaLiAPI/
 │   │   ├── commands/                 # Tauri Commands
 │   │   │   ├── channel.rs            # 渠道管理
 │   │   │   ├── api_key.rs            # 密钥管理
+│   │   │   ├── auth.rs              # Auth 账号管理
 │   │   │   ├── log.rs                # 日志管理
 │   │   │   ├── stats.rs              # 统计数据
 │   │   │   ├── settings.rs           # 设置管理
@@ -436,9 +456,10 @@ WaLiAPI/
 │   │   │   ├── models.rs             # 数据模型
 │   │   │   └── repository.rs         # 数据访问
 │   │   ├── utils/                    # 工具函数
+│   │   ├── channel_presets.rs        # 渠道预设注册表
 │   │   ├── lib.rs                    # 入口 + 系统托盘
 │   │   └── main.rs                   # main 函数
-│   ├── migrations/                   # 数据库迁移 (15 个)
+│   ├── migrations/                   # 数据库迁移 (23 个)
 │   └── tauri.conf.json               # Tauri 配置
 └── package.json
 ```
@@ -446,6 +467,16 @@ WaLiAPI/
 ---
 
 ## 📌 版本历史
+
+### v0.1.9 (2026-08-13)
+
+#### 审计日志体验优化
+
+- ✨ **审计日志自动刷新**：页面可见时每 5 秒静默轮询，新日志自动出现，无需手动刷新。页面切到后台时不轮询，切回前台自动恢复；静默刷新不触发 loading 动画，不干扰用户操作
+
+#### 自动更新体验优化
+
+- ✨ **Release Notes 动态化**：自动更新弹窗中的版本说明从 CHANGELOG.md 自动提取，不再显示固定文案。四个 CI workflow（macOS ARM64/Intel、Windows、Linux）均已接入
 
 ### v0.1.8 (2026-08-12)
 

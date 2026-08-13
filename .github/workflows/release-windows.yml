@@ -14,6 +14,23 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: extract changelog
+        id: changelog
+        shell: bash
+        run: |
+          VERSION=$(grep '"version"' src-tauri/tauri.conf.json | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+          BODY=$(awk -v ver="## v$VERSION" '
+            $0 ~ "^" ver { found=1; next }
+            /^## / && found { exit }
+            found { print }
+          ' CHANGELOG.md)
+          if [ -z "$BODY" ]; then
+            BODY="v$VERSION 更新详情请查看 CHANGELOG.md"
+          fi
+          echo "body<<CHANGELOG_EOF" >> $GITHUB_OUTPUT
+          echo "$BODY" >> $GITHUB_OUTPUT
+          echo "CHANGELOG_EOF" >> $GITHUB_OUTPUT
+
       - name: setup node
         uses: actions/setup-node@v5
         with:
@@ -41,6 +58,6 @@ jobs:
         with:
           tagName: waliapi-v__VERSION__
           releaseName: 'WaLiAPI v__VERSION__'
-          releaseBody: 'See the assets to download this version and install.'
+          releaseBody: ${{ steps.changelog.outputs.body }}
           releaseDraft: false
           prerelease: false

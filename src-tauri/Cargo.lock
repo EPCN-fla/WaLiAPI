@@ -6504,7 +6504,7 @@ dependencies = [
 
 [[package]]
 name = "waliapi"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "async-stream",
