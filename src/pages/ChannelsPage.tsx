@@ -13,6 +13,7 @@ export function ChannelsPage() {
   const [channelStats, setChannelStats] = useState<Record<string, ChannelStats>>({});
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState<Channel | null>(null);
+  const [duplicating, setDuplicating] = useState(false);
   const [testing, setTesting] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, { success: boolean; message: string; latency_ms: number }>>({});
   const [showImport, setShowImport] = useState(false);
@@ -237,7 +238,7 @@ export function ChannelsPage() {
               </div>
             )}
           </div>
-          <button onClick={() => { setEditing(null); setShowForm(true); }} className="action-primary">
+          <button onClick={() => { setEditing(null); setDuplicating(false); setShowForm(true); }} className="action-primary">
             <Plus size={16} /> 新建渠道
           </button>
         </div>
@@ -363,6 +364,9 @@ export function ChannelsPage() {
                     </button>
                     <button onClick={() => { setEditing(ch); setShowForm(true); }} className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600" title="编辑">
                       <Edit size={15} />
+                    </button>
+                    <button onClick={() => { setEditing(ch); setDuplicating(true); setShowForm(true); }} className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600" title="复制">
+                      <Copy size={15} />
                     </button>
                     <button onClick={() => handleToggle(ch)} className="rounded-lg p-1.5 transition-colors hover:bg-slate-100" title={ch.status === 1 ? "禁用" : "启用"}>
                       <Power size={15} className={ch.status === 1 ? "text-emerald-500" : "text-zinc-400"} />
@@ -594,8 +598,9 @@ export function ChannelsPage() {
       {showForm && (
         <ChannelForm
           editing={editing}
-          onClose={() => { setShowForm(false); setEditing(null); }}
-          onSaved={() => { setShowForm(false); setEditing(null); load(); }}
+          duplicate={duplicating}
+          onClose={() => { setShowForm(false); setEditing(null); setDuplicating(false); }}
+          onSaved={() => { setShowForm(false); setEditing(null); setDuplicating(false); load(); }}
         />
       )}
 

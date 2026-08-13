@@ -137,16 +137,17 @@ interface ExtraKeyItem {
   rawValue: string;    // unmasked value when revealed
 }
 
-function initForm(editing: Channel | null): FormState {
+function initForm(editing: Channel | null, duplicate = false): FormState {
   if (editing) {
     const protocol = isProtocol(editing.protocol) ? editing.protocol : "openai";
     const endpoints = (editing.native_endpoints ?? []).filter(isEndpoint);
     return {
-      name: editing.name,
+      name: duplicate ? `${editing.name} (副本)` : editing.name,
       protocol,
       provider: (editing.provider as ChannelProvider) || "custom",
       native_base_url: editing.native_base_url || editing.base_url,
-      api_key: editing.api_key || "",
+      // 复制模式：清空 api_key（列表中是脱敏的），用户需重新输入
+      api_key: duplicate ? "" : (editing.api_key || ""),
       models: editing.models ?? [],
       native_endpoints: endpoints.length > 0 ? endpoints : defaultEndpointsFor(protocol),
       model_mapping: editing.model_mapping ?? {},
@@ -155,7 +156,9 @@ function initForm(editing: Channel | null): FormState {
       timeout_secs: editing.timeout_secs ?? 60,
       preset_revision: editing.preset_revision ?? null,
       legacy_executor_override: editing.legacy_executor_override ?? undefined,
-      extra_keys: (editing.extra_keys ?? []).map(k => ({
+      extra_keys: duplicate
+        ? [] // 复制模式不复制额外 key（脱敏值无法还原）
+        : (editing.extra_keys ?? []).map(k => ({
         id: k.id,
         api_key: k.api_key,
         weight: k.weight,
@@ -185,14 +188,15 @@ function initForm(editing: Channel | null): FormState {
 }
 
 
-export function ChannelForm({ editing, onClose, onSaved }: {
+export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
   editing: Channel | null;
+  duplicate?: boolean;
   onClose: () => void;
   onSaved: () => void;
 }) {
-  const [form, setForm] = useState<FormState>(() => initForm(editing));
+  const [form, setForm] = useState<FormState>(() => initForm(editing, duplicate));
   // 记录编辑态初始掩码值，用于保存时区分「用户未改」vs「真实输入」
-  const [mainKeyOriginalMasked] = useState(editing?.api_key || "");
+  const [mainKeyOriginalMasked] = useState(duplicate ? "" : (editing?.api_key || ""));
   const [modelInput, setModelInput] = useState("");
 
   // ── presets（T01）────────────────────────────────────────────────────────
@@ -212,7 +216,8 @@ export function ChannelForm({ editing, onClose, onSaved }: {
 
   // ── 连接参数 / 测试 receipt 状态 ─────────────────────────────────────────
   // 编辑态下已保存的渠道名视为「用户已命名」，切换预设不自动改名。
-  const [nameTouched, setNameTouched] = useState(!!editing);
+  // 复制模式下名称已被修改过（加了后缀），也视为已命名。
+  const [nameTouched, setNameTouched] = useState(!!editing || duplicate);
   const autoNameRef = useRef<string | null>(null);
   const [receipt, setReceipt] = useState<DraftChannelTestResult | null>(null);
   const [testPhase, setTestPhase] = useState<"idle" | "running" | "failed">("idle");
@@ -350,8 +355,8 @@ export function ChannelForm({ editing, onClose, onSaved }: {
   // 主 Key 编辑模式：点钥匙进入，可看到/修改真实值；点确认退回缩略展示
   async function enterMainKeyEdit() {
     setMainKeyEditing(true);
-    // 进入编辑后拉取真实 key 替换掩码值
-    if (editing) {
+    // 进入编辑后拉取真实 key 替换掩码值（复制模式不需要，因为没有原渠道）
+    if (editing && !duplicate) {
       try {
         const fullValue = await channelApi.getApiKey(editing.id);
         onKeyChange(fullValue);
@@ -618,7 +623,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
     if (form.protocol === "ollama" && !form.native_endpoints.includes("api_chat")) {
       return "Ollama 协议必须包含 /api/chat 端点";
     }
-    if (!editing && keyRequired && !form.api_key.trim()) {
+    if ((!editing || duplicate) && keyRequired && !form.api_key.trim()) {
       return "API Key 不能为空";
     }
     return null;
@@ -630,7 +635,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
     setSaveError(null);
     try {
       const rf = receiptFields(result, forceSave);
-      if (editing) await channelApi.update(buildUpdateInput(rf));
+      if (editing && !duplicate) await channelApi.update(buildUpdateInput(rf));
       else await channelApi.create(buildCreateInput(rf));
       onSaved();
     } catch (e) {
@@ -688,7 +693,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm" onClick={onClose}>
       <div className="surface w-full max-w-2xl max-h-[92vh] overflow-auto rounded-[28px]" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between border-b border-border px-5 py-4 sticky top-0 bg-inherit z-20">
-          <h2 className="text-lg font-semibold">{editing ? "编辑渠道" : "新建渠道"}</h2>
+          <h2 className="text-lg font-semibold">{duplicate ? "复制渠道" : editing ? "编辑渠道" : "新建渠道"}</h2>
           <button onClick={onClose} disabled={saving} className="action-secondary px-3 py-2"><X size={18} /></button>
         </div>
 
@@ -860,7 +865,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
                         value={form.api_key}
                         onChange={e => onKeyChange(e.target.value)}
                         className="min-w-0 flex-1 rounded-lg border border-border bg-background/70 px-3 py-2 text-sm font-mono"
-                        placeholder={editing ? (clearKeyRequested ? "将清除已保存的 Key" : "留空则不修改") : keyRequired ? "sk-..." : "可留空（本地/自管 Ollama）"}
+                        placeholder={(editing && !duplicate) ? (clearKeyRequested ? "将清除已保存的 Key" : "留空则不修改") : keyRequired ? "sk-..." : "可留空（本地/自管 Ollama）"}
                         autoCapitalize="none"
                         autoComplete="off"
                         spellCheck={false}
@@ -868,7 +873,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
                     )}
 
                     {/* 复制 */}
-                    {editing && !clearKeyRequested && !mainKeyEditing && (
+                    {editing && !duplicate && !clearKeyRequested && !mainKeyEditing && (
                       <button
                         type="button"
                         onClick={async () => {

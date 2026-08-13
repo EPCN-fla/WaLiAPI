@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { logApi } from "../lib/api";
 import type { RequestLog, SecurityFinding } from "../types";
 import { formatTime, formatDuration, formatNumber } from "../lib/constants";
@@ -177,8 +177,8 @@ export function LogsPage() {
 
   const hasActiveFilters = keyword || filterApiKey || filterChannel || filterModel || filterDateFrom || filterDateTo || filterTraceId || filterUpstreamType;
 
-  const load = useCallback((p: number = 0) => {
-    setLoading(true);
+  const load = useCallback((p: number = 0, silent: boolean = false) => {
+    if (!silent) setLoading(true);
     logApi.getAll({
       limit: PAGE_SIZE,
       offset: p * PAGE_SIZE,
@@ -196,10 +196,25 @@ export function LogsPage() {
     })
       .then(setLogs)
       .catch(() => setLoadError(true))
-      .finally(() => setLoading(false));
+      .finally(() => { if (!silent) setLoading(false); });
   }, [keyword, filterApiKey, filterChannel, filterModel, filterDateFrom, filterDateTo, filterTraceId, filterUpstreamType]);
 
   useEffect(() => { load(0); }, [load]);
+
+  // ─── Auto-refresh: poll every 5s when page is visible ───────────────────
+  // Silently refreshes the current page so new logs appear without
+  // triggering the loading spinner or disrupting the user's view.
+  const pageRef = useRef(page);
+  pageRef.current = page;
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (document.visibilityState === "visible") {
+        load(pageRef.current, true);
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [load]);
 
   const clearFilters = () => {
     setKeyword("");
