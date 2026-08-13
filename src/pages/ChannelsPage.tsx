@@ -28,6 +28,9 @@ export function ChannelsPage() {
   const [showKeyMap, setShowKeyMap] = useState<Record<string, boolean>>({});
   const [fullKeyMap, setFullKeyMap] = useState<Record<string, string>>({});
   const [keyLoading, setKeyLoading] = useState<string | null>(null);
+  const [extraKeyVisibleMap, setExtraKeyVisibleMap] = useState<Record<string, boolean>>({});
+  const [extraKeyFullMap, setExtraKeyFullMap] = useState<Record<string, string>>({});
+  const [extraKeyLoading, setExtraKeyLoading] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [copiedModel, setCopiedModel] = useState<string | null>(null);
   const importMenuRef = useRef<HTMLDivElement>(null);
@@ -119,6 +122,24 @@ export function ChannelsPage() {
         setShowKeyMap(prev => ({ ...prev, [ch.id]: false }));
       } finally {
         setKeyLoading(null);
+      }
+    }
+  };
+
+  // 切换额外 Key 显隐
+  const handleToggleExtraKey = async (keyId: string) => {
+    const next = !extraKeyVisibleMap[keyId];
+    setExtraKeyVisibleMap(prev => ({ ...prev, [keyId]: next }));
+    if (next && !extraKeyFullMap[keyId]) {
+      setExtraKeyLoading(keyId);
+      try {
+        const fullKey = await channelApi.getExtraKeyValue(keyId);
+        setExtraKeyFullMap(prev => ({ ...prev, [keyId]: fullKey }));
+      } catch (e) {
+        console.error("Failed to get extra key value:", e);
+        setExtraKeyVisibleMap(prev => ({ ...prev, [keyId]: false }));
+      } finally {
+        setExtraKeyLoading(null);
       }
     }
   };
@@ -457,16 +478,32 @@ export function ChannelsPage() {
                           </span>
                         </div>
                         <div className="space-y-1.5">
-                          {ch.extra_keys.map((ek, ekIdx) => (
+                          {ch.extra_keys.map((ek, ekIdx) => {
+                            const ekVisible = extraKeyVisibleMap[ek.id];
+                            const ekFull = extraKeyFullMap[ek.id];
+                            return (
                             <div key={ek.id} className="flex items-center gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs font-mono text-slate-600">
                               <span className="shrink-0 text-slate-400">#{ekIdx + 2}</span>
-                              <span className="truncate">{ek.api_key}</span>
+                              <span className="truncate">
+                                {ekVisible
+                                  ? (ekFull || ek.api_key)
+                                  : `${ek.api_key.slice(0, 8)}${"•".repeat(12)}`}
+                              </span>
+                              <button
+                                onClick={() => handleToggleExtraKey(ek.id)}
+                                disabled={extraKeyLoading === ek.id}
+                                className="shrink-0 rounded-md p-0.5 text-slate-400 transition-colors hover:bg-slate-200 hover:text-slate-600 disabled:opacity-50"
+                                title={ekVisible ? "隐藏" : "显示"}
+                              >
+                                {extraKeyLoading === ek.id ? <Loader2 size={11} className="animate-spin" /> : ekVisible ? <EyeOff size={11} /> : <Eye size={11} />}
+                              </button>
                               <span className="ml-auto shrink-0 rounded-full bg-slate-200 px-1.5 py-0.5 text-[10px] text-slate-500">w:{ek.weight}</span>
                               <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] ${ek.status === 1 ? "bg-emerald-100 text-emerald-600" : "bg-slate-200 text-slate-400"}`}>
                                 {ek.status === 1 ? "启用" : "禁用"}
                               </span>
                             </div>
-                          ))}
+                            );
+                          })}
                         </div>
                         <p className="mt-1 text-[11px] text-slate-400">主 Key + 额外 Keys 按权重负载均衡，失效 Key 自动降级</p>
                       </div>
