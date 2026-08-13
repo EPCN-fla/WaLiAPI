@@ -1,4 +1,5 @@
 import { useState, useMemo, useEffect, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { channelApi } from "../lib/api";
 import type {
   Channel, CreateChannelInput, UpdateChannelInput,
@@ -10,7 +11,7 @@ import type {
 import {
   PROTOCOL_LABELS, ENDPOINT_LABELS, ENDPOINT_PATHS,
 } from "../lib/constants";
-import { X, Plus, Check, RefreshCw, KeyRound, Undo, Loader2 } from "lucide-react";
+import { X, Plus, Check, RefreshCw, KeyRound, Undo, Loader2, Trash2, Power, Copy } from "lucide-react";
 import { MappingSection } from "./MappingSection";
 import { DraftTestModal } from "./channel-form/DraftTestModal";
 import { ModelSyncModal } from "./channel-form/ModelSyncModal";
@@ -79,6 +80,26 @@ function deriveLegacyBaseUrl(protocol: ChannelProtocol, native: string): string 
   return root.endsWith("/v1") ? root : `${root}/v1`;
 }
 
+/** Key 省略展示：超长时显示【前4...后4】，短则全显。 */
+function maskKey(key: string): string {
+  if (!key) return "";
+  if (key.length <= 10) return key;
+  return `【${key.slice(0, 4)}...${key.slice(-4)}】`;
+}
+
+/** 复制到剪贴板 */
+async function copyToClipboard(text: string) {
+  try {
+    await invoke("plugin:clipboard-manager|write_text", { text });
+  } catch {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // ignore
+    }
+  }
+}
+
 /** Base URL（去尾斜杠）+ 端点路径（去首斜杠）→ 实际请求 URL；Base 为空返回空串。 */
 function joinUrl(base: string, path: string): string {
   const root = base.trim().replace(/\/+$/, "");
@@ -100,6 +121,20 @@ interface FormState {
   timeout_secs: number;
   preset_revision: string | null;
   legacy_executor_override?: string;
+  // Multi-key: extra API keys for load balancing
+  extra_keys: ExtraKeyItem[];
+}
+
+/** UI state for a single extra API key entry. */
+interface ExtraKeyItem {
+  id: string;          // DB id for existing keys, temp id for new keys
+  api_key: string;     // masked value from DB or raw input for new keys
+  weight: number;
+  enabled: boolean;
+  isEditing: boolean;  // inline edit mode
+  isRevealed: boolean; // show/hide full key value
+  isExisting: boolean; // true if loaded from DB
+  rawValue: string;    // unmasked value when revealed
 }
 
 function initForm(editing: Channel | null): FormState {
@@ -111,7 +146,7 @@ function initForm(editing: Channel | null): FormState {
       protocol,
       provider: (editing.provider as ChannelProvider) || "custom",
       native_base_url: editing.native_base_url || editing.base_url,
-      api_key: "",
+      api_key: editing.api_key || "",
       models: editing.models ?? [],
       native_endpoints: endpoints.length > 0 ? endpoints : defaultEndpointsFor(protocol),
       model_mapping: editing.model_mapping ?? {},
@@ -120,6 +155,16 @@ function initForm(editing: Channel | null): FormState {
       timeout_secs: editing.timeout_secs ?? 60,
       preset_revision: editing.preset_revision ?? null,
       legacy_executor_override: editing.legacy_executor_override ?? undefined,
+      extra_keys: (editing.extra_keys ?? []).map(k => ({
+        id: k.id,
+        api_key: k.api_key,
+        weight: k.weight,
+        enabled: k.status === 1,
+        isEditing: false,
+        isRevealed: false,
+        isExisting: true,
+        rawValue: "",
+      })),
     };
   }
   return {
@@ -135,6 +180,7 @@ function initForm(editing: Channel | null): FormState {
     weight: 1,
     timeout_secs: 60,
     preset_revision: null,
+    extra_keys: [],
   };
 }
 
@@ -145,6 +191,8 @@ export function ChannelForm({ editing, onClose, onSaved }: {
   onSaved: () => void;
 }) {
   const [form, setForm] = useState<FormState>(() => initForm(editing));
+  // 记录编辑态初始掩码值，用于保存时区分「用户未改」vs「真实输入」
+  const [mainKeyOriginalMasked] = useState(editing?.api_key || "");
   const [modelInput, setModelInput] = useState("");
 
   // ── presets（T01）────────────────────────────────────────────────────────
@@ -171,6 +219,7 @@ export function ChannelForm({ editing, onClose, onSaved }: {
   const [testResult, setTestResult] = useState<DraftChannelTestResult | null>(null);
   const [saving, setSaving] = useState(false);
   const [clearKeyRequested, setClearKeyRequested] = useState(false);
+  const [mainKeyEditing, setMainKeyEditing] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   // ── T14 同步上游模型 ─────────────────────────────────────────────────────
@@ -265,7 +314,9 @@ export function ChannelForm({ editing, onClose, onSaved }: {
   }
   function onKeyChange(v: string) {
     setForm(prev => ({ ...prev, api_key: v }));
-    if (v.trim() !== "") setClearKeyRequested(false);
+    // 仅在非清除态下，有值时重置清除标记
+    // 清除态下输入内容不应自动退出清除模式，需用户点撤销
+    if (v.trim() !== "" && !clearKeyRequested) setClearKeyRequested(false);
     invalidateReceipt();
   }
   function onTimeoutChange(v: number) {
@@ -290,7 +341,101 @@ export function ChannelForm({ editing, onClose, onSaved }: {
     invalidateReceipt();
   }
   function undoClearKey() {
+    setForm(prev => ({ ...prev, api_key: mainKeyOriginalMasked }));
     setClearKeyRequested(false);
+  }
+
+  // ── 多 Key 管理（负载均衡）─────────────────────────────────────────────
+
+  // 主 Key 编辑模式：点钥匙进入，可看到/修改真实值；点确认退回缩略展示
+  async function enterMainKeyEdit() {
+    setMainKeyEditing(true);
+    // 进入编辑后拉取真实 key 替换掩码值
+    if (editing) {
+      try {
+        const fullValue = await channelApi.getApiKey(editing.id);
+        onKeyChange(fullValue);
+      } catch { /* ignore */ }
+    }
+  }
+  function exitMainKeyEdit() {
+    // 退出编辑：如果用户没改过（仍是真实值），恢复掩码值用于展示
+    if (mainKeyOriginalMasked && form.api_key !== mainKeyOriginalMasked) {
+      // 用户改过了，保留真实值（保存时会提交）
+    }
+    setMainKeyEditing(false);
+    invalidateReceipt();
+  }
+
+  function addExtraKey() {
+    const tempId = `new_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    setForm(prev => ({
+      ...prev,
+      extra_keys: [...prev.extra_keys, {
+        id: tempId,
+        api_key: "",
+        weight: 1,
+        enabled: true,
+        isEditing: true,
+        isRevealed: true,
+        isExisting: false,
+        rawValue: "",
+      }],
+    }));
+  }
+
+  function removeExtraKey(keyId: string) {
+    setForm(prev => ({
+      ...prev,
+      extra_keys: prev.extra_keys.filter(k => k.id !== keyId),
+    }));
+    invalidateReceipt();
+  }
+
+  function updateExtraKeyField(keyId: string, field: "api_key" | "weight" | "enabled", value: string | number | boolean) {
+    setForm(prev => ({
+      ...prev,
+      extra_keys: prev.extra_keys.map(k =>
+        k.id === keyId ? { ...k, [field]: value } : k,
+      ),
+    }));
+    invalidateReceipt();
+  }
+
+  async function toggleExtraKeyEdit(keyId: string) {
+    const item = form.extra_keys.find(k => k.id === keyId);
+    if (!item) return;
+    if (!item.isEditing && item.isExisting) {
+      // 进入编辑时拉取真实 key 替换掩码值
+      try {
+        const fullValue = await channelApi.getExtraKeyValue(keyId);
+        setForm(prev => ({
+          ...prev,
+          extra_keys: prev.extra_keys.map(k =>
+            k.id === keyId ? { ...k, isEditing: true, api_key: fullValue } : k,
+          ),
+        }));
+        return;
+      } catch { /* ignore */ }
+    }
+    setForm(prev => ({
+      ...prev,
+      extra_keys: prev.extra_keys.map(k =>
+        k.id === keyId ? { ...k, isEditing: !k.isEditing } : k,
+      ),
+    }));
+  }
+
+  async function toggleExtraKeyStatus(keyId: string) {
+    const item = form.extra_keys.find(k => k.id === keyId);
+    if (!item || !item.isExisting) return;
+    const newStatus = item.enabled ? 0 : 1;
+    try {
+      await channelApi.toggleExtraKey(keyId, newStatus);
+      updateExtraKeyField(keyId, "enabled", !item.enabled);
+    } catch {
+      // ignore
+    }
   }
 
   // ── 模型列表 ────────────────────────────────────────────────────────────
@@ -411,6 +556,14 @@ export function ChannelForm({ editing, onClose, onSaved }: {
       native_endpoints: form.native_endpoints,
       preset_revision: form.preset_revision || undefined,
       legacy_executor_override: form.legacy_executor_override,
+      // Multi-key: send extra keys that have a non-empty api_key value
+      extra_keys: form.extra_keys
+        .filter(k => k.api_key.trim() !== "")
+        .map(k => ({
+          api_key: k.api_key,
+          weight: k.weight,
+          status: k.enabled ? 1 : 0,
+        })),
       ...(rf ?? {}),
     };
   }
@@ -435,9 +588,17 @@ export function ChannelForm({ editing, onClose, onSaved }: {
       native_endpoints: form.native_endpoints,
       preset_revision: form.preset_revision || undefined,
       legacy_executor_override: form.legacy_executor_override,
-      // 编辑留空 = 不修改；显式清除走 clear_api_key 标记。
-      ...(form.api_key.trim() !== "" ? { api_key: form.api_key } : {}),
+      // 编辑留空 = 不修改；掩码值未改 = 不修改；显式清除走 clear_api_key 标记。
+      ...((form.api_key.trim() !== "" && form.api_key !== mainKeyOriginalMasked) ? { api_key: form.api_key } : {}),
       ...(clearKeyRequested ? { clear_api_key: true } : {}),
+      // Multi-key: full-replace semantics — send all extra keys
+      extra_keys: form.extra_keys
+        .filter(k => k.api_key.trim() !== "")
+        .map(k => ({
+          api_key: k.api_key,
+          weight: k.weight,
+          status: k.enabled ? 1 : 0,
+        })),
       ...(rf ?? {}),
     };
   }
@@ -668,34 +829,223 @@ export function ChannelForm({ editing, onClose, onSaved }: {
               )}
             </div>
 
-            {/* API Key */}
+            {/* API Keys（负载均衡）：主 Key（#1）+ 额外 Keys 统一管理 */}
             <div className="mt-4">
-              <label className="mb-2 block text-sm font-medium">API Key</label>
-              <div className="flex gap-2">
-                <input
-                  type="password"
-                  value={form.api_key}
-                  onChange={e => onKeyChange(e.target.value)}
-                  className="flex-1 rounded-2xl border border-border bg-background/70 px-4 py-3 text-sm font-mono"
-                  placeholder={editing ? (clearKeyRequested ? "将清除已保存的 Key" : "留空则不修改") : keyRequired ? "sk-..." : "可留空（本地/自管 Ollama）"}
-                />
-                {editing && !clearKeyRequested && (
-                  <button type="button" onClick={requestClearKey} title="清除已保存的 API Key" className="action-secondary shrink-0 px-3">
-                    <KeyRound size={15} /> 清除 Key
-                  </button>
-                )}
-                {editing && clearKeyRequested && (
-                  <button type="button" onClick={undoClearKey} className="action-secondary shrink-0 px-3" title="撤销清除，保留原 Key">
-                    <Undo size={15} /> 撤销
-                  </button>
-                )}
+              <div className="mb-2 flex items-center justify-between">
+                <label className="block text-sm font-medium">API Keys（负载均衡）</label>
+                <button
+                  type="button"
+                  onClick={addExtraKey}
+                  className="flex items-center gap-1 rounded-lg border border-primary/30 bg-primary/8 px-2.5 py-1.5 text-xs font-medium text-primary transition-all hover:bg-primary/12"
+                >
+                  <Plus size={13} /> 添加 Key
+                </button>
               </div>
-              {form.protocol === "ollama" && (
-                <p className="mt-1.5 text-xs text-muted-foreground">Ollama 本地默认无 API Key，可留空；远程反向代理可填写。</p>
-              )}
-              {!keyRequired && form.protocol !== "ollama" && (
-                <p className="mt-1.5 text-xs text-muted-foreground">该提供商为可选鉴权（如 Ollama 接口），API Key 可留空。</p>
-              )}
+              <div className="space-y-2.5">
+                {/* 主 Key 行：#1，权重联动渠道权重；无删除/启停（后端无主 Key 独立启停概念） */}
+                <div className="rounded-xl border border-border bg-background/50 px-3.5 py-3">
+                  <div className="flex items-center gap-2">
+                    <span className="shrink-0 text-xs font-mono text-muted-foreground w-6">#1</span>
+                    <span className="shrink-0 rounded-md bg-primary/12 px-1.5 py-0.5 text-[11px] font-semibold text-primary">主</span>
+
+                    {/* 主 Key 显示（编辑态缩略展示 + 复制；点钥匙进入输入模式看真实值） */}
+                    {editing && !clearKeyRequested && !mainKeyEditing && (
+                      <code className="min-w-0 flex-1 truncate rounded-lg border border-border bg-background/40 px-3 py-2 text-sm font-mono text-muted-foreground">
+                        {form.api_key.trim() !== "" ? maskKey(form.api_key) : "未设置"}
+                      </code>
+                    )}
+                    {(!editing || clearKeyRequested || mainKeyEditing) && (
+                      <input
+                        type="text"
+                        value={form.api_key}
+                        onChange={e => onKeyChange(e.target.value)}
+                        className="min-w-0 flex-1 rounded-lg border border-border bg-background/70 px-3 py-2 text-sm font-mono"
+                        placeholder={editing ? (clearKeyRequested ? "将清除已保存的 Key" : "留空则不修改") : keyRequired ? "sk-..." : "可留空（本地/自管 Ollama）"}
+                        autoCapitalize="none"
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                    )}
+
+                    {/* 复制 */}
+                    {editing && !clearKeyRequested && !mainKeyEditing && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          try {
+                            const v = await channelApi.getApiKey(editing.id);
+                            await copyToClipboard(v);
+                            showToast("已复制主 Key");
+                          } catch { /* ignore */ }
+                        }}
+                        className="action-secondary shrink-0 p-1.5"
+                        title="复制"
+                      >
+                        <Copy size={14} />
+                      </button>
+                    )}
+
+                    {/* 主 Key 权重：与渠道权重联动 */}
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={form.weight}
+                      onChange={e => setForm(prev => ({ ...prev, weight: parseInt(e.target.value) || 1 }))}
+                      className="w-16 shrink-0 rounded-lg border border-border bg-background/70 px-2 py-2 text-center text-sm"
+                      title="主 Key 权重（联动渠道权重）"
+                    />
+
+                    {/* 钥匙编辑 / 确认编辑 */}
+                    {editing && !clearKeyRequested && !mainKeyEditing && (
+                      <button
+                        type="button"
+                        onClick={enterMainKeyEdit}
+                        className="action-secondary shrink-0 p-1.5"
+                        title="编辑查看"
+                      >
+                        <KeyRound size={14} />
+                      </button>
+                    )}
+                    {editing && mainKeyEditing && !clearKeyRequested && (
+                      <button type="button" onClick={exitMainKeyEdit} title="确认" className="action-secondary shrink-0 p-1.5">
+                        <Check size={14} />
+                      </button>
+                    )}
+
+                    {/* 清除 / 确认新输入 / 撤销 */}
+                    {editing && !mainKeyEditing && !clearKeyRequested && (
+                      <button type="button" onClick={requestClearKey} title="清除已保存的 API Key" className="action-secondary shrink-0 p-1.5">
+                        <Trash2 size={14} />
+                      </button>
+                    )}
+                    {editing && clearKeyRequested && form.api_key.trim() !== "" && (
+                      <button type="button" onClick={() => setClearKeyRequested(false)} title="确认新输入的 Key" className="action-secondary shrink-0 p-1.5">
+                        <Check size={14} />
+                      </button>
+                    )}
+                    {editing && clearKeyRequested && (
+                      <button type="button" onClick={undoClearKey} className="action-secondary shrink-0 p-1.5" title="撤销清除，保留原 Key">
+                        <Undo size={14} />
+                      </button>
+                    )}
+                  </div>
+                  {form.protocol === "ollama" && (
+                    <p className="mt-1.5 text-xs text-muted-foreground">Ollama 本地默认无 API Key，可留空；远程反向代理可填写。</p>
+                  )}
+                  {!keyRequired && form.protocol !== "ollama" && (
+                    <p className="mt-1.5 text-xs text-muted-foreground">该提供商为可选鉴权（如 Ollama 接口），API Key 可留空。</p>
+                  )}
+                </div>
+
+                {/* 额外 Key 行 */}
+
+                {form.extra_keys.map((k, idx) => (
+                    <div
+                      key={k.id}
+                      className={`rounded-xl border px-3.5 py-3 transition-all ${k.enabled ? "border-border bg-background/50" : "border-border bg-muted/30 opacity-60"}`}
+                    >
+                      {/* Key 行：序号 + 徽标 + 输入/显示 + 权重 + 操作 */}
+                      <div className="flex items-center gap-2">
+                        <span className="shrink-0 text-xs font-mono text-muted-foreground w-6">#{idx + 2}</span>
+                        <span className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-semibold text-muted-foreground">从</span>
+
+                        {/* Key 输入/显示 */}
+                        {k.isEditing ? (
+                          <input
+                            type="text"
+                            value={k.api_key}
+                            onChange={e => updateExtraKeyField(k.id, "api_key", e.target.value)}
+                            className="min-w-0 flex-1 rounded-lg border border-border bg-background/70 px-3 py-2 text-sm font-mono"
+                            placeholder="sk-..."
+                            autoCapitalize="none"
+                            autoComplete="off"
+                            spellCheck={false}
+                          />
+                        ) : (
+                          <code className="min-w-0 flex-1 truncate rounded-lg border border-border bg-background/40 px-3 py-2 text-sm font-mono text-muted-foreground">
+                            {maskKey(k.api_key)}
+                          </code>
+                        )}
+
+                        {/* 复制 */}
+                        {k.isExisting && !k.isEditing && (
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                const v = await channelApi.getExtraKeyValue(k.id);
+                                await copyToClipboard(v);
+                                showToast(`已复制从 Key #${idx + 2}`);
+                              } catch { /* ignore */ }
+                            }}
+                            className="action-secondary shrink-0 p-1.5"
+                            title="复制"
+                          >
+                            <Copy size={14} />
+                          </button>
+                        )}
+
+                        {/* 权重 */}
+                        <input
+                          type="number"
+                          min={1}
+                          max={100}
+                          value={k.weight}
+                          onChange={e => updateExtraKeyField(k.id, "weight", parseInt(e.target.value) || 1)}
+                          className="w-16 shrink-0 rounded-lg border border-border bg-background/70 px-2 py-2 text-center text-sm"
+                          title="权重"
+                        />
+
+                        {/* 操作按钮 */}
+                        {k.isEditing ? (
+                          <button
+                            type="button"
+                            onClick={() => toggleExtraKeyEdit(k.id)}
+                            className="action-secondary shrink-0 p-1.5"
+                            title="确认"
+                          >
+                            <Check size={14} />
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => toggleExtraKeyEdit(k.id)}
+                            className="action-secondary shrink-0 p-1.5"
+                            title="编辑"
+                          >
+                            <KeyRound size={14} />
+                          </button>
+                        )}
+
+                        {/* 启用/禁用（仅已存在的 key）*/}
+                        {k.isExisting && (
+                          <button
+                            type="button"
+                            onClick={() => toggleExtraKeyStatus(k.id)}
+                            className={`shrink-0 p-1.5 transition-colors ${k.enabled ? "text-green-500 hover:text-green-600" : "text-muted-foreground hover:text-foreground"}`}
+                            title={k.enabled ? "禁用" : "启用"}
+                          >
+                            <Power size={14} />
+                          </button>
+                        )}
+
+                        {/* 删除 */}
+                        <button
+                          type="button"
+                          onClick={() => removeExtraKey(k.id)}
+                          className="shrink-0 p-1.5 text-muted-foreground transition-colors hover:text-red-500"
+                          title="删除"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                <p className="text-xs text-muted-foreground">
+                  💡 主 Key（#1）+ 额外 Keys 共同参与负载均衡，按权重随机选择。失效 Key 自动降级，请求转发至其他可用 Key。
+                </p>
+              </div>
             </div>
           </div>
 

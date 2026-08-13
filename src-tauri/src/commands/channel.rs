@@ -3,7 +3,7 @@ use crate::channel_presets::ProtocolPresetGroup;
 use crate::core::channel_identity::{
     resolve_channel_identity, ChannelIdentity, ChannelIdentityRow,
 };
-use crate::db::models::{Channel, ChannelStats, CreateChannelInput, UpdateChannelInput};
+use crate::db::models::{Channel, ChannelApiKey, ChannelStats, CreateChannelInput, UpdateChannelInput};
 use crate::db::repository::Repository;
 use crate::services::channel_test::{
     self, DraftChannelTestInput, DraftChannelTestResult, SaveReceiptCheck,
@@ -11,6 +11,7 @@ use crate::services::channel_test::{
 use crate::services::upstream_models::UpstreamModelsResult;
 use crate::AppState;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 /// Output DTO for a channel. Always returns the NORMALIZED protocol identity
 /// (via `resolve_channel_identity`), including the previously omitted
@@ -44,6 +45,32 @@ pub struct ChannelDto {
     pub updated_at: String,
     pub last_test_at: Option<String>,
     pub last_test_ok: Option<i64>,
+    // --- Multi-key: extra API keys for load balancing (migration 023) ---
+    pub extra_keys: Vec<ChannelKeyDto>,
+}
+
+/// Masked DTO for a channel API key entry.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChannelKeyDto {
+    pub id: String,
+    pub api_key: String,
+    pub weight: i64,
+    pub status: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<ChannelApiKey> for ChannelKeyDto {
+    fn from(k: ChannelApiKey) -> Self {
+        ChannelKeyDto {
+            id: k.id,
+            api_key: mask_key(&k.api_key),
+            weight: k.weight,
+            status: k.status,
+            created_at: k.created_at,
+            updated_at: k.updated_at,
+        }
+    }
 }
 
 impl From<Channel> for ChannelDto {
@@ -76,8 +103,23 @@ impl From<Channel> for ChannelDto {
             updated_at: c.updated_at,
             last_test_at: c.last_test_at,
             last_test_ok: c.last_test_ok,
+            extra_keys: Vec::new(), // populated by to_dto_with_keys
         }
     }
+}
+
+/// Build a ChannelDto with extra keys populated from the database.
+async fn to_dto_with_keys(
+    repo: &Repository,
+    c: Channel,
+) -> Result<ChannelDto, String> {
+    let keys = repo
+        .get_channel_api_keys(&c.id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut dto: ChannelDto = c.into();
+    dto.extra_keys = keys.into_iter().map(ChannelKeyDto::from).collect();
+    Ok(dto)
 }
 
 fn mask_key(key: &str) -> String {
@@ -96,10 +138,12 @@ pub async fn get_channels(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<Vec<ChannelDto>, String> {
     let repo = Repository::new(state.db.pool.clone());
-    repo.get_all_channels()
-        .await
-        .map_err(|e| e.to_string())
-        .map(|cs| cs.into_iter().map(to_dto).collect())
+    let channels = repo.get_all_channels().await.map_err(|e| e.to_string())?;
+    let mut dtos = Vec::with_capacity(channels.len());
+    for c in channels {
+        dtos.push(to_dto_with_keys(&repo, c).await?);
+    }
+    Ok(dtos)
 }
 
 #[tauri::command]
@@ -108,10 +152,8 @@ pub async fn get_channel(
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<ChannelDto, String> {
     let repo = Repository::new(state.db.pool.clone());
-    repo.get_channel(&id)
-        .await
-        .map_err(|e| e.to_string())
-        .map(to_dto)
+    let c = repo.get_channel(&id).await.map_err(|e| e.to_string())?;
+    to_dto_with_keys(&repo, c).await
 }
 
 /// 只读：返回全部协议及其 provider 模板，`groups[n].presets[0]` 恒为 custom option。
@@ -152,9 +194,9 @@ pub async fn create_channel(
             .get_channel(&channel.id)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(to_dto(channel))
+        to_dto_with_keys(&repo, channel).await
     } else {
-        Ok(to_dto(channel))
+        to_dto_with_keys(&repo, channel).await
     }
 }
 
@@ -226,9 +268,13 @@ pub async fn update_channel(
             .get_channel(&input.id)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(to_dto(channel))
+        to_dto_with_keys(&repo, channel).await
     } else {
-        Ok(to_dto(channel))
+        let channel = repo
+            .get_channel(&input.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        to_dto_with_keys(&repo, channel).await
     }
 }
 
@@ -416,4 +462,58 @@ pub async fn reorder_channels(
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Get the full (unmasked) extra API keys for a channel. Used by the frontend
+/// to show full key values on demand, similar to get_channel_api_key.
+#[tauri::command]
+pub async fn get_channel_extra_keys(
+    id: String,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<Vec<ChannelKeyDto>, String> {
+    let repo = Repository::new(state.db.pool.clone());
+    let keys = repo
+        .get_channel_api_keys(&id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(keys.into_iter().map(ChannelKeyDto::from).collect())
+}
+
+/// Get a single full (unmasked) extra API key by its id.
+#[tauri::command]
+pub async fn get_channel_extra_key_value(
+    key_id: String,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<String, String> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT api_key FROM channel_api_keys WHERE id = ?")
+        .bind(&key_id)
+        .fetch_optional(&state.db.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    row.map(|(k,)| k).ok_or_else(|| "Key not found".to_string())
+}
+
+/// Toggle a channel API key's enabled/disabled status.
+#[tauri::command]
+pub async fn toggle_channel_extra_key(
+    key_id: String,
+    status: i64,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<(), String> {
+    let repo = Repository::new(state.db.pool.clone());
+    repo.toggle_channel_api_key(&key_id, status)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Delete a channel API key.
+#[tauri::command]
+pub async fn delete_channel_extra_key(
+    key_id: String,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<(), String> {
+    let repo = Repository::new(state.db.pool.clone());
+    repo.delete_channel_api_key(&key_id)
+        .await
+        .map_err(|e| e.to_string())
 }

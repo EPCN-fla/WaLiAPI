@@ -284,6 +284,13 @@ impl Repository {
         .execute(&self.pool)
         .await?;
 
+        // Insert extra API keys for load balancing (migration 023).
+        if let Some(extra) = &input.extra_keys {
+            if !extra.is_empty() {
+                self.replace_channel_api_keys(&id, extra).await?;
+            }
+        }
+
         self.get_channel(&id).await
     }
 
@@ -494,6 +501,32 @@ impl Repository {
         .execute(&mut *tx)
         .await?;
 
+        // Multi-key: replace extra keys if provided (full-replace semantics).
+        if let Some(extra) = &input.extra_keys {
+            // Delete + re-insert within the same transaction.
+            sqlx::query("DELETE FROM channel_api_keys WHERE channel_id = ?")
+                .bind(&input.id)
+                .execute(&mut *tx)
+                .await?;
+            let now_k = &now;
+            for k in extra {
+                let kid = uuid::Uuid::new_v4().to_string();
+                sqlx::query(
+                    "INSERT INTO channel_api_keys (id, channel_id, api_key, weight, status, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&kid)
+                .bind(&input.id)
+                .bind(&k.api_key)
+                .bind(k.weight.unwrap_or(1))
+                .bind(k.status.unwrap_or(1))
+                .bind(now_k)
+                .bind(now_k)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
         tx.commit().await?;
 
         self.get_channel(&input.id).await
@@ -513,6 +546,80 @@ impl Repository {
     pub async fn delete_channel(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM channels WHERE id = ?")
             .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ==================== Channel API Keys (multi-key) ====================
+
+    /// Get all extra API keys for a channel (excluding the primary key stored
+    /// in channels.api_key). Returns enabled keys first, ordered by weight desc.
+    pub async fn get_channel_api_keys(&self, channel_id: &str) -> Result<Vec<ChannelApiKey>, sqlx::Error> {
+        sqlx::query_as::<_, ChannelApiKey>(
+            "SELECT * FROM channel_api_keys WHERE channel_id = ? ORDER BY status DESC, weight DESC, created_at ASC",
+        )
+        .bind(channel_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Replace all extra keys for a channel. Called during create/update to
+    /// implement full-replace semantics (frontend sends the complete key list).
+    pub async fn replace_channel_api_keys(
+        &self,
+        channel_id: &str,
+        keys: &[ChannelApiKeyInput],
+    ) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM channel_api_keys WHERE channel_id = ?")
+            .bind(channel_id)
+            .execute(&mut *tx)
+            .await?;
+
+        for k in keys {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO channel_api_keys (id, channel_id, api_key, weight, status, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(channel_id)
+            .bind(&k.api_key)
+            .bind(k.weight.unwrap_or(1))
+            .bind(k.status.unwrap_or(1))
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Toggle a single channel API key's enabled/disabled status.
+    pub async fn toggle_channel_api_key(
+        &self,
+        key_id: &str,
+        status: i64,
+    ) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        sqlx::query("UPDATE channel_api_keys SET status = ?, updated_at = ? WHERE id = ?")
+            .bind(status)
+            .bind(&now)
+            .bind(key_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Delete a single channel API key.
+    pub async fn delete_channel_api_key(&self, key_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM channel_api_keys WHERE id = ?")
+            .bind(key_id)
             .execute(&self.pool)
             .await?;
         Ok(())

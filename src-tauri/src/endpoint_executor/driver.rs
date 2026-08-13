@@ -34,10 +34,56 @@ use axum::response::{IntoResponse, Response};
 use chrono::{Duration, SecondsFormat, Utc};
 use futures_util::StreamExt;
 use rand::SeedableRng;
+use rand::Rng;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Multi-key load balancing: if the channel has extra API keys in
+/// `channel_api_keys`, randomly select one weighted by `weight`. The
+/// primary `api_key` on the channel row always participates with its
+/// channel-level `weight`. Returns the channel unchanged on error or when
+/// no extra keys exist.
+async fn select_channel_key(channel: &Channel, repo: &Arc<Repository>) -> Channel {
+    let extra_keys = match repo.get_channel_api_keys(&channel.id).await {
+        Ok(keys) => keys.into_iter().filter(|k| k.status == 1).collect::<Vec<_>>(),
+        Err(_) => return channel.clone(),
+    };
+    if extra_keys.is_empty() {
+        return channel.clone();
+    }
+    // Build weighted pool: primary key (weight = channel.weight) + extras.
+    let mut pool: Vec<(String, i64)> = Vec::new();
+    if !channel.api_key.is_empty() {
+        pool.push((channel.api_key.clone(), channel.weight.max(1)));
+    }
+    for k in &extra_keys {
+        pool.push((k.api_key.clone(), k.weight.max(1)));
+    }
+    if pool.is_empty() {
+        return channel.clone();
+    }
+    // Weighted random selection.
+    let total: i64 = pool.iter().map(|(_, w)| w).sum();
+    if total <= 0 {
+        return channel.clone();
+    }
+    let mut rng = rand::rng();
+    let mut pick = rand::rng().random_range(0..total);
+    let mut chosen = &pool[0].0;
+    for (key, w) in &pool {
+        pick -= w;
+        if pick <= 0 {
+            chosen = key;
+            break;
+        }
+    }
+    let _ = rng; // suppress unused warning
+    let mut ch = channel.clone();
+    ch.api_key = chosen.clone();
+    ch
+}
 
 fn candidate_lookup(plan: &RoutePlan) -> HashMap<String, RouteCandidate> {
     plan.groups
@@ -218,6 +264,9 @@ pub(crate) async fn route_plan_response_with_auth_service(
             async move {
                 match candidate {
                     Some(RouteCandidate::Channel { channel, identity }) => {
+                        // Multi-key load balancing: if the channel has extra
+                        // API keys, randomly select one weighted by priority.
+                        let channel = select_channel_key(&channel, &mode_health_repo).await;
                         let result = dispatch_executor(
                             endpoint,
                             &attempt,
@@ -650,6 +699,7 @@ pub(crate) async fn route_stream_plan_with_auth_service(
 
                 let dispatched = match candidate {
                     Some(RouteCandidate::Channel { channel, identity }) => {
+                        let channel = select_channel_key(&channel, repo).await;
                         dispatch_stream_executor(
                             endpoint,
                             &attempt,

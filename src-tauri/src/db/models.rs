@@ -1,6 +1,29 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+/// A single API key belonging to a channel (migration 023: channel_api_keys).
+/// Multiple keys per channel enable load balancing and failover.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ChannelApiKey {
+    pub id: String,
+    pub channel_id: String,
+    pub api_key: String,
+    pub weight: i64,
+    pub status: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Input for creating/updating a channel API key entry.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChannelApiKeyInput {
+    pub api_key: String,
+    #[serde(default)]
+    pub weight: Option<i64>,
+    #[serde(default)]
+    pub status: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Channel {
     pub id: String,
@@ -68,6 +91,9 @@ pub struct CreateChannelInput {
     pub draft_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_save: Option<bool>,
+    // --- Multi-key: additional API keys for load balancing (migration 023) ---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_keys: Option<Vec<ChannelApiKeyInput>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -110,6 +136,9 @@ pub struct UpdateChannelInput {
     pub draft_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_save: Option<bool>,
+    // --- Multi-key: replacement for extra keys (full replace semantics) ---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_keys: Option<Vec<ChannelApiKeyInput>>,
 }
 
 /// Import-write input (T09).  Unlike `CreateChannelInput` (whose repository

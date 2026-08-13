@@ -447,6 +447,31 @@ export function ChannelsPage() {
                       )}
                     </div>
 
+                    {/* 额外 Keys（多 Key 负载均衡）*/}
+                    {ch.extra_keys && ch.extra_keys.length > 0 && (
+                      <div>
+                        <div className="mb-1.5 flex items-center justify-between">
+                          <span className="text-xs font-semibold text-slate-500">额外 Keys（负载均衡）</span>
+                          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">
+                            {ch.extra_keys.length} 个
+                          </span>
+                        </div>
+                        <div className="space-y-1.5">
+                          {ch.extra_keys.map((ek, ekIdx) => (
+                            <div key={ek.id} className="flex items-center gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs font-mono text-slate-600">
+                              <span className="shrink-0 text-slate-400">#{ekIdx + 2}</span>
+                              <span className="truncate">{ek.api_key}</span>
+                              <span className="ml-auto shrink-0 rounded-full bg-slate-200 px-1.5 py-0.5 text-[10px] text-slate-500">w:{ek.weight}</span>
+                              <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] ${ek.status === 1 ? "bg-emerald-100 text-emerald-600" : "bg-slate-200 text-slate-400"}`}>
+                                {ek.status === 1 ? "启用" : "禁用"}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                        <p className="mt-1 text-[11px] text-slate-400">主 Key + 额外 Keys 按权重负载均衡，失效 Key 自动降级</p>
+                      </div>
+                    )}
+
                     {/* 详细统计仪表盘 */}
                     {stats && stats.total_calls > 0 ? (() => {
                       const successRate = (stats.success_calls / stats.total_calls * 100);

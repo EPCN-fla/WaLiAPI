@@ -1,4 +1,22 @@
 // Channel types
+
+/** A single API key entry for a channel (multi-key load balancing). */
+export interface ChannelKey {
+  id: string;
+  api_key: string;
+  weight: number;
+  status: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Input for creating/updating a channel API key. */
+export interface ChannelKeyInput {
+  api_key: string;
+  weight?: number;
+  status?: number;
+}
+
 export interface Channel {
   id: string;
   name: string;
@@ -25,6 +43,8 @@ export interface Channel {
   updated_at: string;
   last_test_at: string | null;
   last_test_ok: number | null;
+  /** Multi-key: extra API keys (masked in DTO, use getChannelExtraKeys for full). */
+  extra_keys: ChannelKey[];
 }
 
 export interface CreateChannelInput {
@@ -51,6 +71,8 @@ export interface CreateChannelInput {
   test_run_id?: string;
   draft_fingerprint?: string;
   force_save?: boolean;
+  /** Multi-key: additional API keys for load balancing. */
+  extra_keys?: ChannelKeyInput[];
 }
 
 export interface UpdateChannelInput {
@@ -80,6 +102,8 @@ export interface UpdateChannelInput {
   test_run_id?: string;
   draft_fingerprint?: string;
   force_save?: boolean;
+  /** Multi-key: replacement for extra keys (full replace semantics). */
+  extra_keys?: ChannelKeyInput[];
 }
 
 export interface TestChannelResult {

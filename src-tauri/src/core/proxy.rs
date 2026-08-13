@@ -4,10 +4,50 @@ use crate::db::models::{Channel, RequestLog};
 use crate::db::repository::Repository;
 use crate::security;
 use crate::utils;
+use rand::Rng;
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
+
+/// Multi-key load balancing for the legacy proxy path.  Selects a random
+/// enabled key from the channel's extra keys, weighted by `weight`.  The
+/// primary `api_key` participates with the channel-level `weight`.
+async fn select_key_for_channel(channel: &Channel, repo: &Arc<Repository>) -> Channel {
+    let extra_keys = match repo.get_channel_api_keys(&channel.id).await {
+        Ok(keys) => keys.into_iter().filter(|k| k.status == 1).collect::<Vec<_>>(),
+        Err(_) => return channel.clone(),
+    };
+    if extra_keys.is_empty() {
+        return channel.clone();
+    }
+    let mut pool: Vec<(String, i64)> = Vec::new();
+    if !channel.api_key.is_empty() {
+        pool.push((channel.api_key.clone(), channel.weight.max(1)));
+    }
+    for k in &extra_keys {
+        pool.push((k.api_key.clone(), k.weight.max(1)));
+    }
+    if pool.is_empty() {
+        return channel.clone();
+    }
+    let total: i64 = pool.iter().map(|(_, w)| w).sum();
+    if total <= 0 {
+        return channel.clone();
+    }
+    let mut pick = rand::rng().random_range(0..total);
+    let mut chosen = &pool[0].0;
+    for (key, w) in &pool {
+        pick -= w;
+        if pick <= 0 {
+            chosen = key;
+            break;
+        }
+    }
+    let mut ch = channel.clone();
+    ch.api_key = chosen.clone();
+    ch
+}
 
 #[allow(dead_code)]
 pub struct ProxyResult {
@@ -135,6 +175,8 @@ pub async fn handle_request(
     let mut last_error = None;
 
     for (attempt, channel) in selected_channels.into_iter().take(max_attempts).enumerate() {
+        // Multi-key load balancing: select a key from extra keys if available.
+        let channel = select_key_for_channel(&channel, &repo).await;
         let config = Dispatcher::channel_to_config(&channel);
         let adaptor = get_adaptor(&channel.channel_type);
         let attempt_start = Instant::now();

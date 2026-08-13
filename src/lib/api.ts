@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Channel, CreateChannelInput, UpdateChannelInput, TestChannelResult,
+  ChannelKey,
   ApiKey, CreateApiKeyInput, ApiKeyStats,
   RequestLog, LogStats, SecurityFinding,
   DashboardStats,
@@ -56,6 +57,14 @@ export const channelApi = {
   /** 拉取上游模型列表（T14）。绝不写库：不覆盖已有模型列表，返回结果供弹窗勾选合并。 */
   syncUpstreamModels: (input: DraftChannelTestInput) =>
     invoke<UpstreamModelsResult>("sync_upstream_models", { input }),
+  /** 获取渠道的额外 API Keys（masked）。 */
+  getExtraKeys: (id: string) => invoke<ChannelKey[]>("get_channel_extra_keys", { id }),
+  /** 获取单个额外 Key 的完整值（unmasked）。 */
+  getExtraKeyValue: (keyId: string) => invoke<string>("get_channel_extra_key_value", { keyId }),
+  /** 启用/禁用一个额外 Key。 */
+  toggleExtraKey: (keyId: string, status: number) => invoke<void>("toggle_channel_extra_key", { keyId, status }),
+  /** 删除一个额外 Key。 */
+  deleteExtraKey: (keyId: string) => invoke<void>("delete_channel_extra_key", { keyId }),
 };
 
 // API Key commands

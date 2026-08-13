@@ -9,6 +9,8 @@
     "sql:default",
     "store:default",
     "clipboard-manager:default",
+    "clipboard-manager:allow-write-text",
+    "clipboard-manager:allow-read-text",
     "notification:default",
     "autostart:default",
     "shell:default",
