@@ -45,6 +45,7 @@ pub use types::{CodecId, PreparedCodec, PreparedConversion, Protocol};
 pub use responses_codec::ResponsesEventAccumulator;
 
 #[cfg(test)]
-mod chat_messages_codec;
+#[path = "tests/chat_messages/mod.rs"]
+mod chat_messages_codec_tests;
 #[cfg(test)]
 mod foundation_tests;
