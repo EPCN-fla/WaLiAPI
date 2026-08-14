@@ -555,7 +555,10 @@ impl Repository {
 
     /// Get all extra API keys for a channel (excluding the primary key stored
     /// in channels.api_key). Returns enabled keys first, ordered by weight desc.
-    pub async fn get_channel_api_keys(&self, channel_id: &str) -> Result<Vec<ChannelApiKey>, sqlx::Error> {
+    pub async fn get_channel_api_keys(
+        &self,
+        channel_id: &str,
+    ) -> Result<Vec<ChannelApiKey>, sqlx::Error> {
         sqlx::query_as::<_, ChannelApiKey>(
             "SELECT * FROM channel_api_keys WHERE channel_id = ? ORDER BY status DESC, weight DESC, created_at ASC",
         )
@@ -677,9 +680,8 @@ impl Repository {
         let allowed_channels =
             serde_json::to_string(&input.allowed_channels.clone().unwrap_or_default())
                 .unwrap_or_else(|_| "[]".to_string());
-        let denied_models =
-            serde_json::to_string(&input.denied_models.clone().unwrap_or_default())
-                .unwrap_or_else(|_| "[]".to_string());
+        let denied_models = serde_json::to_string(&input.denied_models.clone().unwrap_or_default())
+            .unwrap_or_else(|_| "[]".to_string());
         let denied_channels =
             serde_json::to_string(&input.denied_channels.clone().unwrap_or_default())
                 .unwrap_or_else(|_| "[]".to_string());
@@ -718,7 +720,11 @@ impl Repository {
         Ok(())
     }
 
-    pub async fn update_api_key_allowed_models(&self, id: &str, models: &[String]) -> Result<(), sqlx::Error> {
+    pub async fn update_api_key_allowed_models(
+        &self,
+        id: &str,
+        models: &[String],
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
         let json = serde_json::to_string(models).unwrap_or_else(|_| "[]".to_string());
         sqlx::query("UPDATE api_keys SET allowed_models = ?, updated_at = ? WHERE id = ?")
@@ -730,7 +736,11 @@ impl Repository {
         Ok(())
     }
 
-    pub async fn update_api_key_allowed_channels(&self, id: &str, channels: &[String]) -> Result<(), sqlx::Error> {
+    pub async fn update_api_key_allowed_channels(
+        &self,
+        id: &str,
+        channels: &[String],
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
         let json = serde_json::to_string(channels).unwrap_or_else(|_| "[]".to_string());
         sqlx::query("UPDATE api_keys SET allowed_channels = ?, updated_at = ? WHERE id = ?")
@@ -742,7 +752,11 @@ impl Repository {
         Ok(())
     }
 
-    pub async fn update_api_key_denied_models(&self, id: &str, models: &[String]) -> Result<(), sqlx::Error> {
+    pub async fn update_api_key_denied_models(
+        &self,
+        id: &str,
+        models: &[String],
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
         let json = serde_json::to_string(models).unwrap_or_else(|_| "[]".to_string());
         sqlx::query("UPDATE api_keys SET denied_models = ?, updated_at = ? WHERE id = ?")
@@ -754,7 +768,11 @@ impl Repository {
         Ok(())
     }
 
-    pub async fn update_api_key_denied_channels(&self, id: &str, channels: &[String]) -> Result<(), sqlx::Error> {
+    pub async fn update_api_key_denied_channels(
+        &self,
+        id: &str,
+        channels: &[String],
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
         let json = serde_json::to_string(channels).unwrap_or_else(|_| "[]".to_string());
         sqlx::query("UPDATE api_keys SET denied_channels = ?, updated_at = ? WHERE id = ?")
@@ -777,7 +795,11 @@ impl Repository {
         Ok(())
     }
 
-    pub async fn update_api_key_quota(&self, id: &str, quota_limit: i64) -> Result<(), sqlx::Error> {
+    pub async fn update_api_key_quota(
+        &self,
+        id: &str,
+        quota_limit: i64,
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
         sqlx::query("UPDATE api_keys SET quota_limit = ?, updated_at = ? WHERE id = ?")
             .bind(quota_limit)

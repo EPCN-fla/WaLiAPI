@@ -214,9 +214,7 @@ impl RouteCandidate {
             Self::Channel { channel, .. } => {
                 serde_json::from_str(&channel.model_mapping).unwrap_or_default()
             }
-            Self::AuthAccount(account) => {
-                account.model_mapping().unwrap_or_default()
-            }
+            Self::AuthAccount(account) => account.model_mapping().unwrap_or_default(),
         }
     }
 }
@@ -540,7 +538,8 @@ pub fn authorize_request(api_key: &ApiKey, model: &str) -> Result<(), PlanError>
     if !allowed.is_empty() && !allowed.iter().any(|m| m == model) {
         return Err(PlanError::ModelNotAllowed(model.to_string()));
     }
-    let denied_models: Vec<String> = serde_json::from_str(&api_key.denied_models).unwrap_or_default();
+    let denied_models: Vec<String> =
+        serde_json::from_str(&api_key.denied_models).unwrap_or_default();
     if denied_models.iter().any(|m| m == model) {
         return Err(PlanError::ModelNotAllowed(model.to_string()));
     }

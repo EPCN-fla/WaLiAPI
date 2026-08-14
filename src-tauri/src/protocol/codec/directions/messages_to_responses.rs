@@ -916,24 +916,40 @@ impl ResponsesMessagesStream {
             "response.content_part.added" => {
                 self.start(&mut out);
                 let (expected_kind, expected_part, ..) = Self::part_dispatch(&e)?;
-                self.validate_part_lifecycle(&e, &expected_kind, &[expected_part], "content_index")?;
+                self.validate_part_lifecycle(
+                    &e,
+                    &expected_kind,
+                    &[expected_part],
+                    "content_index",
+                )?;
             }
             "response.content_part.done" => {
                 let (expected_kind, expected_part, thinking, refusal) = Self::part_dispatch(&e)?;
-                let ix = self
-                    .validate_part_lifecycle(&e, &expected_kind, &[expected_part], "content_index")?;
-                let text_field = if refusal { "/part/refusal" } else { "/part/text" };
-                let text = e.pointer(text_field).and_then(Value::as_str).ok_or_else(|| {
-                    bad(
-                        FeatureKind::UnknownEvent,
-                        text_field,
-                        if refusal {
-                            "completed refusal text is required"
-                        } else {
-                            "completed output text is required"
-                        },
-                    )
-                })?;
+                let ix = self.validate_part_lifecycle(
+                    &e,
+                    &expected_kind,
+                    &[expected_part],
+                    "content_index",
+                )?;
+                let text_field = if refusal {
+                    "/part/refusal"
+                } else {
+                    "/part/text"
+                };
+                let text = e
+                    .pointer(text_field)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        bad(
+                            FeatureKind::UnknownEvent,
+                            text_field,
+                            if refusal {
+                                "completed refusal text is required"
+                            } else {
+                                "completed output text is required"
+                            },
+                        )
+                    })?;
                 if refusal {
                     self.refused = true;
                 }
@@ -1759,8 +1775,7 @@ mod tests {
         );
         // The message item still streams as text at a distinct index.
         assert!(
-            output.contains("\"text\":\"answer\"")
-                && output.contains("\"type\":\"text_delta\""),
+            output.contains("\"text\":\"answer\"") && output.contains("\"type\":\"text_delta\""),
             "message item must stream as text:\n{output}"
         );
         assert!(output.contains("message_stop"));
@@ -1842,8 +1857,7 @@ mod tests {
         events.extend(decoder.finish().unwrap());
         let output = events.concat();
         assert!(
-            output.contains("\"stop_reason\":\"max_tokens\"")
-                && output.contains("message_stop"),
+            output.contains("\"stop_reason\":\"max_tokens\"") && output.contains("message_stop"),
             "standalone incomplete must terminate with max_tokens:\n{output}"
         );
     }

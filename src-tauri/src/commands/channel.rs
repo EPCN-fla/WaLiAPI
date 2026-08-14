@@ -3,7 +3,9 @@ use crate::channel_presets::ProtocolPresetGroup;
 use crate::core::channel_identity::{
     resolve_channel_identity, ChannelIdentity, ChannelIdentityRow,
 };
-use crate::db::models::{Channel, ChannelApiKey, ChannelStats, CreateChannelInput, UpdateChannelInput};
+use crate::db::models::{
+    Channel, ChannelApiKey, ChannelStats, CreateChannelInput, UpdateChannelInput,
+};
 use crate::db::repository::Repository;
 use crate::services::channel_test::{
     self, DraftChannelTestInput, DraftChannelTestResult, SaveReceiptCheck,
@@ -109,10 +111,7 @@ impl From<Channel> for ChannelDto {
 }
 
 /// Build a ChannelDto with extra keys populated from the database.
-async fn to_dto_with_keys(
-    repo: &Repository,
-    c: Channel,
-) -> Result<ChannelDto, String> {
+async fn to_dto_with_keys(repo: &Repository, c: Channel) -> Result<ChannelDto, String> {
     let keys = repo
         .get_channel_api_keys(&c.id)
         .await
@@ -485,11 +484,12 @@ pub async fn get_channel_extra_key_value(
     key_id: String,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<String, String> {
-    let row: Option<(String,)> = sqlx::query_as("SELECT api_key FROM channel_api_keys WHERE id = ?")
-        .bind(&key_id)
-        .fetch_optional(&state.db.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT api_key FROM channel_api_keys WHERE id = ?")
+            .bind(&key_id)
+            .fetch_optional(&state.db.pool)
+            .await
+            .map_err(|e| e.to_string())?;
     row.map(|(k,)| k).ok_or_else(|| "Key not found".to_string())
 }
 

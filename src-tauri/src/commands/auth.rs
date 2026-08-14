@@ -698,7 +698,13 @@ pub async fn auth_update(
         .unwrap_or_else(|| "{}".to_string());
     let repository = Repository::new(state.db.pool.clone());
     repository
-        .update_auth_account(&input.id, input.label.trim(), input.priority, input.weight, &model_mapping_json)
+        .update_auth_account(
+            &input.id,
+            input.label.trim(),
+            input.priority,
+            input.weight,
+            &model_mapping_json,
+        )
         .await
         .map_err(|_| storage_error())?;
     dto_from_account(
