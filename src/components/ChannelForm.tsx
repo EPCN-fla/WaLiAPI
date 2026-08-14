@@ -469,12 +469,17 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
   }
 
   function buildDraftInput(): DraftChannelTestInput {
+    // 编辑场景：如果 api_key 仍是掩码值（用户未修改），不传给后端测试，
+    // 让 resolve_draft_api_key 走「编辑留空回填已存 Key」路径拿到真实 Key。
+    // 与 buildSaveInput 的保存逻辑保持一致，避免用掩码值当真实 Key 探测。
+    const draftApiKey =
+      editing && form.api_key === mainKeyOriginalMasked ? "" : form.api_key;
     return {
       id: editing?.id,
       name: form.name,
       type: legacyType(),
       base_url: legacyBaseUrl(),
-      api_key: form.api_key,
+      api_key: draftApiKey,
       // 让草稿测试在后端与保存路径解析出相同的有效 Key：
       // 编辑留空未清除 → 沿用已存 Key；显式清除 → 空 Key。
       clear_api_key: clearKeyRequested || undefined,
