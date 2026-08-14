@@ -111,10 +111,18 @@ pub fn encode_messages_to_chat(
         }
     }
 
+    let reasoning_effort = anthropic_thinking_to_reasoning_effort(body);
+    let require_tool_reasoning_content = reasoning_effort.as_deref().is_some_and(|v| v != "none");
+
     let mut chat_messages: Vec<Value> = Vec::new();
     for (i, msg) in messages.iter().enumerate() {
         let mp = format!("/messages/{i}");
-        match convert_anthropic_message_to_chat(msg, &mp, &mut normalized) {
+        match convert_anthropic_message_to_chat(
+            msg,
+            &mp,
+            &mut normalized,
+            require_tool_reasoning_content,
+        ) {
             Ok(mut msgs) => chat_messages.append(&mut msgs),
             Err(e) => out.extend(e.fields),
         }
@@ -215,7 +223,7 @@ pub fn encode_messages_to_chat(
     // semantics).  Only present when the downstream asked for thinking; absent
     // thinking leaves `reasoning_effort` unset so the upstream applies its own
     // default.  The upstream (not us) adjudicates whether the model supports it.
-    if let Some(effort) = anthropic_thinking_to_reasoning_effort(body) {
+    if let Some(effort) = reasoning_effort {
         chat.insert("reasoning_effort".to_string(), Value::String(effort));
     }
 
@@ -276,6 +284,7 @@ fn convert_anthropic_message_to_chat(
     msg: &Value,
     pointer: &str,
     normalized: &mut Vec<String>,
+    require_tool_reasoning_content: bool,
 ) -> Result<Vec<Value>, UnsupportedFeatures> {
     let role = msg.get("role").and_then(Value::as_str).ok_or_else(|| {
         UnsupportedFeatures::single(
@@ -518,7 +527,15 @@ fn convert_anthropic_message_to_chat(
             };
             // Reasoning content extracted from assistant `thinking` blocks
             // (fail-open mapping to OpenAI's non-stream reasoning_content).
-            let reasoning = assistant_had_thinking.then_some(assistant_reasoning);
+            //
+            // Some Messages clients omit the thinking block when replaying a
+            // historical assistant tool-call turn. Thinking-mode OpenAI
+            // upstreams nevertheless require the field to be present on that
+            // turn. Preserve an explicit empty value as a compatibility
+            // fallback; never fabricate non-empty reasoning.
+            let reasoning = (assistant_had_thinking
+                || (!tool_calls.is_empty() && require_tool_reasoning_content))
+                .then_some(assistant_reasoning);
             if tool_calls.is_empty() && content.is_null() && reasoning.is_none() {
                 return Err(UnsupportedFeatures::single(
                     FeatureKind::UnknownBlock,
