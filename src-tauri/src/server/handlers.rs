@@ -3913,6 +3913,7 @@ mod list_models_tests {
             test_run_id: None,
             draft_fingerprint: None,
             force_save: None,
+            extra_keys: None,
         })
         .await
         .unwrap();
