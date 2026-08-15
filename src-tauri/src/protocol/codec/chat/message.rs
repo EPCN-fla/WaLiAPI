@@ -1,6 +1,5 @@
 use super::super::error::{FeatureKind, UnsupportedFeatures};
 use super::super::request;
-use super::encode::parse_data_url;
 use serde_json::Value;
 
 /// Convert one Chat message to an Anthropic message (and possibly system parts).
@@ -391,5 +390,30 @@ pub(super) fn convert_chat_message_to_anthropic(
             format!("{pointer}/role"),
             format!("unsupported Chat message role {other:?}"),
         )),
+    }
+}
+
+/// Parse a `data:` URL into `(media_type, Option<(media_type, payload)>)`.
+fn parse_data_url(url: &str) -> (Option<String>, Option<(String, String)>) {
+    if let Some(rest) = url.strip_prefix("data:") {
+        if let Some(semi) = rest.find(';') {
+            let media_type = rest[..semi].to_string();
+            let after = &rest[semi + 1..];
+            if let Some(b64) = after.strip_prefix("base64,") {
+                return (
+                    Some(media_type.clone()),
+                    Some((media_type, b64.to_string())),
+                );
+            }
+            // e.g. data:image/png;charset=utf-8,...
+            return (Some(media_type), None);
+        }
+        if let Some(comma) = rest.find(',') {
+            let media_type = rest[..comma].to_string();
+            return (Some(media_type), None);
+        }
+        (Some(rest.to_string()), None)
+    } else {
+        (None, None)
     }
 }

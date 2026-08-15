@@ -21,6 +21,9 @@ mod decode;
 mod encode;
 mod stream;
 
+// Facade re-export：`mod protocol` 是 crate 私有，此 re-export 保留一个无 crate 内
+// 消费者的内部路径，rustc 会将其标记为未使用 —— 与模块树各 facade 的
+// `#[allow(unused_imports)]` 约定一致。
 #[allow(unused_imports)]
 pub use decode::decode_messages_response;
 pub use encode::encode_request;

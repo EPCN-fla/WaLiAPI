@@ -19,7 +19,7 @@ pub(super) struct ResponsesChatState {
 }
 
 #[derive(Default)]
-pub(super) struct ToolCallState {
+struct ToolCallState {
     item_id: String,
     call_id: String,
     name: String,
