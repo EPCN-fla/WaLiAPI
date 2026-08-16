@@ -17,8 +17,6 @@ pub const CODEC_UNSUPPORTED_FEATURE: &str = "unsupported_feature";
 /// Error code used when a field is present but its *value* is not a
 /// representable media form (for example an invalid image source).
 pub const CODEC_UNSUPPORTED_MEDIA: &str = "unsupported_media";
-/// Error code for "rejected before upstream access" guard outcomes.
-pub const REJECTED_BEFORE_UPSTREAM: &str = "rejected_before_upstream";
 
 /// Machine class of a rejected feature, for routing and error reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]

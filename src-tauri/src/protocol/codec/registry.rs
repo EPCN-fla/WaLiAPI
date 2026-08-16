@@ -4,82 +4,25 @@ use super::direction::CodecDirection;
 use super::error::{CodecError, DecodeError, FeatureKind, PrepareError, UnsupportedFeatures};
 use super::identity::{CHAT_IDENTITY, MESSAGES_IDENTITY, RESPONSES_IDENTITY};
 use super::ports::{
-    LegacyNonStreamDecoderAdapter, LegacyStreamDecoderAdapter,
-    NonStreamDecoder as FactoryNonStreamDecoder, StreamDecoder as FactoryStreamDecoder,
+    DecodedResponse, NonStreamDecoder as FactoryNonStreamDecoder,
+    StreamDecoder as FactoryStreamDecoder,
 };
-use super::report::ConversionReport;
+use super::report::{ConversionContext, ConversionReport};
 use super::types::{CodecId, PreparedCodec, PreparedConversion, Protocol};
 use super::{chat, directions, messages, responses_codec};
 use serde_json::Value;
 
-/// Legacy decoder ports kept at this import path for callers of the
-/// five-argument [`CodecRegistry::prepare`] API. New consumers should import
-/// factory ports from the codec facade and use [`CodecRegistry::prepare_pair`].
-pub use super::ports::{
-    DecodedResponse, LegacyNonStreamDecoder as NonStreamDecoder,
-    LegacyStreamDecoder as StreamDecoder,
-};
-
-/// Legacy endpoint enums. New code must use [`Protocol`] for both sides of a
-/// direction; these wrappers remain so old call sites can be migrated without
-/// semantic remapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Downstream {
-    ChatCompletions,
-    Messages,
-    Responses,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Upstream {
-    ChatCompletions,
-    Messages,
-    Responses,
-}
-
-impl From<Downstream> for Protocol {
-    fn from(value: Downstream) -> Self {
-        match value {
-            Downstream::ChatCompletions => Protocol::Chat,
-            Downstream::Messages => Protocol::Messages,
-            Downstream::Responses => Protocol::Responses,
-        }
-    }
-}
-
-impl From<Upstream> for Protocol {
-    fn from(value: Upstream) -> Self {
-        match value {
-            Upstream::ChatCompletions => Protocol::Chat,
-            Upstream::Messages => Protocol::Messages,
-            Upstream::Responses => Protocol::Responses,
-        }
-    }
-}
-
-/// Compatibility marker for the pre-strategy registry API. Codec selection is
-/// now solely determined by the protocol pair.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Version(String);
-
-impl Version {
-    pub fn v1_0() -> Self {
-        Self("v1".to_owned())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+type EncodeFn = fn(&Value, &str) -> Result<(Value, ConversionContext), PrepareError>;
+type NonStreamDecoderFn = fn(&ConversionContext) -> Box<dyn FactoryNonStreamDecoder + Send + Sync>;
+type StreamDecoderFn = fn(&ConversionContext) -> Box<dyn FactoryStreamDecoder + Send + Sync>;
 
 struct FnDirection {
     id: CodecId,
     downstream: Protocol,
     upstream: Protocol,
-    encode: fn(&Value, &str) -> Result<(Value, super::report::ConversionContext), PrepareError>,
-    non_stream:
-        fn(&super::report::ConversionContext) -> Box<dyn FactoryNonStreamDecoder + Send + Sync>,
-    streaming: fn(&super::report::ConversionContext) -> Box<dyn FactoryStreamDecoder + Send + Sync>,
+    encode: EncodeFn,
+    non_stream: NonStreamDecoderFn,
+    streaming: StreamDecoderFn,
 }
 
 impl CodecDirection for FnDirection {
@@ -229,10 +172,6 @@ impl FactoryNonStreamDecoder for ResponsesToChatNonStreamDecoder {
 pub struct CodecRegistry;
 
 impl CodecRegistry {
-    pub fn version() -> Version {
-        Version::v1_0()
-    }
-
     fn direction(
         downstream: Protocol,
         upstream: Protocol,
@@ -272,41 +211,8 @@ impl CodecRegistry {
         Ok(PreparedConversion {
             encoded_request,
             report,
-            context,
-            non_stream: Box::new(LegacyNonStreamDecoderAdapter::new(
-                codec.new_non_stream_decoder(),
-            )),
-            streaming: Box::new(LegacyStreamDecoderAdapter::new(codec.new_stream_decoder())),
             codec,
         })
-    }
-
-    /// Source-compatible entry point for the old `(Downstream, Upstream,
-    /// Version, model, request)` call shape. Its decoder fields are retained
-    /// through adapters while callers migrate to [`Self::prepare_pair`].
-    #[deprecated(note = "use CodecRegistry::prepare_pair(Protocol, Protocol, model, request)")]
-    pub fn prepare(
-        downstream: Downstream,
-        upstream: Upstream,
-        _version: &Version,
-        model: &str,
-        request: &Value,
-    ) -> Result<PreparedConversion, PrepareError> {
-        Self::prepare_pair(downstream.into(), upstream.into(), model, request)
-    }
-
-    /// Named migration alias retained for code that adopted it during the
-    /// refactor. New callers should use [`Self::prepare_pair`].
-    #[deprecated(note = "use CodecRegistry::prepare_pair(Protocol, Protocol, model, request)")]
-    #[allow(deprecated)]
-    pub fn prepare_legacy(
-        downstream: Downstream,
-        upstream: Upstream,
-        version: &Version,
-        model: &str,
-        request: &Value,
-    ) -> Result<PreparedConversion, PrepareError> {
-        Self::prepare(downstream, upstream, version, model, request)
     }
 
     pub fn chat_to_messages(

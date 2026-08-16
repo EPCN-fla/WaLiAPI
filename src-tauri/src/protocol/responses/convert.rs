@@ -40,16 +40,14 @@ pub fn convert_openai_sse_to_responses(
     state: &mut StreamState,
 ) -> Vec<String> {
     let mut events = Vec::new();
-    let msg_id = if response_id.starts_with("resp_") {
-        format!("msg_{}", &response_id[5..])
-    } else {
-        format!("msg_{}", response_id)
-    };
-    let reasoning_id = if response_id.starts_with("resp_") {
-        format!("rs_{}", &response_id[5..])
-    } else {
-        format!("rs_{}", response_id)
-    };
+    let msg_id = format!(
+        "msg_{}",
+        response_id.strip_prefix("resp_").unwrap_or(response_id)
+    );
+    let reasoning_id = format!(
+        "rs_{}",
+        response_id.strip_prefix("resp_").unwrap_or(response_id)
+    );
 
     for line in chunk_text.lines() {
         let trimmed = line.trim();

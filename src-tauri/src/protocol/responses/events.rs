@@ -63,11 +63,10 @@ pub fn create_synthetic_completed_events(
     usage_completion: i64,
 ) -> Vec<String> {
     let mut events = Vec::new();
-    let msg_id = if response_id.starts_with("resp_") {
-        format!("msg_{}", &response_id[5..])
-    } else {
-        format!("msg_{}", response_id)
-    };
+    let msg_id = format!(
+        "msg_{}",
+        response_id.strip_prefix("resp_").unwrap_or(response_id)
+    );
 
     // We need a mutable state to track sequence numbers, but we receive &StreamState.
     // Use a local counter starting from the state's current sequence_number.
@@ -83,11 +82,10 @@ pub fn create_synthetic_completed_events(
     // Close reasoning item if it was opened and not yet closed
     if state.reasoning_item_added && !state.reasoning_item_done {
         let reasoning_output_index = state.reasoning_output_index;
-        let reasoning_id = if response_id.starts_with("resp_") {
-            format!("rs_{}", &response_id[5..])
-        } else {
-            format!("rs_{}", response_id)
-        };
+        let reasoning_id = format!(
+            "rs_{}",
+            response_id.strip_prefix("resp_").unwrap_or(response_id)
+        );
 
         let s = next_seq!();
         let text_done = serde_json::json!({
@@ -257,11 +255,10 @@ pub fn create_synthetic_completed_events(
 
     // Add reasoning item to output if it was added
     if state.reasoning_item_added {
-        let reasoning_id = if response_id.starts_with("resp_") {
-            format!("rs_{}", &response_id[5..])
-        } else {
-            format!("rs_{}", response_id)
-        };
+        let reasoning_id = format!(
+            "rs_{}",
+            response_id.strip_prefix("resp_").unwrap_or(response_id)
+        );
         output_items.push(serde_json::json!({
             "id": reasoning_id,
             "type": "reasoning",

@@ -1,8 +1,8 @@
 use super::super::error::{DecodeError, FeatureKind, UnsupportedFeatures};
+use super::super::messages;
 use super::super::ports::StreamDecoder;
 use super::super::report::{ConversionContext, Usage};
 use super::super::sse;
-use super::super::{chat, messages};
 use super::state::{responses_response_id, ResponsesChatState};
 use serde_json::Value;
 
@@ -31,19 +31,13 @@ impl StreamDecoder for ResponsesStreamDecoder {
 /// Composition-only streaming decoder: Responses → Chat SSE then the existing
 /// Chat → Messages state machine.  There is intentionally no second direct
 /// Responses → Messages protocol machine.
+///
+/// Exercised only by the unit tests below; direction strategies wire the direct
+/// decoders, so non-test builds flag it as dead.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct ResponsesMessagesStreamDecoder {
     pub(super) chat: ResponsesStreamDecoder,
     pub(super) messages: Box<dyn StreamDecoder + Send + Sync>,
-}
-impl ResponsesMessagesStreamDecoder {
-    pub fn boxed(context: &ConversionContext) -> Box<dyn StreamDecoder + Send + Sync> {
-        Box::new(Self {
-            chat: ResponsesStreamDecoder {
-                state: ResponsesChatState::new(context),
-            },
-            messages: chat::ChatStreamDecoder::boxed(context),
-        })
-    }
 }
 impl StreamDecoder for ResponsesMessagesStreamDecoder {
     fn feed(&mut self, bytes: &[u8]) -> Result<Vec<String>, DecodeError> {

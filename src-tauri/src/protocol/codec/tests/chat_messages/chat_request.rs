@@ -40,7 +40,7 @@ fn chat_request_text_system_and_sampling() {
     assert_eq!(msgs.len(), 2);
     assert_eq!(msgs[0]["role"], "user");
     assert_eq!(msgs[1]["role"], "assistant");
-    assert_eq!(prepared.context.upstream_model, "upstream-model");
+    assert_eq!(prepared.codec.context().upstream_model, "upstream-model");
 }
 
 #[test]

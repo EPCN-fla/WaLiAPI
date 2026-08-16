@@ -32,6 +32,10 @@ pub fn encode_messages_to_responses(
 /// `responses_via_chat` path keeps its 4096 default), and records the
 /// codex-only top-level fields that have no Chat representation in the
 /// ConversionReport.
+///
+/// Exercised only by the unit tests below; the direction strategies wire the
+/// direct encoders, so non-test builds flag it as dead.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_responses_to_messages(
     body: &Value,
     model: &str,

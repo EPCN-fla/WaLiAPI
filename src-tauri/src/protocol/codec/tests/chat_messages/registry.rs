@@ -1,5 +1,6 @@
 use crate::protocol::codec::error::FeatureKind;
-use crate::protocol::codec::registry::{CodecRegistry, Downstream, Upstream};
+use crate::protocol::codec::registry::CodecRegistry;
+use crate::protocol::codec::types::Protocol;
 use serde_json::json;
 
 // ===========================================================================
@@ -105,10 +106,9 @@ fn responses_to_messages_prepares_codex_request() {
 
 #[test]
 fn responses_identity_direction_prepares_native_codec() {
-    let prepared = CodecRegistry::prepare_legacy(
-        Downstream::Responses,
-        Upstream::Responses,
-        &CodecRegistry::version(),
+    let prepared = CodecRegistry::prepare_pair(
+        Protocol::Responses,
+        Protocol::Responses,
         "m",
         &json!({ "model": "m", "input": [] }),
     )

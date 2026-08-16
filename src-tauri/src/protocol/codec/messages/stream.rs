@@ -12,10 +12,7 @@ use std::collections::BTreeMap;
 #[derive(Default)]
 struct MsgToolAccum {
     index: usize,
-    id: String,
-    name: String,
     arguments: String,
-    started: bool,
     completed: bool,
 }
 
@@ -25,7 +22,6 @@ pub struct MessagesSseState {
     pending: Vec<u8>,
     started: bool,
     ended: bool,
-    current_text_index: Option<usize>,
     text_content_index: Option<usize>,
     tools: BTreeMap<usize, MsgToolAccum>,
     next_tool_index: usize,
@@ -85,10 +81,6 @@ impl MessagesSseState {
         }
         self.emit_final(&mut events)?;
         Ok(events)
-    }
-
-    pub fn usage(&self) -> Usage {
-        self.usage
     }
 
     fn consume_json(
@@ -176,10 +168,7 @@ impl MessagesSseState {
                             index,
                             MsgToolAccum {
                                 index: tool_index,
-                                id: id.clone(),
-                                name: name.clone(),
                                 arguments: String::new(),
-                                started: true,
                                 completed: false,
                             },
                         );

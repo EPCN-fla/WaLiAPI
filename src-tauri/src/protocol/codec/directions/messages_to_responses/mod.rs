@@ -44,7 +44,7 @@ impl CodecDirection for MessagesToResponses {
         r: &Value,
         m: &str,
     ) -> Result<(Value, ConversionContext), PrepareError> {
-        encode_request(r, m).map_err(PrepareError::from)
+        encode_request(r, m)
     }
     fn new_response_decoder(
         &self,

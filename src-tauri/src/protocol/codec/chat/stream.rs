@@ -104,10 +104,6 @@ impl ChatSseState {
         Ok(events)
     }
 
-    pub fn usage(&self) -> Usage {
-        self.usage
-    }
-
     fn consume_json(
         &mut self,
         json: Value,

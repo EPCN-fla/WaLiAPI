@@ -33,11 +33,6 @@ impl ResponsesSseAssembler {
         records
     }
 
-    /// Whether bytes are still buffered awaiting a record terminator.
-    pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
     /// Flush any trailing bytes at EOF as a final record (a record that
     /// terminated exactly at EOF must not be lost).
     pub fn flush(&mut self) -> Vec<String> {

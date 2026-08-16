@@ -52,8 +52,6 @@ pub struct StreamState {
     pub tool_calls: HashMap<u64, ToolCallState>,
     /// Whether any tool calls were seen in this stream.
     pub has_tool_calls: bool,
-    /// Whether response.completed has been emitted.
-    pub completed_sent: bool,
     /// Monotonic sequence number counter for all events.
     pub sequence_number: u64,
 }

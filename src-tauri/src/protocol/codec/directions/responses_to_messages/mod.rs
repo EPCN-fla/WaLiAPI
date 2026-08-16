@@ -48,7 +48,7 @@ impl CodecDirection for ResponsesToMessages {
         request: &Value,
         mapped_model: &str,
     ) -> Result<(Value, ConversionContext), PrepareError> {
-        encode_request(request, mapped_model).map_err(PrepareError::from)
+        encode_request(request, mapped_model)
     }
     fn new_response_decoder(
         &self,
