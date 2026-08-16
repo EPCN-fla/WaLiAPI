@@ -976,6 +976,58 @@ impl Repository {
         Ok(())
     }
 
+    /// Atomically overwrite re-login credentials on an existing local account.
+    ///
+    /// Unlike the generic `(provider, account_id)` conflict upsert, this update
+    /// is keyed by true local `id` and guarded by optimistic preconditions on
+    /// `provider` and `account_id`.  A zero-row update means the account was
+    /// deleted or its identity moved concurrently (e.g. by refresh rotation),
+    /// which the caller must treat as a fail-closed precondition failure.
+    ///
+    /// The same statement clears `model_states_json` and `last_models_sync_at`
+    /// so a successfully re-logged account cannot route against a stale model
+    /// catalog until the follow-up `/models` sync succeeds and rewrites the
+    /// snapshot.
+    pub async fn replace_auth_account(
+        &self,
+        id: &str,
+        expected_account_id: &str,
+        input: &AuthAccountUpsert,
+    ) -> Result<AuthAccount, sqlx::Error> {
+        let now = now_iso();
+        let attributes_json = serde_json::to_string(&input.attributes)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let payload_json = serde_json::to_string(&input.payload)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let result = sqlx::query(
+            "UPDATE auth_accounts
+             SET provider = ?, label = ?, account_id = ?, payload_json = ?, attributes_json = ?,
+                 model_states_json = ?, last_models_sync_at = NULL,
+                 last_refreshed_at = ?, next_refresh_after = ?, next_retry_after = ?,
+                 status = 'active', updated_at = ?
+             WHERE id = ? AND provider = ? AND account_id = ?",
+        )
+        .bind(&input.provider)
+        .bind(&input.label)
+        .bind(&input.account_id)
+        .bind(payload_json)
+        .bind(attributes_json)
+        .bind(serde_json::to_string(&ModelStates::default()).unwrap())
+        .bind(&input.last_refreshed_at)
+        .bind(&input.next_refresh_after)
+        .bind(&input.next_retry_after)
+        .bind(&now)
+        .bind(id)
+        .bind(&input.provider)
+        .bind(expected_account_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        self.get_auth_account(id).await
+    }
+
     /// This is only called after a successful provider sync. Keeping the
     /// update separate makes failures naturally preserve the old snapshot and
     /// its timestamp.

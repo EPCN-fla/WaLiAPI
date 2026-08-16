@@ -450,7 +450,11 @@ mod auth_account {
             ProviderKind::Codex
         }
 
-        async fn login(&self, _: &dyn LoginRuntime) -> Result<LoginResult, ProviderError> {
+        async fn login(
+            &self,
+            _: &crate::auth_provider::ProviderLoginContext,
+            _: &dyn LoginRuntime,
+        ) -> Result<LoginResult, ProviderError> {
             Err(ProviderError::LoginFailed)
         }
 

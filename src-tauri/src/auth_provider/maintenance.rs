@@ -38,8 +38,8 @@ mod tests {
     use crate::{
         auth_provider::service::Clock,
         auth_provider::{
-            LoginResult, LoginRuntime, Provider, ProviderError, ProviderKind, ProviderModels,
-            ProviderPayload, ProviderRegistry, ProviderRequest, RefreshedPayload,
+            LoginResult, LoginRuntime, Provider, ProviderError, ProviderKind, ProviderLoginContext,
+            ProviderModels, ProviderPayload, ProviderRegistry, ProviderRequest, RefreshedPayload,
         },
         db::{models::AuthAccount, models::AuthAccountUpsert, repository::Repository},
     };
@@ -89,7 +89,11 @@ mod tests {
             ProviderKind::Codex
         }
 
-        async fn login(&self, _: &dyn LoginRuntime) -> Result<LoginResult, ProviderError> {
+        async fn login(
+            &self,
+            _: &ProviderLoginContext,
+            _: &dyn LoginRuntime,
+        ) -> Result<LoginResult, ProviderError> {
             Err(ProviderError::LoginFailed)
         }
 

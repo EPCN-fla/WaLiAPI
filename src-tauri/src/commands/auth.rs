@@ -15,7 +15,8 @@ use uuid::Uuid;
 use crate::{
     auth_provider::{
         codex_login::{CodexLogin, TauriLoginRuntime, CODEX_IMPORT_NOTICE},
-        AuthAccountSummary, LoginRuntime, ProviderError, ProviderKind, ProviderPayload,
+        AuthAccountSummary, LoginRuntime, LoginStep, ProviderError, ProviderKind,
+        ProviderPayload,
     },
     db::{
         models::{ModelState, QuotaState},
@@ -166,6 +167,7 @@ struct SessionLoginRuntime {
     inner: TauriLoginRuntime,
     sessions: Arc<LoginSessions>,
     session_id: String,
+    cancellation: watch::Receiver<bool>,
 }
 
 #[async_trait::async_trait]
@@ -173,8 +175,37 @@ impl LoginRuntime for SessionLoginRuntime {
     async fn open_browser(&self, url: &str) -> Result<(), ProviderError> {
         self.inner.open_browser(url).await?;
         // This is an actual opener success, not a timer-driven estimate.
-        let _ = self.sessions.set_step(&self.session_id, "callback").await;
+        self.sessions
+            .set_step(&self.session_id, LoginStep::Authorizing.as_str())
+            .await;
         Ok(())
+    }
+
+    async fn set_step(&self, step: LoginStep) {
+        self.sessions
+            .set_step(&self.session_id, step.as_str())
+            .await;
+    }
+
+    async fn present_device_authorization(
+        &self,
+        _verification_url: &str,
+        _user_code: &str,
+        _expires_at: Option<String>,
+    ) -> Result<(), ProviderError> {
+        // Session verification surface is wired in the device-flow card (C7).
+        // The method must succeed so the device flow can proceed even before
+        // session storage exists; Codex never calls it.
+        Ok(())
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.cancellation.borrow()
+    }
+
+    async fn cancelled(&self) {
+        let mut receiver = self.cancellation.clone();
+        while !*receiver.borrow() && receiver.changed().await.is_ok() {}
     }
 }
 
@@ -191,7 +222,7 @@ impl LoginSessions {
         let status = AuthLoginSessionStatus {
             session_id: session_id.clone(),
             state: "pending".into(),
-            step: Some("listener".into()),
+            step: Some("preparing".into()),
             result: None,
             error_code: None,
             error: None,
@@ -334,10 +365,11 @@ fn validate_account_id(id: &str) -> Result<(), String> {
 
 fn provider_kind(provider: Option<String>) -> Result<ProviderKind, String> {
     let provider = provider.unwrap_or_else(|| "codex".to_owned());
-    if provider.trim() != "codex" {
-        return Err("Unsupported auth provider".to_owned());
+    let kind = ProviderKind::from(provider.trim());
+    match kind {
+        ProviderKind::Codex | ProviderKind::Kimi => Ok(kind),
+        ProviderKind::Other(_) => Err("Unsupported auth provider".to_owned()),
     }
-    Ok(ProviderKind::Codex)
 }
 
 fn validate_update(input: &AuthUpdateInput) -> Result<(), String> {
@@ -404,7 +436,7 @@ async fn persist_login_result(
 async fn run_codex_login_session(
     sessions: Arc<LoginSessions>,
     session_id: String,
-    mut cancellation: watch::Receiver<bool>,
+    cancellation: watch::Receiver<bool>,
     app: tauri::AppHandle,
     db: Arc<crate::db::Database>,
     service: Arc<crate::auth_provider::service::AuthService>,
@@ -413,10 +445,11 @@ async fn run_codex_login_session(
         inner: TauriLoginRuntime::new(app),
         sessions: sessions.clone(),
         session_id: session_id.clone(),
+        cancellation,
     };
     let login = CodexLogin::new();
-    let _ = sessions.set_step(&session_id, "browser").await;
-    let login_result = login.login_cancellable(&runtime, &mut cancellation).await;
+    let _ = sessions.set_step(&session_id, LoginStep::Preparing.as_str()).await;
+    let login_result = login.login(&runtime).await;
     let result = match login_result {
         Ok(login_result) => {
             // The second half of the cancellation guarantee.  A callback or
@@ -508,6 +541,15 @@ pub async fn auth_login(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<AuthMutationResult, String> {
     let kind = provider_kind(Some(provider))?;
+    // Device-code providers have no loopback callback for the synchronous
+    // command.  Refuse before any network request so `login("kimi")` can never
+    // block here waiting for a device authorization; the session API must be
+    // used instead.
+    if crate::auth_provider::spec::provider_spec(&kind)
+        .is_some_and(|spec| spec.login_mode == crate::auth_provider::AuthLoginMode::DeviceCode)
+    {
+        return Err("interactive_session_required".to_owned());
+    }
     let runtime = TauriLoginRuntime::new(app);
     let summary = state
         .auth_service

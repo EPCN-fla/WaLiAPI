@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use super::{
     codex_login::CodexLogin, LoginResult, LoginRuntime, Provider, ProviderError, ProviderKind,
-    ProviderModels, ProviderPayload, ProviderRequest, RefreshedPayload,
+    ProviderLoginContext, ProviderModels, ProviderPayload, ProviderRequest, RefreshedPayload,
 };
 use crate::db::models::{AuthAccount, ModelState, QuotaLimit, QuotaState, QuotaWindow};
 
@@ -147,7 +147,11 @@ impl Provider for CodexProvider {
         ProviderKind::Codex
     }
 
-    async fn login(&self, runtime: &dyn LoginRuntime) -> Result<LoginResult, ProviderError> {
+    async fn login(
+        &self,
+        _context: &ProviderLoginContext,
+        runtime: &dyn LoginRuntime,
+    ) -> Result<LoginResult, ProviderError> {
         self.login.login(runtime).await
     }
 

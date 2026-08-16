@@ -205,6 +205,41 @@ pub struct RefreshedPayload {
     pub next_retry_after: Option<String>,
 }
 
+/// Where a login result should land.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoginTarget {
+    /// Create a new account, upserting by `(provider, provider_account_id)`.
+    New,
+    /// Overwrite the specified local account (re-login) in place.
+    Replace { local_account_id: String },
+}
+
+/// Bound context passed to a provider login.  The command layer never passes
+/// raw `payload_json`; replacement details live in a sanitized boundary object
+/// with only the fields a provider legitimately needs.
+#[derive(Clone, Debug)]
+pub struct ProviderLoginContext {
+    pub replacement: Option<ReplacementContext>,
+}
+
+/// Sanitized replacement material.  `previous_payload` is the only credential
+/// reference a provider may read during a replacement login.
+#[derive(Clone, Debug)]
+pub struct ReplacementContext {
+    pub local_account_id: String,
+    pub provider_account_id: String,
+    pub previous_payload: ProviderPayload,
+}
+
+/// Result of an OAuth/import flow before any persistence.  It carries the
+/// resolved target so a caller cannot swap the account after authentication.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedLogin {
+    pub kind: ProviderKind,
+    pub result: LoginResult,
+    pub replacement: Option<ReplacementContext>,
+}
+
 /// A non-secret outbound request.  The service injects the persisted account
 /// and decrypted-in-memory provider payload immediately before dispatch.
 pub struct ProviderRequest<'a> {
