@@ -49,6 +49,13 @@ pub async fn start_server(
 }
 
 fn get_server_host(app: &AppHandle) -> String {
+    if let Ok(host) = std::env::var("WALIAPI_SERVER_HOST") {
+        let trimmed = host.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
     if let Ok(store) = app.store("settings.json") {
         if let Some(host) = store.get("server.host") {
             if let Some(value) = host.as_str() {
@@ -63,6 +70,14 @@ fn get_server_host(app: &AppHandle) -> String {
 }
 
 fn get_server_port(app: &AppHandle) -> u16 {
+    if let Ok(port) = std::env::var("WALIAPI_SERVER_PORT") {
+        if let Ok(value) = port.trim().parse::<u16>() {
+            if value != 0 {
+                return value;
+            }
+        }
+    }
+
     if let Ok(store) = app.store("settings.json") {
         if let Some(port) = store.get("server.port") {
             if let Some(value) = port.as_u64() {

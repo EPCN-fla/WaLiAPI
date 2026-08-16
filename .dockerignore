@@ -1,0 +1,14 @@
+.git
+.github
+.idea
+.vscode
+node_modules
+dist
+src-tauri/target
+src-tauri/gen
+*.db
+*.db-shm
+*.db-wal
+*.log
+coverage
+tmp

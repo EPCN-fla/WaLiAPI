@@ -111,6 +111,10 @@ pub fn run() {
                     }
                     _ => {}
                 });
+
+                if env_flag("WALIAPI_HIDE_WINDOW") {
+                    let _ = window.hide();
+                }
             }
 
             let app_handle = app.handle().clone();
@@ -294,4 +298,10 @@ fn should_close_to_tray(app: &tauri::AppHandle) -> bool {
         .ok()
         .and_then(|store| store.get("general.close_to_tray").and_then(|v| v.as_bool()))
         .unwrap_or(true)
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
