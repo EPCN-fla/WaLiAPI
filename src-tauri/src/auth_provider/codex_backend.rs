@@ -241,6 +241,7 @@ impl Provider for CodexProvider {
                 unavailable: false,
                 next_retry_after: None,
                 last_error: None,
+                protocol: None,
             })
             .collect();
         Ok(models)
@@ -1064,6 +1065,7 @@ mod tests {
                 unavailable: false,
                 next_retry_after: None,
                 last_error: None,
+                protocol: None,
             }],
         };
         repository

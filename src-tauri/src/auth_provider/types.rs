@@ -14,6 +14,7 @@ use crate::{
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ProviderKind {
     Codex,
+    Kimi,
     Other(String),
 }
 
@@ -21,6 +22,7 @@ impl ProviderKind {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Codex => "codex",
+            Self::Kimi => "kimi",
             Self::Other(value) => value,
         }
     }
@@ -30,6 +32,7 @@ impl From<&str> for ProviderKind {
     fn from(value: &str) -> Self {
         match value {
             "codex" => Self::Codex,
+            "kimi" => Self::Kimi,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -298,3 +301,39 @@ impl fmt::Debug for ProviderError {
 impl std::error::Error for ProviderError {}
 
 pub type ProviderModels = Vec<ModelState>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_kind_codex_round_trip() {
+        let kind = ProviderKind::Codex;
+        assert_eq!(kind.as_str(), "codex");
+        assert_eq!(ProviderKind::from("codex"), ProviderKind::Codex);
+        assert_eq!(kind.to_string(), "codex");
+    }
+
+    #[test]
+    fn provider_kind_kimi_round_trip() {
+        let kind = ProviderKind::Kimi;
+        assert_eq!(kind.as_str(), "kimi");
+        assert_eq!(ProviderKind::from("kimi"), ProviderKind::Kimi);
+        assert_eq!(kind.to_string(), "kimi");
+    }
+
+    #[test]
+    fn provider_kind_unknown_goes_to_other() {
+        let kind = ProviderKind::from("unknown-provider");
+        assert_eq!(kind, ProviderKind::Other("unknown-provider".to_owned()));
+        assert_eq!(kind.as_str(), "unknown-provider");
+        assert_eq!(kind.to_string(), "unknown-provider");
+    }
+
+    #[test]
+    fn provider_kind_other_is_not_a_known_spec() {
+        // The registry decides availability; spec lookup must be conservative.
+        assert!(crate::auth_provider::spec::provider_spec(&ProviderKind::Other("nope".into()))
+            .is_none());
+    }
+}

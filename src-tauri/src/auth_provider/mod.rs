@@ -5,6 +5,7 @@ pub mod codex_backend;
 pub mod codex_login;
 pub mod maintenance;
 pub mod service;
+pub mod spec;
 pub mod types;
 
 use std::{collections::HashMap, sync::Arc};
@@ -16,6 +17,7 @@ pub use types::{
     AuthAccountSummary, LoginResult, ProviderError, ProviderKind, ProviderModels, ProviderPayload,
     ProviderRequest, RefreshedPayload,
 };
+pub use spec::{AuthLoginMode, AuthNonStreamFraming, ProviderSpec};
 
 /// Minimal host capability needed by an interactive provider login.  Specific
 /// providers may add their own local callback handling without coupling that

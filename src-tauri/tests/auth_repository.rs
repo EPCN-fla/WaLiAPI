@@ -98,6 +98,7 @@ async fn auth_repository_model_failure_preserves_snapshot_and_expired_quota_rout
             unavailable: false,
             next_retry_after: None,
             last_error: None,
+            protocol: None,
         }],
     };
     repo.update_models_if_success(&account.id, &snapshot, "2026-08-09T01:00:00.000Z")

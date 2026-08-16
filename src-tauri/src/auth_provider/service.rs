@@ -737,6 +737,7 @@ mod tests {
                 unavailable: false,
                 next_retry_after: None,
                 last_error: None,
+                protocol: None,
             }],
         };
         let old_sync = "2026-08-08T00:00:00Z";
@@ -848,6 +849,7 @@ mod tests {
                         unavailable: false,
                         next_retry_after: None,
                         last_error: None,
+                        protocol: None,
                     }],
                 },
                 "2026-08-09T00:00:00Z",

@@ -536,6 +536,7 @@ mod auth_account {
                     unavailable: false,
                     next_retry_after: None,
                     last_error: None,
+                    protocol: None,
                 }],
             },
             &now(),
