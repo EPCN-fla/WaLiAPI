@@ -1842,6 +1842,9 @@ struct KimiMock {
     chat_headers: Arc<Mutex<Vec<axum::http::HeaderMap>>>,
     messages_headers: Arc<Mutex<Vec<axum::http::HeaderMap>>>,
     fail_401: Arc<AtomicBool>,
+    /// Fail exactly one /coding/v1/chat/completions request with 401 then go
+    /// back to success, so a test can exercise a real single refresh-replay.
+    fail_chat_once: Arc<AtomicBool>,
 }
 
 impl Default for KimiMock {
@@ -1854,6 +1857,7 @@ impl Default for KimiMock {
             chat_headers: Arc::new(Mutex::new(Vec::new())),
             messages_headers: Arc::new(Mutex::new(Vec::new())),
             fail_401: Arc::new(AtomicBool::new(false)),
+            fail_chat_once: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1889,6 +1893,12 @@ async fn kimi_mock() -> (
                     s.chat_hits.fetch_add(1, Ordering::SeqCst);
                     s.chat_bodies.lock().unwrap().push(serde_json::from_slice(&b).unwrap_or(Value::Null));
                     s.chat_headers.lock().unwrap().push(h.clone());
+                    if s.fail_chat_once.load(Ordering::SeqCst) {
+                        // Consume the one-shot 401 flag; the _next_ request
+                        // replays into the success branch.
+                        s.fail_chat_once.store(false, Ordering::SeqCst);
+                        return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+                    }
                     if s.fail_401.load(Ordering::SeqCst) {
                         return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
                     }
@@ -2121,11 +2131,12 @@ async fn kimi_anthropic_non_stream_keeps_fixed_betas_and_decodes_messages() {
 async fn kimi_chat_401_triggers_single_refresh_replay() {
     let (service, state, repo, account) = kimi_mock().await;
     state.fail_401.store(true, Ordering::SeqCst);
-    // Give the account a refresh token so the 401 path refreshes (mock refresh
-    // is a no-op via the provider default) and replays once.
+    // Give the account a refresh token so the 401 path refreshes via the mock
+    // /oauth/token and replays once.  `fail_401` stays on, so the replay also
+    // returns 401 → ChannelAuthTerminal.
     repo.update_tokens(
         &account.id,
-        &json!({"access_token":"tok","device_id":"d","expires_at":"2099-01-01T00:00:00Z"}),
+        &json!({"access_token":"tok","refresh_token":"rot","device_id":"d","expires_at":"2099-01-01T00:00:00Z"}),
         None,
         None,
         None,
@@ -2149,10 +2160,52 @@ async fn kimi_chat_401_triggers_single_refresh_replay() {
         &[],
     )
     .await;
-    // 401 on replay → ChannelAuthTerminal (502 downstream).
+    // 401 on replay → ChannelAuthTerminal (502 downstream).  Two upstream hits:
+    // the original and the single refresh replay.
     let AttemptResult::Failure(failure) = result else {
         panic!("expected auth-terminal failure, got {result:?}");
     };
     assert_eq!(failure.failure_class, FailureClass::ChannelAuthTerminal);
-    assert_eq!(state.chat_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(state.chat_hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn kimi_chat_401_refreshes_and_replays_once_successfully() {
+    let (service, state, repo, account) = kimi_mock().await;
+    // Full credential so the lazy/force refresh can rotate via the mock
+    // /oauth/token.  The one-shot 401 flag makes only the first chat request
+    // fail; the replay goes through and returns 200.
+    repo.update_tokens(
+        &account.id,
+        &json!({"access_token":"tok","refresh_token":"rot","device_id":"d","expires_at":"2099-01-01T00:00:00Z"}),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    state.fail_chat_once.store(true, Ordering::SeqCst);
+    let body = json!({"model":"kimi-k2.5","messages":[{"role":"user","content":"hi"}]});
+    let attempt = kimi_attempt(
+        &account.id,
+        EndpointKind::ChatCompletions,
+        body,
+        "openai",
+        "chat_completions",
+        crate::core::route_plan::AuthNonStreamFraming::Json,
+        "kimi-k2.5",
+    );
+    let result = crate::endpoint_executor::dispatch_auth_account_executor(
+        EndpointKind::ChatCompletions,
+        &attempt,
+        &service,
+        &[],
+    )
+    .await;
+    // One 401, then a successful replay → Success, exactly two upstream hits.
+    let AttemptResult::Success(success) = result else {
+        panic!("expected success after one refresh replay, got {result:?}");
+    };
+    assert_eq!(success.status, 200);
+    assert_eq!(state.chat_hits.load(Ordering::SeqCst), 2);
 }

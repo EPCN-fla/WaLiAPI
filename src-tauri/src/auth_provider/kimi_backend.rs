@@ -338,6 +338,7 @@ mod tests {
 
     use axum::{
         extract::State,
+        response::IntoResponse,
         routing::{get, post},
         Json, Router,
     };
@@ -356,6 +357,12 @@ mod tests {
         chat_headers: Arc<Mutex<Vec<HeaderMap>>>,
         messages_headers: Arc<Mutex<Vec<HeaderMap>>>,
         bodies: Arc<Mutex<Vec<Value>>>,
+        /// Request URIs the provider actually hit, so a test can pin the fixed
+        /// URL/beta-query transport contract.
+        uris: Arc<Mutex<Vec<axum::http::Uri>>>,
+        /// Overrides for the `/v1/models` route: status code and JSON body.
+        models_status: Arc<AtomicUsize>,
+        models_response: Arc<Mutex<Value>>,
     }
 
     fn account() -> AuthAccount {
@@ -415,10 +422,11 @@ mod tests {
             .route(
                 "/coding/v1/chat/completions",
                 post(
-                    move |State(s): State<MockState>, h: HeaderMap, body: axum::body::Bytes| {
+                    move |State(s): State<MockState>, uri: axum::extract::OriginalUri, h: HeaderMap, body: axum::body::Bytes| {
                         let s = s.clone();
                         async move {
                             s.chat_hits.fetch_add(1, Ordering::SeqCst);
+                            s.uris.lock().unwrap().push(uri.0.clone());
                             s.chat_headers.lock().unwrap().push(h.clone());
                             s.bodies
                                 .lock()
@@ -432,10 +440,11 @@ mod tests {
             .route(
                 "/coding/v1/messages",
                 post(
-                    move |State(s): State<MockState>, h: HeaderMap, body: axum::body::Bytes| {
+                    move |State(s): State<MockState>, uri: axum::extract::OriginalUri, h: HeaderMap, body: axum::body::Bytes| {
                         let s = s.clone();
                         async move {
                             s.messages_hits.fetch_add(1, Ordering::SeqCst);
+                            s.uris.lock().unwrap().push(uri.0.clone());
                             s.messages_headers.lock().unwrap().push(h.clone());
                             s.bodies
                                 .lock()
@@ -446,7 +455,29 @@ mod tests {
                     },
                 ),
             )
-            .route("/coding/v1/models", get(|| async { "models" }))
+            .route(
+                "/coding/v1/models",
+                get(
+                    move |State(s): State<MockState>, h: HeaderMap| async move {
+                        s.chat_headers.lock().unwrap().push(h.clone());
+                        s.uris.lock().unwrap().push(
+                            axum::http::Uri::from_static("/coding/v1/models"),
+                        );
+                        let status = s
+                            .models_status
+                            .load(std::sync::atomic::Ordering::SeqCst);
+                        if status != 0 {
+                            return (
+                                axum::http::StatusCode::from_u16(status as u16).unwrap(),
+                                Json(json!({"error": "upstream"})),
+                            )
+                                .into_response();
+                        }
+                        let body = s.models_response.lock().unwrap().clone();
+                        (axum::http::StatusCode::OK, Json(body)).into_response()
+                    },
+                ),
+            )
             .route(
                 "/oauth/device",
                 post(move |_: axum::extract::State<MockState>| async {
@@ -541,6 +572,90 @@ mod tests {
         );
         assert_eq!(state.chat_hits.load(Ordering::SeqCst), 1);
         assert_eq!(state.messages_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn chat_hit_uses_plain_chat_completions_path_with_no_beta_query() {
+        let (provider, state) = mock_provider().await;
+        let body = json!({"model":"kimi-k2.5","messages":[{"role":"user","content":"hi"}]});
+        provider
+            .outbound(req(
+                &account(),
+                &payload(),
+                &body,
+                "openai",
+                "chat_completions",
+                false,
+                &HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        let uri = &state.uris.lock().unwrap()[0];
+        assert_eq!(uri.path(), "/coding/v1/chat/completions");
+        assert_eq!(uri.query(), None);
+    }
+
+    #[tokio::test]
+    async fn messages_beta_hit_forces_fixed_beta_query() {
+        let (provider, state) = mock_provider().await;
+        let body = json!({"model":"kimi-k2.5","messages":[]});
+        provider
+            .outbound(req(
+                &account(),
+                &payload(),
+                &body,
+                "anthropic",
+                "messages_beta",
+                true,
+                &HeaderMap::new(),
+            ))
+            .await
+            .unwrap();
+        let uri = &state.uris.lock().unwrap()[0];
+        assert_eq!(uri.path(), "/coding/v1/messages");
+        assert_eq!(uri.query(), Some(BETA_QUERY));
+    }
+
+    #[tokio::test]
+    async fn list_models_fetches_url_with_bearer_and_normalizes() {
+        let (provider, state) = mock_provider().await;
+        *state.models_response.lock().unwrap() = json!({
+            "data": [
+                {"id": "kimi-k2.5", "protocol": "kimi"},
+                {"id": "kimi-k2.5-anthropic", "protocol": "anthropic"},
+                {"id": "weird", "protocol": "nope"}
+            ]
+        });
+        let models = provider
+            .list_models(&account(), &payload())
+            .await
+            .unwrap();
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["kimi-k2.5", "kimi-k2.5-anthropic", "weird"]);
+        // The weird protocol is fail-closed as unavailable, never routed.
+        assert!(!models.iter().any(|m| m.id == "weird" && !m.unavailable));
+        // URL is the fixed /v1/models path with the Bearer token and device header.
+        let uri = &state.uris.lock().unwrap()[0];
+        assert_eq!(uri.path(), "/coding/v1/models");
+        let h = &state.chat_headers.lock().unwrap()[0];
+        assert_eq!(
+            h.get(reqwest::header::AUTHORIZATION).unwrap().to_str().unwrap(),
+            "Bearer tok"
+        );
+        assert_eq!(
+            h.get("x-msh-device-id").unwrap().to_str().unwrap(),
+            DEVICE_ID
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_401_maps_to_unauthorized() {
+        let (provider, state) = mock_provider().await;
+        state
+            .models_status
+            .store(401, std::sync::atomic::Ordering::SeqCst);
+        let result = provider.list_models(&account(), &payload()).await;
+        assert!(matches!(result, Err(crate::auth_provider::ProviderError::Unauthorized)));
     }
 
     #[tokio::test]

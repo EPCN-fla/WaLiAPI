@@ -118,6 +118,9 @@ mod tests {
             let token = Self::token(payload);
             Self::count(&self.refreshes, token.clone());
             self.operations.fetch_add(1, Ordering::SeqCst);
+            if token == "unauthorized" {
+                return Err(ProviderError::Unauthorized);
+            }
             if token == "fails" {
                 return Err(ProviderError::Retryable);
             }
@@ -401,14 +404,14 @@ mod tests {
     #[tokio::test]
     async fn kimi_refresh_unauthorized_keeps_account_invalid() {
         let repository = repository().await;
-        // "kimi-fails" is both the account name AND the refresh token, which
-        // the fake maps to a Retryable failure.  A real Kimi Unauthorized is
-        // classified by the provider; here we verify the maintenance loop
-        // keeps the account invalid and schedules a retry.
+        // "unauthorized" is the refresh token the fake maps to a Kimi
+        // `ProviderError::Unauthorized` (real Kimi 401/403/invalid_grant →
+        // Unauthorized classification).  The maintenance loop must keep the
+        // account invalid and schedule a retry.
         let id = add_account_for(
             &repository,
             "kimi",
-            "fails",
+            "unauthorized",
             "2026-08-09T03:00:00Z",
             "invalid",
             Some("2026-08-08T00:00:00Z"),

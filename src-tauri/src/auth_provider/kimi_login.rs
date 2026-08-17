@@ -215,9 +215,11 @@ impl KimiLogin {
             let mut current_interval = interval;
 
             // UI surface FIRST, so a browser failure still shows URL + code.
+            // `expires_at` reflects the server's `expires_in` so the UI can
+            // show a real countdown instead of an already-expired timestamp.
             let expires_at = device
                 .expires_in
-                .map(|_| (Utc::now() + ChronoDuration::seconds(0)).to_rfc3339());
+                .map(|seconds| (Utc::now() + ChronoDuration::seconds(seconds as i64)).to_rfc3339());
             runtime
                 .present_device_authorization(&verification_url, &device.user_code, expires_at)
                 .await?;
@@ -568,6 +570,12 @@ mod tests {
         headers: Arc<Mutex<Vec<HeaderMap>>>,
         device_hits: Arc<AtomicUsize>,
         token_hits: Arc<AtomicUsize>,
+        /// Monotonic timestamps of every token poll, so a test can assert the
+        /// RFC 8628 slow_down +5s interval bump is actually honored.
+        token_times: Arc<Mutex<Vec<std::time::Instant>>>,
+        /// When set, every token poll returns `authorization_pending` — the
+        /// device never authorizes.  Used to drive timeout/cancel tests.
+        always_pending: Arc<std::sync::atomic::AtomicBool>,
         /// Token responses served in order; the last one is repeated.
         queue: Arc<Mutex<VecDeque<(u16, Value)>>>,
         device_codes: Arc<Mutex<VecDeque<String>>>,
@@ -608,12 +616,19 @@ mod tests {
         body: axum::body::Bytes,
     ) -> (axum::http::StatusCode, Json<Value>) {
         state.token_hits.fetch_add(1, Ordering::SeqCst);
+        state.token_times.lock().unwrap().push(std::time::Instant::now());
         state.headers.lock().unwrap().push(headers.clone());
         state
             .seen
             .lock()
             .unwrap()
             .push(String::from_utf8_lossy(&body).to_string());
+        if state.always_pending.load(std::sync::atomic::Ordering::SeqCst) {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": "authorization_pending"})),
+            );
+        }
         let mut queue = state.queue.lock().unwrap();
         if queue.is_empty() {
             // Default final success.
@@ -655,6 +670,7 @@ mod tests {
     struct TestRuntime {
         steps: Arc<Mutex<Vec<String>>>,
         shown: Arc<Mutex<Vec<(String, String)>>>,
+        expires: Arc<Mutex<Vec<Option<String>>>>,
         cancel: Arc<watch::Sender<bool>>,
         // Kept alive so `send(true)` actually updates the value even with no
         // other observer; dropping the only receiver makes watch::send a no-op.
@@ -666,6 +682,7 @@ mod tests {
             Self {
                 steps: Arc::new(Mutex::new(Vec::new())),
                 shown: Arc::new(Mutex::new(Vec::new())),
+                expires: Arc::new(Mutex::new(Vec::new())),
                 cancel: Arc::new(tx),
                 _rx: Arc::new(rx),
             }
@@ -688,12 +705,13 @@ mod tests {
             &self,
             url: &str,
             user_code: &str,
-            _expires_at: Option<String>,
+            expires_at: Option<String>,
         ) -> Result<(), ProviderError> {
             self.shown
                 .lock()
                 .unwrap()
                 .push((url.to_owned(), user_code.to_owned()));
+            self.expires.lock().unwrap().push(expires_at);
             Ok(())
         }
         fn is_cancelled(&self) -> bool {
@@ -792,6 +810,83 @@ mod tests {
         assert_eq!(result.account_id, DEVICE_ID);
         // slow_down bumps interval so poll #2 uses interval+5.
         assert_eq!(state.token_hits.load(Ordering::SeqCst), 2);
+        // The mock device interval is 1s; slow_down must add 5s, so the gap
+        // between the two token polls is ~6s (5..=7 to absorb clock jitter).
+        let times = state.token_times.lock().unwrap();
+        assert_eq!(times.len(), 2);
+        let gap = times[1].saturating_duration_since(times[0]).as_secs();
+        assert!(
+            (5..=7).contains(&gap),
+            "slow_down interval bump not honored: token poll gap was {gap}s"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_hits_deadline_after_pending() {
+        let (login, state) = mock(true).await;
+        // The device never authorizes and every poll is pending; a zero poll
+        // interval plus a very short deadline means the poll loop exits via the
+        // deadline.
+        state
+            .always_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut interval = 0;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+        let result = login
+            .poll_device_token(&TestRuntime::default(), "code", &mut interval, deadline)
+            .await;
+        assert!(
+            matches!(result, Err(TokenPollError::Timeout)),
+            "expected Timeout, got a different poll outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_during_polling_exits_promptly() {
+        let (login, state) = mock(true).await;
+        // First poll returns pending; then a cancellation arrives while the
+        // poll sleep is pending, which must interrupt the sleep (not wait for
+        // the full interval).
+        state
+            .queue
+            .lock()
+            .unwrap()
+            .push_back((400, json!({"error": "authorization_pending"})));
+        let runtime = TestRuntime::default();
+        let handle = tokio::spawn({
+            let login = login.clone();
+            let runtime = runtime.clone();
+            async move { login.login(&runtime, DEVICE_ID).await }
+        });
+        // Give the login time to reach the first pending poll and start sleeping.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        runtime.cancel();
+        let result = handle.await.unwrap().unwrap_err();
+        assert_eq!(result, ProviderError::LoginCancelled);
+    }
+
+    #[tokio::test]
+    async fn device_authorization_ui_surfaces_real_expiry_not_deadline() {
+        let (login, _state) = mock(true).await;
+        let runtime = TestRuntime::default();
+        login.login(&runtime, DEVICE_ID).await.unwrap();
+        // The mock `/device` responds `expires_in: 1800`.  The UI must receive an
+        // `expires_at` roughly `now + 1800s`, not `now` (the historic bug where
+        // `expires_in` was only used as a presence check).
+        let expires = runtime.expires.lock().unwrap();
+        let Some(Some(expires_at)) = expires.last().cloned() else {
+            panic!("present_device_authorization was never called with an expires_at");
+        };
+        let parsed = chrono::DateTime::parse_from_rfc3339(&expires_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        let window = (chrono::Utc::now() - parsed).num_seconds().unsigned_abs();
+        // 1800s expected; the bug produced ~0s.  Allow ±60s of clock skew.
+        assert!(
+            (1750..=1850).contains(&window),
+            "expires_at was {window}s from now (expected ~1800s)"
+        );
     }
 
     #[tokio::test]

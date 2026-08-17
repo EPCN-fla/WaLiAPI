@@ -1407,14 +1407,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_then_refresh_keeps_new_login_credentials() {
+    async fn replacement_then_forced_refresh_uses_new_refresh_token_not_stale() {
+        // Provider that can BOTH log in with fresh credentials AND refresh,
+        // echoing back which refresh token it was handed so a replacement can
+        // be distinguished from a stale database credential.
+        #[derive(Clone)]
+        struct LoginAndRefresh {
+            login_account_id: String,
+            login_payload: serde_json::Value,
+            refresh_saw: std::sync::Arc<Mutex<Option<String>>>,
+            refreshed_access: String,
+        }
+        #[async_trait]
+        impl Provider for LoginAndRefresh {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Codex
+            }
+            async fn login(
+                &self,
+                _: &ProviderLoginContext,
+                _: &dyn LoginRuntime,
+            ) -> Result<LoginResult, ProviderError> {
+                Ok(LoginResult {
+                    account_id: self.login_account_id.clone(),
+                    label: "Codex".into(),
+                    attributes: json!({}),
+                    payload: ProviderPayload::new(self.login_payload.clone()),
+                    last_refreshed_at: Some("2026-08-09T03:00:00Z".into()),
+                    next_refresh_after: None,
+                    next_retry_after: None,
+                })
+            }
+            async fn import(&self, _: &[u8]) -> Result<LoginResult, ProviderError> {
+                Err(ProviderError::ImportFailed)
+            }
+            async fn refresh(&self, payload: &ProviderPayload) -> Result<RefreshedPayload, ProviderError> {
+                let token = payload
+                    .as_value()
+                    .get("refresh_token")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                *self.refresh_saw.lock().unwrap() = Some(token.clone());
+                Ok(RefreshedPayload {
+                    payload: ProviderPayload::new(json!({
+                        "access_token": self.refreshed_access,
+                        "refresh_token": token,
+                        "expires_at": "2099-01-01T00:00:00Z"
+                    })),
+                    last_refreshed_at: Some("2026-08-09T03:01:00Z".into()),
+                    next_refresh_after: None,
+                    next_retry_after: None,
+                })
+            }
+            async fn outbound(
+                &self,
+                _: ProviderRequest<'_>,
+            ) -> Result<reqwest::Response, ProviderError> {
+                Err(ProviderError::Retryable)
+            }
+            async fn list_models(
+                &self,
+                _: &AuthAccount,
+                _: &ProviderPayload,
+            ) -> Result<ProviderModels, ProviderError> {
+                Ok(vec![])
+            }
+        }
+        let saw = std::sync::Arc::new(Mutex::new(None));
         let repository = repository().await;
         let account = account(&repository).await;
-        let provider = Arc::new(LoginProvider {
-            kind: ProviderKind::Codex,
+        let provider = Arc::new(LoginAndRefresh {
             login_account_id: account.account_id.clone(),
-            login_payload: fresh_login_payload(),
-            login_operations: AtomicUsize::new(0),
+            login_payload: fresh_login_payload(), // refresh_token "fresh-login-refresh"
+            refresh_saw: saw.clone(),
+            refreshed_access: "post-refresh-access".into(),
         });
         let mut registry = ProviderRegistry::new();
         registry.register(provider.clone());
@@ -1433,18 +1500,19 @@ mod tests {
             .unwrap();
         service.persist_authenticated(authenticated).await.unwrap();
 
-        // A due refresh afterwards must rotate the NEW refresh token, never
-        // reintroduce the old access token.  `refresh_account` returns early
-        // because the new payload still has ~1h until expiry (clock pinned).
-        service
-            .refresh_account_if_due(&account.id, "2026-08-09T00:10:00Z".parse().unwrap())
-            .await
-            .unwrap();
-
+        // A forced refresh afterwards must hand the provider the NEW refresh
+        // token (fresh-login-refresh), not something stale, and the resulting
+        // access token must be the refreshed one.
+        service.force_refresh_account(&account.id).await.unwrap();
+        assert_eq!(
+            saw.lock().unwrap().as_deref(),
+            Some("fresh-login-refresh"),
+            "refresh must use the replacement's refresh token"
+        );
         let stored = repository.get_auth_account(&account.id).await.unwrap();
         assert!(
-            stored.payload_json.contains("fresh-login-access"),
-            "stale refresh must not overwrite replacement credentials"
+            stored.payload_json.contains("post-refresh-access"),
+            "forced refresh result was not persisted"
         );
     }
 

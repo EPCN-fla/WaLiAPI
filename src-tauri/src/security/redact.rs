@@ -264,16 +264,20 @@ mod tests {
     }
 
     #[test]
-    fn verification_url_is_redacted_as_url_field_not_secret() {
-        // verification_uri_complete is not a "secret" key, but the value
-        // contains no credential and must not be treated as secret; it is a
-        // non-secret routing URL and stays readable so support can see it.
+    fn verification_url_survives_log_redaction_as_url_not_secret() {
+        // `verification_uri_complete` is a non-secret routing URL surfaced to the
+        // UI; redaction must not mangle it, so support logs keep a usable
+        // reference.  Kimi secrecy for this URL is NOT enforced here — the
+        // login-session layer never persists it and the command DTO drops it on
+        // terminal states (kimi-auth.md §14).  This test pins only the redactor
+        // contract: an URL field passes through intact, and the embedded
+        // `user_code` is not stripped as a side effect.
         let value = json!({"verification_uri_complete": "https://auth.kimi.com/verify?user_code=ABCD-EFGH"});
         let redacted = redact_json_for_logging(&value);
-        // The URL itself survives (it is not a secret key); the user_code
-        // inside the query would be caught by pattern redaction only if it
-        // looks like a credential — treat as acceptable here.
         assert!(redacted["verification_uri_complete"].as_str().is_some());
+        // user_code as its own field is a secret and must be masked.
+        let secret = redact_json_for_logging(&json!({"user_code": "ABCD-EFGH"}));
+        assert_ne!(secret["user_code"].as_str().unwrap(), "ABCD-EFGH");
     }
 
     #[test]

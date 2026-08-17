@@ -576,6 +576,18 @@ pub async fn auth_accounts_list(
         .collect()
 }
 
+/// Pure guard: device-code providers cannot use the synchronous `auth_login`
+/// (no loopback callback).  Returns the stable error so `auth_login` refuses
+/// before any network call and the session API is used instead.
+fn refuse_device_code_login(kind: &ProviderKind) -> Result<(), String> {
+    if crate::auth_provider::spec::provider_spec(kind)
+        .is_some_and(|spec| spec.login_mode == crate::auth_provider::AuthLoginMode::DeviceCode)
+    {
+        return Err("interactive_session_required".to_owned());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn auth_login(
     provider: String,
@@ -583,15 +595,7 @@ pub async fn auth_login(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<AuthMutationResult, String> {
     let kind = provider_kind(Some(provider))?;
-    // Device-code providers have no loopback callback for the synchronous
-    // command.  Refuse before any network request so `login("kimi")` can never
-    // block here waiting for a device authorization; the session API must be
-    // used instead.
-    if crate::auth_provider::spec::provider_spec(&kind)
-        .is_some_and(|spec| spec.login_mode == crate::auth_provider::AuthLoginMode::DeviceCode)
-    {
-        return Err("interactive_session_required".to_owned());
-    }
+    refuse_device_code_login(&kind)?;
     let runtime = TauriLoginRuntime::new(app);
     let summary = state
         .auth_service
@@ -1099,19 +1103,20 @@ mod tests {
         assert!(sessions.status(&id3).await.unwrap().verification.is_none());
     }
 
-    #[tokio::test]
-    async fn legacy_auth_login_kimi_refuses_before_network_interactive_session_required() {
-        // `provider_kind("kimi")` resolves; the DeviceCode guard in `auth_login`
-        // must return interactive_session_required without any provider call.
+    #[test]
+    fn legacy_auth_login_kimi_refuses_before_network_interactive_session_required() {
+        // `provider_kind("kimi")` resolves and the DeviceCode guard in
+        // `auth_login` returns the stable error before any provider call.
+        let kind = provider_kind(Some("kimi".into())).unwrap();
+        assert_eq!(kind, ProviderKind::Kimi);
         assert_eq!(
-            provider_kind(Some("kimi".into())).unwrap(),
-            ProviderKind::Kimi
+            refuse_device_code_login(&kind),
+            Err("interactive_session_required".to_owned())
         );
-        let kind = ProviderKind::Kimi;
-        let spec = crate::auth_provider::spec::provider_spec(&kind).unwrap();
+        // The same guard lets the loopback provider through.
         assert_eq!(
-            spec.login_mode,
-            crate::auth_provider::AuthLoginMode::DeviceCode
+            refuse_device_code_login(&ProviderKind::Codex),
+            Ok(())
         );
     }
 
