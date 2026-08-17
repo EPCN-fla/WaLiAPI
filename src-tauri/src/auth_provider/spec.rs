@@ -125,7 +125,10 @@ mod tests {
 
     #[test]
     fn provider_spec_by_name_resolves_both_providers() {
-        assert_eq!(provider_spec_by_name("codex").map(|s| s.kind), Some("codex"));
+        assert_eq!(
+            provider_spec_by_name("codex").map(|s| s.kind),
+            Some("codex")
+        );
         assert_eq!(provider_spec_by_name("kimi").map(|s| s.kind), Some("kimi"));
         assert!(provider_spec_by_name("codEx").is_none());
     }

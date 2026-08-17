@@ -543,7 +543,10 @@ mod tests {
             protocol: None,
         };
         let json = serde_json::to_string(&bare).unwrap();
-        assert!(!json.contains("protocol"), "None protocol must not serialize");
+        assert!(
+            !json.contains("protocol"),
+            "None protocol must not serialize"
+        );
     }
 
     #[test]

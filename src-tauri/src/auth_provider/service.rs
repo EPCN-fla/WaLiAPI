@@ -67,9 +67,7 @@ impl AuthService {
         kind: ProviderKind,
         runtime: &dyn LoginRuntime,
     ) -> Result<AuthAccountSummary, ProviderError> {
-        let authenticated = self
-            .authenticate(kind, LoginTarget::New, runtime)
-            .await?;
+        let authenticated = self.authenticate(kind, LoginTarget::New, runtime).await?;
         self.persist_authenticated(authenticated).await
     }
 
@@ -587,7 +585,7 @@ mod tests {
 
     use super::*;
     use crate::auth_provider::{
-        LoginResult, LoginStep, LoginTarget, Provider, ProviderModels, ProviderLoginContext,
+        LoginResult, LoginStep, LoginTarget, Provider, ProviderLoginContext, ProviderModels,
         RefreshedPayload,
     };
     use crate::db::models::QuotaState;
@@ -733,7 +731,10 @@ mod tests {
             _user_code: &str,
             _expires_at: Option<String>,
         ) -> Result<(), ProviderError> {
-            self.device_authorizations.lock().unwrap().push(url.to_owned());
+            self.device_authorizations
+                .lock()
+                .unwrap()
+                .push(url.to_owned());
             Ok(())
         }
         fn is_cancelled(&self) -> bool {
@@ -780,7 +781,10 @@ mod tests {
         async fn refresh(&self, _: &ProviderPayload) -> Result<RefreshedPayload, ProviderError> {
             Err(ProviderError::Retryable)
         }
-        async fn outbound(&self, _: ProviderRequest<'_>) -> Result<reqwest::Response, ProviderError> {
+        async fn outbound(
+            &self,
+            _: ProviderRequest<'_>,
+        ) -> Result<reqwest::Response, ProviderError> {
             Err(ProviderError::Retryable)
         }
         async fn list_models(
@@ -1228,7 +1232,11 @@ mod tests {
         let service = AuthService::new(repository.clone(), registry);
 
         let authenticated = service
-            .authenticate(ProviderKind::Codex, LoginTarget::New, &RecordingRuntime::default())
+            .authenticate(
+                ProviderKind::Codex,
+                LoginTarget::New,
+                &RecordingRuntime::default(),
+            )
             .await
             .unwrap();
         let summary = service.persist_authenticated(authenticated).await.unwrap();
@@ -1323,7 +1331,10 @@ mod tests {
             .unwrap();
         repository.delete_auth_account(&account.id).await.unwrap();
         assert_eq!(
-            service.persist_authenticated(authenticated).await.unwrap_err(),
+            service
+                .persist_authenticated(authenticated)
+                .await
+                .unwrap_err(),
             ProviderError::InvalidPayload
         );
     }
@@ -1354,7 +1365,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            service.persist_authenticated(authenticated).await.unwrap_err(),
+            service
+                .persist_authenticated(authenticated)
+                .await
+                .unwrap_err(),
             ProviderError::InvalidPayload
         );
         // Original credentials are untouched.
@@ -1393,10 +1407,7 @@ mod tests {
         // reintroduce the old access token.  `refresh_account` returns early
         // because the new payload still has ~1h until expiry (clock pinned).
         service
-            .refresh_account_if_due(
-                &account.id,
-                "2026-08-09T00:10:00Z".parse().unwrap(),
-            )
+            .refresh_account_if_due(&account.id, "2026-08-09T00:10:00Z".parse().unwrap())
             .await
             .unwrap();
 
@@ -1423,11 +1434,7 @@ mod tests {
 
         let runtime = RecordingRuntime::default();
         let _ = service
-            .authenticate(
-                ProviderKind::Codex,
-                LoginTarget::New,
-                &runtime,
-            )
+            .authenticate(ProviderKind::Codex, LoginTarget::New, &runtime)
             .await;
         // The provider drives steps; assert the runtime surface is usable.
         runtime.set_step(LoginStep::Preparing).await;
@@ -1477,7 +1484,10 @@ mod tests {
             async fn import(&self, _: &[u8]) -> Result<LoginResult, ProviderError> {
                 Err(ProviderError::ImportFailed)
             }
-            async fn refresh(&self, _: &ProviderPayload) -> Result<RefreshedPayload, ProviderError> {
+            async fn refresh(
+                &self,
+                _: &ProviderPayload,
+            ) -> Result<RefreshedPayload, ProviderError> {
                 Err(ProviderError::Retryable)
             }
             async fn outbound(
