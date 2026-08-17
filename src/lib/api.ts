@@ -13,6 +13,7 @@ import type {
   UpstreamModelsResult,
   AuthAccount, AuthLoginSessionStatus, AuthLoginStart, AuthMutationResult, AuthLogoutResult, AuthExportResult,
   AuthQuotaStatus, AuthUpdateInput,
+  AuthProviderInfo,
 } from "../types";
 
 /**
@@ -104,8 +105,18 @@ export const logApi = {
 // payloads remain inside the native command layer.
 export const authApi = {
   accountsList: () => invoke<AuthAccount[]>("auth_accounts_list"),
+  providersList: () => invoke<AuthProviderInfo[]>("auth_providers_list"),
+  /**
+   * @deprecated Synchronous login for Codex compatibility only.  Kimi (and any
+   * DeviceCode provider) must use `loginStart`; the backend refuses `login`
+   * for them before any network request.
+   */
   login: (provider: string) => invoke<AuthMutationResult>("auth_login", { provider }),
-  loginStart: (provider: string) => invoke<AuthLoginStart>("auth_login_start", { provider }),
+  loginStart: (provider: string, replaceAccountId?: string) =>
+    invoke<AuthLoginStart>("auth_login_start", {
+      provider,
+      replaceAccountId: replaceAccountId ?? null,
+    }),
   loginStatus: (sessionId: string) => invoke<AuthLoginSessionStatus>("auth_login_status", { sessionId }),
   loginCancel: (sessionId: string) => invoke<AuthLoginSessionStatus>("auth_login_cancel", { sessionId }),
   loginImport: (provider?: string, path?: string) =>
