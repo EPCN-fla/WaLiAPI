@@ -393,6 +393,45 @@ async fn write_non_stream_log(
 
     let is_retry = execution.attempts > 1;
     let last_failure = execution.last_failure.as_ref();
+
+    // Extract response_choices from the upstream response body for audit log display.
+    let response_choices = if execution.status >= 200 && execution.status < 300 {
+        // OpenAI Chat Completions: extract `choices` array
+        if let Some(choices) = execution.body.get("choices") {
+            serde_json::to_string(choices).ok()
+        }
+        // Anthropic Messages: synthesize a choices-like structure
+        else if execution.body.get("content").is_some() {
+            let msg = serde_json::json!({
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": execution.body.get("content"),
+                },
+                "finish_reason": execution.body.get("stop_reason").unwrap_or(&serde_json::Value::Null),
+            });
+            serde_json::to_string(&vec![msg]).ok()
+        }
+        // OpenAI Responses API: synthesize from `output`
+        else if let Some(output) = execution.body.get("output").and_then(|o| o.as_array()) {
+            let choices: Vec<serde_json::Value> = output.iter().map(|item| {
+                serde_json::json!({
+                    "index": item.get("index").unwrap_or(&serde_json::json!(0)),
+                    "message": {
+                        "role": "assistant",
+                        "content": item.get("content"),
+                    },
+                    "finish_reason": "stop",
+                })
+            }).collect();
+            serde_json::to_string(&choices).ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let log = RequestLog {
         id: utils::id::new_id(),
         seq: None,
@@ -413,7 +452,7 @@ async fn write_non_stream_log(
         is_retry: i64::from(is_retry),
         created_at: utils::time::now_iso(),
         request_body: Some(sanitized_log_body.to_string()),
-        response_choices: None,
+        response_choices,
         risk_level: audited.audit_result.risk_level.as_str().to_string(),
         risk_score: audited.audit_result.risk_score as i64,
         risk_summary: Some(audited.audit_result.summary.clone()),
@@ -1039,6 +1078,7 @@ impl StreamLogFinalizer {
         usage_prompt: i64,
         usage_completion: i64,
         usage_total: i64,
+        response_choices: Option<String>,
     ) {
         let duration_ms = self.started.elapsed().as_millis() as i64;
         let log = RequestLog {
@@ -1069,7 +1109,7 @@ impl StreamLogFinalizer {
             is_retry: i64::from(self.is_retry),
             created_at: utils::time::now_iso(),
             request_body: Some(self.sanitized_log_body.clone()),
-            response_choices: None,
+            response_choices,
             risk_level: self.audited.audit_result.risk_level.as_str().to_string(),
             risk_score: self.audited.audit_result.risk_score as i64,
             risk_summary: Some(self.audited.audit_result.summary.clone()),
@@ -1137,7 +1177,7 @@ impl Drop for StreamLogFinalizer {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             let f = self.clone();
             tokio::spawn(async move {
-                f.write(true, false, Some("client_cancelled"), 0, 0, 0)
+                f.write(true, false, Some("client_cancelled"), 0, 0, 0, None)
                     .await;
             });
         }
@@ -1290,8 +1330,13 @@ fn stream_response_body(
         // Mark the request completed so the Drop finalizer does NOT write a
         // duplicate client_cancelled row, then write the normal log inline.
         completed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let response_choices = if !had_error {
+            pump.build_response_choices()
+        } else {
+            None
+        };
         finalizer
-            .write(false, had_error, error_message.as_deref(), usage_prompt, usage_completion, usage_total)
+            .write(false, had_error, error_message.as_deref(), usage_prompt, usage_completion, usage_total, response_choices)
             .await;
     }
 }
