@@ -170,6 +170,7 @@ pub fn run() {
             commands::api_key::delete_api_key,
             commands::api_key::get_api_key_stats,
             commands::auth::auth_accounts_list,
+            commands::auth::auth_providers_list,
             commands::auth::auth_login,
             commands::auth::auth_login_start,
             commands::auth::auth_login_status,
