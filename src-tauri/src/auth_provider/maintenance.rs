@@ -53,11 +53,21 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct FakeProvider {
         refreshes: Mutex<HashMap<String, usize>>,
         models: Mutex<HashMap<String, usize>>,
         operations: AtomicUsize,
+        kind: ProviderKind,
+    }
+    impl Default for FakeProvider {
+        fn default() -> Self {
+            Self {
+                refreshes: Mutex::new(HashMap::new()),
+                models: Mutex::new(HashMap::new()),
+                operations: AtomicUsize::new(0),
+                kind: ProviderKind::Codex,
+            }
+        }
     }
 
     impl FakeProvider {
@@ -86,7 +96,7 @@ mod tests {
     #[async_trait]
     impl Provider for FakeProvider {
         fn kind(&self) -> ProviderKind {
-            ProviderKind::Codex
+            self.kind.clone()
         }
 
         async fn login(
@@ -158,8 +168,9 @@ mod tests {
         Arc::new(Repository::new(pool))
     }
 
-    async fn add_account(
+    async fn add_account_for(
         repository: &Repository,
+        provider: &str,
         name: &str,
         expires_at: &str,
         status: &str,
@@ -167,7 +178,7 @@ mod tests {
     ) -> String {
         let account = repository
             .upsert_by_provider_account_id(&AuthAccountUpsert {
-                provider: "codex".into(),
+                provider: provider.into(),
                 label: name.into(),
                 account_id: name.into(),
                 attributes: json!({}),
@@ -211,9 +222,18 @@ mod tests {
     #[tokio::test]
     async fn startup_scan_and_each_twelve_hour_tick_only_process_due_accounts() {
         let repository = repository().await;
-        add_account(&repository, "due", "2026-08-09T00:01:00Z", "active", None).await;
-        add_account(
+        add_account_for(
             &repository,
+            "codex",
+            "due",
+            "2026-08-09T00:01:00Z",
+            "active",
+            None,
+        )
+        .await;
+        add_account_for(
+            &repository,
+            "codex",
             "not-due",
             "2026-08-09T02:00:00Z",
             "active",
@@ -259,32 +279,36 @@ mod tests {
     #[tokio::test]
     async fn invalid_recovery_and_failure_are_isolated_per_account() {
         let repository = repository().await;
-        let recovered = add_account(
+        let recovered = add_account_for(
             &repository,
+            "codex",
             "recover",
             "2026-08-09T03:00:00Z",
             "invalid",
             None,
         )
         .await;
-        let failed = add_account(
+        let failed = add_account_for(
             &repository,
+            "codex",
             "fails",
             "2026-08-09T03:00:00Z",
             "invalid",
             None,
         )
         .await;
-        add_account(
+        add_account_for(
             &repository,
+            "codex",
             "models-fail",
             "2026-08-09T00:01:00Z",
             "active",
             None,
         )
         .await;
-        add_account(
+        add_account_for(
             &repository,
+            "codex",
             "active",
             "2026-08-09T00:01:00Z",
             "active",
@@ -315,5 +339,91 @@ mod tests {
         assert_eq!(provider.refreshes_for("active"), 1);
         assert_eq!(provider.models_for("active"), 1);
         assert_eq!(provider.models_for("models-fail"), 1);
+    }
+
+    // --- C9: Kimi accounts join the same provider-neutral maintenance cycle ---
+
+    #[tokio::test]
+    async fn kimi_active_account_joins_model_sync_maintenance() {
+        let repository = repository().await;
+        let id = add_account_for(
+            &repository,
+            "kimi",
+            "kimi-due",
+            "2026-08-09T00:01:00Z",
+            "active",
+            None,
+        )
+        .await;
+        let mut provider = FakeProvider::default();
+        provider.kind = ProviderKind::Kimi;
+        let provider = Arc::new(provider);
+        let service = service(repository.clone(), provider.clone());
+
+        // One maintenance pass: the due Kimi account refreshes then lists models.
+        crate::auth_provider::maintenance::run_maintenance_once(&service).await;
+
+        assert_eq!(provider.refreshes_for("kimi-due"), 1);
+        assert_eq!(provider.models_for("kimi-due"), 1);
+        let stored = repository.get_auth_account(&id).await.unwrap();
+        assert_eq!(stored.provider, "kimi");
+        assert_eq!(stored.status, "active");
+    }
+
+    #[tokio::test]
+    async fn kimi_invalid_account_with_due_refresh_recovers() {
+        let repository = repository().await;
+        let id = add_account_for(
+            &repository,
+            "kimi",
+            "kimi-recover",
+            "2026-08-09T03:00:00Z",
+            "invalid",
+            Some("2026-08-08T00:00:00Z"),
+        )
+        .await;
+        let mut provider = FakeProvider::default();
+        provider.kind = ProviderKind::Kimi;
+        let provider = Arc::new(provider);
+        let service = service(repository.clone(), provider.clone());
+
+        crate::auth_provider::maintenance::run_maintenance_once(&service).await;
+
+        let stored = repository.get_auth_account(&id).await.unwrap();
+        assert_eq!(stored.status, "active");
+        // force refresh (recovery) + lazy refresh inside the follow-up model
+        // sync (token still due under the pinned clock).
+        assert_eq!(provider.refreshes_for("kimi-recover"), 2);
+    }
+
+    #[tokio::test]
+    async fn kimi_refresh_unauthorized_keeps_account_invalid() {
+        let repository = repository().await;
+        // "kimi-fails" is both the account name AND the refresh token, which
+        // the fake maps to a Retryable failure.  A real Kimi Unauthorized is
+        // classified by the provider; here we verify the maintenance loop
+        // keeps the account invalid and schedules a retry.
+        let id = add_account_for(
+            &repository,
+            "kimi",
+            "fails",
+            "2026-08-09T03:00:00Z",
+            "invalid",
+            Some("2026-08-08T00:00:00Z"),
+        )
+        .await;
+        let mut provider = FakeProvider::default();
+        provider.kind = ProviderKind::Kimi;
+        let provider = Arc::new(provider);
+        let service = service(repository.clone(), provider.clone());
+
+        crate::auth_provider::maintenance::run_maintenance_once(&service).await;
+
+        let stored = repository.get_auth_account(&id).await.unwrap();
+        assert_eq!(stored.status, "invalid");
+        assert_eq!(
+            stored.next_retry_after.as_deref(),
+            Some("2026-08-09T12:00:00+00:00")
+        );
     }
 }

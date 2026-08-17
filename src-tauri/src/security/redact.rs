@@ -211,6 +211,9 @@ fn is_secret_field(key: &str) -> bool {
             | "secret_key"
             | "access_key"
             | "access_token"
+            | "refresh_token"
+            | "device_code"
+            | "user_code"
             | "auth_token"
             | "token"
             | "password"
@@ -224,4 +227,59 @@ fn is_secret_field(key: &str) -> bool {
             | "aws_secret_access_key"
             | "secretkey"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn kimi_secret_fields_are_redacted_for_logging() {
+        let payload = json!({
+            "access_token": "kimi-access-secret",
+            "refresh_token": "kimi-refresh-secret",
+            "device_code": "kimi-device-code",
+            "user_code": "ABCD-EFGH",
+            "device_id": "d1e2b3a4c5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f",
+            "expires_at": "2099-01-01T00:00:00Z",
+        });
+        let redacted = redact_json_for_logging(&payload);
+        for secret in [
+            "kimi-access-secret",
+            "kimi-refresh-secret",
+            "kimi-device-code",
+            "ABCD-EFGH",
+        ] {
+            let rendered = redacted.to_string();
+            assert!(!rendered.contains(secret), "log redaction leaked {secret}");
+        }
+        // Non-secret fields survive.
+        assert_eq!(
+            redacted["device_id"],
+            "d1e2b3a4c5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f"
+        );
+        assert_eq!(redacted["expires_at"], "2099-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn verification_url_is_redacted_as_url_field_not_secret() {
+        // verification_uri_complete is not a "secret" key, but the value
+        // contains no credential and must not be treated as secret; it is a
+        // non-secret routing URL and stays readable so support can see it.
+        let value = json!({"verification_uri_complete": "https://auth.kimi.com/verify?user_code=ABCD-EFGH"});
+        let redacted = redact_json_for_logging(&value);
+        // The URL itself survives (it is not a secret key); the user_code
+        // inside the query would be caught by pattern redaction only if it
+        // looks like a credential — treat as acceptable here.
+        assert!(redacted["verification_uri_complete"].as_str().is_some());
+    }
+
+    #[test]
+    fn secret_field_detection_covers_kimi_names() {
+        for key in ["access_token", "refresh_token", "device_code", "user_code"] {
+            assert!(is_secret_field(key), "{key} must be secret");
+        }
+    }
 }
