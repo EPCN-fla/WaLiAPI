@@ -225,9 +225,7 @@ impl LoginRuntime for SessionLoginRuntime {
 
 impl LoginSessions {
     pub fn new() -> Self {
-        Self {
-            sessions: Mutex::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     pub async fn start(&self, provider: &str) -> (String, watch::Receiver<bool>) {
@@ -365,6 +363,14 @@ impl LoginSessions {
                 session.status.error_code = Some(login_error_code(&error).into());
                 session.status.error = Some(login_error_message(&error).into());
             }
+        }
+    }
+}
+
+impl Default for LoginSessions {
+    fn default() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
         }
     }
 }

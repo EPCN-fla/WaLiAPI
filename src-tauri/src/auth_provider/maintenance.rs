@@ -355,9 +355,10 @@ mod tests {
             None,
         )
         .await;
-        let mut provider = FakeProvider::default();
-        provider.kind = ProviderKind::Kimi;
-        let provider = Arc::new(provider);
+        let provider = Arc::new(FakeProvider {
+            kind: ProviderKind::Kimi,
+            ..FakeProvider::default()
+        });
         let service = service(repository.clone(), provider.clone());
 
         // One maintenance pass: the due Kimi account refreshes then lists models.
@@ -382,9 +383,10 @@ mod tests {
             Some("2026-08-08T00:00:00Z"),
         )
         .await;
-        let mut provider = FakeProvider::default();
-        provider.kind = ProviderKind::Kimi;
-        let provider = Arc::new(provider);
+        let provider = Arc::new(FakeProvider {
+            kind: ProviderKind::Kimi,
+            ..FakeProvider::default()
+        });
         let service = service(repository.clone(), provider.clone());
 
         crate::auth_provider::maintenance::run_maintenance_once(&service).await;
@@ -412,9 +414,10 @@ mod tests {
             Some("2026-08-08T00:00:00Z"),
         )
         .await;
-        let mut provider = FakeProvider::default();
-        provider.kind = ProviderKind::Kimi;
-        let provider = Arc::new(provider);
+        let provider = Arc::new(FakeProvider {
+            kind: ProviderKind::Kimi,
+            ..FakeProvider::default()
+        });
         let service = service(repository.clone(), provider.clone());
 
         crate::auth_provider::maintenance::run_maintenance_once(&service).await;

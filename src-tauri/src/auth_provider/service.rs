@@ -1323,7 +1323,7 @@ mod tests {
 
         let stored = repository.get_auth_account(&account.id).await.unwrap();
         // Fresh credentials replaced the old ones.
-        assert_eq!(stored.payload_json.contains("fresh-login-access"), true);
+        assert!(stored.payload_json.contains("fresh-login-access"));
         // Model snapshot was atomically cleared and sync timestamp reset.
         assert_eq!(stored.model_states().unwrap().models.len(), 0);
         assert_eq!(stored.last_models_sync_at, None);
@@ -1403,7 +1403,7 @@ mod tests {
         );
         // Original credentials are untouched.
         let stored = repository.get_auth_account(&account.id).await.unwrap();
-        assert_eq!(stored.payload_json.contains("fixture-access-token"), true);
+        assert!(stored.payload_json.contains("fixture-access-token"));
     }
 
     #[tokio::test]
@@ -1442,9 +1442,8 @@ mod tests {
             .unwrap();
 
         let stored = repository.get_auth_account(&account.id).await.unwrap();
-        assert_eq!(
+        assert!(
             stored.payload_json.contains("fresh-login-access"),
-            true,
             "stale refresh must not overwrite replacement credentials"
         );
     }

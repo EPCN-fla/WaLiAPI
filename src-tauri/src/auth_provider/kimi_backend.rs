@@ -680,13 +680,13 @@ mod tests {
             ]
         );
         assert_eq!(models[0].protocol.as_deref(), Some("kimi"));
-        assert_eq!(models[0].unavailable, false);
+        assert!(!models[0].unavailable);
         assert_eq!(models[1].protocol.as_deref(), Some("anthropic"));
         assert_eq!(models[2].protocol.as_deref(), Some("kimi"));
-        assert_eq!(models[2].unavailable, false);
+        assert!(!models[2].unavailable);
         // Unknown protocol fails closed: unavailable, never routed as Chat.
         assert_eq!(models[3].protocol.as_deref(), Some("mars"));
-        assert_eq!(models[3].unavailable, true);
+        assert!(models[3].unavailable);
         assert_eq!(models[3].status, "unavailable");
         assert!(models[3].last_error.is_some());
     }

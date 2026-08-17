@@ -2708,7 +2708,6 @@ mod tests {
 
     #[test]
     fn kimi_missing_protocol_resolves_chat_profile() {
-        let key = api_key(&[], &[]);
         let account = kimi_account("k1", "kimi-k2.5", "");
         let profile = resolve_auth_route_profile(&account, "kimi-k2.5").unwrap();
         assert_eq!(profile.provider, "kimi");
@@ -2866,7 +2865,6 @@ mod tests {
 
     #[test]
     fn kimi_alias_all_same_profile_routes() {
-        let key = api_key(&[], &[]);
         let account = account_with_models(
             "k5",
             "kimi",

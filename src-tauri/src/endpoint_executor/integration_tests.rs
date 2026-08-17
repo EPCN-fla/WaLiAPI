@@ -13,7 +13,7 @@
 
 use crate::auth_provider::service::AuthService;
 use crate::auth_provider::ProviderRegistry;
-use crate::core::attempt::{AttemptFailure, AttemptResult, FailureClass, PreparedAttempt};
+use crate::core::attempt::{AttemptResult, FailureClass, PreparedAttempt};
 use crate::core::feature_flags::FeatureFlags;
 use crate::core::route_plan::{authorize_and_plan, EndpointKind};
 use crate::core::stream_supervisor::StreamSupervisor;
@@ -2120,7 +2120,6 @@ async fn kimi_anthropic_non_stream_keeps_fixed_betas_and_decodes_messages() {
 #[tokio::test]
 async fn kimi_chat_401_triggers_single_refresh_replay() {
     let (service, state, repo, account) = kimi_mock().await;
-    let mut state = state;
     state.fail_401.store(true, Ordering::SeqCst);
     // Give the account a refresh token so the 401 path refreshes (mock refresh
     // is a no-op via the provider default) and replays once.
