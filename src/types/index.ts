@@ -237,6 +237,8 @@ export interface AuthAccount {
   weight: number;
   email: string | null;
   plan_type: string | null;
+  /** Stable, non-secret reason the account was marked invalid (e.g. "payment_required"). */
+  invalidation_reason: string | null;
   models: AuthModelState[];
   quota: AuthQuotaState | null;
   model_mapping?: Record<string, string | string[]>;
