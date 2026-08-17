@@ -421,6 +421,9 @@ impl KimiLogin {
                     });
                 }
                 Err(RefreshError::Unauthorized) => return Err(ProviderError::Unauthorized),
+                Err(RefreshError::PaymentRequired) => {
+                    return Err(ProviderError::PaymentRequired)
+                }
                 Err(RefreshError::Retryable) => {
                     attempt += 1;
                     if attempt >= 3 {
@@ -445,6 +448,9 @@ impl KimiLogin {
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(RefreshError::Unauthorized);
+        }
+        if status == reqwest::StatusCode::PAYMENT_REQUIRED {
+            return Err(RefreshError::PaymentRequired);
         }
         if status.is_success() {
             let wire: TokenWireResponse = match response.json().await {
@@ -532,6 +538,8 @@ enum TokenPollError {
 
 enum RefreshError {
     Unauthorized,
+    /// Upstream reports the paid subscription cannot be used.  Terminal.
+    PaymentRequired,
     Retryable,
     Protocol,
 }
@@ -1016,6 +1024,20 @@ mod tests {
                 ProviderError::Unauthorized
             );
         }
+    }
+
+    #[tokio::test]
+    async fn refresh_402_maps_to_payment_required() {
+        let (login, state) = mock(true).await;
+        state.queue.lock().unwrap().push_back((402, Value::Null));
+        let payload = ProviderPayload::new(json!({"refresh_token": REFRESH}));
+        assert_eq!(
+            login
+                .refresh_payload(&payload, DEVICE_ID)
+                .await
+                .unwrap_err(),
+            ProviderError::PaymentRequired
+        );
     }
 
     #[tokio::test]

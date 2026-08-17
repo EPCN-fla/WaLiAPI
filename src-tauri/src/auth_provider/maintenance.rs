@@ -121,6 +121,9 @@ mod tests {
             if token == "unauthorized" {
                 return Err(ProviderError::Unauthorized);
             }
+            if token == "payment-required" {
+                return Err(ProviderError::PaymentRequired);
+            }
             if token == "fails" {
                 return Err(ProviderError::Retryable);
             }
@@ -156,6 +159,9 @@ mod tests {
             Self::count(&self.models, token.clone());
             if token == "models-fail" {
                 return Err(ProviderError::Retryable);
+            }
+            if token == "models-payment" {
+                return Err(ProviderError::PaymentRequired);
             }
             Ok(vec![])
         }
@@ -431,5 +437,34 @@ mod tests {
             stored.next_retry_after.as_deref(),
             Some("2026-08-09T12:00:00+00:00")
         );
+    }
+
+    #[tokio::test]
+    async fn active_account_with_dead_subscription_is_marked_invalid_by_maintenance() {
+        let repository = repository().await;
+        // The account name is both label and refresh token; the fake maps the
+        // "models-payment" token to a PaymentRequired list_models failure.
+        let id = add_account_for(
+            &repository,
+            "kimi",
+            "models-payment",
+            "2026-08-09T00:01:00Z",
+            "active",
+            None,
+        )
+        .await;
+        let provider = Arc::new(FakeProvider {
+            kind: ProviderKind::Kimi,
+            ..FakeProvider::default()
+        });
+        let service = service(repository.clone(), provider.clone());
+
+        crate::auth_provider::maintenance::run_maintenance_once(&service).await;
+
+        // A dead subscription is terminal: the account leaves routing and gets
+        // a backoff, rather than staying active and retrying 12h forever.
+        let stored = repository.get_auth_account(&id).await.unwrap();
+        assert_eq!(stored.status, "invalid");
+        assert!(stored.next_retry_after.is_some());
     }
 }

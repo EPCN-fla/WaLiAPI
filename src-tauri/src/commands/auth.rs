@@ -454,10 +454,22 @@ async fn sync_after_login(
     let account = AuthAccountDto::try_from(summary).map_err(safe_error)?;
     let warning = match service.sync_models(&account_id).await {
         Ok(_) => None,
-        Err(_) => Some(
-            "Account saved, but model sync failed; it will not route until sync succeeds."
-                .to_owned(),
-        ),
+        Err(error) => {
+            // Model sync failing is the top diagnostic gap for new accounts: it
+            // can be a bad token, a missing /models endpoint, or an unexpected
+            // payload shape.  Surface the concrete provider error (stable class
+            // only, never credential material) so support can tell these apart.
+            tracing::warn!(
+                account_id = %account_id,
+                provider = %account.provider,
+                error = ?error.failure_class(),
+                "model sync failed after login; account will not route until sync succeeds"
+            );
+            Some(
+                "Account saved, but model sync failed; it will not route until sync succeeds."
+                    .to_owned(),
+            )
+        }
     };
     Ok(AuthMutationResult {
         account,

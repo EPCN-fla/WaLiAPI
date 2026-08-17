@@ -268,6 +268,13 @@ impl Provider for KimiProvider {
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(ProviderError::Unauthorized);
         }
+        if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
+            // Kimi returns 402 when the account's membership benefits cannot be
+            // verified.  This is not transient: retrying on a maintenance
+            // cadence is pointless, so classify it terminal so the account
+            // stays out of routing and the UI can explain the subscription.
+            return Err(ProviderError::PaymentRequired);
+        }
         if !response.status().is_success() {
             return Err(ProviderError::Retryable);
         }

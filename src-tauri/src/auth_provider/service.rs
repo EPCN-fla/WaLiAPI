@@ -395,7 +395,18 @@ impl AuthService {
                     // routeability of new models — fresh even for imported /
                     // long-lived tokens (ADR-8, design §7 step 3).
                     if let Err(error) = self.sync_models(&account.id).await {
-                        tracing::warn!(account_id = %account.id, "auth account model sync failed during maintenance: {error}");
+                        if error.is_payment_required() {
+                            // A dead subscription can never be fixed by retrying
+                            // on the maintenance cadence; take the account out
+                            // of routing until the user resolves it.
+                            tracing::warn!(
+                                account_id = %account.id,
+                                "auth account subscription is not usable; marking invalid"
+                            );
+                            self.schedule_maintenance_retry(&account.id).await;
+                        } else {
+                            tracing::warn!(account_id = %account.id, "auth account model sync failed during maintenance: {error}");
+                        }
                     }
                     continue;
                 }

@@ -288,6 +288,10 @@ pub enum ProviderError {
     AuthorizationDenied,
     ImportFailed,
     Unauthorized,
+    /// Provider reports the subscription cannot be used (e.g. Kimi 402
+    /// "membership benefits").  Terminal: retrying on a maintenance cadence
+    /// never fixes an inactive membership.
+    PaymentRequired,
     UnsupportedFeatures { pointer: String },
     Retryable,
     Storage,
@@ -302,6 +306,7 @@ impl ProviderError {
                 FailureClass::CallerTerminal
             }
             Self::Unauthorized => FailureClass::ChannelAuthTerminal,
+            Self::PaymentRequired => FailureClass::CallerTerminal,
             Self::Protocol => FailureClass::UpstreamProtocolError,
             Self::UnknownProvider { .. }
             | Self::LoginFailed
@@ -314,6 +319,14 @@ impl ProviderError {
             | Self::Retryable
             | Self::Storage => FailureClass::Retryable,
         }
+    }
+}
+
+impl ProviderError {
+    /// Whether this error means the account's paid subscription is unusable
+    /// (e.g. Kimi 402).  Terminal: maintenance retries cannot fix it.
+    pub fn is_payment_required(&self) -> bool {
+        matches!(self, Self::PaymentRequired)
     }
 }
 
@@ -336,6 +349,9 @@ impl fmt::Display for ProviderError {
             Self::AuthorizationDenied => formatter.write_str("provider authorization was denied"),
             Self::ImportFailed => formatter.write_str("provider credential import failed"),
             Self::Unauthorized => formatter.write_str("provider credentials were rejected"),
+            Self::PaymentRequired => {
+                formatter.write_str("provider subscription is not usable")
+            }
             Self::UnsupportedFeatures { pointer } => {
                 write!(formatter, "unsupported provider request field at {pointer}")
             }
