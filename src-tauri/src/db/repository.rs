@@ -1073,11 +1073,36 @@ impl Repository {
         &self,
         id: &str,
         next_retry_after: Option<&str>,
+        reason: Option<&str>,
     ) -> Result<(), sqlx::Error> {
+        // Persist a stable, non-secret reason for the invalidation (e.g.
+        // "payment_required" for an unusable subscription) alongside the status
+        // flip.  Stored in attributes_json so no schema migration is needed,
+        // and merged (not overwriting) so login metadata like email/plan_type
+        // survives.  The DTO surfaces it again as `invalidation_reason`.
+        let merged_attributes: Option<String> = if reason.is_some() {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT attributes_json FROM auth_accounts WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+            row.map(|(attributes_json,)| {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(&attributes_json).unwrap_or(serde_json::Value::Object(
+                        serde_json::Map::new(),
+                    ));
+                value["invalidation_reason"] = reason.unwrap().into();
+                serde_json::to_string(&value).unwrap_or(attributes_json)
+            })
+        } else {
+            None
+        };
         sqlx::query(
-            "UPDATE auth_accounts SET status = 'invalid', next_retry_after = ?, updated_at = ? WHERE id = ?",
+            "UPDATE auth_accounts SET status = 'invalid', next_retry_after = ?, attributes_json = COALESCE(?, attributes_json), updated_at = ? WHERE id = ?",
         )
         .bind(next_retry_after)
+        .bind(merged_attributes.as_deref())
         .bind(now_iso())
         .bind(id)
         .execute(&self.pool)

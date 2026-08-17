@@ -403,7 +403,8 @@ impl AuthService {
                                 account_id = %account.id,
                                 "auth account subscription is not usable; marking invalid"
                             );
-                            self.schedule_maintenance_retry(&account.id).await;
+                            self.schedule_maintenance_retry(&account.id, Some("payment_required"))
+                                .await;
                         } else {
                             tracing::warn!(account_id = %account.id, "auth account model sync failed during maintenance: {error}");
                         }
@@ -420,7 +421,7 @@ impl AuthService {
             };
 
             if refresh_result.is_err() {
-                self.schedule_maintenance_retry(&account.id).await;
+                self.schedule_maintenance_retry(&account.id, None).await;
                 continue;
             }
 
@@ -453,7 +454,7 @@ impl AuthService {
             // A due refresh is part of preparing this account for outbound use.
             // Never leave a rejected credential in the active route pool, and
             // keep the maintenance retry cadence consistent with its failure path.
-            self.schedule_maintenance_retry(account_id).await;
+            self.schedule_maintenance_retry(account_id, None).await;
             return Err(error);
         }
         let response = self
@@ -479,7 +480,7 @@ impl AuthService {
             // Rejected credentials get the same backoff as a failed lazy
             // refresh, so the maintenance loop does not hammer the provider
             // on the very next pass.
-            self.schedule_maintenance_retry(account_id).await;
+            self.schedule_maintenance_retry(account_id, None).await;
             return Err(ProviderError::Unauthorized);
         }
         let retry = self
@@ -493,7 +494,7 @@ impl AuthService {
             )
             .await?;
         if retry.status() == reqwest::StatusCode::UNAUTHORIZED {
-            self.schedule_maintenance_retry(account_id).await;
+            self.schedule_maintenance_retry(account_id, None).await;
             return Err(ProviderError::Unauthorized);
         }
         self.persist_quota_if_present(account_id, &retry).await;
@@ -525,11 +526,11 @@ impl AuthService {
             .await
     }
 
-    async fn schedule_maintenance_retry(&self, account_id: &str) {
+    async fn schedule_maintenance_retry(&self, account_id: &str, reason: Option<&str>) {
         let next_retry_after = (self.clock.now() + Duration::hours(12)).to_rfc3339();
         if self
             .repository
-            .mark_invalid(account_id, Some(&next_retry_after))
+            .mark_invalid(account_id, Some(&next_retry_after), reason)
             .await
             .is_err()
         {

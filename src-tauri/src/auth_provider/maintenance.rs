@@ -199,7 +199,7 @@ mod tests {
             .await
             .unwrap();
         if status == "invalid" {
-            repository.mark_invalid(&account.id, retry).await.unwrap();
+            repository.mark_invalid(&account.id, retry, None).await.unwrap();
         }
         account.id
     }

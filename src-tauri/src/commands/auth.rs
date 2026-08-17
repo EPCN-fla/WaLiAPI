@@ -39,6 +39,10 @@ pub struct AuthAccountDto {
     pub weight: i64,
     pub email: Option<String>,
     pub plan_type: Option<String>,
+    /// Stable, non-secret reason the account was marked invalid (e.g.
+    /// "payment_required" for an unusable subscription).  Written via
+    /// `Repository::mark_invalid` into `attributes_json.invalidation_reason`.
+    pub invalidation_reason: Option<String>,
     pub models: Vec<ModelState>,
     pub quota: Option<QuotaState>,
     pub model_mapping: serde_json::Value,
@@ -67,6 +71,11 @@ impl TryFrom<AuthAccountSummary> for AuthAccountDto {
             .get("plan_type")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let invalidation_reason = value
+            .attributes
+            .get("invalidation_reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         Ok(Self {
             id: value.id,
             provider: value.provider,
@@ -78,6 +87,7 @@ impl TryFrom<AuthAccountSummary> for AuthAccountDto {
             weight: value.weight,
             email,
             plan_type,
+            invalidation_reason,
             models: value.models.models,
             quota: value.quota,
             model_mapping: value.model_mapping,
@@ -740,7 +750,7 @@ pub async fn auth_refresh_token(
         Ok(summary) => AuthAccountDto::try_from(summary).map_err(safe_error),
         Err(error) => {
             let repository = Repository::new(state.db.pool.clone());
-            let _ = repository.mark_invalid(&id, None).await;
+            let _ = repository.mark_invalid(&id, None, None).await;
             Err(safe_error(error))
         }
     }
@@ -949,6 +959,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn account_dto_surfaces_invalidation_reason_without_credential_material() {
+        let mut account = account_fixture();
+        account.status = "invalid".into();
+        // Reason lives in attributes_json, mirroring Repository::mark_invalid.
+        account.attributes_json = json!({
+            "email": "person@example.test",
+            "invalidation_reason": "payment_required"
+        })
+        .to_string();
+        let dto = dto_from_account(account).unwrap();
+        assert_eq!(dto.invalidation_reason.as_deref(), Some("payment_required"));
+        // The serialized DTO carries the reason but never payload fields.
+        let encoded = serde_json::to_string(&dto).unwrap();
+        assert!(encoded.contains("payment_required"));
+        assert!(!encoded.contains("access_token") && !encoded.contains("refresh_token"));
     }
 
     async fn test_repository() -> Repository {
