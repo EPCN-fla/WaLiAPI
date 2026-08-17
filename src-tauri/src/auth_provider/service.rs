@@ -423,11 +423,18 @@ impl AuthService {
 
     /// Dispatch with a fresh persisted payload.  Provider-specific HTTP policy
     /// remains in the implementation; callers never parse `payload_json`.
+    ///
+    /// `is_stream` / `upstream_protocol` / `upstream_endpoint` are the trusted,
+    /// immutable values frozen by RoutePlan.  A 401 single replay reuses the
+    /// exact same values so the retry hits the identical fixed endpoint.
     pub async fn outbound(
         &self,
         account_id: &str,
         body: &serde_json::Value,
         headers: &reqwest::header::HeaderMap,
+        is_stream: bool,
+        upstream_protocol: &str,
+        upstream_endpoint: &str,
     ) -> Result<reqwest::Response, ProviderError> {
         // Refresh through the summary-only API, then load raw credentials only
         // inside this module for the provider call.
@@ -439,7 +446,14 @@ impl AuthService {
             return Err(error);
         }
         let response = self
-            .send_with_persisted_account(account_id, body, headers)
+            .send_with_persisted_account(
+                account_id,
+                body,
+                headers,
+                is_stream,
+                upstream_protocol,
+                upstream_endpoint,
+            )
             .await?;
         if response.status() != reqwest::StatusCode::UNAUTHORIZED {
             self.persist_quota_if_present(account_id, &response).await;
@@ -458,7 +472,14 @@ impl AuthService {
             return Err(ProviderError::Unauthorized);
         }
         let retry = self
-            .send_with_persisted_account(account_id, body, headers)
+            .send_with_persisted_account(
+                account_id,
+                body,
+                headers,
+                is_stream,
+                upstream_protocol,
+                upstream_endpoint,
+            )
             .await?;
         if retry.status() == reqwest::StatusCode::UNAUTHORIZED {
             self.schedule_maintenance_retry(account_id).await;
@@ -473,6 +494,9 @@ impl AuthService {
         account_id: &str,
         body: &serde_json::Value,
         headers: &reqwest::header::HeaderMap,
+        is_stream: bool,
+        upstream_protocol: &str,
+        upstream_endpoint: &str,
     ) -> Result<reqwest::Response, ProviderError> {
         let account = self.get_account(account_id).await?;
         let payload = Self::payload_for(&account)?;
@@ -483,6 +507,9 @@ impl AuthService {
                 payload: &payload,
                 body,
                 headers,
+                is_stream,
+                upstream_protocol,
+                upstream_endpoint,
             })
             .await
     }
@@ -1103,7 +1130,10 @@ mod tests {
                 .outbound(
                     &account.id,
                     &json!({"model": "gpt-test"}),
-                    &HeaderMap::new()
+                    &HeaderMap::new(),
+                    true,
+                    "responses",
+                    "responses"
                 )
                 .await
                 .unwrap_err(),

@@ -242,11 +242,19 @@ pub struct AuthenticatedLogin {
 
 /// A non-secret outbound request.  The service injects the persisted account
 /// and decrypted-in-memory provider payload immediately before dispatch.
+///
+/// `is_stream` / `upstream_protocol` / `upstream_endpoint` are trusted values
+/// frozen by the RoutePlan and carried immutably through the attempt; providers
+/// rely on them to pick the fixed URL, headers and framing.  They are never
+/// guessed from the body or Content-Type, and never read from renderer input.
 pub struct ProviderRequest<'a> {
     pub account: &'a crate::db::models::AuthAccount,
     pub payload: &'a ProviderPayload,
     pub body: &'a Value,
     pub headers: &'a reqwest::header::HeaderMap,
+    pub is_stream: bool,
+    pub upstream_protocol: &'a str,
+    pub upstream_endpoint: &'a str,
 }
 
 impl fmt::Debug for ProviderRequest<'_> {
@@ -256,6 +264,9 @@ impl fmt::Debug for ProviderRequest<'_> {
             .field("account_id", &self.account.id)
             .field("provider", &self.account.provider)
             .field("body", &"<caller payload omitted>")
+            .field("is_stream", &self.is_stream)
+            .field("upstream_protocol", &self.upstream_protocol)
+            .field("upstream_endpoint", &self.upstream_endpoint)
             .finish()
     }
 }

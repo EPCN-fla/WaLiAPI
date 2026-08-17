@@ -80,6 +80,9 @@ pub async fn dispatch_auth_account_executor(
             &attempt.channel_id,
             &force_responses_stream(&attempt.encoded_body),
             &header_map(safe_headers),
+            true,
+            "responses",
+            "responses",
         )
         .await
     {
@@ -127,6 +130,9 @@ pub async fn dispatch_auth_account_stream_executor(
             &attempt.channel_id,
             &force_responses_stream(&attempt.encoded_body),
             &header_map(safe_headers),
+            true,
+            "responses",
+            "responses",
         )
         .await
     {

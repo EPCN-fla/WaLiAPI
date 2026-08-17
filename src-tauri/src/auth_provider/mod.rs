@@ -3,6 +3,7 @@
 
 pub mod codex_backend;
 pub mod codex_login;
+pub mod kimi_backend;
 pub mod kimi_login;
 pub mod maintenance;
 pub mod service;

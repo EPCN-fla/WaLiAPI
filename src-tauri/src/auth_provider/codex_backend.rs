@@ -731,6 +731,9 @@ mod tests {
                 payload: &payload,
                 body: &json!({"model":"gpt-test","input":"hi","stream":false}),
                 headers: &caller,
+                is_stream: true,
+                upstream_protocol: "responses",
+                upstream_endpoint: "responses",
             })
             .await
             .unwrap();
@@ -912,6 +915,9 @@ mod tests {
                     }
                 }),
                 headers: &HeaderMap::new(),
+                is_stream: true,
+                upstream_protocol: "responses",
+                upstream_endpoint: "responses",
             })
             .await
             .unwrap();
@@ -939,6 +945,9 @@ mod tests {
                 payload: &payload,
                 body: &json!({"model":"gpt-test","metadata":{"secret":true}}),
                 headers: &HeaderMap::new(),
+                is_stream: true,
+                upstream_protocol: "responses",
+                upstream_endpoint: "responses",
             })
             .await
             .unwrap();
@@ -1014,7 +1023,14 @@ mod tests {
         registry.register(Arc::new(provider));
         let service = crate::auth_provider::service::AuthService::new(repository.clone(), registry);
         let error = service
-            .outbound(&account.id, &json!({"model":"gpt-test"}), &HeaderMap::new())
+            .outbound(
+                &account.id,
+                &json!({"model":"gpt-test"}),
+                &HeaderMap::new(),
+                true,
+                "responses",
+                "responses",
+            )
             .await
             .unwrap_err();
         assert_eq!(error, ProviderError::Unauthorized);
@@ -1039,7 +1055,14 @@ mod tests {
         registry.register(Arc::new(provider));
         let service = crate::auth_provider::service::AuthService::new(repository.clone(), registry);
         let response = service
-            .outbound(&account.id, &json!({"model":"gpt-test"}), &HeaderMap::new())
+            .outbound(
+                &account.id,
+                &json!({"model":"gpt-test"}),
+                &HeaderMap::new(),
+                true,
+                "responses",
+                "responses",
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
