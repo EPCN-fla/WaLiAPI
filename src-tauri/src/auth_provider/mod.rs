@@ -138,6 +138,7 @@ impl Default for ProviderRegistry {
             providers: HashMap::new(),
         };
         registry.register(Arc::new(codex_backend::CodexProvider::new()));
+        registry.register(Arc::new(kimi_backend::KimiProvider::new()));
         registry
     }
 }
