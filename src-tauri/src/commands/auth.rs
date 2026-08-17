@@ -15,8 +15,7 @@ use uuid::Uuid;
 use crate::{
     auth_provider::{
         codex_login::{CodexLogin, TauriLoginRuntime, CODEX_IMPORT_NOTICE},
-        AuthAccountSummary, LoginRuntime, LoginStep, ProviderError, ProviderKind,
-        ProviderPayload,
+        AuthAccountSummary, LoginRuntime, LoginStep, ProviderError, ProviderKind, ProviderPayload,
     },
     db::{
         models::{ModelState, QuotaState},
@@ -331,6 +330,7 @@ fn login_error_code(error: &ProviderError) -> &'static str {
         ProviderError::BrowserOpenFailed => "browser_open",
         ProviderError::CallbackFailed => "callback_state",
         ProviderError::TokenExchangeFailed => "token_exchange",
+        ProviderError::AuthorizationDenied => "authorization_denied",
         _ => "login_failed",
     }
 }
@@ -342,6 +342,7 @@ fn login_error_message(error: &ProviderError) -> &'static str {
         "browser_open" => "无法打开浏览器授权页，请检查默认浏览器后重试。",
         "callback_state" => "授权回调无效或被拒绝，请重新开始登录。",
         "token_exchange" => "授权完成，但令牌交换失败，请重新开始登录。",
+        "authorization_denied" => "授权被拒绝，请重新开始登录。",
         _ => "登录未完成，请检查浏览器授权后重试。",
     }
 }
@@ -448,7 +449,9 @@ async fn run_codex_login_session(
         cancellation,
     };
     let login = CodexLogin::new();
-    let _ = sessions.set_step(&session_id, LoginStep::Preparing.as_str()).await;
+    let _ = sessions
+        .set_step(&session_id, LoginStep::Preparing.as_str())
+        .await;
     let login_result = login.login(&runtime).await;
     let result = match login_result {
         Ok(login_result) => {

@@ -3,6 +3,7 @@
 
 pub mod codex_backend;
 pub mod codex_login;
+pub mod kimi_login;
 pub mod maintenance;
 pub mod service;
 pub mod spec;
@@ -13,12 +14,12 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 
 pub use crate::db::models::{AuthAccount, QuotaState};
+pub use spec::{AuthLoginMode, AuthNonStreamFraming, ProviderSpec};
 pub use types::{
     AuthAccountSummary, AuthenticatedLogin, LoginResult, ProviderError, ProviderKind,
     ProviderLoginContext, ProviderModels, ProviderPayload, ProviderRequest, RefreshedPayload,
     ReplacementContext,
 };
-pub use spec::{AuthLoginMode, AuthNonStreamFraming, ProviderSpec};
 
 /// Progress marker for an interactive provider login.  Concrete providers map
 /// their real work onto these steps; the command layer never fabricates

@@ -272,7 +272,9 @@ pub enum ProviderError {
     LoginTimeout,
     BrowserOpenFailed,
     CallbackFailed,
+    DeviceAuthorizationFailed,
     TokenExchangeFailed,
+    AuthorizationDenied,
     ImportFailed,
     Unauthorized,
     UnsupportedFeatures { pointer: String },
@@ -285,6 +287,9 @@ impl ProviderError {
     pub fn failure_class(&self) -> FailureClass {
         match self {
             Self::UnsupportedFeatures { .. } | Self::InvalidPayload => FailureClass::CallerTerminal,
+            Self::AuthorizationDenied | Self::DeviceAuthorizationFailed => {
+                FailureClass::CallerTerminal
+            }
             Self::Unauthorized => FailureClass::ChannelAuthTerminal,
             Self::Protocol => FailureClass::UpstreamProtocolError,
             Self::UnknownProvider { .. }
@@ -314,6 +319,10 @@ impl fmt::Display for ProviderError {
             Self::BrowserOpenFailed => formatter.write_str("could not open provider login browser"),
             Self::CallbackFailed => formatter.write_str("provider login callback failed"),
             Self::TokenExchangeFailed => formatter.write_str("provider token exchange failed"),
+            Self::DeviceAuthorizationFailed => {
+                formatter.write_str("provider device authorization failed")
+            }
+            Self::AuthorizationDenied => formatter.write_str("provider authorization was denied"),
             Self::ImportFailed => formatter.write_str("provider credential import failed"),
             Self::Unauthorized => formatter.write_str("provider credentials were rejected"),
             Self::UnsupportedFeatures { pointer } => {
@@ -368,7 +377,9 @@ mod tests {
     #[test]
     fn provider_kind_other_is_not_a_known_spec() {
         // The registry decides availability; spec lookup must be conservative.
-        assert!(crate::auth_provider::spec::provider_spec(&ProviderKind::Other("nope".into()))
-            .is_none());
+        assert!(
+            crate::auth_provider::spec::provider_spec(&ProviderKind::Other("nope".into()))
+                .is_none()
+        );
     }
 }
