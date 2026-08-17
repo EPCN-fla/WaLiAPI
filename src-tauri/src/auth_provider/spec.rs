@@ -6,19 +6,8 @@
 //! wire behavior (base URL, protocol, endpoint, framing) is decided per model
 //! by the `/models` snapshot in `core::route_plan`, *not* by this static spec.
 
-use serde::Serialize;
-
 use super::ProviderKind;
-
-/// Non-stream framing fixed by a resolved auth route profile.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthNonStreamFraming {
-    /// Ordinary request/response JSON (Kimi Chat and Anthropic Messages).
-    Json,
-    /// Upstream Responses endpoint forces SSE, which the executor aggregates.
-    ForcedResponsesSse,
-}
+pub use crate::core::route_plan::AuthNonStreamFraming;
 
 /// Interactive login protocol used by a provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

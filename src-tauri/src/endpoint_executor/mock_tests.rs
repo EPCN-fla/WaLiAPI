@@ -232,6 +232,8 @@ fn prepared(
         upstream_endpoint: endpoint.to_string(),
         upstream_model: model.to_string(),
         native_base_url: base.to_string(),
+        auth_provider: None,
+        auth_non_stream_framing: None,
         codec_version: codec_version.map(|s| s.to_string()),
         prepared_codec: protocol_codec,
         encoded_body: body,

@@ -33,6 +33,16 @@ pub const DEFAULT_MAX_ATTEMPTS_PER_GROUP: usize = 3;
 /// Default whole-request attempt budget (T00 decision 4).
 pub const DEFAULT_MAX_ATTEMPTS_TOTAL: usize = 6;
 
+/// Non-stream framing fixed by a resolved auth route profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthNonStreamFraming {
+    /// Ordinary request/response JSON (Kimi Chat and Anthropic Messages).
+    Json,
+    /// Upstream Responses endpoint forces SSE, which the executor aggregates.
+    ForcedResponsesSse,
+}
+
 /// The downstream endpoint being routed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum EndpointKind {
@@ -219,6 +229,17 @@ impl RouteCandidate {
     }
 }
 
+/// Immutable per-model wire profile for an auth account, resolved from the
+/// provider `/models` snapshot (never from renderer, headers, or body).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthRouteProfile {
+    pub provider: String,
+    pub native_base_url: String,
+    pub upstream_protocol: UpstreamProtocol,
+    pub upstream_endpoint: String,
+    pub non_stream_framing: AuthNonStreamFraming,
+}
+
 /// One candidate that survived model matching and endpoint-capability filtering.
 #[derive(Debug, Clone)]
 pub struct RouteGroupCandidate {
@@ -226,6 +247,15 @@ pub struct RouteGroupCandidate {
     pub tier: GroupTier,
     pub upstream_protocol: UpstreamProtocol,
     pub upstream_endpoint: String,
+    /// Registered provider string for auth candidates (`codex`, `kimi`);
+    /// `None` for regular channels.
+    pub auth_provider: Option<String>,
+    /// Frozen base URL the executor must use.  Auth candidates carry the
+    /// per-model profile base; channels carry their identity base.
+    pub native_base_url: String,
+    /// Non-stream framing for auth candidates; `None` for channels (which use
+    /// the codec-bound framing).
+    pub auth_non_stream_framing: Option<AuthNonStreamFraming>,
 }
 
 /// A named bucket of candidates sharing one upstream protocol/endpoint and an
@@ -686,6 +716,113 @@ fn account_quota_unavailable(account: &AuthAccount) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Auth route profiles (per-model wire profile, frozen at plan time)
+// ---------------------------------------------------------------------------
+
+/// Fixed mapping for a single model snapshot entry to a wire profile.
+///
+/// The `protocol` value is the provider `/models` catalog's non-secret routing
+/// metadata.  `missing`/`kimi` → Kimi Chat; `anthropic` → Kimi Messages beta;
+/// any other non-empty value fails closed (not routable as Chat).
+fn profile_for_model_state(provider: &str, protocol: Option<&str>) -> Option<AuthRouteProfile> {
+    // Missing OR empty protocol is the Kimi Chat-compatible default.
+    let protocol = match protocol {
+        Some("") | None => "kimi",
+        Some(value) => value,
+    };
+    match (provider, protocol) {
+        ("codex", _) => Some(AuthRouteProfile {
+            provider: "codex".into(),
+            native_base_url: "https://chatgpt.com/backend-api/codex".into(),
+            upstream_protocol: UpstreamProtocol::Responses,
+            upstream_endpoint: "responses".into(),
+            non_stream_framing: AuthNonStreamFraming::ForcedResponsesSse,
+        }),
+        ("kimi", "kimi") => Some(AuthRouteProfile {
+            provider: "kimi".into(),
+            native_base_url: "https://api.kimi.com/coding/v1".into(),
+            upstream_protocol: UpstreamProtocol::OpenAI,
+            upstream_endpoint: "chat_completions".into(),
+            non_stream_framing: AuthNonStreamFraming::Json,
+        }),
+        ("kimi", "anthropic") => Some(AuthRouteProfile {
+            provider: "kimi".into(),
+            native_base_url: "https://api.kimi.com/coding".into(),
+            upstream_protocol: UpstreamProtocol::Anthropic,
+            upstream_endpoint: "messages_beta".into(),
+            non_stream_framing: AuthNonStreamFraming::Json,
+        }),
+        // Unknown provider or unknown non-empty Kimi protocol: fail closed.
+        _ => None,
+    }
+}
+
+/// The wire profile for one auth account routing `requested_model`.
+///
+/// A direct snapshot hit uses that model's own `protocol`.  An alias mapping
+/// (`model_mapping[requested_model]` = one or more upstream model names) is
+/// allowed only when every target resolves to the *same* profile; a mixed
+/// `kimi`/`anthropic` mapping must fail closed rather than randomly change the
+/// group protocol.  An unknown provider, unknown Kimi protocol, missing target,
+/// or malformed snapshot also returns `None` (fail closed, never Codex URL or
+/// Kimi Chat fallback).
+pub fn resolve_auth_route_profile(
+    account: &AuthAccount,
+    requested_model: &str,
+) -> Option<AuthRouteProfile> {
+    let provider = account.provider.clone();
+
+    // Direct hit on the synced snapshot.
+    let states = account.model_states().ok()?;
+    if let Some(state) = states
+        .models
+        .iter()
+        .find(|state| state.id == requested_model)
+    {
+        // A present-but-unavailable model is not routable (fail closed).
+        if state.status != "available" || state.unavailable {
+            return None;
+        }
+        return profile_for_model_state(&provider, state.protocol.as_deref());
+    }
+
+    // Alias mapping: every target must resolve to an identical profile.
+    let mapping: Value = serde_json::from_str(&account.model_mapping_json).unwrap_or_default();
+    let Some(targets) = mapping.get(requested_model) else {
+        return None;
+    };
+    let target_names: Vec<String> = match targets {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+        _ => return None,
+    };
+    if target_names.is_empty() {
+        return None;
+    }
+    let mut profiles: Vec<AuthRouteProfile> = Vec::new();
+    for name in &target_names {
+        let Some(state) = states.models.iter().find(|state| &state.id == name) else {
+            return None;
+        };
+        if state.status != "available" || state.unavailable {
+            return None;
+        }
+        profiles.push(profile_for_model_state(
+            &provider,
+            state.protocol.as_deref(),
+        )?);
+    }
+    // Mixed profiles fail closed: require every target to agree exactly.
+    if profiles.windows(2).any(|w| w[0] != w[1]) {
+        return None;
+    }
+    profiles.into_iter().next()
+}
+
+// ---------------------------------------------------------------------------
 // Group building
 // ---------------------------------------------------------------------------
 
@@ -867,23 +1004,41 @@ fn classify_channel(
     }
 }
 
-/// Auth accounts have a fixed `/responses` upstream and deliberately do not
-/// consult rollout capability flags.  CountTokens and Embeddings have no
-/// account adapter in v1, so they never form a group.
-fn classify_auth_account(endpoint: EndpointKind) -> Option<(GroupTier, UpstreamProtocol, String)> {
-    match endpoint {
-        EndpointKind::Responses => Some((
-            GroupTier::Native,
-            UpstreamProtocol::Responses,
-            "responses".into(),
-        )),
-        EndpointKind::ChatCompletions | EndpointKind::Messages => Some((
-            GroupTier::Conversion,
-            UpstreamProtocol::Responses,
-            "responses".into(),
-        )),
-        EndpointKind::CountTokens | EndpointKind::Embeddings => None,
+/// Classify an auth account against its resolved per-model profile for the
+/// given downstream endpoint.
+///
+/// The profile is the single source of the upstream protocol/endpoint/framing
+/// (never the rollout capability flags — auth accounts keep their existing
+/// conversion groups even when `cross_protocol_codec` is off).  CountTokens and
+/// Embeddings have no account adapter in v1, so they never form a group.
+fn classify_auth_account(
+    endpoint: EndpointKind,
+    profile: &AuthRouteProfile,
+) -> Option<(GroupTier, UpstreamProtocol, String)> {
+    if matches!(
+        endpoint,
+        EndpointKind::CountTokens | EndpointKind::Embeddings
+    ) {
+        return None;
     }
+    // Native means the downstream endpoint expects this profile's protocol
+    // with no conversion: Chat↔OpenAI, Messages↔Anthropic, Responses↔Responses.
+    let native = match endpoint {
+        EndpointKind::ChatCompletions => profile.upstream_protocol == UpstreamProtocol::OpenAI,
+        EndpointKind::Responses => profile.upstream_protocol == UpstreamProtocol::Responses,
+        EndpointKind::Messages => profile.upstream_protocol == UpstreamProtocol::Anthropic,
+        EndpointKind::CountTokens | EndpointKind::Embeddings => false,
+    };
+    let tier = if native {
+        GroupTier::Native
+    } else {
+        GroupTier::Conversion
+    };
+    Some((
+        tier,
+        profile.upstream_protocol,
+        profile.upstream_endpoint.clone(),
+    ))
 }
 
 /// Build the ordered group plan from the surviving model candidates.
@@ -899,7 +1054,7 @@ fn build_route_plan<R: Rng + ?Sized>(
     let mut config_errors = Vec::new();
 
     for candidate in candidates {
-        let classified = match &candidate {
+        match candidate {
             RouteCandidate::Channel { channel, identity } => {
                 if identity.native_base_url.is_empty() && identity.native_endpoints.is_empty() {
                     config_errors.push(format!(
@@ -908,17 +1063,44 @@ fn build_route_plan<R: Rng + ?Sized>(
                     ));
                     continue;
                 }
-                classify_channel(endpoint, identity, channel, flags)
+                let native_base_url = identity.native_base_url.clone();
+                if let Some((tier, proto, ep)) =
+                    classify_channel(endpoint, &identity, &channel, flags)
+                {
+                    routed.push(RouteGroupCandidate {
+                        candidate: RouteCandidate::Channel { channel, identity },
+                        tier,
+                        upstream_protocol: proto,
+                        upstream_endpoint: ep,
+                        auth_provider: None,
+                        native_base_url,
+                        auth_non_stream_framing: None,
+                    });
+                }
             }
-            RouteCandidate::AuthAccount(_) => classify_auth_account(endpoint),
-        };
-        if let Some((tier, proto, ep)) = classified {
-            routed.push(RouteGroupCandidate {
-                candidate,
-                tier,
-                upstream_protocol: proto,
-                upstream_endpoint: ep,
-            });
+            RouteCandidate::AuthAccount(account) => {
+                // The per-model wire profile is resolved ONLY from the provider
+                // `/models` snapshot.  Unknown provider, unknown Kimi protocol,
+                // missing target, or mixed-profile alias fails closed here.
+                let Some(profile) = resolve_auth_route_profile(&account, model) else {
+                    config_errors.push(format!(
+                        "auth account '{}' ({}): model '{}' has no resolvable wire profile",
+                        account.label, account.id, model
+                    ));
+                    continue;
+                };
+                if let Some((tier, proto, ep)) = classify_auth_account(endpoint, &profile) {
+                    routed.push(RouteGroupCandidate {
+                        candidate: RouteCandidate::AuthAccount(account),
+                        tier,
+                        upstream_protocol: proto,
+                        upstream_endpoint: ep,
+                        auth_provider: Some(profile.provider),
+                        native_base_url: profile.native_base_url,
+                        auth_non_stream_framing: Some(profile.non_stream_framing),
+                    });
+                }
+            }
         }
     }
 
@@ -2494,5 +2676,327 @@ mod tests {
         account.model_mapping_json = json!({"auto": "gpt-4o"}).to_string();
         let candidates = resolve_route_candidates(&[], &[account], "unknown-alias", &key);
         assert_eq!(candidates.len(), 0);
+    }
+
+    // --- C5: per-model auth route profiles ---
+
+    fn kimi_account(id: &str, model: &str, protocol: &str) -> AuthAccount {
+        let mut account = auth_account(id, model, 1, 1);
+        account.provider = "kimi".into();
+        account.model_states_json = json!({
+            "version": 1,
+            "models": [{
+                "id": model,
+                "status": "available",
+                "unavailable": false,
+                "next_retry_after": null,
+                "last_error": null,
+                "protocol": protocol
+            }]
+        })
+        .to_string();
+        account
+    }
+
+    fn account_with_models(id: &str, provider: &str, models: Value, mapping: Value) -> AuthAccount {
+        let mut account = auth_account(id, "unused", 1, 1);
+        account.provider = provider.into();
+        account.model_states_json = models.to_string();
+        account.model_mapping_json = mapping.to_string();
+        account
+    }
+
+    #[test]
+    fn kimi_missing_protocol_resolves_chat_profile() {
+        let key = api_key(&[], &[]);
+        let account = kimi_account("k1", "kimi-k2.5", "");
+        let profile = resolve_auth_route_profile(&account, "kimi-k2.5").unwrap();
+        assert_eq!(profile.provider, "kimi");
+        assert_eq!(profile.native_base_url, "https://api.kimi.com/coding/v1");
+        assert_eq!(profile.upstream_protocol, UpstreamProtocol::OpenAI);
+        assert_eq!(profile.upstream_endpoint, "chat_completions");
+        assert_eq!(profile.non_stream_framing, AuthNonStreamFraming::Json);
+    }
+
+    #[test]
+    fn kimi_kimi_protocol_is_chat_native_for_chat_endpoint() {
+        let key = api_key(&[], &[]);
+        let account = kimi_account("k1", "kimi-k2.5", "kimi");
+        let plan = authorize_and_plan_with_accounts(
+            &key,
+            "kimi-k2.5",
+            EndpointKind::ChatCompletions,
+            &[],
+            &[account],
+            &flags(false),
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap();
+        let group = &plan.groups[0];
+        assert_eq!(group.tier, GroupTier::Native);
+        assert_eq!(group.upstream_protocol, UpstreamProtocol::OpenAI);
+        assert_eq!(group.upstream_endpoint, "chat_completions");
+        assert_eq!(
+            group.candidates[0].auth_non_stream_framing,
+            Some(AuthNonStreamFraming::Json)
+        );
+        assert_eq!(group.candidates[0].auth_provider.as_deref(), Some("kimi"));
+        assert_eq!(
+            group.candidates[0].native_base_url,
+            "https://api.kimi.com/coding/v1"
+        );
+    }
+
+    #[test]
+    fn kimi_chat_profile_converts_responses_and_messages_to_chat() {
+        let key = api_key(&[], &[]);
+        for endpoint in [EndpointKind::Responses, EndpointKind::Messages] {
+            let account = kimi_account("k1", "kimi-k2.5", "kimi");
+            let plan = authorize_and_plan_with_accounts(
+                &key,
+                "kimi-k2.5",
+                endpoint,
+                &[],
+                &[account],
+                &flags(false),
+                &json!({}),
+                &mut seeded(),
+            )
+            .unwrap();
+            let group = &plan.groups[0];
+            assert_eq!(group.tier, GroupTier::Conversion);
+            assert_eq!(group.upstream_protocol, UpstreamProtocol::OpenAI);
+            assert_eq!(group.upstream_endpoint, "chat_completions");
+        }
+    }
+
+    #[test]
+    fn kimi_anthropic_profile_is_messages_beta_native() {
+        let key = api_key(&[], &[]);
+        let account = kimi_account("k2", "kimi-anthropic", "anthropic");
+        let plan = authorize_and_plan_with_accounts(
+            &key,
+            "kimi-anthropic",
+            EndpointKind::Messages,
+            &[],
+            &[account],
+            &flags(false),
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap();
+        let group = &plan.groups[0];
+        assert_eq!(group.tier, GroupTier::Native);
+        assert_eq!(group.upstream_protocol, UpstreamProtocol::Anthropic);
+        assert_eq!(group.upstream_endpoint, "messages_beta");
+        assert_eq!(
+            group.candidates[0].auth_non_stream_framing,
+            Some(AuthNonStreamFraming::Json)
+        );
+        assert_eq!(
+            group.candidates[0].native_base_url,
+            "https://api.kimi.com/coding"
+        );
+    }
+
+    #[test]
+    fn kimi_anthropic_profile_converts_chat_and_responses_to_messages_beta() {
+        let key = api_key(&[], &[]);
+        for endpoint in [EndpointKind::ChatCompletions, EndpointKind::Responses] {
+            let account = kimi_account("k2", "kimi-anthropic", "anthropic");
+            let plan = authorize_and_plan_with_accounts(
+                &key,
+                "kimi-anthropic",
+                endpoint,
+                &[],
+                &[account],
+                &flags(false),
+                &json!({}),
+                &mut seeded(),
+            )
+            .unwrap();
+            let group = &plan.groups[0];
+            assert_eq!(group.tier, GroupTier::Conversion);
+            assert_eq!(group.upstream_protocol, UpstreamProtocol::Anthropic);
+            assert_eq!(group.upstream_endpoint, "messages_beta");
+        }
+    }
+
+    #[test]
+    fn kimi_unknown_protocol_fails_closed_no_candidate() {
+        let key = api_key(&[], &[]);
+        let account = kimi_account("k3", "kimi-mars", "mars");
+        let plan = authorize_and_plan_with_accounts(
+            &key,
+            "kimi-mars",
+            EndpointKind::ChatCompletions,
+            &[],
+            &[account],
+            &flags(false),
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            plan,
+            PlanError::NoEndpointSupported(EndpointKind::ChatCompletions, "kimi-mars".into())
+        );
+    }
+
+    #[test]
+    fn kimi_unavailable_model_never_routes() {
+        let key = api_key(&[], &[]);
+        let mut account = kimi_account("k4", "kimi-k2.5", "kimi");
+        account.model_states_json = json!({
+            "version": 1,
+            "models": [{
+                "id": "kimi-k2.5",
+                "status": "unavailable",
+                "unavailable": true,
+                "next_retry_after": null,
+                "last_error": "unsupported wire protocol",
+                "protocol": "mars"
+            }]
+        })
+        .to_string();
+        let candidates = resolve_route_candidates(&[], &[account], "kimi-k2.5", &key);
+        assert_eq!(candidates.len(), 0);
+    }
+
+    #[test]
+    fn kimi_alias_all_same_profile_routes() {
+        let key = api_key(&[], &[]);
+        let account = account_with_models(
+            "k5",
+            "kimi",
+            json!({
+                "version": 1,
+                "models": [
+                    {"id": "kimi-k2.5", "status": "available", "unavailable": false,
+                     "next_retry_after": null, "last_error": null, "protocol": "kimi"},
+                    {"id": "kimi-k2.5-alt", "status": "available", "unavailable": false,
+                     "next_retry_after": null, "last_error": null, "protocol": "kimi"}
+                ]
+            }),
+            json!({"auto": ["kimi-k2.5", "kimi-k2.5-alt"]}),
+        );
+        let profile = resolve_auth_route_profile(&account, "auto").unwrap();
+        assert_eq!(profile.upstream_protocol, UpstreamProtocol::OpenAI);
+        assert_eq!(profile.upstream_endpoint, "chat_completions");
+    }
+
+    #[test]
+    fn kimi_alias_mixed_profiles_fail_closed() {
+        let key = api_key(&[], &[]);
+        let account = account_with_models(
+            "k6",
+            "kimi",
+            json!({
+                "version": 1,
+                "models": [
+                    {"id": "kimi-k2.5", "status": "available", "unavailable": false,
+                     "next_retry_after": null, "last_error": null, "protocol": "kimi"},
+                    {"id": "kimi-anthropic", "status": "available", "unavailable": false,
+                     "next_retry_after": null, "last_error": null, "protocol": "anthropic"}
+                ]
+            }),
+            json!({"auto": ["kimi-k2.5", "kimi-anthropic"]}),
+        );
+        // Mixed profile fails closed in the profile resolution itself.
+        assert!(resolve_auth_route_profile(&account, "auto").is_none());
+        // And in the planner: no group is formed, no RNG flip changes protocol.
+        let err = authorize_and_plan_with_accounts(
+            &key,
+            "auto",
+            EndpointKind::ChatCompletions,
+            &[],
+            &[account],
+            &flags(false),
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PlanError::NoEndpointSupported(EndpointKind::ChatCompletions, "auto".into())
+        );
+    }
+
+    #[test]
+    fn kimi_count_tokens_and_embeddings_never_form_auth_group() {
+        let key = api_key(&[], &[]);
+        for endpoint in [EndpointKind::CountTokens, EndpointKind::Embeddings] {
+            let account = kimi_account("k7", "kimi-k2.5", "kimi");
+            let err = authorize_and_plan_with_accounts(
+                &key,
+                "kimi-k2.5",
+                endpoint,
+                &[],
+                &[account],
+                &flags(false),
+                &json!({}),
+                &mut seeded(),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                PlanError::NoEndpointSupported(e, _) if e == endpoint
+            ));
+        }
+    }
+
+    #[test]
+    fn codex_profile_still_responses_with_forced_sse_framing() {
+        let key = api_key(&[], &[]);
+        let account = auth_account("codex-1", "m", 1, 1);
+        let plan = authorize_and_plan_with_accounts(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &[],
+            &[account],
+            &flags(false),
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap();
+        let group = &plan.groups[0];
+        assert_eq!(group.tier, GroupTier::Native);
+        assert_eq!(group.upstream_protocol, UpstreamProtocol::Responses);
+        assert_eq!(
+            group.candidates[0].auth_non_stream_framing,
+            Some(AuthNonStreamFraming::ForcedResponsesSse)
+        );
+        assert_eq!(group.candidates[0].auth_provider.as_deref(), Some("codex"));
+        assert_eq!(
+            group.candidates[0].native_base_url,
+            "https://chatgpt.com/backend-api/codex"
+        );
+    }
+
+    #[test]
+    fn prefer_same_protocol_picks_kimi_chat_over_codex_for_chat() {
+        let key = api_key(&[], &[]);
+        let codex = auth_account("codex", "m", 0, 1);
+        let kimi = kimi_account("kimi", "m", "kimi");
+        let mut f = flags(false);
+        f.prefer_same_protocol = true;
+        let plan = authorize_and_plan_with_accounts(
+            &key,
+            "m",
+            EndpointKind::ChatCompletions,
+            &[],
+            &[codex, kimi],
+            &f,
+            &json!({}),
+            &mut seeded(),
+        )
+        .unwrap();
+        // Same-protocol (OpenAI chat) Kimi group comes first.
+        let first = &plan.groups[0];
+        assert_eq!(first.tier, GroupTier::Native);
+        assert_eq!(first.upstream_protocol, UpstreamProtocol::OpenAI);
+        assert!(first.candidates.iter().any(|c| c.candidate.id() == "kimi"));
     }
 }
