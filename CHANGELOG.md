@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.1
+
+- 审计日志流式响应修复：流式请求的 `response_choices` 现在正确记录响应内容（content / reasoning_content / tool_calls），与非流式路径行为一致
+- 支持三种流式协议的响应累积：OpenAI Chat Completions、Anthropic Messages、OpenAI Responses API
+- 版本号统一升级至 0.2.1（package.json / Cargo.toml / tauri.conf.json）
+
 ## v0.1.9
 
 - 渠道多 Key 负载均衡：单个渠道配置多个 API Key，按权重随机选择，分散并发压力
