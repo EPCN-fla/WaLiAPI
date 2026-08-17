@@ -9,7 +9,8 @@
 //! Directions implemented in this first version:
 //!   - [`chat_to_messages_v1`]:   Chat Completions request  → Messages request
 //!   - [`messages_to_chat_v1`]:   Messages request         → Chat request
-//! plus the response directions:
+//!
+//! Plus the response directions:
 //!   - [`chat::NonStreamResponseDecoder`]  (Chat  → Messages non-stream body)
 //!   - [`messages::NonStreamResponseDecoder`] (Messages → Chat non-stream body)
 //!   - [`chat::StreamDecoder`]  (OpenAI Chat SSE  → Messages SSE)
@@ -29,14 +30,24 @@ pub mod responses_codec;
 pub mod sse;
 pub mod types;
 
+// Facade re-exports keep every pre-refactor public path reachable (zero public
+// API change).  `mod protocol` is crate-private, so an item without an in-crate
+// consumer is flagged as an unused import — these `#[allow(unused_imports)]`
+// markers match the convention used across the module-tree facades
+// (protocol/mod.rs, directions, chat, messages, responses).
+#[allow(unused_imports)]
 pub use direction::CodecDirection;
+#[allow(unused_imports)]
 pub use error::{
     CodecError, DecodeError, FeatureKind, PrepareError, ResponseDecodeError, UnsupportedFeatures,
     CODEC_UNSUPPORTED_FEATURE, CODEC_UNSUPPORTED_MEDIA,
 };
+#[allow(unused_imports)]
 pub use ports::{DecodedResponse, NonStreamDecoder, StreamDecoder};
-pub use registry::{CodecRegistry, Downstream, Upstream, Version};
-pub use report::{CodecVersion, ConversionContext, ConversionReport, FieldStatus, Usage};
+pub use registry::CodecRegistry;
+#[allow(unused_imports)]
+pub use report::{ConversionContext, ConversionReport, Usage};
+#[allow(unused_imports)]
 pub use types::{CodecId, PreparedCodec, PreparedConversion, Protocol};
 // Auth transport still needs to assemble the provider's Responses SSE into a
 // completed envelope before the request-scoped decoder runs. Re-export the
@@ -45,6 +56,7 @@ pub use types::{CodecId, PreparedCodec, PreparedConversion, Protocol};
 pub use responses_codec::ResponsesEventAccumulator;
 
 #[cfg(test)]
-mod chat_messages_codec;
+#[path = "tests/chat_messages/mod.rs"]
+mod chat_messages_codec_tests;
 #[cfg(test)]
 mod foundation_tests;

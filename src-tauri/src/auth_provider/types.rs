@@ -114,7 +114,8 @@ impl AuthAccountSummary {
             .map_err(|_| ProviderError::InvalidPayload)?;
         let attributes = serde_json::from_str(&account.attributes_json)
             .map_err(|_| ProviderError::InvalidPayload)?;
-        let model_mapping = account.model_mapping()
+        let model_mapping = account
+            .model_mapping()
             .map_err(|_| ProviderError::InvalidPayload)?;
         Ok(Self {
             id: account.id.clone(),

@@ -33,8 +33,8 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{Duration, SecondsFormat, Utc};
 use futures_util::StreamExt;
-use rand::SeedableRng;
 use rand::Rng;
+use rand::SeedableRng;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,7 +47,10 @@ use std::time::Instant;
 /// no extra keys exist.
 async fn select_channel_key(channel: &Channel, repo: &Arc<Repository>) -> Channel {
     let extra_keys = match repo.get_channel_api_keys(&channel.id).await {
-        Ok(keys) => keys.into_iter().filter(|k| k.status == 1).collect::<Vec<_>>(),
+        Ok(keys) => keys
+            .into_iter()
+            .filter(|k| k.status == 1)
+            .collect::<Vec<_>>(),
         Err(_) => return channel.clone(),
     };
     if extra_keys.is_empty() {

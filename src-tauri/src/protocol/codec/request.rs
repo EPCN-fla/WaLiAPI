@@ -42,6 +42,7 @@ pub fn finish(out: Vec<super::error::RejectedField>) -> Result<(), UnsupportedFe
 ///   - `"auto"`/`"none"` → string passthrough
 ///   - `"required"` → `{"type":"any"}`
 ///   - `{"type":"function","function":{"name":...}}` → `{"type":"tool","name":...}`
+///
 /// Anything else (including a named-function `"auto"` string, `"disable_parallel_tool_calls"`,
 /// `parallel_tool_calls` interplay, or an unknown object) is rejected.
 pub fn chat_tool_choice_to_anthropic(
@@ -287,18 +288,4 @@ pub fn anthropic_image_to_chat(block: &Value, pointer: &str) -> Result<Value, Un
             "image source missing type",
         )),
     }
-}
-
-/// True when a value is present and not the JSON `null`.
-pub fn present(v: &Option<&Value>) -> bool {
-    match v {
-        None => false,
-        Some(Value::Null) => false,
-        Some(_) => true,
-    }
-}
-
-/// Read an optional string field without allocating when absent.
-pub fn opt_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
-    v.get(key).and_then(Value::as_str)
 }
