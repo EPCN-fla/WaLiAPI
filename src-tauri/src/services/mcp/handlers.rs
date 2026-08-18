@@ -14,7 +14,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tokio::sync::{mpsc, RwLock};
 
 /// MCP server instructions — agent 首次连接时注入 system prompt
@@ -1388,7 +1388,8 @@ async fn handle_tool_call(
             tokio::task::spawn_blocking(move || {
                 let rt = tokio::runtime::Handle::current();
                 rt.block_on(async {
-                    let _ = app_clone.emit(
+                    crate::server::event_bridge::emit_admin(
+                        &app_clone,
                         "kb-index-progress",
                         serde_json::json!({
                             "kb_id": &kb_id_clone,
@@ -1406,7 +1407,8 @@ async fn handle_tool_call(
                     {
                         Ok(()) => {
                             tracing::info!("HNSW index built for KB {}", kb_id_clone);
-                            let _ = app_clone.emit(
+                            crate::server::event_bridge::emit_admin(
+                                &app_clone,
                                 "kb-index-progress",
                                 serde_json::json!({
                                     "kb_id": &kb_id_clone,
@@ -1421,7 +1423,8 @@ async fn handle_tool_call(
                             repo.update_kb_index_status(&kb_id_clone, "error")
                                 .await
                                 .ok();
-                            let _ = app_clone.emit(
+                            crate::server::event_bridge::emit_admin(
+                                &app_clone,
                                 "kb-index-progress",
                                 serde_json::json!({
                                     "kb_id": &kb_id_clone,

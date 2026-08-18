@@ -3,7 +3,7 @@ use super::models::SearchResult;
 use super::repository::KbRepository;
 use sqlx::SqlitePool;
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 /// Default HNSW parameters
 const DEFAULT_M: usize = 16;
@@ -303,7 +303,8 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Res
 
     // Emit initial progress with total count
     let total_items = items.len();
-    let _ = app.emit(
+    crate::server::event_bridge::emit_admin(
+        app,
         "kb-index-progress",
         serde_json::json!({
             "kb_id": kb_id,
@@ -327,7 +328,8 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Res
             } else {
                 100
             };
-            let _ = app_clone.emit(
+            crate::server::event_bridge::emit_admin(
+                &app_clone,
                 "kb-index-progress",
                 serde_json::json!({
                     "kb_id": &kb_id_clone,

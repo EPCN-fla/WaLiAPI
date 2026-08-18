@@ -110,11 +110,16 @@ export const authApi = {
   loginCancel: (sessionId: string) => invoke<AuthLoginSessionStatus>("auth_login_cancel", { sessionId }),
   loginImport: (provider?: string, path?: string) =>
     invoke<AuthMutationResult>("auth_login_import", { provider, path }),
+  /** Web 版：直接上传 auth.json 内容导入（无服务器文件路径）。 */
+  loginImportContent: (provider: string, content: string) =>
+    invoke<AuthMutationResult>("auth_login_import_content", { provider, content }),
   defaultImportPath: () => invoke<string>("auth_default_import_path"),
   logout: (id: string) => invoke<AuthLogoutResult>("auth_logout", { id }),
   refreshToken: (id: string) => invoke<AuthAccount>("auth_refresh_token", { id }),
   syncModels: (id: string) => invoke<AuthAccount>("auth_sync_models", { id }),
   exportJson: (id: string, path: string) => invoke<AuthExportResult>("auth_export_json", { id, path }),
+  /** Web 版：导出 auth.json 内容，由浏览器触发下载。 */
+  exportJsonContent: (id: string) => invoke<string>("auth_export_json_content", { id }),
   toggle: (id: string, disabled: boolean) => invoke<AuthAccount>("auth_toggle", { id, disabled }),
   quotaStatus: (id: string) => invoke<AuthQuotaStatus>("auth_quota_status", { id }),
   update: (input: AuthUpdateInput) => invoke<AuthAccount>("auth_update", { input }),

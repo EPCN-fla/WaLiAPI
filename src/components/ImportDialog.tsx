@@ -1,8 +1,13 @@
 import { useState } from "react";
 import { importExportApi, type ImportResult, type ScannedSource } from "../lib/api";
+import { isWebRuntime, pickFileAsText } from "../lib/web";
 import { X, Upload, FileJson, ScanLine, Check, AlertCircle, Loader2, ChevronDown, ChevronRight } from "lucide-react";
 
 type ImportMode = "menu" | "walicode" | "waliapi" | "scan";
+
+/** 桌面端走原生文件对话框；Web 版用浏览器文件选择器读取内容。 */
+const pickImportContent = (): Promise<string | null> =>
+  isWebRuntime() ? pickFileAsText(".json,application/json") : importExportApi.pickImportFile();
 
 export function ImportDialog({ onClose, onImported }: {
   onClose: () => void;
@@ -21,7 +26,7 @@ export function ImportDialog({ onClose, onImported }: {
     setLoading(true);
     setError(null);
     try {
-      const content = await importExportApi.pickImportFile();
+      const content = await pickImportContent();
       if (!content) {
         setLoading(false);
         return;
@@ -42,7 +47,7 @@ export function ImportDialog({ onClose, onImported }: {
     setLoading(true);
     setError(null);
     try {
-      const content = await importExportApi.pickImportFile();
+      const content = await pickImportContent();
       if (!content) {
         setLoading(false);
         return;

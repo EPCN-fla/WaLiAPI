@@ -1,5 +1,9 @@
+pub mod admin_auth;
+pub mod admin_routes;
+pub mod event_bridge;
 pub mod handlers;
 pub mod router;
+pub mod static_assets;
 
 use crate::AppState;
 use tauri::{AppHandle, Emitter};

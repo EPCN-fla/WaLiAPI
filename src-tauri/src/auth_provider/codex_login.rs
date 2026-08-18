@@ -584,18 +584,9 @@ fn required_string(
         .ok_or(error)
 }
 
-fn write_auth_json_with_rename<F>(
-    path: &Path,
-    payload: &ProviderPayload,
-    rename: F,
-) -> Result<AuthJsonWriteResult, ProviderError>
-where
-    F: Fn(&Path, &Path) -> io::Result<()>,
-{
-    let parent = path
-        .parent()
-        .filter(|parent| parent.is_dir())
-        .ok_or(ProviderError::Storage)?;
+/// Serialize the Codex auth.json document for an account payload.
+/// Shared by the atomic file exporter and the Web 管理面板 content export.
+fn encode_auth_json(payload: &ProviderPayload) -> Result<Vec<u8>, ProviderError> {
     let id_token = required_string(
         payload.as_value(),
         "id_token",
@@ -616,7 +607,7 @@ where
         "account_id",
         ProviderError::InvalidPayload,
     )?;
-    let encoded = serde_json::to_vec_pretty(&json!({
+    serde_json::to_vec_pretty(&json!({
         "auth_mode": "chatgpt",
         "OPENAI_API_KEY": Value::Null,
         "tokens": {
@@ -627,7 +618,30 @@ where
         },
         "last_refresh": Utc::now().to_rfc3339(),
     }))
-    .map_err(|_| ProviderError::Storage)?;
+    .map_err(|_| ProviderError::Storage)
+}
+
+impl CodexLogin {
+    /// Web 管理面板用：导出 auth.json 内容（不落盘）。
+    pub fn export_auth_json_content(payload: &ProviderPayload) -> Result<String, ProviderError> {
+        let bytes = encode_auth_json(payload)?;
+        String::from_utf8(bytes).map_err(|_| ProviderError::Storage)
+    }
+}
+
+fn write_auth_json_with_rename<F>(
+    path: &Path,
+    payload: &ProviderPayload,
+    rename: F,
+) -> Result<AuthJsonWriteResult, ProviderError>
+where
+    F: Fn(&Path, &Path) -> io::Result<()>,
+{
+    let parent = path
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .ok_or(ProviderError::Storage)?;
+    let encoded = encode_auth_json(payload)?;
     let stamp = Utc::now().format("%Y%m%d%H%M%S%f");
     let filename = path
         .file_name()

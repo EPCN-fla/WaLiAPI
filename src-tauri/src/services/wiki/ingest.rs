@@ -6,7 +6,7 @@ use crate::db::repository::Repository;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 /// Ingest a source file: read → parse → generate wiki pages via LLM → write to disk+DB.
 pub async fn ingest_source(
@@ -275,7 +275,8 @@ fn emit_wiki_progress(
     progress: u8,
     detail: &str,
 ) {
-    let _ = app.emit(
+    crate::server::event_bridge::emit_admin(
+        app,
         "wiki-source-progress",
         serde_json::json!({
             "source_id": source_id,

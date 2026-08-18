@@ -35,6 +35,10 @@ pub struct AppState {
     /// `test_run_id + draft_fingerprint + force_save` at channel save time.
     /// Process restart clears it → every receipt expires → re-test required.
     pub test_receipts: Arc<crate::services::channel_test::TestReceiptStore>,
+    /// Web 管理面板：管理员会话（内存存储，重启失效）。
+    pub admin_sessions: Arc<server::admin_auth::SessionStore>,
+    /// Web 管理面板：SSE 事件桥广播通道。
+    pub event_tx: tokio::sync::broadcast::Sender<server::event_bridge::AdminEvent>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -121,10 +125,16 @@ pub fn run() {
             tauri::async_runtime::block_on(async move {
                 let db = db::Database::new(&app_handle).await;
                 let db = Arc::new(db);
+                if let Err(e) = server::admin_auth::ensure_initial_admin(&db.pool).await {
+                    log::error!("初始化 Web 管理员账号失败: {e}");
+                }
                 let auth_service = Arc::new(auth_provider::service::AuthService::new(
                     Arc::new(db::repository::Repository::new(db.pool.clone())),
                     auth_provider::ProviderRegistry::new(),
                 ));
+                let (event_tx, _) = tokio::sync::broadcast::channel(
+                    server::event_bridge::EVENT_CHANNEL_CAPACITY,
+                );
                 let state = Arc::new(AppState {
                     db,
                     auth_service: auth_service.clone(),
@@ -135,6 +145,8 @@ pub fn run() {
                     test_receipts: Arc::new(crate::services::channel_test::TestReceiptStore::new(
                         std::time::Duration::from_secs(30 * 60),
                     )),
+                    admin_sessions: server::admin_auth::SessionStore::new(),
+                    event_tx,
                 });
                 app_handle.manage(state.clone());
 
@@ -179,11 +191,13 @@ pub fn run() {
             commands::auth::auth_login_status,
             commands::auth::auth_login_cancel,
             commands::auth::auth_login_import,
+            commands::auth::auth_login_import_content,
             commands::auth::auth_default_import_path,
             commands::auth::auth_logout,
             commands::auth::auth_refresh_token,
             commands::auth::auth_sync_models,
             commands::auth::auth_export_json,
+            commands::auth::auth_export_json_content,
             commands::auth::auth_toggle,
             commands::auth::auth_quota_status,
             commands::auth::auth_update,

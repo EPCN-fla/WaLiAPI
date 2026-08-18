@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::AppHandle;
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_store::StoreExt;
 
@@ -209,11 +209,11 @@ pub async fn save_settings(settings: Settings, app: AppHandle) -> Result<(), Str
 
 #[tauri::command]
 pub async fn apply_theme(theme: String, app: AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") {
-        window
-            .emit("theme-changed", serde_json::json!({ "theme": theme }))
-            .map_err(|e| e.to_string())?;
-    }
+    crate::server::event_bridge::emit_admin(
+        &app,
+        "theme-changed",
+        serde_json::json!({ "theme": theme }),
+    );
     Ok(())
 }
 

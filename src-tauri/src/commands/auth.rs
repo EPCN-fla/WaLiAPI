@@ -573,6 +573,31 @@ pub async fn auth_login_import(
     .await
 }
 
+/// Web 管理面板：直接以文件内容导入（浏览器 `<input type=file>` 上传，无服务器路径）。
+#[tauri::command]
+pub async fn auth_login_import_content(
+    provider: Option<String>,
+    content: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<AuthMutationResult, String> {
+    let kind = provider_kind(provider)?;
+    let bytes = content.into_bytes();
+    if bytes.is_empty() {
+        return Err("Unable to read auth file".to_owned());
+    }
+    let summary = state
+        .auth_service
+        .import(kind, &bytes)
+        .await
+        .map_err(safe_error)?;
+    sync_after_login(
+        &state.auth_service,
+        summary,
+        Some(CODEX_IMPORT_NOTICE.to_owned()),
+    )
+    .await
+}
+
 #[tauri::command]
 pub async fn auth_logout(
     id: String,
@@ -641,6 +666,27 @@ pub async fn auth_export_json(
             .backup_path
             .map(|path| path.to_string_lossy().into_owned()),
     })
+}
+
+/// Web 管理面板：导出 auth.json 内容（由浏览器触发下载，不写服务器磁盘）。
+#[tauri::command]
+pub async fn auth_export_json_content(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<String, String> {
+    validate_account_id(&id)?;
+    let repository = Repository::new(state.db.pool.clone());
+    let account = repository
+        .get_auth_account(&id)
+        .await
+        .map_err(|_| storage_error())?;
+    if account.provider != "codex" {
+        return Err("Unsupported auth provider".to_owned());
+    }
+    let payload = serde_json::from_str(&account.payload_json)
+        .map(ProviderPayload::new)
+        .map_err(|_| safe_error(ProviderError::InvalidPayload))?;
+    CodexLogin::export_auth_json_content(&payload).map_err(safe_error)
 }
 
 #[tauri::command]

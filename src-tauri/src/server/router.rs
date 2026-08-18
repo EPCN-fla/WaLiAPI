@@ -12,6 +12,9 @@ use tower_http::cors::{Any, CorsLayer};
 pub fn create_router(app: AppHandle, state: Arc<AppState>) -> Router {
     let shared = SharedState {
         app: app.clone(),
+        // App 生命周期即进程生命周期，泄漏一次以换取 'static 引用，
+        // 使管理路由可以构造 State<'static, Arc<AppState>> 直接复用 Tauri command。
+        app_static: Box::leak(Box::new(app.clone())),
         state: state.clone(),
     };
 
@@ -24,6 +27,9 @@ pub fn create_router(app: AppHandle, state: Arc<AppState>) -> Router {
     // Service registry — merge all service routes
     let registry = crate::services::ServiceRegistry::new();
     let service_router = registry.merge_routes(state.clone());
+
+    // Web 管理面板（/admin/api/*，自带会话鉴权）
+    let admin = super::admin_routes::router(shared.clone());
 
     Router::new()
         // OpenAI Chat Completions
@@ -57,6 +63,10 @@ pub fn create_router(app: AppHandle, state: Arc<AppState>) -> Router {
         .route("/health", get(handle_health))
         // Service routes (Knowledge Base, MCP, etc.)
         .merge(service_router)
+        // Web 管理面板 API
+        .nest("/admin/api", admin)
+        // 内嵌 Web 静态资源（SPA fallback，须放在所有 API 路由之后）
+        .merge(super::static_assets::static_router())
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(cors)
         .with_state(shared)
@@ -65,5 +75,6 @@ pub fn create_router(app: AppHandle, state: Arc<AppState>) -> Router {
 #[derive(Clone)]
 pub struct SharedState {
     pub app: AppHandle,
+    pub app_static: &'static AppHandle,
     pub state: Arc<AppState>,
 }

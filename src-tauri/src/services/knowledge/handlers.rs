@@ -13,7 +13,7 @@ use axum::{
 };
 use serde::Deserialize;
 use sha2::Digest;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -600,7 +600,8 @@ pub async fn build_index(State(shared): State<SharedState>, Path(kb_id): Path<St
 
         rt.block_on(async {
             // Emit progress: starting
-            let _ = app.emit(
+            crate::server::event_bridge::emit_admin(
+                &app,
                 "kb-index-progress",
                 serde_json::json!({
                     "kb_id": &kb_id,
@@ -612,7 +613,8 @@ pub async fn build_index(State(shared): State<SharedState>, Path(kb_id): Path<St
             match retriever::build_index(&pool, &kb_id, &app).await {
                 Ok(()) => {
                     tracing::info!("HNSW index built successfully for KB {}", kb_id);
-                    let _ = app.emit(
+                    crate::server::event_bridge::emit_admin(
+                        &app,
                         "kb-index-progress",
                         serde_json::json!({
                             "kb_id": &kb_id,
@@ -625,7 +627,8 @@ pub async fn build_index(State(shared): State<SharedState>, Path(kb_id): Path<St
                     tracing::error!("Failed to build HNSW index for KB {}: {}", kb_id, e);
                     let repo = KbRepository::new(pool.clone());
                     repo.update_kb_index_status(&kb_id, "error").await.ok();
-                    let _ = app.emit(
+                    crate::server::event_bridge::emit_admin(
+                        &app,
                         "kb-index-progress",
                         serde_json::json!({
                             "kb_id": &kb_id,

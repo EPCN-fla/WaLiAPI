@@ -3,7 +3,7 @@ use crate::services::knowledge::{models::*, repository::KbRepository};
 use crate::AppState;
 use serde::Deserialize;
 use std::sync::Arc;
-use tauri::{Emitter, State};
+use tauri::State;
 
 #[tauri::command]
 pub async fn get_knowledge_bases(
@@ -594,7 +594,8 @@ pub async fn build_kb_index(
         let kb_id_clone = kb_id.clone();
 
         // Emit starting event
-        let _ = app.emit(
+        crate::server::event_bridge::emit_admin(
+            &app,
             "kb-index-progress",
             serde_json::json!({
                 "kb_id": &kb_id_clone,
@@ -609,7 +610,8 @@ pub async fn build_kb_index(
         match crate::services::knowledge::retriever::build_index(&pool, &kb_id_clone, &app).await {
             Ok(()) => {
                 tracing::info!("HNSW index built successfully for KB {}", kb_id_clone);
-                let _ = app.emit(
+                crate::server::event_bridge::emit_admin(
+                    &app,
                     "kb-index-progress",
                     serde_json::json!({
                         "kb_id": &kb_id_clone,
@@ -625,7 +627,8 @@ pub async fn build_kb_index(
                 repo.update_kb_index_status(&kb_id_clone, "error")
                     .await
                     .ok();
-                let _ = app.emit(
+                crate::server::event_bridge::emit_admin(
+                    &app,
                     "kb-index-progress",
                     serde_json::json!({
                         "kb_id": &kb_id_clone,

@@ -47,7 +47,7 @@ async fn auth_repository_upsert_preserves_route_configuration_and_provider_scope
         ))
         .await
         .expect("first upsert");
-    repo.update_auth_account(&first.id, "Custom label", 7, 4)
+    repo.update_auth_account(&first.id, "Custom label", 7, 4, "{}")
         .await
         .expect("update route settings");
     repo.update_auth_account_disabled(&first.id, true)

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { settingsApi, serverApi, securityApi } from "../lib/api";
+import { isWebRuntime } from "../lib/web";
 import type { Settings, BuiltinRule, CustomRule } from "../types";
 import { Save, RotateCcw, Check, Server, SlidersHorizontal, Palette, RefreshCw, ShieldAlert, Plus, Trash2, ListChecks, Pencil, X, AlertCircle, HelpCircle } from "lucide-react";
 
@@ -150,7 +151,10 @@ export function SettingsPage() {
   const handleSave = async () => {
     await settingsApi.save(settings);
     await settingsApi.applyTheme(settings.ui_theme);
-    await settingsApi.setAutoStart(settings.auto_start);
+    // Web 版无系统自启能力，跳过（开关在 Web 下已隐藏，保持默认值）
+    if (!isWebRuntime()) {
+      await settingsApi.setAutoStart(settings.auto_start);
+    }
     document.documentElement.setAttribute("data-theme", settings.ui_theme || "dark");
     document.documentElement.lang = settings.ui_language || "zh-CN";
     setSaved(true);
@@ -522,7 +526,7 @@ export function SettingsPage() {
               ["最小化到托盘", "minimize_to_tray"],
               ["关闭到托盘", "close_to_tray"],
               ["开机自启", "auto_start"],
-            ] as const).map(([label, key]) => (
+            ] as const).filter(() => !isWebRuntime()).map(([label, key]) => (
               <label key={key} className="surface-soft flex items-center justify-between rounded-2xl px-4 py-4">
                 <span className="text-sm">{label}</span>
                 <input

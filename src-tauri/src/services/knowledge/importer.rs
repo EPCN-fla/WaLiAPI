@@ -5,7 +5,7 @@ use super::repository::KbRepository;
 use sha2::Digest;
 use sqlx::SqlitePool;
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 /// Import a Git repository: clone → filter → process files
 pub async fn import_git_repo(
@@ -521,7 +521,8 @@ fn is_supported_extension(ext: &str) -> bool {
 }
 
 fn emit_import_progress(app: &AppHandle, kb_id: &str, source_id: &str, progress: u8, detail: &str) {
-    let _ = app.emit(
+    crate::server::event_bridge::emit_admin(
+        app,
         "kb-import-progress",
         serde_json::json!({
             "kb_id": kb_id,

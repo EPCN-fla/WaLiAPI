@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { CircleAlert, KeyRound, Loader2, Upload, X } from "lucide-react";
 import { authApi } from "../lib/api";
+import { downloadTextFile, isWebRuntime, pickFileAsText } from "../lib/web";
 import type { AuthAccount, AuthMutationResult } from "../types";
 import { AccountCard } from "../components/auth/AccountCard";
 import { EditModal } from "../components/auth/EditModal";
@@ -57,6 +58,20 @@ export function AuthChannelsPage() {
     void load();
   };
   const importAuth = async () => {
+    // Web 版：浏览器文件选择器读取内容后按内容导入
+    if (isWebRuntime()) {
+      const content = await pickFileAsText(".json,application/json");
+      if (content === null) return; // 用户取消 → 静默 no-op
+      setPendingId("import"); setNotice({ kind: "success", message: "正在导入 auth.json …" });
+      try {
+        const result = await authApi.loginImportContent("codex", content);
+        setNotice(result.warning ? { kind: "warning", message: "账号已保存但暂不参与路由：模型同步失败。" } : { kind: "success", message: result.notice || "已导入账号。" });
+        await load();
+      } catch (_) {
+        setNotice({ kind: "error", message: "导入失败，请确认 auth.json 字段完整。" });
+      } finally { setPendingId(null); }
+      return;
+    }
     let path: string | null = null;
     try {
       const { open } = await import("@tauri-apps/plugin-dialog");
@@ -102,6 +117,20 @@ export function AuthChannelsPage() {
     }
   };
   const exportAuth = async (account: AuthAccount) => {
+    // Web 版：后端返回文件内容，浏览器直接下载
+    if (isWebRuntime()) {
+      setPendingId(account.id);
+      try {
+        const content = await authApi.exportJsonContent(account.id);
+        downloadTextFile(content, exportFileName(account));
+        setNotice({ kind: "success", message: "已导出 auth.json。" });
+      } catch (_) {
+        setNotice({ kind: "error", message: "导出失败，请稍后重试。" });
+      } finally {
+        setPendingId(null);
+      }
+      return;
+    }
     let path: string | null = null;
     try {
       const { save } = await import("@tauri-apps/plugin-dialog");

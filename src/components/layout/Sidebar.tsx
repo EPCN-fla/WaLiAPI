@@ -14,8 +14,10 @@ import {
   ExternalLink,
   Link,
   Database,
+  LogOut,
 } from "lucide-react";
 import { serverApi } from "../../lib/api";
+import { isWebRuntime } from "../../lib/web";
 import type { ServerStatus } from "../../types";
 import packageJson from "../../../package.json";
 
@@ -31,6 +33,17 @@ const navItems = [
 
 const githubUrl = "https://github.com/fuzhengwei/WaLiAPI";
 const appVersion = packageJson.version;
+
+/** Web 管理面板：清除会话并回到登录页（桌面端不渲染入口）。 */
+function webLogout() {
+  const token = localStorage.getItem("waliapi_admin_token");
+  void fetch("/admin/api/auth/logout", {
+    method: "POST",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  }).catch(() => {});
+  localStorage.removeItem("waliapi_admin_token");
+  location.assign("/login");
+}
 
 export function Sidebar({
   hasUpdate,
@@ -154,6 +167,18 @@ export function Sidebar({
           </span>
           <ExternalLink size={14} className="text-slate-400" />
         </button>
+
+        {isWebRuntime() && (
+          <button
+            onClick={webLogout}
+            className="flex w-full items-center gap-3 rounded-[18px] border border-slate-200 bg-white/70 px-4 py-3 text-left text-sm text-slate-600 transition-all hover:bg-white hover:text-rose-600 hover:shadow-[0_8px_18px_rgba(15,23,42,0.05)]"
+          >
+            <span className="flex h-9 w-9 items-center justify-center rounded-xl border border-slate-200 bg-white">
+              <LogOut size={17} />
+            </span>
+            <span className="min-w-0 flex-1 font-medium">退出登录</span>
+          </button>
+        )}
       </div>
     </aside>
   );

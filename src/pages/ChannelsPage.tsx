@@ -3,6 +3,7 @@ import { channelApi, importExportApi } from "../lib/api";
 import type { ChannelStats } from "../lib/api";
 import type { Channel } from "../types";
 import { getProtocolLabel, getChannelProviderLabel, formatTime, formatNumber, formatDuration } from "../lib/constants";
+import { downloadTextFile, isWebRuntime } from "../lib/web";
 import { Plus, Radio, Trash2, Zap, Power, Edit, Download, ChevronDown, Upload, Loader2, X, Activity, Clock, GripVertical, Eye, EyeOff, Copy, Check, AlertCircle } from "lucide-react";
 import { ChannelForm } from "../components/ChannelForm";
 import { ImportDialog } from "../components/ImportDialog";
@@ -66,7 +67,12 @@ export function ChannelsPage() {
     try {
       const content = await importExportApi.exportChannels();
       const timestamp = new Date().toISOString().slice(0, 10);
-      await importExportApi.saveExportFile(content, `waliapi-export-${timestamp}.json`);
+      const filename = `waliapi-export-${timestamp}.json`;
+      if (isWebRuntime()) {
+        downloadTextFile(content, filename);
+      } else {
+        await importExportApi.saveExportFile(content, filename);
+      }
     } catch (e) {
       console.error("Export failed:", e);
     }

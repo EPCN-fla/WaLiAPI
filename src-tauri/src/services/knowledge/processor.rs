@@ -7,7 +7,7 @@ use super::splitter;
 use crate::db::models::now_iso;
 use crate::db::repository::Repository;
 use sqlx::SqlitePool;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 /// Default embedding model
 const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
@@ -22,7 +22,8 @@ fn emit_progress(
     progress: u8,
     detail: &str,
 ) {
-    let _ = app.emit(
+    crate::server::event_bridge::emit_admin(
+        app,
         "kb-document-progress",
         serde_json::json!({
             "doc_id": doc_id,
@@ -62,7 +63,8 @@ pub async fn process_document(
         let _ = repo
             .update_document_status(doc_id, "failed", Some(&err_msg))
             .await;
-        let _ = app.emit(
+        crate::server::event_bridge::emit_admin(
+            app,
             "kb-document-error",
             serde_json::json!({
                 "doc_id": doc_id,
@@ -166,7 +168,8 @@ async fn process_document_inner(
 
     if chunks.is_empty() {
         // 分块后为空状态改为失败,且失败信息给客户端提示
-        let _ = app.emit(
+        crate::server::event_bridge::emit_admin(
+            app,
             "kb-document-error",
             serde_json::json!({
                 "doc_id": doc_id,
@@ -310,7 +313,8 @@ async fn process_document_inner(
                     kb_id_clone,
                     e
                 );
-                let _ = app_clone.emit(
+                crate::server::event_bridge::emit_admin(
+                    &app_clone,
                     "kb-index-progress",
                     serde_json::json!({
                         "kb_id": &kb_id_clone,
@@ -319,7 +323,8 @@ async fn process_document_inner(
                     }),
                 );
             } else {
-                let _ = app_clone.emit(
+                crate::server::event_bridge::emit_admin(
+                    &app_clone,
                     "kb-index-progress",
                     serde_json::json!({
                         "kb_id": &kb_id_clone,

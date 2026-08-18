@@ -1,0 +1,781 @@
+//! Web ???? REST ???`/admin/api/*`??
+//!
+//! - `/auth/*`??? / ?? / ???? / ?????login ?????????
+//! - `/invoke`?? Tauri invoke ?? 1:1 ????????? cmd ???? commands ??
+//! - `/events`?SSE ??????????? `app.emit` ??
+//!
+//! ? `/auth/login` ???????????Bearer token ? `waliapi_admin_token` Cookie??
+
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::{
+    extract::{Extension, Request, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Json, Response,
+    },
+    routing::{get, post},
+    Router,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tauri::{AppHandle, Manager};
+use tokio::sync::broadcast;
+
+use super::admin_auth::{self, AdminSession};
+use super::router::SharedState;
+use crate::commands;
+use crate::AppState;
+
+const SESSION_COOKIE: &str = "waliapi_admin_token";
+const SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+
+/// ??????? request extensions ??????
+#[derive(Clone)]
+pub struct AdminIdentity {
+    pub token: String,
+    pub session: AdminSession,
+}
+
+pub fn router(shared: SharedState) -> Router<SharedState> {
+    let public = Router::new().route("/auth/login", post(login));
+
+    let protected = Router::new()
+        .route("/auth/logout", post(logout))
+        .route("/auth/check", get(check))
+        .route("/auth/change-password", post(change_password))
+        .route("/invoke", post(invoke_handler))
+        .route("/events", get(events_handler))
+        .route_layer(middleware::from_fn_with_state(shared.clone(), require_auth));
+
+    Router::new().merge(public).merge(protected)
+}
+
+// ?? ????? ????????????????????????????????????????????????????????????????
+
+fn extract_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = headers.get(header::AUTHORIZATION) {
+        if let Ok(value) = value.to_str() {
+            if let Some(token) = value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+            {
+                let token = token.trim();
+                if !token.is_empty() {
+                    return Some(token.to_string());
+                }
+            }
+        }
+    }
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    for pair in cookie_header.split(';') {
+        let pair = pair.trim();
+        if let Some(value) = pair.strip_prefix(SESSION_COOKIE) {
+            if let Some(value) = value.strip_prefix('=') {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn require_auth(
+    State(shared): State<SharedState>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let token = extract_token(req.headers()).ok_or_else(unauthorized)?;
+    let session = shared
+        .state
+        .admin_sessions
+        .get(&token)
+        .ok_or_else(unauthorized)?;
+    req.extensions_mut().insert(AdminIdentity { token, session });
+    Ok(next.run(req).await)
+}
+
+fn unauthorized() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "?????????" })),
+    )
+}
+
+fn internal_error(message: String) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": message })),
+    )
+}
+
+fn bad_request(message: String) -> (StatusCode, Json<Value>) {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": message })))
+}
+
+fn session_cookie_header(token: &str) -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{SESSION_COOKIE}={token}; Path=/; Max-Age={SESSION_MAX_AGE_SECS}; SameSite=Lax"
+    ))
+    .expect("session token is header-safe")
+}
+
+// ?? /auth/* ???????????????????????????????????????????????????????????????????
+
+#[derive(Deserialize)]
+struct LoginBody {
+    username: String,
+    password: String,
+}
+
+async fn login(
+    State(shared): State<SharedState>,
+    Json(body): Json<LoginBody>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let user = admin_auth::find_user_by_username(&shared.state.db.pool, body.username.trim())
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| bad_request("????????".to_string()))?;
+
+    if !admin_auth::verify_password(&body.password, &user.password_hash) {
+        return Err(bad_request("????????".to_string()));
+    }
+
+    let token = admin_auth::generate_token();
+    let session = AdminSession {
+        user_id: user.id,
+        username: user.username,
+        must_change_password: user.must_change_password,
+    };
+    shared
+        .state
+        .admin_sessions
+        .insert(token.clone(), session.clone());
+
+    let mut response = Json(json!({
+        "token": token,
+        "username": session.username,
+        "must_change_password": session.must_change_password,
+    }))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, session_cookie_header(&token));
+    Ok(response)
+}
+
+async fn logout(
+    State(shared): State<SharedState>,
+    Extension(identity): Extension<AdminIdentity>,
+) -> Response {
+    shared.state.admin_sessions.remove(&identity.token);
+    let mut response = Json(json!({ "ok": true })).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static("waliapi_admin_token=; Path=/; Max-Age=0; SameSite=Lax"),
+    );
+    response
+}
+
+async fn check(Extension(identity): Extension<AdminIdentity>) -> Json<Value> {
+    Json(json!({
+        "username": identity.session.username,
+        "must_change_password": identity.session.must_change_password,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordBody {
+    old_password: String,
+    new_password: String,
+}
+
+async fn change_password(
+    State(shared): State<SharedState>,
+    Extension(identity): Extension<AdminIdentity>,
+    Json(body): Json<ChangePasswordBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if body.new_password.len() < 8 {
+        return Err(bad_request("??????? 8 ?".to_string()));
+    }
+    let user = admin_auth::find_user_by_username(&shared.state.db.pool, &identity.session.username)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(unauthorized)?;
+    if !admin_auth::verify_password(&body.old_password, &user.password_hash) {
+        return Err(bad_request("?????".to_string()));
+    }
+    admin_auth::update_password(&shared.state.db.pool, &user.id, &body.new_password)
+        .await
+        .map_err(internal_error)?;
+
+    // ????????????????
+    let session = AdminSession {
+        must_change_password: false,
+        ..identity.session.clone()
+    };
+    shared
+        .state
+        .admin_sessions
+        .insert(identity.token.clone(), session);
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ?? /events?SSE ?????????????????????????????????????????????????????????
+
+async fn events_handler(
+    State(shared): State<SharedState>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let rx = shared.state.event_tx.subscribe();
+    let stream = async_stream::stream! {
+        let mut rx = rx;
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    yield Ok(Event::default().event(event.event).data(event.payload.to_string()));
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::debug!("SSE client lagged, skipped {} events", skipped);
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
+// ?? /invoke?Tauri command ???? ??????????????????????????????????????????
+
+#[derive(Deserialize)]
+struct InvokeRequest {
+    cmd: String,
+    #[serde(default)]
+    args: Value,
+}
+
+async fn invoke_handler(
+    State(shared): State<SharedState>,
+    Json(body): Json<InvokeRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dispatch(&shared, &body.cmd, body.args)
+        .await
+        .map(Json)
+        .map_err(internal_error)
+}
+
+/// ? args ???? Tauri ? camelCase ??????????????
+/// ????? `null` ???`Option<T>` ?????? `None`??
+fn arg<T: serde::de::DeserializeOwned>(args: &Value, key: &str) -> Result<T, String> {
+    serde_json::from_value(args.get(key).cloned().unwrap_or(Value::Null))
+        .map_err(|e| format!("?? {key} ??: {e}"))
+}
+
+fn to_json<T: serde::Serialize>(result: Result<T, String>) -> Result<Value, String> {
+    result.and_then(|value| serde_json::to_value(value).map_err(|e| e.to_string()))
+}
+
+async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value, String> {
+    let app: &'static AppHandle = shared.app_static;
+    let state = app.state::<Arc<AppState>>();
+    match cmd {
+        // ?? ?? ??
+        "get_channels" => to_json(commands::channel::get_channels(state).await),
+        "get_channel" => to_json(commands::channel::get_channel(arg(&args, "id")?, state).await),
+        "get_channel_api_key" => {
+            to_json(commands::channel::get_channel_api_key(arg(&args, "id")?, state).await)
+        }
+        "get_channel_presets" => to_json(commands::channel::get_channel_presets()),
+        "create_channel" => {
+            to_json(commands::channel::create_channel(arg(&args, "input")?, state).await)
+        }
+        "update_channel" => {
+            to_json(commands::channel::update_channel(arg(&args, "input")?, state).await)
+        }
+        "toggle_channel" => {
+            to_json(
+                commands::channel::toggle_channel(arg(&args, "id")?, arg(&args, "status")?, state)
+                    .await,
+            )
+        }
+        "delete_channel" => {
+            to_json(commands::channel::delete_channel(arg(&args, "id")?, state).await)
+        }
+        "test_channel" => to_json(commands::channel::test_channel(arg(&args, "id")?, state).await),
+        "test_channel_draft" => {
+            to_json(commands::channel::test_channel_draft(arg(&args, "input")?, state).await)
+        }
+        "sync_upstream_models" => {
+            to_json(commands::channel::sync_upstream_models(arg(&args, "input")?, state).await)
+        }
+        "get_channel_stats" => to_json(commands::channel::get_channel_stats(state).await),
+        "reorder_channels" => {
+            to_json(commands::channel::reorder_channels(arg(&args, "orderedIds")?, state).await)
+        }
+        "get_channel_extra_keys" => {
+            to_json(commands::channel::get_channel_extra_keys(arg(&args, "id")?, state).await)
+        }
+        "get_channel_extra_key_value" => {
+            to_json(
+                commands::channel::get_channel_extra_key_value(arg(&args, "keyId")?, state).await,
+            )
+        }
+        "toggle_channel_extra_key" => {
+            to_json(
+                commands::channel::toggle_channel_extra_key(
+                    arg(&args, "keyId")?,
+                    arg(&args, "status")?,
+                    state,
+                )
+                .await,
+            )
+        }
+        "delete_channel_extra_key" => {
+            to_json(commands::channel::delete_channel_extra_key(arg(&args, "keyId")?, state).await)
+        }
+
+        // ?? API ?? ??
+        "get_api_keys" => to_json(commands::api_key::get_api_keys(state).await),
+        "create_api_key" => {
+            to_json(commands::api_key::create_api_key(arg(&args, "input")?, state).await)
+        }
+        "update_api_key" => {
+            to_json(commands::api_key::update_api_key(arg(&args, "input")?, state).await)
+        }
+        "delete_api_key" => {
+            to_json(commands::api_key::delete_api_key(arg(&args, "id")?, state).await)
+        }
+        "get_api_key_stats" => to_json(commands::api_key::get_api_key_stats(state).await),
+
+        // ?? ?? ??
+        "get_logs" => to_json(commands::log::get_logs(arg(&args, "input")?, state).await),
+        "get_log" => to_json(commands::log::get_log(arg(&args, "id")?, state).await),
+        "get_log_security_findings" => {
+            to_json(commands::log::get_log_security_findings(arg(&args, "logId")?, state).await)
+        }
+        "get_log_stats" => to_json(commands::log::get_log_stats(arg(&args, "days")?, state).await),
+        "delete_log" => to_json(commands::log::delete_log(arg(&args, "id")?, state).await),
+        "delete_logs_before" => {
+            to_json(commands::log::delete_logs_before(arg(&args, "beforeDate")?, state).await)
+        }
+        "delete_all_logs" => to_json(commands::log::delete_all_logs(state).await),
+
+        // ?? Auth ?? ??
+        "auth_accounts_list" => to_json(commands::auth::auth_accounts_list(state).await),
+        "auth_login" => {
+            to_json(commands::auth::auth_login(arg(&args, "provider")?, app.clone(), state).await)
+        }
+        "auth_login_start" => {
+            to_json(
+                commands::auth::auth_login_start(arg(&args, "provider")?, app.clone(), state)
+                    .await,
+            )
+        }
+        "auth_login_status" => {
+            to_json(commands::auth::auth_login_status(arg(&args, "sessionId")?, state).await)
+        }
+        "auth_login_cancel" => {
+            to_json(commands::auth::auth_login_cancel(arg(&args, "sessionId")?, state).await)
+        }
+        "auth_login_import" => {
+            to_json(
+                commands::auth::auth_login_import(
+                    arg(&args, "provider")?,
+                    arg(&args, "path")?,
+                    state,
+                )
+                .await,
+            )
+        }
+        "auth_login_import_content" => {
+            to_json(
+                commands::auth::auth_login_import_content(
+                    arg(&args, "provider")?,
+                    arg(&args, "content")?,
+                    state,
+                )
+                .await,
+            )
+        }
+        "auth_default_import_path" => to_json(commands::auth::auth_default_import_path().await),
+        "auth_logout" => to_json(commands::auth::auth_logout(arg(&args, "id")?, state).await),
+        "auth_refresh_token" => {
+            to_json(commands::auth::auth_refresh_token(arg(&args, "id")?, state).await)
+        }
+        "auth_sync_models" => {
+            to_json(commands::auth::auth_sync_models(arg(&args, "id")?, state).await)
+        }
+        "auth_export_json" => {
+            to_json(
+                commands::auth::auth_export_json(arg(&args, "id")?, arg(&args, "path")?, state)
+                    .await,
+            )
+        }
+        "auth_export_json_content" => {
+            to_json(commands::auth::auth_export_json_content(arg(&args, "id")?, state).await)
+        }
+        "auth_toggle" => {
+            to_json(
+                commands::auth::auth_toggle(arg(&args, "id")?, arg(&args, "disabled")?, state)
+                    .await,
+            )
+        }
+        "auth_quota_status" => {
+            to_json(commands::auth::auth_quota_status(arg(&args, "id")?, state).await)
+        }
+        "auth_update" => to_json(commands::auth::auth_update(arg(&args, "input")?, state).await),
+
+        // ?? ??? / ?? / ???? ??
+        "get_dashboard_stats" => to_json(commands::stats::get_dashboard_stats(state).await),
+        "get_settings" => to_json(commands::settings::get_settings(app.clone()).await),
+        "save_settings" => {
+            to_json(commands::settings::save_settings(arg(&args, "settings")?, app.clone()).await)
+        }
+        "apply_theme" => {
+            to_json(commands::settings::apply_theme(arg(&args, "theme")?, app.clone()).await)
+        }
+        "set_auto_start" => {
+            to_json(commands::settings::set_auto_start(arg(&args, "enabled")?, app.clone()).await)
+        }
+        "get_feature_flags" => to_json(commands::settings::get_feature_flags(app.clone())),
+        "get_server_status" => to_json(commands::server::get_server_status(state).await),
+        "restart_server" => to_json(commands::server::restart_server(app.clone(), state).await),
+        "get_service_statuses" => to_json(commands::services::get_service_statuses(state).await),
+
+        // ?? ???? ??
+        "get_builtin_security_rules" => {
+            to_json(commands::security::get_builtin_security_rules(state).await)
+        }
+        "update_builtin_security_rule" => {
+            to_json(
+                commands::security::update_builtin_security_rule(
+                    arg(&args, "id")?,
+                    arg(&args, "input")?,
+                    state,
+                )
+                .await,
+            )
+        }
+        "delete_builtin_security_rule" => {
+            to_json(commands::security::delete_builtin_security_rule(arg(&args, "id")?, state).await)
+        }
+        "reset_builtin_security_rules" => {
+            to_json(commands::security::reset_builtin_security_rules(state).await)
+        }
+        "get_custom_security_rules" => {
+            to_json(commands::security::get_custom_security_rules(state).await)
+        }
+        "create_custom_security_rule" => {
+            to_json(
+                commands::security::create_custom_security_rule(arg(&args, "input")?, state).await,
+            )
+        }
+        "toggle_custom_security_rule" => {
+            to_json(
+                commands::security::toggle_custom_security_rule(
+                    arg(&args, "id")?,
+                    arg(&args, "enabled")?,
+                    state,
+                )
+                .await,
+            )
+        }
+        "delete_custom_security_rule" => {
+            to_json(commands::security::delete_custom_security_rule(arg(&args, "id")?, state).await)
+        }
+
+        // ?? ?? / ?? ??
+        "export_channels" => to_json(commands::import_export::export_channels(state).await),
+        "import_walicode_backup" => {
+            to_json(
+                commands::import_export::import_walicode_backup(arg(&args, "content")?, state)
+                    .await,
+            )
+        }
+        "import_waliapi_export" => {
+            to_json(
+                commands::import_export::import_waliapi_export(arg(&args, "content")?, state).await,
+            )
+        }
+        "scan_local_ai_configs" => to_json(commands::import_export::scan_local_ai_configs().await),
+        "import_scanned_sources" => {
+            to_json(
+                commands::import_export::import_scanned_sources(arg(&args, "sources")?, state)
+                    .await,
+            )
+        }
+        "pick_import_file" => to_json(commands::import_export::pick_import_file(app.clone()).await),
+        "save_export_file" => {
+            to_json(
+                commands::import_export::save_export_file(
+                    app.clone(),
+                    arg(&args, "content")?,
+                    arg(&args, "defaultName")?,
+                )
+                .await,
+            )
+        }
+
+        // ?? ??? ??
+        "get_knowledge_bases" => {
+            to_json(commands::knowledge_base::get_knowledge_bases(state).await)
+        }
+        "create_knowledge_base" => {
+            to_json(
+                commands::knowledge_base::create_knowledge_base(state, arg(&args, "input")?).await,
+            )
+        }
+        "update_knowledge_base" => {
+            to_json(
+                commands::knowledge_base::update_knowledge_base(
+                    state,
+                    arg(&args, "id")?,
+                    arg(&args, "input")?,
+                )
+                .await,
+            )
+        }
+        "delete_knowledge_base" => {
+            to_json(commands::knowledge_base::delete_knowledge_base(state, arg(&args, "id")?).await)
+        }
+        "get_kb_documents" => {
+            to_json(commands::knowledge_base::get_kb_documents(state, arg(&args, "kbId")?).await)
+        }
+        "delete_kb_document" => {
+            to_json(
+                commands::knowledge_base::delete_kb_document(
+                    state,
+                    arg(&args, "docId")?,
+                    arg(&args, "kbId")?,
+                )
+                .await,
+            )
+        }
+        "reindex_kb_document" => {
+            to_json(
+                commands::knowledge_base::reindex_kb_document(
+                    state,
+                    app.clone(),
+                    arg(&args, "docId")?,
+                )
+                .await,
+            )
+        }
+        "get_kb_tags" => {
+            to_json(
+                commands::knowledge_base::get_kb_tags(
+                    state,
+                    arg(&args, "kbId")?,
+                    arg(&args, "limit")?,
+                )
+                .await,
+            )
+        }
+        "search_knowledge_base" => {
+            to_json(
+                commands::knowledge_base::search_knowledge_base(state, arg(&args, "input")?).await,
+            )
+        }
+        "ask_knowledge_base" => {
+            to_json(
+                commands::knowledge_base::ask_knowledge_base(
+                    state,
+                    app.clone(),
+                    arg(&args, "input")?,
+                )
+                .await,
+            )
+        }
+        "get_kb_stats" => {
+            to_json(commands::knowledge_base::get_kb_stats(state, arg(&args, "kbId")?).await)
+        }
+        "upload_kb_document" => {
+            to_json(
+                commands::knowledge_base::upload_kb_document(
+                    state,
+                    app.clone(),
+                    arg(&args, "input")?,
+                )
+                .await,
+            )
+        }
+        "get_kb_conversations" => {
+            to_json(
+                commands::knowledge_base::get_kb_conversations(state, arg(&args, "kbId")?).await,
+            )
+        }
+        "clear_kb_conversations" => {
+            to_json(
+                commands::knowledge_base::clear_kb_conversations(state, arg(&args, "kbId")?).await,
+            )
+        }
+        "get_kb_sources" => {
+            to_json(commands::knowledge_base::get_kb_sources(state, arg(&args, "kbId")?).await)
+        }
+        "delete_kb_source" => {
+            to_json(
+                commands::knowledge_base::delete_kb_source(
+                    state,
+                    arg(&args, "sourceId")?,
+                    arg(&args, "kbId")?,
+                )
+                .await,
+            )
+        }
+        "import_kb_source" => {
+            to_json(
+                commands::knowledge_base::import_kb_source(
+                    state,
+                    app.clone(),
+                    arg(&args, "kbId")?,
+                    arg(&args, "input")?,
+                )
+                .await,
+            )
+        }
+        "get_kb_index_status" => {
+            to_json(
+                commands::knowledge_base::get_kb_index_status(state, arg(&args, "kbId")?).await,
+            )
+        }
+        "build_kb_index" => {
+            to_json(
+                commands::knowledge_base::build_kb_index(state, app.clone(), arg(&args, "kbId")?)
+                    .await,
+            )
+        }
+        "drop_kb_index" => {
+            to_json(commands::knowledge_base::drop_kb_index(state, arg(&args, "kbId")?).await)
+        }
+
+        // ?? Wiki ??
+        "get_wiki_projects" => to_json(commands::wiki::get_wiki_projects(state).await),
+        "create_wiki_project" => {
+            to_json(commands::wiki::create_wiki_project(state, arg(&args, "input")?).await)
+        }
+        "get_wiki_project" => {
+            to_json(commands::wiki::get_wiki_project(state, arg(&args, "id")?).await)
+        }
+        "update_wiki_project" => {
+            to_json(
+                commands::wiki::update_wiki_project(state, arg(&args, "id")?, arg(&args, "input")?)
+                    .await,
+            )
+        }
+        "delete_wiki_project" => {
+            to_json(commands::wiki::delete_wiki_project(state, arg(&args, "id")?).await)
+        }
+        "get_wiki_pages" => {
+            to_json(commands::wiki::get_wiki_pages(state, arg(&args, "projectId")?).await)
+        }
+        "get_wiki_page" => {
+            to_json(
+                commands::wiki::get_wiki_page(state, arg(&args, "projectId")?, arg(&args, "path")?)
+                    .await,
+            )
+        }
+        "save_wiki_page" => {
+            to_json(
+                commands::wiki::save_wiki_page(
+                    state,
+                    arg(&args, "projectId")?,
+                    arg(&args, "path")?,
+                    arg(&args, "content")?,
+                )
+                .await,
+            )
+        }
+        "get_wiki_sources" => {
+            to_json(commands::wiki::get_wiki_sources(state, arg(&args, "projectId")?).await)
+        }
+        "add_wiki_source" => {
+            to_json(
+                commands::wiki::add_wiki_source(
+                    state,
+                    arg(&args, "projectId")?,
+                    arg(&args, "input")?,
+                )
+                .await,
+            )
+        }
+        "delete_wiki_source" => {
+            to_json(commands::wiki::delete_wiki_source(state, arg(&args, "sourceId")?).await)
+        }
+        "search_wiki" => {
+            to_json(
+                commands::wiki::search_wiki(
+                    state,
+                    arg(&args, "projectId")?,
+                    arg(&args, "query")?,
+                    arg(&args, "topK")?,
+                )
+                .await,
+            )
+        }
+        "get_wiki_graph" => {
+            to_json(commands::wiki::get_wiki_graph(state, arg(&args, "projectId")?).await)
+        }
+        "get_wiki_tags" => {
+            to_json(
+                commands::wiki::get_wiki_tags(state, arg(&args, "projectId")?, arg(&args, "limit")?)
+                    .await,
+            )
+        }
+        "get_wiki_stats" => {
+            to_json(commands::wiki::get_wiki_stats(state, arg(&args, "projectId")?).await)
+        }
+        "ingest_wiki_source" => {
+            to_json(
+                commands::wiki::ingest_wiki_source(
+                    app.clone(),
+                    state,
+                    arg(&args, "projectId")?,
+                    arg(&args, "sourceId")?,
+                )
+                .await,
+            )
+        }
+        "rescan_wiki_sources" => {
+            to_json(
+                commands::wiki::rescan_wiki_sources(app.clone(), state, arg(&args, "projectId")?)
+                    .await,
+            )
+        }
+
+        // ?? ????????????????????????
+        "get_app_configs" => to_json(commands::app_config::get_app_configs(state).await),
+        "apply_app_config" => {
+            to_json(
+                commands::app_config::apply_app_config(
+                    arg(&args, "appName")?,
+                    arg(&args, "apiKey")?,
+                    arg(&args, "model")?,
+                    state,
+                )
+                .await,
+            )
+        }
+        "clear_app_config" => {
+            to_json(commands::app_config::clear_app_config(arg(&args, "appName")?).await)
+        }
+        "get_app_config_content" => {
+            to_json(commands::app_config::get_app_config_content(arg(&args, "appName")?).await)
+        }
+        "open_config_folder" => {
+            to_json(commands::app_config::open_config_folder(arg(&args, "appName")?).await)
+        }
+
+        _ => Err(format!("????: {cmd}")),
+    }
+}

@@ -2,7 +2,7 @@ use crate::AppState;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tauri::{Emitter, State};
+use tauri::State;
 
 // Re-export models for convenience
 pub use crate::services::wiki::models::*;
@@ -329,7 +329,8 @@ pub async fn ingest_wiki_source(
                 let _ = repo
                     .update_source_status(&sid, "failed", 0, Some(&err))
                     .await;
-                let _ = app_clone.emit(
+                crate::server::event_bridge::emit_admin(
+                    &app_clone,
                     "wiki-source-progress",
                     serde_json::json!({
                         "source_id": sid,

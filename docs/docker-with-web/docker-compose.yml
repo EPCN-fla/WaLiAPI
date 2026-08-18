@@ -10,11 +10,9 @@ services:
       XDG_DATA_HOME: /data
       TZ: Asia/Shanghai
     ports:
-      - "6080:6080"
+      - "8777:8777"
     volumes:
       - waliapi-data:/data
-    expose:
-      - "8777"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8777/health >/dev/null"]
       interval: 30s
