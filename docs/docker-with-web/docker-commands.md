@@ -34,10 +34,9 @@ docker compose down
 
 - 公网 API: `https://fla1662.cc.cd/health`
 - 局域网 API: `https://192.168.123.222:8443/health`
-- 局域网 UI: `http://192.168.123.222:6080/vnc.html?autoconnect=1&resize=scale`
+- Web 管理面板: `https://192.168.123.222:8443/`（或直连 `http://192.168.123.222:8777`）
 
 ## 备注
 
-- UI 默认不对公网开放。
-- 如果需要临时打开 UI，把 `docker-compose.yml` 里的 `WALIAPI_ENABLE_UI` 改成 `"1"`，再执行 `docker compose up -d --force-recreate`。
+- 管理面板随 API 同源开放，无独立 UI 端口；首次登录的临时密码见 `docker logs waliapi` 或容器内 `/data/waliapi.xiaofuge.cn/INITIAL_PASSWORD`。
 - 如果 NAS 的 `443` 已被占用，先改宿主端口映射，再同步调整路由器或穿透配置。

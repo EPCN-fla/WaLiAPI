@@ -134,7 +134,8 @@ pub async fn update_username(pool: &SqlitePool, user_id: &str, new_username: &st
 }
 
 /// 首次启动时若无 admin 用户，创建 admin + 随机 16 位密码并写入 INITIAL_PASSWORD 文件。
-pub async fn ensure_initial_admin(pool: &SqlitePool) -> Result<(), String> {
+/// `data_dir` 为应用数据目录（容器内 /data/<identifier>）。
+pub async fn ensure_initial_admin(pool: &SqlitePool, data_dir: &std::path::Path) -> Result<(), String> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_users")
         .fetch_one(pool)
         .await
@@ -168,11 +169,8 @@ pub async fn ensure_initial_admin(pool: &SqlitePool) -> Result<(), String> {
     println!("请登录后立即修改密码。");
     println!("==============================================");
 
-    // 写入数据目录，容器内为 /data/INITIAL_PASSWORD
-    let data_dir = std::env::var("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+    // 写入数据目录，容器内为 /data/<identifier>/INITIAL_PASSWORD
+    if let Err(e) = std::fs::create_dir_all(data_dir) {
         log::warn!("创建数据目录失败: {e}");
     }
     let file = data_dir.join("INITIAL_PASSWORD");

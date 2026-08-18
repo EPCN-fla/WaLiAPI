@@ -6,7 +6,10 @@
 import { clearToken, getToken } from "./auth";
 
 export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-Requested-With": "XMLHttpRequest",
+  };
   const token = getToken();
   if (token) headers["Authorization"] = `Bearer ${token}`;
 

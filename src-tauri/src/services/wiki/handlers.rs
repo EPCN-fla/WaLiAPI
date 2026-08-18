@@ -14,7 +14,6 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::AppHandle;
 
 #[derive(Deserialize)]
 pub struct SearchQuery {
@@ -168,14 +167,15 @@ pub async fn ingest_source(
     State(shared): State<SharedState>,
     Path((id, sid)): Path<(String, String)>,
 ) -> Response {
-    let app = shared.app.clone();
+    let events = shared.state.events.clone();
+    let settings = shared.state.settings.clone();
     let pool = shared.state.db.pool.clone();
 
     // Spawn ingest in background, return immediately with task info
     let project_id = id.clone();
     let source_id = sid.clone();
 
-    match ingest::ingest_source(&app, &pool, &project_id, &source_id).await {
+    match ingest::ingest_source(&events, &settings, &pool, &project_id, &source_id).await {
         Ok(result) => Json(serde_json::json!({
             "status": "done",
             "pages_created": result.pages_created,
@@ -194,7 +194,8 @@ pub async fn ingest_source(
 }
 
 pub async fn rescan_sources(State(shared): State<SharedState>, Path(id): Path<String>) -> Response {
-    let app = shared.app.clone();
+    let events = shared.state.events.clone();
+    let settings = shared.state.settings.clone();
     let pool = shared.state.db.pool.clone();
     let repo = WikiRepository::new(pool.clone());
 
@@ -208,7 +209,7 @@ pub async fn rescan_sources(State(shared): State<SharedState>, Path(id): Path<St
     let mut results = Vec::new();
 
     for source in &pending {
-        match ingest::ingest_source(&app, &pool, &id, &source.id).await {
+        match ingest::ingest_source(&events, &settings, &pool, &id, &source.id).await {
             Ok(r) => results.push(serde_json::json!({
                 "source_id": source.id,
                 "filename": source.filename,
@@ -301,7 +302,6 @@ pub async fn update_page(
 
     let repo = WikiRepository::new(shared.state.db.pool.clone());
     match update_page_inner(
-        &shared.app,
         &shared.state.db.pool,
         &repo,
         &id,
@@ -317,7 +317,6 @@ pub async fn update_page(
 
 /// Inner logic for saving a wiki page — shared by HTTP handler and MCP handler.
 pub async fn update_page_inner(
-    app: &AppHandle,
     pool: &sqlx::SqlitePool,
     repo: &WikiRepository,
     id: &str,
@@ -433,7 +432,7 @@ pub async fn ask_inner(
     let pool = &shared.state.db.pool;
     let repo = WikiRepository::new(pool.clone());
     let db_repo = Arc::new(Repository::new(pool.clone()));
-    let app = shared.app.clone();
+    let settings = shared.state.settings.clone();
 
     // Search relevant pages
     let results = repo
@@ -503,7 +502,7 @@ pub async fn ask_inner(
 
     let proxy_result = proxy::handle_request(
         &db_repo,
-        &app,
+        &settings,
         &chat_channel_id,
         "Wiki Chat",
         chat_request,

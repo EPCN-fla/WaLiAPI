@@ -813,22 +813,30 @@ pub async fn import_scanned_sources(
 /// Open a file dialog and return the file content (for import)
 #[tauri::command]
 pub async fn pick_import_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    use tauri_plugin_dialog::DialogExt;
+    #[cfg(not(feature = "desktop-ui"))]
+    {
+        let _ = &app;
+        return Err("文件对话框仅桌面版可用".to_string());
+    }
+    #[cfg(feature = "desktop-ui")]
+    {
+        use tauri_plugin_dialog::DialogExt;
 
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
-        .file()
-        .add_filter("JSON files", &["json"])
-        .pick_file(move |file_path| {
-            let result = file_path.and_then(|f| {
-                let path = f.into_path().ok()?;
-                std::fs::read_to_string(&path).ok()
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.dialog()
+            .file()
+            .add_filter("JSON files", &["json"])
+            .pick_file(move |file_path| {
+                let result = file_path.and_then(|f| {
+                    let path = f.into_path().ok()?;
+                    std::fs::read_to_string(&path).ok()
+                });
+                let _ = tx.send(result);
             });
-            let _ = tx.send(result);
-        });
 
-    let result = rx.await.map_err(|_| "对话框取消".to_string())?;
-    Ok(result)
+        let result = rx.await.map_err(|_| "对话框取消".to_string())?;
+        Ok(result)
+    }
 }
 
 /// Save a file dialog and return whether save was successful (for export)
@@ -838,33 +846,41 @@ pub async fn save_export_file(
     content: String,
     default_name: String,
 ) -> Result<bool, String> {
-    use tauri_plugin_dialog::DialogExt;
+    #[cfg(not(feature = "desktop-ui"))]
+    {
+        let _ = (&app, &content, &default_name);
+        return Err("文件对话框仅桌面版可用".to_string());
+    }
+    #[cfg(feature = "desktop-ui")]
+    {
+        use tauri_plugin_dialog::DialogExt;
 
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
-        .file()
-        .set_file_name(&default_name)
-        .add_filter("JSON files", &["json"])
-        .save_file(move |file_path| {
-            if let Some(path) = file_path {
-                if let Some(p) = path.as_path() {
-                    match std::fs::write(p, &content) {
-                        Ok(_) => {
-                            let _ = tx.send(true);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.dialog()
+            .file()
+            .set_file_name(&default_name)
+            .add_filter("JSON files", &["json"])
+            .save_file(move |file_path| {
+                if let Some(path) = file_path {
+                    if let Some(p) = path.as_path() {
+                        match std::fs::write(p, &content) {
+                            Ok(_) => {
+                                let _ = tx.send(true);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to save export file: {}", e);
+                                let _ = tx.send(false);
+                            }
                         }
-                        Err(e) => {
-                            tracing::error!("Failed to save export file: {}", e);
-                            let _ = tx.send(false);
-                        }
+                        return;
                     }
-                    return;
                 }
-            }
-            let _ = tx.send(false);
-        });
+                let _ = tx.send(false);
+            });
 
-    let result = rx.await.map_err(|_| "对话框取消".to_string())?;
-    Ok(result)
+        let result = rx.await.map_err(|_| "对话框取消".to_string())?;
+        Ok(result)
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

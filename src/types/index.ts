@@ -333,6 +333,7 @@ export interface DashboardStats {
 export interface Settings {
   server_port: number;
   server_host: string;
+  auto_start_server: boolean;
   ui_theme: string;
   ui_language: string;
   minimize_to_tray: boolean;

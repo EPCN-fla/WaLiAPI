@@ -1,0 +1,90 @@
+//! waliapi-web：headless 服务模式（无桌面窗口），供 Docker / 服务器部署。
+//!
+//! 用法：
+//!   waliapi-web start [--host 0.0.0.0] [--port 8777] [--data-dir /data]
+//!
+//! 环境变量：WALIAPI_SERVER_HOST / WALIAPI_SERVER_PORT / WALIAPI_DATA_DIR / XDG_DATA_HOME
+
+use waliapi_lib::web_server::{resolve_data_dir, run, WebServerConfig};
+
+fn print_usage() {
+    println!(
+        "waliapi-web — WaLiAPI headless 服务模式（LLM 网关 + Web 管理面板）
+
+用法:
+  waliapi-web start [--host <地址>] [--port <端口>] [--data-dir <目录>]
+
+选项:
+  --host       监听地址（默认读取 WALIAPI_SERVER_HOST 或设置，缺省 127.0.0.1）
+  --port       监听端口（默认读取 WALIAPI_SERVER_PORT 或设置，缺省 8777）
+  --data-dir   数据目录（默认读取 WALIAPI_DATA_DIR / XDG_DATA_HOME，再缺省为平台应用数据目录）
+  -h, --help   显示帮助
+"
+    );
+}
+
+fn parse_args(args: &[String]) -> Result<WebServerConfig, String> {
+    let mut host = None;
+    let mut port = None;
+    let mut data_dir = None;
+    let mut i = 0;
+    while i < args.len() {
+        let mut value_of = |i: &mut usize, name: &str| -> Result<String, String> {
+            *i += 1;
+            args.get(*i)
+                .cloned()
+                .ok_or_else(|| format!("{name} 缺少参数值"))
+        };
+        match args[i].as_str() {
+            "--host" => host = Some(value_of(&mut i, "--host")?),
+            "--port" => {
+                let raw = value_of(&mut i, "--port")?;
+                port = Some(
+                    raw.trim()
+                        .parse::<u16>()
+                        .map_err(|_| format!("--port 无效: {raw}"))?,
+                );
+            }
+            "--data-dir" => data_dir = Some(value_of(&mut i, "--data-dir")?),
+            other => return Err(format!("未知参数: {other}")),
+        }
+        i += 1;
+    }
+    Ok(WebServerConfig {
+        host,
+        port,
+        data_dir: resolve_data_dir(data_dir),
+    })
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().init();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("start") => {
+            let cfg = match parse_args(&args[1..]) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("参数错误: {e}\n");
+                    print_usage();
+                    std::process::exit(2);
+                }
+            };
+            tracing::info!("数据目录: {}", cfg.data_dir.display());
+            if let Err(e) = run(cfg).await {
+                eprintln!("服务异常退出: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some("-h") | Some("--help") | None => {
+            print_usage();
+        }
+        Some(other) => {
+            eprintln!("未知命令: {other}\n");
+            print_usage();
+            std::process::exit(2);
+        }
+    }
+}

@@ -11,8 +11,7 @@
 //! | `routing.prefer_auth_accounts` | Sort auth-account candidates before channel candidates within the same route group. |
 //! | `routing.prefer_same_protocol` | Prefer candidates that can serve the request without protocol conversion. |
 
-use tauri::AppHandle;
-use tauri_plugin_store::StoreExt;
+use crate::settings_store::SettingsStore;
 
 /// Snapshot of the four routing feature flags.  Defaults are all-off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,39 +48,20 @@ impl FeatureFlags {
     }
 }
 
-/// Read the routing flags from the Tauri settings store (`settings.json`).
+/// Read the routing flags from the settings store（桌面 tauri store / headless JSON 文件）。
 ///
 /// Core routing capabilities are no longer user-facing rollout switches:
 /// protocol conversion and native Responses are baseline compatibility features.
 /// The planner never reads the store itself — handlers read it once and pass a
 /// snapshot so the planner stays pure and deterministic in tests.
-pub fn read_feature_flags(app: &AppHandle) -> FeatureFlags {
-    let Ok(store) = app.store("settings.json") else {
-        return FeatureFlags {
-            new_routeplan: true,
-            cross_protocol_codec: true,
-            native_responses: true,
-            ollama_native: false,
-            prefer_auth_accounts: false,
-            prefer_same_protocol: false,
-        };
-    };
+pub fn read_feature_flags(settings: &SettingsStore) -> FeatureFlags {
     FeatureFlags {
         new_routeplan: true,
         cross_protocol_codec: true,
         native_responses: true,
-        ollama_native: store
-            .get("features.ollama_native")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        prefer_auth_accounts: store
-            .get("routing.prefer_auth_accounts")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        prefer_same_protocol: store
-            .get("routing.prefer_same_protocol")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        ollama_native: settings.get_bool("features.ollama_native", false),
+        prefer_auth_accounts: settings.get_bool("routing.prefer_auth_accounts", false),
+        prefer_same_protocol: settings.get_bool("routing.prefer_same_protocol", false),
     }
 }
 

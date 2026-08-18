@@ -303,52 +303,55 @@ pub async fn get_wiki_stats(
 
 #[tauri::command]
 pub async fn ingest_wiki_source(
-    app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
     projectId: String,
     sourceId: String,
 ) -> Result<serde_json::Value, String> {
     let pool = state.db.pool.clone();
-    crate::services::wiki::ingest::ingest_source(&app, &pool, &projectId, &sourceId)
-        .await
-        .map(|r| {
-            serde_json::json!({
-                "status": "done",
-                "pages_created": r.pages_created,
-                "page_paths": r.page_paths,
-            })
+    crate::services::wiki::ingest::ingest_source(
+        &state.events,
+        &state.settings,
+        &pool,
+        &projectId,
+        &sourceId,
+    )
+    .await
+    .map(|r| {
+        serde_json::json!({
+            "status": "done",
+            "pages_created": r.pages_created,
+            "page_paths": r.page_paths,
         })
-        .map_err(|e| {
-            let pool_clone = pool.clone();
-            let sid = sourceId.clone();
-            let pid = projectId.clone();
-            let err = e.clone();
-            let app_clone = app.clone();
-            tokio::spawn(async move {
-                let repo = crate::services::wiki::repository::WikiRepository::new(pool_clone);
-                let _ = repo
-                    .update_source_status(&sid, "failed", 0, Some(&err))
-                    .await;
-                crate::server::event_bridge::emit_admin(
-                    &app_clone,
-                    "wiki-source-progress",
-                    serde_json::json!({
-                        "source_id": sid,
-                        "project_id": pid,
-                        "filename": "",
-                        "stage": "error",
-                        "progress": 0,
-                        "detail": &err,
-                    }),
-                );
-            });
-            e
-        })
+    })
+    .map_err(|e| {
+        let pool_clone = pool.clone();
+        let sid = sourceId.clone();
+        let pid = projectId.clone();
+        let err = e.clone();
+        let events = state.events.clone();
+        tokio::spawn(async move {
+            let repo = crate::services::wiki::repository::WikiRepository::new(pool_clone);
+            let _ = repo
+                .update_source_status(&sid, "failed", 0, Some(&err))
+                .await;
+            events.emit(
+                "wiki-source-progress",
+                serde_json::json!({
+                    "source_id": sid,
+                    "project_id": pid,
+                    "filename": "",
+                    "stage": "error",
+                    "progress": 0,
+                    "detail": &err,
+                }),
+            );
+        });
+        e
+    })
 }
 
 #[tauri::command]
 pub async fn rescan_wiki_sources(
-    app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
     projectId: String,
 ) -> Result<serde_json::Value, String> {
@@ -360,8 +363,14 @@ pub async fn rescan_wiki_sources(
     let mut results = Vec::new();
 
     for source in &pending {
-        match crate::services::wiki::ingest::ingest_source(&app, &pool, &projectId, &source.id)
-            .await
+        match crate::services::wiki::ingest::ingest_source(
+            &state.events,
+            &state.settings,
+            &pool,
+            &projectId,
+            &source.id,
+        )
+        .await
         {
             Ok(r) => results.push(serde_json::json!({
                 "source_id": source.id,

@@ -3,12 +3,11 @@ use crate::core::dispatcher::Dispatcher;
 use crate::db::models::{Channel, RequestLog};
 use crate::db::repository::Repository;
 use crate::security;
+use crate::settings_store::SettingsStore;
 use crate::utils;
 use rand::Rng;
 use std::sync::Arc;
 use std::time::Instant;
-use tauri::AppHandle;
-use tauri_plugin_store::StoreExt;
 
 /// Multi-key load balancing for the legacy proxy path.  Selects a random
 /// enabled key from the channel's extra keys, weighted by `weight`.  The
@@ -60,7 +59,7 @@ pub struct ProxyResult {
 
 pub async fn handle_request(
     repo: &Arc<Repository>,
-    app: &AppHandle,
+    settings: &SettingsStore,
     api_key_id: &str,
     api_key_name: &str,
     body: serde_json::Value,
@@ -80,7 +79,7 @@ pub async fn handle_request(
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
-    let security_settings = security::get_security_settings(app);
+    let security_settings = security::get_security_settings(settings);
     // The gate already audited the ORIGINAL protocol JSON at the handler.
     // Re-scanning the (possibly converted) Chat JSON here would be a redundant,
     // competing non-authoritative audit — only do that when the caller had no
@@ -165,7 +164,7 @@ pub async fn handle_request(
         return Err((503, format!("No channel available for model: {}", model)));
     }
 
-    let (retry_enabled, retry_times) = get_retry_settings(app);
+    let (retry_enabled, retry_times) = get_retry_settings(settings);
     let max_attempts = if retry_enabled {
         (retry_times.max(0) as usize + 1).min(selected_channels.len())
     } else {
@@ -451,17 +450,8 @@ pub async fn handle_request(
     ))
 }
 
-pub fn get_retry_settings(app: &AppHandle) -> (bool, i32) {
-    if let Ok(store) = app.store("settings.json") {
-        let enabled = store
-            .get("retry.enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        let times = store
-            .get("retry.times")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(2) as i32;
-        return (enabled, times);
-    }
-    (true, 2)
+pub fn get_retry_settings(settings: &SettingsStore) -> (bool, i32) {
+    let enabled = settings.get_bool("retry.enabled", true);
+    let times = settings.get_u64("retry.times", 2) as i32;
+    (enabled, times)
 }

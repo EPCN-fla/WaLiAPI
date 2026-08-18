@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use axum::{
     extract::{Extension, Request, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -23,7 +23,8 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Manager};
+#[cfg(feature = "desktop-ui")]
+use tauri::AppHandle;
 use tokio::sync::broadcast;
 
 use super::admin_auth::{self, AdminSession};
@@ -53,7 +54,35 @@ pub fn router(shared: SharedState) -> Router<SharedState> {
         .route("/events", get(events_handler))
         .route_layer(middleware::from_fn_with_state(shared.clone(), require_auth));
 
-    Router::new().merge(public).merge(protected)
+    Router::new()
+        .merge(public)
+        .merge(protected)
+        .layer(middleware::from_fn(csrf_guard))
+}
+
+/// CSRF 防护：所有变更类方法必须带 `X-Requested-With: XMLHttpRequest` 头。
+/// 浏览器跨域表单/简单请求无法携带自定义头；跨域 fetch 携带自定义头会触发预检，
+/// 而 /admin/api 不下发任何 CORS 允许头，预检必然失败 —— 双重拦截跨站伪造请求。
+/// GET/HEAD（含 SSE /events）无状态变更，且响应在无 CORS 头时跨域不可读，无需校验。
+async fn csrf_guard(req: Request, next: Next) -> Result<Response, (StatusCode, Json<Value>)> {
+    if matches!(
+        *req.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        let has_header = req
+            .headers()
+            .get("x-requested-with")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("XMLHttpRequest"))
+            .unwrap_or(false);
+        if !has_header {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "CSRF 校验失败" })),
+            ));
+        }
+    }
+    Ok(next.run(req).await)
 }
 
 // ── 认证中间件 ────────────────────────────────────────────────────────────────
@@ -276,7 +305,7 @@ async fn change_username(
 async fn events_handler(
     State(shared): State<SharedState>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-    let rx = shared.state.event_tx.subscribe();
+    let rx = shared.state.events.subscribe();
     let stream = async_stream::stream! {
         let mut rx = rx;
         loop {
@@ -330,8 +359,14 @@ fn to_json<T: serde::Serialize>(result: Result<T, String>) -> Result<Value, Stri
 }
 
 async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value, String> {
-    let app: &'static AppHandle = shared.app_static;
-    let state = app.state::<Arc<AppState>>();
+    let state = shared.state_static.clone();
+    // 桌面专属命令的 AppHandle（仅 desktop-ui 构建存在）
+    #[cfg(feature = "desktop-ui")]
+    let desktop_app = |name: &str| -> Result<&'static AppHandle, String> {
+        shared
+            .desktop_app
+            .ok_or_else(|| format!("{name} 仅桌面版可用"))
+    };
     match cmd {
         // ── 渠道 ──
         "get_channels" => to_json(commands::channel::get_channels(state).await),
@@ -416,15 +451,23 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
 
         // ── Auth 账号 ──
         "auth_accounts_list" => to_json(commands::auth::auth_accounts_list(state).await),
+        #[cfg(feature = "desktop-ui")]
         "auth_login" => {
+            let app = desktop_app("OAuth 登录")?;
             to_json(commands::auth::auth_login(arg(&args, "provider")?, app.clone(), state).await)
         }
+        #[cfg(not(feature = "desktop-ui"))]
+        "auth_login" => Err("OAuth 登录仅桌面版可用，请使用 auth.json 导入".to_string()),
+        #[cfg(feature = "desktop-ui")]
         "auth_login_start" => {
+            let app = desktop_app("OAuth 登录")?;
             to_json(
                 commands::auth::auth_login_start(arg(&args, "provider")?, app.clone(), state)
                     .await,
             )
         }
+        #[cfg(not(feature = "desktop-ui"))]
+        "auth_login_start" => Err("OAuth 登录仅桌面版可用，请使用 auth.json 导入".to_string()),
         "auth_login_status" => {
             to_json(commands::auth::auth_login_status(arg(&args, "sessionId")?, state).await)
         }
@@ -481,19 +524,29 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
 
         // ── 仪表盘 / 设置 / 服务状态 ──
         "get_dashboard_stats" => to_json(commands::stats::get_dashboard_stats(state).await),
-        "get_settings" => to_json(commands::settings::get_settings(app.clone()).await),
+        "get_settings" => to_json(commands::settings::get_settings(state).await),
         "save_settings" => {
-            to_json(commands::settings::save_settings(arg(&args, "settings")?, app.clone()).await)
+            to_json(commands::settings::save_settings(arg(&args, "settings")?, state).await)
         }
         "apply_theme" => {
-            to_json(commands::settings::apply_theme(arg(&args, "theme")?, app.clone()).await)
+            to_json(commands::settings::apply_theme(arg(&args, "theme")?, state).await)
         }
+        #[cfg(feature = "desktop-ui")]
         "set_auto_start" => {
+            let app = desktop_app("开机自启")?;
             to_json(commands::settings::set_auto_start(arg(&args, "enabled")?, app.clone()).await)
         }
-        "get_feature_flags" => to_json(commands::settings::get_feature_flags(app.clone())),
+        #[cfg(not(feature = "desktop-ui"))]
+        "set_auto_start" => Ok(Value::Null),
+        "get_feature_flags" => to_json(commands::settings::get_feature_flags(state)),
         "get_server_status" => to_json(commands::server::get_server_status(state).await),
-        "restart_server" => to_json(commands::server::restart_server(app.clone(), state).await),
+        #[cfg(feature = "desktop-ui")]
+        "restart_server" => match shared.desktop_app {
+            Some(app) => to_json(commands::server::restart_server(app.clone(), state).await),
+            None => to_json(restart_server_headless(shared).await),
+        },
+        #[cfg(not(feature = "desktop-ui"))]
+        "restart_server" => to_json(restart_server_headless(shared).await),
         "get_service_statuses" => to_json(commands::services::get_service_statuses(state).await),
 
         // ── 安全规则 ──
@@ -558,8 +611,16 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
                     .await,
             )
         }
-        "pick_import_file" => to_json(commands::import_export::pick_import_file(app.clone()).await),
+        #[cfg(feature = "desktop-ui")]
+        "pick_import_file" => {
+            let app = desktop_app("文件选择对话框")?;
+            to_json(commands::import_export::pick_import_file(app.clone()).await)
+        }
+        #[cfg(not(feature = "desktop-ui"))]
+        "pick_import_file" => Err("文件选择对话框仅桌面版可用".to_string()),
+        #[cfg(feature = "desktop-ui")]
         "save_export_file" => {
+            let app = desktop_app("文件保存对话框")?;
             to_json(
                 commands::import_export::save_export_file(
                     app.clone(),
@@ -569,6 +630,8 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
                 .await,
             )
         }
+        #[cfg(not(feature = "desktop-ui"))]
+        "save_export_file" => Err("文件保存对话框仅桌面版可用".to_string()),
 
         // ── 知识库 ──
         "get_knowledge_bases" => {
@@ -607,12 +670,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         }
         "reindex_kb_document" => {
             to_json(
-                commands::knowledge_base::reindex_kb_document(
-                    state,
-                    app.clone(),
-                    arg(&args, "docId")?,
-                )
-                .await,
+                commands::knowledge_base::reindex_kb_document(state, arg(&args, "docId")?).await,
             )
         }
         "get_kb_tags" => {
@@ -632,12 +690,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         }
         "ask_knowledge_base" => {
             to_json(
-                commands::knowledge_base::ask_knowledge_base(
-                    state,
-                    app.clone(),
-                    arg(&args, "input")?,
-                )
-                .await,
+                commands::knowledge_base::ask_knowledge_base(state, arg(&args, "input")?).await,
             )
         }
         "get_kb_stats" => {
@@ -645,12 +698,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         }
         "upload_kb_document" => {
             to_json(
-                commands::knowledge_base::upload_kb_document(
-                    state,
-                    app.clone(),
-                    arg(&args, "input")?,
-                )
-                .await,
+                commands::knowledge_base::upload_kb_document(state, arg(&args, "input")?).await,
             )
         }
         "get_kb_conversations" => {
@@ -680,7 +728,6 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
             to_json(
                 commands::knowledge_base::import_kb_source(
                     state,
-                    app.clone(),
                     arg(&args, "kbId")?,
                     arg(&args, "input")?,
                 )
@@ -693,10 +740,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
             )
         }
         "build_kb_index" => {
-            to_json(
-                commands::knowledge_base::build_kb_index(state, app.clone(), arg(&args, "kbId")?)
-                    .await,
-            )
+            to_json(commands::knowledge_base::build_kb_index(state, arg(&args, "kbId")?).await)
         }
         "drop_kb_index" => {
             to_json(commands::knowledge_base::drop_kb_index(state, arg(&args, "kbId")?).await)
@@ -781,7 +825,6 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         "ingest_wiki_source" => {
             to_json(
                 commands::wiki::ingest_wiki_source(
-                    app.clone(),
                     state,
                     arg(&args, "projectId")?,
                     arg(&args, "sourceId")?,
@@ -790,10 +833,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
             )
         }
         "rescan_wiki_sources" => {
-            to_json(
-                commands::wiki::rescan_wiki_sources(app.clone(), state, arg(&args, "projectId")?)
-                    .await,
-            )
+            to_json(commands::wiki::rescan_wiki_sources(state, arg(&args, "projectId")?).await)
         }
 
         // ── 应用配置（容器内通常全部不可用，由前端置灰）──
@@ -821,4 +861,22 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
 
         _ => Err(format!("未知命令: {cmd}")),
     }
+}
+
+/// headless 模式的服务重启：中止当前监听任务并按最新设置重新绑定端口。
+async fn restart_server_headless(shared: &SharedState) -> Result<(), String> {
+    let mut guard = shared.state.server_handle.write().await;
+    if let Some(handle) = guard.take() {
+        handle.abort();
+    }
+    shared
+        .state
+        .server_running
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let state = shared.state.clone();
+    let handle = tauri::async_runtime::spawn(async move {
+        let _ = crate::server::start_server(state, None).await;
+    });
+    *guard = Some(handle);
+    Ok(())
 }

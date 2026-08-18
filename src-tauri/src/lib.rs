@@ -11,18 +11,41 @@ mod protocol;
 #[cfg(test)]
 mod rollout_integration_tests;
 pub mod security;
-mod server;
+pub mod server;
+pub mod settings_store;
 pub mod services;
 pub mod utils;
+pub mod web_server;
+
+/// 应用标识符（与 tauri.conf.json 一致），用于 headless 数据目录解析。
+pub const APP_IDENTIFIER: &str = "waliapi.xiaofuge.cn";
 
 use std::sync::Arc;
+#[cfg(feature = "desktop-ui")]
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, RunEvent,
 };
+use tauri::{AppHandle, Emitter, Manager, RunEvent};
 use tauri_plugin_store::StoreExt;
 use tokio::sync::RwLock;
+
+/// 桌面端设置后端：tauri-plugin-store（settings.json）。
+struct TauriSettingsBackend(AppHandle);
+
+impl settings_store::SettingsBackend for TauriSettingsBackend {
+    fn get(&self, key: &str) -> Option<serde_json::Value> {
+        self.0.store("settings.json").ok()?.get(key)
+    }
+
+    fn set_many(&self, entries: &[(String, serde_json::Value)]) -> Result<(), String> {
+        let store = self.0.store("settings.json").map_err(|e| e.to_string())?;
+        for (key, value) in entries {
+            store.set(key.clone(), value.clone());
+        }
+        store.save().map_err(|e| e.to_string())
+    }
+}
 
 pub struct AppState {
     pub db: Arc<db::Database>,
@@ -30,15 +53,19 @@ pub struct AppState {
     pub login_sessions: Arc<commands::auth::LoginSessions>,
     pub server_port: Arc<RwLock<u16>>,
     pub server_running: Arc<std::sync::atomic::AtomicBool>,
-    pub server_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    pub server_handle: Arc<RwLock<Option<tauri::async_runtime::JoinHandle<()>>>>,
     /// T07: short-lived, in-process test-run receipt store used to validate
     /// `test_run_id + draft_fingerprint + force_save` at channel save time.
     /// Process restart clears it → every receipt expires → re-test required.
     pub test_receipts: Arc<crate::services::channel_test::TestReceiptStore>,
     /// Web 管理面板：管理员会话（内存存储，重启失效）。
     pub admin_sessions: Arc<server::admin_auth::SessionStore>,
-    /// Web 管理面板：SSE 事件桥广播通道。
-    pub event_tx: tokio::sync::broadcast::Sender<server::event_bridge::AdminEvent>,
+    /// 统一事件出口（桌面 Webview + Web SSE 桥）。
+    pub events: server::event_bridge::EventSink,
+    /// 设置存储（桌面 tauri-plugin-store / headless JSON 文件）。
+    pub settings: settings_store::SettingsStore,
+    /// 应用数据目录（KB 文件等落盘位置）。
+    pub data_dir: std::path::PathBuf,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -74,33 +101,36 @@ pub fn run() {
             None::<Vec<&str>>,
         ))
         .setup(|app| {
-            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let show_item = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            #[cfg(feature = "desktop-ui")]
+            {
+                let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+                let show_item = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
 
-            TrayIconBuilder::with_id("main")
-                .icon(app.default_window_icon().unwrap().clone())
-                .menu(&menu)
-                .tooltip("WaLiAPI - Local LLM API Gateway")
-                .show_menu_on_left_click(false)
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let _ = restore_main_window(tray.app_handle());
-                    }
-                })
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "quit" => app.exit(0),
-                    "show" => {
-                        let _ = restore_main_window(app);
-                    }
-                    _ => {}
-                })
-                .build(app)?;
+                TrayIconBuilder::with_id("main")
+                    .icon(app.default_window_icon().unwrap().clone())
+                    .menu(&menu)
+                    .tooltip("WaLiAPI - Local LLM API Gateway")
+                    .show_menu_on_left_click(false)
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            let _ = restore_main_window(tray.app_handle());
+                        }
+                    })
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "quit" => app.exit(0),
+                        "show" => {
+                            let _ = restore_main_window(app);
+                        }
+                        _ => {}
+                    })
+                    .build(app)?;
+            }
 
             if let Some(window) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();
@@ -123,9 +153,14 @@ pub fn run() {
 
             let app_handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
+                let data_dir = app_handle
+                    .path()
+                    .app_data_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
                 let db = db::Database::new(&app_handle).await;
                 let db = Arc::new(db);
-                if let Err(e) = server::admin_auth::ensure_initial_admin(&db.pool).await {
+                if let Err(e) = server::admin_auth::ensure_initial_admin(&db.pool, &data_dir).await
+                {
                     log::error!("初始化 Web 管理员账号失败: {e}");
                 }
                 let auth_service = Arc::new(auth_provider::service::AuthService::new(
@@ -135,6 +170,7 @@ pub fn run() {
                 let (event_tx, _) = tokio::sync::broadcast::channel(
                     server::event_bridge::EVENT_CHANNEL_CAPACITY,
                 );
+                let emit_handle = app_handle.clone();
                 let state = Arc::new(AppState {
                     db,
                     auth_service: auth_service.clone(),
@@ -146,7 +182,16 @@ pub fn run() {
                         std::time::Duration::from_secs(30 * 60),
                     )),
                     admin_sessions: server::admin_auth::SessionStore::new(),
-                    event_tx,
+                    events: server::event_bridge::EventSink::desktop(
+                        move |event, payload| {
+                            let _ = emit_handle.emit(event, payload);
+                        },
+                        event_tx,
+                    ),
+                    settings: settings_store::SettingsStore::new(Arc::new(TauriSettingsBackend(
+                        app_handle.clone(),
+                    ))),
+                    data_dir,
                 });
                 app_handle.manage(state.clone());
 
@@ -154,10 +199,16 @@ pub fn run() {
                     auth_provider::maintenance::run_maintenance_loop(auth_service).await;
                 });
 
-                let handle = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = server::start_server(handle, state).await;
-                });
+                // 桌面版默认不启动内嵌服务（Web 面板/网关），
+                // 可在「设置 → 服务配置」开启随应用启动。
+                if state.settings.get_bool("server.auto_start", false) {
+                    let state_clone = state.clone();
+                    let app_clone = app_handle.clone();
+                    let handle = tauri::async_runtime::spawn(async move {
+                        let _ = server::start_server(state_clone, Some(app_clone)).await;
+                    });
+                    *state.server_handle.write().await = Some(handle);
+                }
             });
 
             Ok(())

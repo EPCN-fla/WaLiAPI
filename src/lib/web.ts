@@ -61,7 +61,10 @@ export async function webAdminFetch<T>(path: string, options?: {
   body?: unknown;
 }): Promise<T> {
   const token = localStorage.getItem(ADMIN_TOKEN_KEY);
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-Requested-With": "XMLHttpRequest",
+  };
   if (token) headers["Authorization"] = `Bearer ${token}`;
   const res = await fetch(`/admin/api${path}`, {
     method: options?.method ?? "GET",

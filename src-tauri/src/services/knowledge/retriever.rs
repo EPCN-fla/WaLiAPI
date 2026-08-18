@@ -3,7 +3,7 @@ use super::models::SearchResult;
 use super::repository::KbRepository;
 use sqlx::SqlitePool;
 use std::path::PathBuf;
-use tauri::AppHandle;
+use crate::server::event_bridge::EventSink;
 
 /// Default HNSW parameters
 const DEFAULT_M: usize = 16;
@@ -264,7 +264,7 @@ pub async fn detect_embedding_dim(pool: &SqlitePool, kb_id: &str) -> Result<Opti
 
 /// Build HNSW index for a KB from all its chunks.
 /// Emits `kb-index-progress` Tauri events with percentage.
-pub async fn build_index(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Result<(), String> {
+pub async fn build_index(pool: &SqlitePool, kb_id: &str, events: &EventSink) -> Result<(), String> {
     let repo = KbRepository::new(pool.clone());
 
     let chunks = repo
@@ -303,8 +303,7 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Res
 
     // Emit initial progress with total count
     let total_items = items.len();
-    crate::server::event_bridge::emit_admin(
-        app,
+    events.emit(
         "kb-index-progress",
         serde_json::json!({
             "kb_id": kb_id,
@@ -316,7 +315,7 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Res
         }),
     );
 
-    let app_clone = app.clone();
+    let app_clone = events.clone();
     let kb_id_clone = kb_id.to_string();
 
     // CPU-intensive build runs on blocking thread pool to avoid starving async runtime
@@ -328,8 +327,7 @@ pub async fn build_index(pool: &SqlitePool, kb_id: &str, app: &AppHandle) -> Res
             } else {
                 100
             };
-            crate::server::event_bridge::emit_admin(
-                &app_clone,
+            app_clone.emit(
                 "kb-index-progress",
                 serde_json::json!({
                     "kb_id": &kb_id_clone,

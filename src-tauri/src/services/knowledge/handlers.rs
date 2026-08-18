@@ -140,12 +140,7 @@ pub async fn upload_document(
     let file_type = super::parser::get_file_type(&input.filename);
     let file_size = content.len() as i64;
 
-    let app_data_dir = shared
-        .app
-        .path()
-        .app_data_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let kb_dir = app_data_dir.join("kb_files").join(&kb_id);
+    let kb_dir = shared.state.data_dir.join("kb_files").join(&kb_id);
     std::fs::create_dir_all(&kb_dir).ok();
     let doc_id = uuid::Uuid::new_v4().to_string();
     let file_path = kb_dir.join(format!("{}_{}", &doc_id, &input.filename));
@@ -185,7 +180,7 @@ pub async fn upload_document(
     };
 
     let pool = shared.state.db.pool.clone();
-    let app = shared.app.clone();
+    let events = shared.state.events.clone();
     let doc_id_clone = doc.id.clone();
     let filename_clone = input.filename.clone();
     let emb_model = kb.embedding_model.clone();
@@ -193,7 +188,7 @@ pub async fn upload_document(
     tokio::spawn(async move {
         if let Err(e) = processor::process_document(
             &pool,
-            &app,
+            &events,
             &kb_id,
             &doc_id_clone,
             &filename_clone,
@@ -250,10 +245,10 @@ pub async fn reindex_document(
     Path((_kb_id, doc_id)): Path<(String, String)>,
 ) -> Response {
     let pool = shared.state.db.pool.clone();
-    let app = shared.app.clone();
+    let events = shared.state.events.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = processor::reindex_document(&pool, &app, &doc_id).await {
+        if let Err(e) = processor::reindex_document(&pool, &events, &doc_id).await {
             tracing::error!("Reindex failed: {}", e);
         }
     });
@@ -353,7 +348,7 @@ pub async fn ask(State(shared): State<SharedState>, Json(input): Json<AskInput>)
             &input.model,
             input.top_k,
             input.max_rounds,
-            &shared.app,
+            &shared.state.settings,
         )
         .await
         {
@@ -380,7 +375,7 @@ pub async fn ask(State(shared): State<SharedState>, Json(input): Json<AskInput>)
             input.top_k,
             false,
             &history,
-            &shared.app,
+            &shared.state.settings,
             vector_weight,
             keyword_weight,
             search_mode,
@@ -506,7 +501,7 @@ pub async fn import_source(
     Json(input): Json<ImportSourceInput>,
 ) -> Response {
     let pool = shared.state.db.pool.clone();
-    let app = shared.app.clone();
+    let events = shared.state.events.clone();
 
     let repo = KbRepository::new(pool.clone());
 
@@ -536,11 +531,11 @@ pub async fn import_source(
 
     tokio::spawn(async move {
         let result = if source_type == "git" {
-            super::importer::import_git_repo(&pool, &app, &kb_id, &source_id, &input).await
+            super::importer::import_git_repo(&pool, &events, &kb_id, &source_id, &input).await
         } else if source_type == "url" {
-            super::importer::import_url(&pool, &app, &kb_id, &source_id, &input).await
+            super::importer::import_url(&pool, &events, &kb_id, &source_id, &input).await
         } else if source_type == "local_dir" {
-            super::importer::import_local_dir(&pool, &app, &kb_id, &source_id, &input).await
+            super::importer::import_local_dir(&pool, &events, &kb_id, &source_id, &input).await
         } else {
             Err(format!("Unknown source type: {}", source_type))
         };
@@ -584,7 +579,7 @@ pub async fn get_index_status(
 pub async fn build_index(State(shared): State<SharedState>, Path(kb_id): Path<String>) -> Response {
     let pool = shared.state.db.pool.clone();
     let kb_id_clone = kb_id.clone();
-    let app = shared.app.clone();
+    let events = shared.state.events.clone();
 
     // Update index status to building immediately
     let repo = KbRepository::new(pool.clone());
@@ -600,8 +595,7 @@ pub async fn build_index(State(shared): State<SharedState>, Path(kb_id): Path<St
 
         rt.block_on(async {
             // Emit progress: starting
-            crate::server::event_bridge::emit_admin(
-                &app,
+            events.emit(
                 "kb-index-progress",
                 serde_json::json!({
                     "kb_id": &kb_id,
@@ -610,11 +604,10 @@ pub async fn build_index(State(shared): State<SharedState>, Path(kb_id): Path<St
                 }),
             );
 
-            match retriever::build_index(&pool, &kb_id, &app).await {
+            match retriever::build_index(&pool, &kb_id, &events).await {
                 Ok(()) => {
                     tracing::info!("HNSW index built successfully for KB {}", kb_id);
-                    crate::server::event_bridge::emit_admin(
-                        &app,
+                    events.emit(
                         "kb-index-progress",
                         serde_json::json!({
                             "kb_id": &kb_id,
@@ -627,8 +620,7 @@ pub async fn build_index(State(shared): State<SharedState>, Path(kb_id): Path<St
                     tracing::error!("Failed to build HNSW index for KB {}: {}", kb_id, e);
                     let repo = KbRepository::new(pool.clone());
                     repo.update_kb_index_status(&kb_id, "error").await.ok();
-                    crate::server::event_bridge::emit_admin(
-                        &app,
+                    events.emit(
                         "kb-index-progress",
                         serde_json::json!({
                             "kb_id": &kb_id,

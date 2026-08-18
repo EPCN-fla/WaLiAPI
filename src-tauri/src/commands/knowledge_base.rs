@@ -74,11 +74,10 @@ pub async fn delete_kb_document(
 #[tauri::command]
 pub async fn reindex_kb_document(
     state: State<'_, Arc<AppState>>,
-    app: tauri::AppHandle,
     doc_id: String,
 ) -> Result<(), String> {
     let pool = state.db.pool.clone();
-    crate::services::knowledge::processor::reindex_document(&pool, &app, &doc_id)
+    crate::services::knowledge::processor::reindex_document(&pool, &state.events, &doc_id)
         .await
         .map_err(|e| e)
 }
@@ -289,7 +288,6 @@ fn default_max_rounds() -> usize {
 #[tauri::command]
 pub async fn ask_knowledge_base(
     state: State<'_, Arc<AppState>>,
-    app: tauri::AppHandle,
     input: KbAskInput,
 ) -> Result<RagAnswer, String> {
     let pool = &state.db.pool;
@@ -316,7 +314,7 @@ pub async fn ask_knowledge_base(
             &input.model,
             input.top_k,
             input.max_rounds,
-            &app,
+            &state.settings,
         )
         .await
         .map_err(|e| e)
@@ -334,7 +332,7 @@ pub async fn ask_knowledge_base(
             input.top_k,
             false,
             &history,
-            &app,
+            &state.settings,
             vector_weight,
             keyword_weight,
             search_mode,
@@ -380,11 +378,9 @@ pub struct UploadDocInput {
 #[tauri::command]
 pub async fn upload_kb_document(
     state: State<'_, Arc<AppState>>,
-    app: tauri::AppHandle,
     input: UploadDocInput,
 ) -> Result<KbDocument, String> {
     use sha2::Digest;
-    use tauri::Manager;
 
     let pool = &state.db.pool;
     let repo = KbRepository::new(pool.clone());
@@ -403,11 +399,7 @@ pub async fn upload_kb_document(
     let file_type = crate::services::knowledge::parser::get_file_type(&input.filename);
     let file_size = content.len() as i64;
 
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let kb_dir = app_data_dir.join("kb_files").join(&input.kb_id);
+    let kb_dir = state.data_dir.join("kb_files").join(&input.kb_id);
     std::fs::create_dir_all(&kb_dir).ok();
     let doc_id = uuid::Uuid::new_v4().to_string();
     let file_path = kb_dir.join(format!("{}_{}", &doc_id, &input.filename));
@@ -430,14 +422,14 @@ pub async fn upload_kb_document(
     let emb_model = kb.embedding_model.clone();
 
     let pool_clone = pool.clone();
-    let app_clone = app.clone();
+    let events_clone = state.events.clone();
     let doc_id_clone = doc.id.clone();
     let filename_clone = input.filename.clone();
 
     tokio::spawn(async move {
         if let Err(e) = crate::services::knowledge::processor::process_document(
             &pool_clone,
-            &app_clone,
+            &events_clone,
             &input.kb_id,
             &doc_id_clone,
             &filename_clone,
@@ -507,11 +499,11 @@ pub async fn delete_kb_source(
 #[tauri::command]
 pub async fn import_kb_source(
     state: State<'_, Arc<AppState>>,
-    app: tauri::AppHandle,
     kb_id: String,
     input: ImportSourceInput,
 ) -> Result<KbSource, String> {
     let pool = state.db.pool.clone();
+    let events = state.events.clone();
     let repo = KbRepository::new(pool.clone());
 
     let source = repo
@@ -531,17 +523,17 @@ pub async fn import_kb_source(
     tokio::spawn(async move {
         let result = if source_type == "git" {
             crate::services::knowledge::importer::import_git_repo(
-                &pool, &app, &kb_id, &source_id, &input,
+                &pool, &events, &kb_id, &source_id, &input,
             )
             .await
         } else if source_type == "url" {
             crate::services::knowledge::importer::import_url(
-                &pool, &app, &kb_id, &source_id, &input,
+                &pool, &events, &kb_id, &source_id, &input,
             )
             .await
         } else if source_type == "local_dir" {
             crate::services::knowledge::importer::import_local_dir(
-                &pool, &app, &kb_id, &source_id, &input,
+                &pool, &events, &kb_id, &source_id, &input,
             )
             .await
         } else {
@@ -579,10 +571,10 @@ pub async fn get_kb_index_status(
 #[tauri::command]
 pub async fn build_kb_index(
     state: State<'_, Arc<AppState>>,
-    app: tauri::AppHandle,
     kb_id: String,
 ) -> Result<(), String> {
     let pool = state.db.pool.clone();
+    let events = state.events.clone();
 
     // Update status to building immediately
     let repo = KbRepository::new(pool.clone());
@@ -590,12 +582,10 @@ pub async fn build_kb_index(
 
     // Spawn the actual HNSW index build
     tokio::spawn(async move {
-        let app = app.clone();
         let kb_id_clone = kb_id.clone();
 
         // Emit starting event
-        crate::server::event_bridge::emit_admin(
-            &app,
+        events.emit(
             "kb-index-progress",
             serde_json::json!({
                 "kb_id": &kb_id_clone,
@@ -607,11 +597,10 @@ pub async fn build_kb_index(
             }),
         );
 
-        match crate::services::knowledge::retriever::build_index(&pool, &kb_id_clone, &app).await {
+        match crate::services::knowledge::retriever::build_index(&pool, &kb_id_clone, &events).await {
             Ok(()) => {
                 tracing::info!("HNSW index built successfully for KB {}", kb_id_clone);
-                crate::server::event_bridge::emit_admin(
-                    &app,
+                events.emit(
                     "kb-index-progress",
                     serde_json::json!({
                         "kb_id": &kb_id_clone,
@@ -627,8 +616,7 @@ pub async fn build_kb_index(
                 repo.update_kb_index_status(&kb_id_clone, "error")
                     .await
                     .ok();
-                crate::server::event_bridge::emit_admin(
-                    &app,
+                events.emit(
                     "kb-index-progress",
                     serde_json::json!({
                         "kb_id": &kb_id_clone,

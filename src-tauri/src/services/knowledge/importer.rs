@@ -5,12 +5,12 @@ use super::repository::KbRepository;
 use sha2::Digest;
 use sqlx::SqlitePool;
 use std::path::PathBuf;
-use tauri::AppHandle;
+use crate::server::event_bridge::EventSink;
 
 /// Import a Git repository: clone → filter → process files
 pub async fn import_git_repo(
     pool: &SqlitePool,
-    app: &AppHandle,
+    events: &EventSink,
     kb_id: &str,
     source_id: &str,
     input: &ImportSourceInput,
@@ -38,7 +38,7 @@ pub async fn import_git_repo(
         repo_url.clone()
     };
 
-    emit_import_progress(app, kb_id, source_id, 0, "Cloning repository...");
+    emit_import_progress(events, kb_id, source_id, 0, "Cloning repository...");
 
     let clone_result = tokio::process::Command::new("git")
         .args(&[
@@ -71,7 +71,7 @@ pub async fn import_git_repo(
 
     let result = process_directory_files(
         pool,
-        app,
+        events,
         kb_id,
         source_id,
         &temp_dir,
@@ -93,14 +93,14 @@ pub async fn import_git_repo(
 /// Import from a URL: fetch content → process
 pub async fn import_url(
     pool: &SqlitePool,
-    app: &AppHandle,
+    events: &EventSink,
     kb_id: &str,
     source_id: &str,
     input: &ImportSourceInput,
 ) -> Result<usize, String> {
     let url = input.url.as_ref().ok_or("url is required for url import")?;
 
-    emit_import_progress(app, kb_id, source_id, 0, "Fetching URL...");
+    emit_import_progress(events, kb_id, source_id, 0, "Fetching URL...");
 
     let client = reqwest::Client::new();
     let resp = client
@@ -147,7 +147,7 @@ pub async fn import_url(
 
     // Check duplicate
     if let Ok(Some(_)) = repo.find_document_by_hash(kb_id, &hash_hex).await {
-        emit_import_progress(app, kb_id, source_id, 100, "URL content already exists");
+        emit_import_progress(events, kb_id, source_id, 100, "URL content already exists");
         return Ok(0);
     }
 
@@ -170,11 +170,11 @@ pub async fn import_url(
     let kb = repo.get_kb(kb_id).await.map_err(|e| e.to_string())?;
     let emb_model = kb.embedding_model.clone();
 
-    emit_import_progress(app, kb_id, source_id, 30, "Processing document...");
+    emit_import_progress(events, kb_id, source_id, 30, "Processing document...");
 
     processor::process_document(
         pool,
-        app,
+        events,
         kb_id,
         &doc.id,
         &filename,
@@ -183,14 +183,14 @@ pub async fn import_url(
     )
     .await?;
 
-    emit_import_progress(app, kb_id, source_id, 100, "URL import complete");
+    emit_import_progress(events, kb_id, source_id, 100, "URL import complete");
     Ok(1)
 }
 
 /// Import from a local directory: scan → filter → process files
 pub async fn import_local_dir(
     pool: &SqlitePool,
-    app: &AppHandle,
+    events: &EventSink,
     kb_id: &str,
     source_id: &str,
     input: &ImportSourceInput,
@@ -211,7 +211,7 @@ pub async fn import_local_dir(
 
     process_directory_files(
         pool,
-        app,
+        events,
         kb_id,
         source_id,
         &path,
@@ -228,7 +228,7 @@ pub async fn import_local_dir(
 /// Common: process all files in a directory with filtering
 async fn process_directory_files(
     pool: &SqlitePool,
-    app: &AppHandle,
+    events: &EventSink,
     kb_id: &str,
     source_id: &str,
     dir: &PathBuf,
@@ -239,13 +239,13 @@ async fn process_directory_files(
     source_url: Option<&str>,
     _source_path: Option<&str>,
 ) -> Result<usize, String> {
-    emit_import_progress(app, kb_id, source_id, 5, "Scanning directory...");
+    emit_import_progress(events, kb_id, source_id, 5, "Scanning directory...");
 
     let files = scan_directory(dir, excluded_dirs, included_files, max_file_size)?;
 
     if files.is_empty() {
         emit_import_progress(
-            app,
+            events,
             kb_id,
             source_id,
             100,
@@ -270,7 +270,7 @@ async fn process_directory_files(
 
         let pct = 10 + ((i as f64 / total as f64) * 80.0) as u8;
         emit_import_progress(
-            app,
+            events,
             kb_id,
             source_id,
             pct,
@@ -332,7 +332,7 @@ async fn process_directory_files(
         // Process document
         if let Err(e) = processor::process_document(
             pool,
-            app,
+            events,
             kb_id,
             &doc.id,
             &filename,
@@ -352,7 +352,7 @@ async fn process_directory_files(
     repo.update_kb_counts(kb_id).await.ok();
 
     emit_import_progress(
-        app,
+        events,
         kb_id,
         source_id,
         100,
@@ -520,9 +520,8 @@ fn is_supported_extension(ext: &str) -> bool {
     )
 }
 
-fn emit_import_progress(app: &AppHandle, kb_id: &str, source_id: &str, progress: u8, detail: &str) {
-    crate::server::event_bridge::emit_admin(
-        app,
+fn emit_import_progress(events: &EventSink, kb_id: &str, source_id: &str, progress: u8, detail: &str) {
+    events.emit(
         "kb-import-progress",
         serde_json::json!({
             "kb_id": kb_id,

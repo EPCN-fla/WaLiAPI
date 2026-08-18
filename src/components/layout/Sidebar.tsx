@@ -39,7 +39,10 @@ function webLogout() {
   const token = localStorage.getItem("waliapi_admin_token");
   void fetch("/admin/api/auth/logout", {
     method: "POST",
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    headers: {
+      "X-Requested-With": "XMLHttpRequest",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
   }).catch(() => {});
   localStorage.removeItem("waliapi_admin_token");
   location.assign("/login");

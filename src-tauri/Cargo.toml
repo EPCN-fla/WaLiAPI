@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["test"] }
 tauri-plugin-opener = "2"
 tauri-plugin-sql = { version = "2", features = ["sqlite"] }
 tauri-plugin-store = "2"
@@ -88,4 +88,16 @@ mime_guess = "2"
 rust-embed = { version = "8", optional = true }
 
 [features]
+# desktop-ui：桌面专属能力（托盘图标/文件对话框/开机自启/OAuth 打开系统浏览器），
+# 会引入 GTK/DBus 等动态库；headless（waliapi-web）用 --no-default-features 关闭。
+default = ["desktop-ui"]
+desktop-ui = ["tauri/tray-icon"]
 embed-web = ["dep:rust-embed"]
+
+[profile.release]
+# LTO + 单 CGU：让链接器彻底丢弃 headless 二进制未引用的桌面端代码
+# （否则 waliapi_lib::run<Wry> 与路由 handler 共驻同一 CGU，wry/webkit 会被链入 NEEDED）
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"

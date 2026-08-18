@@ -3,14 +3,16 @@ use super::project;
 use super::repository::WikiRepository;
 use crate::core::proxy;
 use crate::db::repository::Repository;
+use crate::server::event_bridge::EventSink;
+use crate::settings_store::SettingsStore;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tauri::AppHandle;
 
 /// Ingest a source file: read → parse → generate wiki pages via LLM → write to disk+DB.
 pub async fn ingest_source(
-    app: &AppHandle,
+    events: &EventSink,
+    settings: &SettingsStore,
     pool: &sqlx::SqlitePool,
     project_id: &str,
     source_id: &str,
@@ -32,7 +34,7 @@ pub async fn ingest_source(
     repo.update_task_status(&task_id, "running", 0, 0, 3, None, None)
         .await?;
     emit_wiki_progress(
-        app,
+        events,
         source_id,
         project_id,
         &source.filename,
@@ -66,7 +68,7 @@ pub async fn ingest_source(
     repo.update_task_status(&task_id, "running", 10, 0, 3, None, None)
         .await?;
     emit_wiki_progress(
-        app,
+        events,
         source_id,
         project_id,
         &source.filename,
@@ -98,7 +100,7 @@ pub async fn ingest_source(
     repo.update_task_status(&task_id, "running", 30, 1, 3, None, None)
         .await?;
     emit_wiki_progress(
-        app,
+        events,
         source_id,
         project_id,
         &source.filename,
@@ -107,7 +109,7 @@ pub async fn ingest_source(
         "LLM 生成页面",
     );
     let pages = generate_wiki_pages(
-        app,
+        settings,
         &db_repo,
         ingest_model,
         &ingest_channel_id,
@@ -124,7 +126,7 @@ pub async fn ingest_source(
     repo.update_task_status(&task_id, "running", 60, 2, 3, None, None)
         .await?;
     emit_wiki_progress(
-        app,
+        events,
         source_id,
         project_id,
         &source.filename,
@@ -179,7 +181,7 @@ pub async fn ingest_source(
     repo.update_task_status(&task_id, "running", 80, 2, 3, None, None)
         .await?;
     emit_wiki_progress(
-        app,
+        events,
         source_id,
         project_id,
         &source.filename,
@@ -237,7 +239,7 @@ pub async fn ingest_source(
     repo.update_task_status(&task_id, "done", 100, 3, 3, Some(&result_json), None)
         .await?;
     emit_wiki_progress(
-        app,
+        events,
         source_id,
         project_id,
         &source.filename,
@@ -267,16 +269,15 @@ struct GeneratedPage {
 
 /// Emit wiki source ingest progress event to frontend.
 fn emit_wiki_progress(
-    app: &AppHandle,
+    events: &EventSink,
     source_id: &str,
     project_id: &str,
     filename: &str,
     stage: &str,
     progress: u8,
     detail: &str,
-) {
-    crate::server::event_bridge::emit_admin(
-        app,
+    ) {
+    events.emit(
         "wiki-source-progress",
         serde_json::json!({
             "source_id": source_id,
@@ -417,7 +418,7 @@ fn parse_json(content: &str) -> Vec<ContentSection> {
 
 /// Generate wiki pages from content sections via LLM.
 async fn generate_wiki_pages(
-    app: &AppHandle,
+    settings: &SettingsStore,
     db_repo: &Arc<Repository>,
     model: &str,
     channel_id: &str,
@@ -507,7 +508,7 @@ Generate 3-8 pages depending on document complexity. Focus on the most important
 
     let proxy_result = proxy::handle_request(
         db_repo,
-        app,
+        settings,
         channel_id,
         "Wiki Ingest",
         chat_request,

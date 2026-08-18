@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tauri::AppHandle;
 use tauri_plugin_autostart::ManagerExt;
-use tauri_plugin_store::StoreExt;
+
+use crate::settings_store::SettingsStore;
+use crate::AppState;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
@@ -9,6 +12,9 @@ pub struct Settings {
     pub server_port: u16,
     #[serde(default = "default_host")]
     pub server_host: String,
+    /// 随应用启动内嵌服务（网关 + Web 面板）；桌面版默认 false。
+    #[serde(default = "default_false")]
+    pub auto_start_server: bool,
     #[serde(default = "default_theme")]
     pub ui_theme: String,
     #[serde(default = "default_language")]
@@ -81,6 +87,7 @@ impl Default for Settings {
         Settings {
             server_port: default_port(),
             server_host: default_host(),
+            auto_start_server: default_false(),
             ui_theme: default_theme(),
             ui_language: default_language(),
             minimize_to_tray: default_true(),
@@ -102,19 +109,16 @@ impl Default for Settings {
     }
 }
 
-fn get_str(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str, default: &str) -> String {
-    store
-        .get(key)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| default.to_string())
+fn get_str(store: &SettingsStore, key: &str, default: &str) -> String {
+    store.get_str(key, default)
 }
 
-fn get_u64(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str, default: u64) -> u64 {
-    store.get(key).and_then(|v| v.as_u64()).unwrap_or(default)
+fn get_u64(store: &SettingsStore, key: &str, default: u64) -> u64 {
+    store.get_u64(key, default)
 }
 
-fn get_bool(store: &tauri_plugin_store::Store<tauri::Wry>, key: &str, default: bool) -> bool {
-    store.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+fn get_bool(store: &SettingsStore, key: &str, default: bool) -> bool {
+    store.get_bool(key, default)
 }
 
 /// Feature-flag snapshot exposed to the UI (T00 decision 9 / T10 rollout).
@@ -133,8 +137,8 @@ pub struct FeatureFlagsDto {
 }
 
 #[tauri::command]
-pub fn get_feature_flags(app: AppHandle) -> Result<FeatureFlagsDto, String> {
-    let f = crate::core::feature_flags::read_feature_flags(&app);
+pub fn get_feature_flags(state: tauri::State<'_, Arc<AppState>>) -> Result<FeatureFlagsDto, String> {
+    let f = crate::core::feature_flags::read_feature_flags(&state.settings);
     Ok(FeatureFlagsDto {
         new_routeplan: f.new_routeplan,
         cross_protocol_codec: f.cross_protocol_codec,
@@ -146,84 +150,89 @@ pub fn get_feature_flags(app: AppHandle) -> Result<FeatureFlagsDto, String> {
 }
 
 #[tauri::command]
-pub async fn get_settings(app: AppHandle) -> Result<Settings, String> {
-    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+pub async fn get_settings(state: tauri::State<'_, Arc<AppState>>) -> Result<Settings, String> {
+    let store = &state.settings;
     let settings = Settings {
-        server_port: get_u64(&store, "server.port", 8777) as u16,
-        server_host: get_str(&store, "server.host", "127.0.0.1"),
-        ui_theme: get_str(&store, "ui.theme", "dark"),
-        ui_language: get_str(&store, "ui.language", "zh-CN"),
-        minimize_to_tray: get_bool(&store, "general.minimize_to_tray", true),
-        close_to_tray: get_bool(&store, "general.close_to_tray", true),
-        auto_start: get_bool(&store, "general.auto_start", false),
-        retry_enabled: get_bool(&store, "retry.enabled", true),
-        retry_times: get_u64(&store, "retry.times", 2) as i32,
-        security_enabled: get_bool(&store, "security.enabled", true),
-        security_mode: get_str(&store, "security.mode", "audit"),
-        security_scan_unicode: get_bool(&store, "security.scan_unicode", true),
-        security_scan_tools: get_bool(&store, "security.scan_tools", true),
-        security_scan_network: get_bool(&store, "security.scan_network", true),
-        security_scan_response: get_bool(&store, "security.scan_response", false),
-        security_redact_secrets: get_bool(&store, "security.redact_secrets", false),
-        security_block_on_critical: get_bool(&store, "security.block_on_critical", false),
-        routing_prefer_auth_accounts: get_bool(&store, "routing.prefer_auth_accounts", true),
-        routing_prefer_same_protocol: get_bool(&store, "routing.prefer_same_protocol", true),
+        server_port: get_u64(store, "server.port", 8777) as u16,
+        server_host: get_str(store, "server.host", "127.0.0.1"),
+        auto_start_server: get_bool(store, "server.auto_start", false),
+        ui_theme: get_str(store, "ui.theme", "dark"),
+        ui_language: get_str(store, "ui.language", "zh-CN"),
+        minimize_to_tray: get_bool(store, "general.minimize_to_tray", true),
+        close_to_tray: get_bool(store, "general.close_to_tray", true),
+        auto_start: get_bool(store, "general.auto_start", false),
+        retry_enabled: get_bool(store, "retry.enabled", true),
+        retry_times: get_u64(store, "retry.times", 2) as i32,
+        security_enabled: get_bool(store, "security.enabled", true),
+        security_mode: get_str(store, "security.mode", "audit"),
+        security_scan_unicode: get_bool(store, "security.scan_unicode", true),
+        security_scan_tools: get_bool(store, "security.scan_tools", true),
+        security_scan_network: get_bool(store, "security.scan_network", true),
+        security_scan_response: get_bool(store, "security.scan_response", false),
+        security_redact_secrets: get_bool(store, "security.redact_secrets", false),
+        security_block_on_critical: get_bool(store, "security.block_on_critical", false),
+        routing_prefer_auth_accounts: get_bool(store, "routing.prefer_auth_accounts", true),
+        routing_prefer_same_protocol: get_bool(store, "routing.prefer_same_protocol", true),
     };
     Ok(settings)
 }
 
 #[tauri::command]
-pub async fn save_settings(settings: Settings, app: AppHandle) -> Result<(), String> {
-    let store = app.store("settings.json").map_err(|e| e.to_string())?;
-    store.set("server.port", serde_json::json!(settings.server_port));
-    store.set("server.host", serde_json::json!(settings.server_host));
-    store.set("ui.theme", serde_json::json!(settings.ui_theme));
-    store.set("ui.language", serde_json::json!(settings.ui_language));
-    store.set("general.minimize_to_tray", settings.minimize_to_tray);
-    store.set("general.close_to_tray", settings.close_to_tray);
-    store.set("general.auto_start", settings.auto_start);
-    store.set("retry.enabled", settings.retry_enabled);
-    store.set("retry.times", settings.retry_times);
-    store.set("security.enabled", settings.security_enabled);
-    store.set("security.mode", serde_json::json!(settings.security_mode));
-    store.set("security.scan_unicode", settings.security_scan_unicode);
-    store.set("security.scan_tools", settings.security_scan_tools);
-    store.set("security.scan_network", settings.security_scan_network);
-    store.set("security.scan_response", settings.security_scan_response);
-    store.set("security.redact_secrets", settings.security_redact_secrets);
-    store.set(
-        "security.block_on_critical",
-        settings.security_block_on_critical,
-    );
-    store.set(
-        "routing.prefer_auth_accounts",
-        settings.routing_prefer_auth_accounts,
-    );
-    store.set(
-        "routing.prefer_same_protocol",
-        settings.routing_prefer_same_protocol,
-    );
-    store.save().map_err(|e| e.to_string())?;
+pub async fn save_settings(
+    settings: Settings,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    state.settings.set_many(&[
+        ("server.port".to_string(), serde_json::json!(settings.server_port)),
+        ("server.host".to_string(), serde_json::json!(settings.server_host)),
+        ("server.auto_start".to_string(), serde_json::json!(settings.auto_start_server)),
+        ("ui.theme".to_string(), serde_json::json!(settings.ui_theme)),
+        ("ui.language".to_string(), serde_json::json!(settings.ui_language)),
+        ("general.minimize_to_tray".to_string(), serde_json::json!(settings.minimize_to_tray)),
+        ("general.close_to_tray".to_string(), serde_json::json!(settings.close_to_tray)),
+        ("general.auto_start".to_string(), serde_json::json!(settings.auto_start)),
+        ("retry.enabled".to_string(), serde_json::json!(settings.retry_enabled)),
+        ("retry.times".to_string(), serde_json::json!(settings.retry_times)),
+        ("security.enabled".to_string(), serde_json::json!(settings.security_enabled)),
+        ("security.mode".to_string(), serde_json::json!(settings.security_mode)),
+        ("security.scan_unicode".to_string(), serde_json::json!(settings.security_scan_unicode)),
+        ("security.scan_tools".to_string(), serde_json::json!(settings.security_scan_tools)),
+        ("security.scan_network".to_string(), serde_json::json!(settings.security_scan_network)),
+        ("security.scan_response".to_string(), serde_json::json!(settings.security_scan_response)),
+        ("security.redact_secrets".to_string(), serde_json::json!(settings.security_redact_secrets)),
+        ("security.block_on_critical".to_string(), serde_json::json!(settings.security_block_on_critical)),
+        ("routing.prefer_auth_accounts".to_string(), serde_json::json!(settings.routing_prefer_auth_accounts)),
+        ("routing.prefer_same_protocol".to_string(), serde_json::json!(settings.routing_prefer_same_protocol)),
+    ])?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn apply_theme(theme: String, app: AppHandle) -> Result<(), String> {
-    crate::server::event_bridge::emit_admin(
-        &app,
-        "theme-changed",
-        serde_json::json!({ "theme": theme }),
-    );
+pub async fn apply_theme(
+    theme: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    state
+        .events
+        .emit("theme-changed", serde_json::json!({ "theme": theme }));
     Ok(())
 }
 
 #[tauri::command]
 pub async fn set_auto_start(enabled: bool, app: AppHandle) -> Result<(), String> {
-    let autostart = app.autolaunch();
-    if enabled {
-        autostart.enable().map_err(|e| e.to_string())?;
-    } else {
-        autostart.disable().map_err(|e| e.to_string())?;
+    #[cfg(not(feature = "desktop-ui"))]
+    {
+        let _ = (enabled, &app);
+        return Ok(());
     }
-    Ok(())
+    #[cfg(feature = "desktop-ui")]
+    {
+        let autostart = app.autolaunch();
+        if enabled {
+            autostart.enable().map_err(|e| e.to_string())?;
+        } else {
+            autostart.disable().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
 }

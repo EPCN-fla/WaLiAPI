@@ -35,10 +35,12 @@ async function parseError(res: Response): Promise<Error> {
   return new Error(`请求失败 (${res.status})`);
 }
 
+const CSRF_HEADERS = { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" } as const;
+
 export async function login(username: string, password: string): Promise<LoginResult> {
   const res = await fetch("/admin/api/auth/login", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...CSRF_HEADERS },
     body: JSON.stringify({ username, password }),
   });
   if (!res.ok) throw await parseError(res);
@@ -52,7 +54,9 @@ export async function logout() {
   try {
     await fetch("/admin/api/auth/logout", {
       method: "POST",
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      headers: token
+        ? { Authorization: `Bearer ${token}`, "X-Requested-With": "XMLHttpRequest" }
+        : { "X-Requested-With": "XMLHttpRequest" },
     });
   } finally {
     clearToken();
@@ -76,7 +80,7 @@ export async function changePassword(oldPassword: string, newPassword: string): 
   const res = await fetch("/admin/api/auth/change-password", {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
+      ...CSRF_HEADERS,
       Authorization: `Bearer ${getToken() ?? ""}`,
     },
     body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),

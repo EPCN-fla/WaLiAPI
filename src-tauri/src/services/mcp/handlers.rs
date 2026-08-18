@@ -943,7 +943,7 @@ async fn handle_tool_call(
                 top_k,
                 true,
                 &[],
-                &shared.app,
+                &shared.state.settings,
                 vector_weight,
                 keyword_weight,
                 search_mode,
@@ -1227,12 +1227,7 @@ async fn handle_tool_call(
             let file_size = content.len() as i64;
 
             // Save file to disk
-            let app_data_dir = shared
-                .app
-                .path()
-                .app_data_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let kb_dir = app_data_dir.join("kb_files").join(&kb_id);
+            let kb_dir = shared.state.data_dir.join("kb_files").join(&kb_id);
             std::fs::create_dir_all(&kb_dir).ok();
             let doc_id = uuid::Uuid::new_v4().to_string();
             let file_path = kb_dir.join(format!("{}_{}", &doc_id, &filename));
@@ -1256,7 +1251,7 @@ async fn handle_tool_call(
 
             // Spawn async processing
             let pool_clone = pool.clone();
-            let app_clone = shared.app.clone();
+            let events_clone = shared.state.events.clone();
             let doc_id_clone = doc.id.clone();
             let filename_clone = filename.clone();
             let kb_id_clone = kb_id.clone();
@@ -1264,7 +1259,7 @@ async fn handle_tool_call(
             tokio::spawn(async move {
                 if let Err(e) = crate::services::knowledge::processor::process_document(
                     &pool_clone,
-                    &app_clone,
+                    &events_clone,
                     &kb_id_clone,
                     &doc_id_clone,
                     &filename_clone,
@@ -1382,14 +1377,13 @@ async fn handle_tool_call(
             kb_repo.update_kb_index_status(kb_id, "building").await.ok();
 
             let pool_clone = pool.clone();
-            let app_clone = shared.app.clone();
+            let events_clone = shared.state.events.clone();
             let kb_id_clone = kb_id.to_string();
 
             tokio::task::spawn_blocking(move || {
                 let rt = tokio::runtime::Handle::current();
                 rt.block_on(async {
-                    crate::server::event_bridge::emit_admin(
-                        &app_clone,
+                    events_clone.emit(
                         "kb-index-progress",
                         serde_json::json!({
                             "kb_id": &kb_id_clone,
@@ -1401,14 +1395,13 @@ async fn handle_tool_call(
                     match crate::services::knowledge::retriever::build_index(
                         &pool_clone,
                         &kb_id_clone,
-                        &app_clone,
+                        &events_clone,
                     )
                     .await
                     {
                         Ok(()) => {
                             tracing::info!("HNSW index built for KB {}", kb_id_clone);
-                            crate::server::event_bridge::emit_admin(
-                                &app_clone,
+                            events_clone.emit(
                                 "kb-index-progress",
                                 serde_json::json!({
                                     "kb_id": &kb_id_clone,
@@ -1423,8 +1416,7 @@ async fn handle_tool_call(
                             repo.update_kb_index_status(&kb_id_clone, "error")
                                 .await
                                 .ok();
-                            crate::server::event_bridge::emit_admin(
-                                &app_clone,
+                            events_clone.emit(
                                 "kb-index-progress",
                                 serde_json::json!({
                                     "kb_id": &kb_id_clone,
@@ -1516,14 +1508,14 @@ async fn handle_tool_call(
             let source_id = source.id.clone();
             let source_type_clone = input.source_type.clone();
             let pool_clone = pool.clone();
-            let app_clone = shared.app.clone();
+            let events_clone = shared.state.events.clone();
             let kb_id_clone = kb_id.clone();
 
             tokio::spawn(async move {
                 let result = if source_type_clone == "git" {
                     crate::services::knowledge::importer::import_git_repo(
                         &pool_clone,
-                        &app_clone,
+                        &events_clone,
                         &kb_id_clone,
                         &source_id,
                         &input,
@@ -1532,7 +1524,7 @@ async fn handle_tool_call(
                 } else if source_type_clone == "url" {
                     crate::services::knowledge::importer::import_url(
                         &pool_clone,
-                        &app_clone,
+                        &events_clone,
                         &kb_id_clone,
                         &source_id,
                         &input,
@@ -1541,7 +1533,7 @@ async fn handle_tool_call(
                 } else if source_type_clone == "local_dir" {
                     crate::services::knowledge::importer::import_local_dir(
                         &pool_clone,
-                        &app_clone,
+                        &events_clone,
                         &kb_id_clone,
                         &source_id,
                         &input,
@@ -1696,7 +1688,6 @@ async fn handle_tool_call(
             // Call the wiki update_page handler logic
             let wiki_repo = WikiRepository::new(pool.clone());
             let result = wiki_handlers::update_page_inner(
-                &shared.app,
                 pool,
                 &wiki_repo,
                 project_id,
@@ -1911,9 +1902,15 @@ async fn handle_tool_call(
                 .and_then(|s| s.as_str())
                 .ok_or("Missing source_id")?;
 
-            let result = wiki_ingest::ingest_source(&shared.app, pool, project_id, source_id)
-                .await
-                .map_err(|e| e.to_string())?;
+            let result = wiki_ingest::ingest_source(
+                &shared.state.events,
+                &shared.state.settings,
+                pool,
+                project_id,
+                source_id,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
 
             Ok(serde_json::json!({
                 "content": [{

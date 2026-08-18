@@ -509,6 +509,18 @@ export function SettingsPage() {
               </button>
             </div>
           </div>
+          <label className="surface-soft flex items-center justify-between rounded-2xl px-4 py-4">
+            <span className="flex items-center gap-1.5 text-sm">
+              随应用启动内嵌服务
+              <span className="text-xs text-muted-foreground">（网关 + Web 管理面板；关闭后需手动点「重启服务」启动）</span>
+            </span>
+            <input
+              type="checkbox"
+              checked={settings.auto_start_server}
+              onChange={e => setSettings({ ...settings, auto_start_server: e.target.checked })}
+              className="h-5 w-5"
+            />
+          </label>
         </div>
       )}
 

@@ -155,8 +155,12 @@ impl Database {
             .path()
             .app_data_dir()
             .expect("failed to get app data dir");
+        Self::new_with_path(&app_data_dir).await
+    }
 
-        std::fs::create_dir_all(&app_data_dir).expect("failed to create app data dir");
+    /// headless（waliapi-web）入口：显式指定数据目录。
+    pub async fn new_with_path(app_data_dir: &Path) -> Self {
+        std::fs::create_dir_all(app_data_dir).expect("failed to create app data dir");
 
         let db_path = app_data_dir.join("waliapi.db");
         let db_url = format!("sqlite://{}?mode=rwc", db_path.display());

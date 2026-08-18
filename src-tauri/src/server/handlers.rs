@@ -43,7 +43,7 @@ fn audit_original(
         .get("stream")
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
-    let settings = security::get_security_settings(&shared.app);
+    let settings = security::get_security_settings(&shared.state.settings);
     match security::gate::gate_original(
         protocol,
         endpoint,
@@ -112,7 +112,7 @@ async fn maybe_route_plan(
     sanitized_log_body: &str,
     trace_id: Option<String>,
 ) -> Result<Option<Response>, Response> {
-    let flags = feature_flags::read_feature_flags(&shared.app);
+    let flags = feature_flags::read_feature_flags(&shared.state.settings);
     // Auth accounts are request-scoped route candidates. They force the mixed
     // RoutePlan rollout while the global Channel rollout flag is off; absent a
     // usable account, retain the legacy pure-Channel path unchanged.
@@ -545,7 +545,7 @@ pub async fn handle_chat_completions(
     } else {
         match proxy::handle_request(
             &repo,
-            &shared.app,
+            &shared.state.settings,
             &key_record.id,
             &key_record.name,
             forward_json,
@@ -790,7 +790,7 @@ async fn handle_stream(
         return (StatusCode::SERVICE_UNAVAILABLE, "No channel for model").into_response();
     }
 
-    let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.app);
+    let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.state.settings);
     let max_attempts = if retry_enabled {
         (retry_times.max(0) as usize + 1).min(selected_channels.len())
     } else {
@@ -1828,7 +1828,7 @@ pub async fn handle_messages(
             format!("No channel for model: {model}"),
         );
     }
-    let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.app);
+    let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.state.settings);
     let max_attempts = if retry_enabled {
         (retry_times.max(0) as usize + 1).min(selected.len())
     } else {
@@ -2254,7 +2254,7 @@ pub async fn handle_messages_count_tokens(
         .into_iter()
         .filter(crate::endpoint_executor::driver::supports_count_tokens)
         .collect();
-    let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.app);
+    let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.state.settings);
     let max_attempts = if retry_enabled {
         (retry_times.max(0) as usize + 1).min(native_channels.len())
     } else {
@@ -2447,7 +2447,7 @@ pub async fn handle_responses(
     } else {
         match proxy::handle_request(
             &repo,
-            &shared.app,
+            &shared.state.settings,
             &key_record.id,
             &key_record.name,
             openai_body,
@@ -2620,7 +2620,7 @@ async fn handle_responses_stream(
         return (StatusCode::SERVICE_UNAVAILABLE, "No channel for model").into_response();
     }
 
-    let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.app);
+    let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.state.settings);
     let max_attempts = if retry_enabled {
         (retry_times.max(0) as usize + 1).min(selected_channels.len())
     } else {
@@ -3074,7 +3074,7 @@ pub async fn handle_embeddings(
         return (StatusCode::SERVICE_UNAVAILABLE, "No channel for model").into_response();
     }
 
-    let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.app);
+    let (retry_enabled, retry_times) = proxy::get_retry_settings(&shared.state.settings);
     let max_attempts = if retry_enabled {
         (retry_times.max(0) as usize + 1).min(selected_channels.len())
     } else {

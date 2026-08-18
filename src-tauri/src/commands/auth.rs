@@ -507,14 +507,22 @@ pub async fn auth_login(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<AuthMutationResult, String> {
-    let kind = provider_kind(Some(provider))?;
-    let runtime = TauriLoginRuntime::new(app);
-    let summary = state
-        .auth_service
-        .login(kind, &runtime)
-        .await
-        .map_err(safe_error)?;
-    sync_after_login(&state.auth_service, summary, None).await
+    #[cfg(not(feature = "desktop-ui"))]
+    {
+        let _ = (&provider, &app, &state);
+        return Err("OAuth 登录仅桌面版可用，请使用 auth.json 导入".to_string());
+    }
+    #[cfg(feature = "desktop-ui")]
+    {
+        let kind = provider_kind(Some(provider))?;
+        let runtime = TauriLoginRuntime::new(app);
+        let summary = state
+            .auth_service
+            .login(kind, &runtime)
+            .await
+            .map_err(safe_error)?;
+        sync_after_login(&state.auth_service, summary, None).await
+    }
 }
 
 #[tauri::command]
@@ -523,16 +531,24 @@ pub async fn auth_login_start(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<AuthLoginStart, String> {
-    provider_kind(Some(provider))?;
-    let (session_id, cancellation) = state.login_sessions.start().await;
-    let sessions = state.login_sessions.clone();
-    let db = state.db.clone();
-    let service = state.auth_service.clone();
-    let task_id = session_id.clone();
-    tauri::async_runtime::spawn(async move {
-        run_codex_login_session(sessions, task_id, cancellation, app, db, service).await;
-    });
-    Ok(AuthLoginStart { session_id })
+    #[cfg(not(feature = "desktop-ui"))]
+    {
+        let _ = (&provider, &app, &state);
+        return Err("OAuth 登录仅桌面版可用，请使用 auth.json 导入".to_string());
+    }
+    #[cfg(feature = "desktop-ui")]
+    {
+        provider_kind(Some(provider))?;
+        let (session_id, cancellation) = state.login_sessions.start().await;
+        let sessions = state.login_sessions.clone();
+        let db = state.db.clone();
+        let service = state.auth_service.clone();
+        let task_id = session_id.clone();
+        tauri::async_runtime::spawn(async move {
+            run_codex_login_session(sessions, task_id, cancellation, app, db, service).await;
+        });
+        Ok(AuthLoginStart { session_id })
+    }
 }
 
 #[tauri::command]

@@ -7,14 +7,14 @@ use super::splitter;
 use crate::db::models::now_iso;
 use crate::db::repository::Repository;
 use sqlx::SqlitePool;
-use tauri::AppHandle;
+use crate::server::event_bridge::EventSink;
 
 /// Default embedding model
 const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
 /// Emit progress event to frontend
 fn emit_progress(
-    app: &AppHandle,
+    events: &EventSink,
     doc_id: &str,
     kb_id: &str,
     filename: &str,
@@ -22,8 +22,7 @@ fn emit_progress(
     progress: u8,
     detail: &str,
 ) {
-    crate::server::event_bridge::emit_admin(
-        app,
+    events.emit(
         "kb-document-progress",
         serde_json::json!({
             "doc_id": doc_id,
@@ -39,7 +38,7 @@ fn emit_progress(
 /// Process an uploaded document: parse → split → embed → store
 pub async fn process_document(
     pool: &SqlitePool,
-    app: &AppHandle,
+    events: &EventSink,
     kb_id: &str,
     doc_id: &str,
     filename: &str,
@@ -53,18 +52,17 @@ pub async fn process_document(
         .await
         .map_err(|e| e.to_string())?;
 
-    emit_progress(app, doc_id, kb_id, filename, "processing", 0, "开始处理");
+    emit_progress(events, doc_id, kb_id, filename, "processing", 0, "开始处理");
 
     let result =
-        process_document_inner(pool, app, kb_id, doc_id, filename, content, embedding_model).await;
+        process_document_inner(pool, events, kb_id, doc_id, filename, content, embedding_model).await;
 
     if let Err(ref e) = result {
         let err_msg = format!("文档「{}」处理失败: {}", filename, e);
         let _ = repo
             .update_document_status(doc_id, "failed", Some(&err_msg))
             .await;
-        crate::server::event_bridge::emit_admin(
-            app,
+        events.emit(
             "kb-document-error",
             serde_json::json!({
                 "doc_id": doc_id,
@@ -74,7 +72,7 @@ pub async fn process_document(
             }),
         );
     } else {
-        emit_progress(app, doc_id, kb_id, filename, "done", 100, "处理完成");
+        emit_progress(events, doc_id, kb_id, filename, "done", 100, "处理完成");
     }
 
     result
@@ -82,7 +80,7 @@ pub async fn process_document(
 
 async fn process_document_inner(
     pool: &SqlitePool,
-    app: &AppHandle,
+    events: &EventSink,
     kb_id: &str,
     doc_id: &str,
     filename: &str,
@@ -92,7 +90,7 @@ async fn process_document_inner(
     let repo = KbRepository::new(pool.clone());
 
     // 1. Parse file
-    emit_progress(app, doc_id, kb_id, filename, "parsing", 5, "解析文件");
+    emit_progress(events, doc_id, kb_id, filename, "parsing", 5, "解析文件");
     let parsed = parser::parse_file(filename, content)?;
 
     let (text, file_type_label): (String, String) = match &parsed {
@@ -103,7 +101,7 @@ async fn process_document_inner(
     };
 
     // 2. Split into chunks — use KB-level config if available
-    emit_progress(app, doc_id, kb_id, filename, "splitting", 15, "文本分块");
+    emit_progress(events, doc_id, kb_id, filename, "splitting", 15, "文本分块");
     let kb = repo.get_kb(kb_id).await.map_err(|e| e.to_string())?;
     let config = splitter::SplitConfig {
         chunk_size: if kb.chunk_size > 0 {
@@ -123,12 +121,12 @@ async fn process_document_inner(
     };
 
     // 符号感知分块：代码文件且语言受支持时，按 AST 符号边界切分
-    // 提前处理代码符号和进度更新（在 catch_unwind 外部，避免传递 AppHandle）
+    // 提前处理代码符号和进度更新（在 catch_unwind 外部，避免传递 EventSink）
     let chunks = if let parser::ParsedContent::Code { text, language } = &parsed {
         if code_parser::is_supported_language(language) {
             let symbols = code_parser::extract_symbols(filename, text);
             emit_progress(
-                app,
+                events,
                 doc_id,
                 kb_id,
                 filename,
@@ -168,8 +166,7 @@ async fn process_document_inner(
 
     if chunks.is_empty() {
         // 分块后为空状态改为失败,且失败信息给客户端提示
-        crate::server::event_bridge::emit_admin(
-            app,
+        events.emit(
             "kb-document-error",
             serde_json::json!({
                 "doc_id": doc_id,
@@ -232,7 +229,7 @@ async fn process_document_inner(
         // Embedding progress: 20% ~ 80%
         let pct = 20 + ((batch_done as f64 / total_batches as f64) * 60.0) as u8;
         emit_progress(
-            app,
+            events,
             doc_id,
             kb_id,
             filename,
@@ -260,7 +257,7 @@ async fn process_document_inner(
         if i % 10 == 0 || i == chunks_total - 1 {
             let pct = 80 + ((i as f64 + 1.0) / chunks_total as f64 * 15.0) as u8;
             emit_progress(
-                app,
+                events,
                 doc_id,
                 kb_id,
                 filename,
@@ -288,7 +285,7 @@ async fn process_document_inner(
     }
 
     // 5. Update document and KB counts
-    emit_progress(app, doc_id, kb_id, filename, "finalizing", 98, "更新统计");
+    emit_progress(events, doc_id, kb_id, filename, "finalizing", 98, "更新统计");
     repo.update_document_counts(doc_id, total_chunks, total_tokens)
         .await
         .map_err(|e| e.to_string())?;
@@ -300,21 +297,20 @@ async fn process_document_inner(
         .map_err(|e| e.to_string())?;
 
     // 6. Rebuild HNSW index (best-effort, non-blocking on failure)
-    emit_progress(app, doc_id, kb_id, filename, "indexing", 99, "更新向量索引");
+    emit_progress(events, doc_id, kb_id, filename, "indexing", 99, "更新向量索引");
     let pool_clone = pool.clone();
     let kb_id_clone = kb_id.to_string();
-    let app_clone = app.clone();
+    let events_clone = events.clone();
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
-            if let Err(e) = retriever::build_index(&pool_clone, &kb_id_clone, &app_clone).await {
+            if let Err(e) = retriever::build_index(&pool_clone, &kb_id_clone, &events_clone).await {
                 tracing::warn!(
                     "Failed to rebuild HNSW index for KB {} after doc: {}",
                     kb_id_clone,
                     e
                 );
-                crate::server::event_bridge::emit_admin(
-                    &app_clone,
+                events_clone.emit(
                     "kb-index-progress",
                     serde_json::json!({
                         "kb_id": &kb_id_clone,
@@ -323,8 +319,7 @@ async fn process_document_inner(
                     }),
                 );
             } else {
-                crate::server::event_bridge::emit_admin(
-                    &app_clone,
+                events_clone.emit(
                     "kb-index-progress",
                     serde_json::json!({
                         "kb_id": &kb_id_clone,
@@ -342,7 +337,7 @@ async fn process_document_inner(
 /// Reindex a document (delete old chunks, reprocess)
 pub async fn reindex_document(
     pool: &SqlitePool,
-    app: &AppHandle,
+    events: &EventSink,
     doc_id: &str,
 ) -> Result<(), String> {
     let repo = KbRepository::new(pool.clone());
@@ -365,7 +360,7 @@ pub async fn reindex_document(
 
     process_document(
         pool,
-        app,
+        events,
         &doc.kb_id,
         doc_id,
         &doc.filename,

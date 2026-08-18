@@ -4,9 +4,9 @@ use super::repository::KbRepository;
 use super::retriever;
 use crate::core::proxy;
 use crate::db::repository::Repository;
+use crate::settings_store::SettingsStore;
 use sqlx::SqlitePool;
 use std::sync::Arc;
-use tauri::AppHandle;
 
 /// RAG: Retrieve relevant chunks, then generate answer via WaLiAPI proxy
 /// Enhanced with conversation history, token limit fallback, and configurable search modes.
@@ -19,7 +19,7 @@ pub async fn ask(
     top_k: usize,
     mcp_only: bool,
     history: &[ConversationMessage],
-    app: &AppHandle,
+    settings: &SettingsStore,
 ) -> Result<RagAnswer, String> {
     ask_with_config(
         pool,
@@ -30,7 +30,7 @@ pub async fn ask(
         top_k,
         mcp_only,
         history,
-        app,
+        settings,
         0.7,
         0.3,
         "hybrid",
@@ -48,7 +48,7 @@ pub async fn ask_with_config(
     top_k: usize,
     mcp_only: bool,
     history: &[ConversationMessage],
-    app: &AppHandle,
+    settings: &SettingsStore,
     vector_weight: f32,
     keyword_weight: f32,
     search_mode: &str,
@@ -241,7 +241,7 @@ pub async fn ask_with_config(
     let chat_request_str: String = serde_json::to_string(&chat_request).unwrap_or_default();
     let proxy_result = proxy::handle_request(
         &Arc::new(repo),
-        app,
+        settings,
         "kb-internal",
         "RAG",
         chat_request,
@@ -466,7 +466,7 @@ pub async fn deep_research(
     chat_model: &str,
     top_k: usize,
     max_rounds: usize,
-    app: &AppHandle,
+    settings: &SettingsStore,
 ) -> Result<RagAnswer, String> {
     let repo = Repository::new(pool.clone());
     let kb_repo = KbRepository::new(pool.clone());
@@ -512,7 +512,7 @@ pub async fn deep_research(
                 serde_json::to_string(&follow_up_request).unwrap_or_default();
             match proxy::handle_request(
                 &Arc::new(Repository::new(pool.clone())),
-                app,
+                settings,
                 "kb-research",
                 "深度研究",
                 follow_up_request,
@@ -619,7 +619,7 @@ pub async fn deep_research(
         let chat_request_str: String = serde_json::to_string(&chat_request).unwrap_or_default();
         let proxy_result = proxy::handle_request(
             &Arc::new(Repository::new(pool.clone())),
-            app,
+            settings,
             "kb-research",
             "深度研究",
             chat_request,
@@ -694,7 +694,7 @@ pub async fn deep_research(
     let final_request_str: String = serde_json::to_string(&final_request).unwrap_or_default();
     let proxy_result = proxy::handle_request(
         &Arc::new(repo),
-        app,
+        settings,
         "kb-research",
         "深度研究",
         final_request,
