@@ -78,6 +78,26 @@ impl super::LoginRuntime for TauriLoginRuntime {
             .open_url(url, None::<&str>)
             .map_err(|_| ProviderError::LoginFailed)
     }
+
+    async fn set_step(&self, _step: super::LoginStep) {}
+
+    async fn present_device_authorization(
+        &self,
+        _verification_url: &str,
+        _user_code: &str,
+        _expires_at: Option<String>,
+    ) -> Result<(), ProviderError> {
+        // Codex uses loopback callback authorization and has no device code.
+        Err(ProviderError::LoginFailed)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+
+    async fn cancelled(&self) {
+        std::future::pending::<()>().await;
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
@@ -106,6 +126,44 @@ type CodexOauthClient = Client<
 impl Default for CodexLogin {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Abstraction over the two cancel sources the Codex flow can select on: the
+/// command-layer `watch` receiver (legacy/tests) and the generic `LoginRuntime`
+/// cancel surface that device-flow providers share.
+#[async_trait::async_trait]
+trait LoginCancellation: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+    async fn wait_cancelled(&self);
+}
+
+struct ReceiverCancel<'a> {
+    cancellation: &'a mut watch::Receiver<bool>,
+}
+
+#[async_trait::async_trait]
+impl LoginCancellation for ReceiverCancel<'_> {
+    fn is_cancelled(&self) -> bool {
+        *self.cancellation.borrow()
+    }
+    async fn wait_cancelled(&self) {
+        let mut receiver = self.cancellation.clone();
+        let _ = receiver.changed().await;
+    }
+}
+
+struct RuntimeCancel<'a> {
+    runtime: &'a dyn super::LoginRuntime,
+}
+
+#[async_trait::async_trait]
+impl LoginCancellation for RuntimeCancel<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.runtime.is_cancelled()
+    }
+    async fn wait_cancelled(&self) {
+        self.runtime.cancelled().await;
     }
 }
 
@@ -164,12 +222,15 @@ impl CodexLogin {
 
     /// Start a one-shot loopback listener before opening the browser, then exchange exactly
     /// one matching callback code. The spawned server is aborted on every result path.
+    ///
+    /// Cancellation comes from the runtime, so the command layer never needs to
+    /// hold the receiver itself.
     pub async fn login(
         &self,
         runtime: &dyn super::LoginRuntime,
     ) -> Result<LoginResult, ProviderError> {
-        let (_cancel_sender, mut cancellation) = watch::channel(false);
-        self.login_cancellable(runtime, &mut cancellation).await
+        let cancel = RuntimeCancel { runtime };
+        self.login_flow(runtime, &cancel).await
     }
 
     /// The command layer owns the cancellation sender, while this method owns
@@ -180,9 +241,19 @@ impl CodexLogin {
         runtime: &dyn super::LoginRuntime,
         cancellation: &mut watch::Receiver<bool>,
     ) -> Result<LoginResult, ProviderError> {
-        if *cancellation.borrow() {
+        let cancel = ReceiverCancel { cancellation };
+        self.login_flow(runtime, &cancel).await
+    }
+
+    async fn login_flow(
+        &self,
+        runtime: &dyn super::LoginRuntime,
+        cancel: &(dyn LoginCancellation + Sync),
+    ) -> Result<LoginResult, ProviderError> {
+        if cancel.is_cancelled() {
             return Err(ProviderError::LoginCancelled);
         }
+        runtime.set_step(super::LoginStep::Preparing).await;
         let listener = bind_callback_listener(self.callback_ports)
             .await
             .map_err(|_| ProviderError::LoginFailed)?;
@@ -217,24 +288,27 @@ impl CodexLogin {
             .url();
 
         let result = async {
+            runtime.set_step(super::LoginStep::Authorizing).await;
             runtime
                 .open_browser(browser_url.as_str())
                 .await
                 .map_err(|_| ProviderError::BrowserOpenFailed)?;
-            if *cancellation.borrow() {
+            if cancel.is_cancelled() {
                 return Err(ProviderError::LoginCancelled);
             }
+            runtime.set_step(super::LoginStep::Waiting).await;
             let callback = tokio::select! {
-                _ = cancellation.changed() => Err(ProviderError::LoginCancelled),
+                _ = cancel.wait_cancelled() => Err(ProviderError::LoginCancelled),
                 callback = tokio::time::timeout(self.timeout, callback_state.receive()) => {
                     callback.map_err(|_| ProviderError::LoginTimeout)?
                 }
             }?;
-            if *cancellation.borrow() {
+            if cancel.is_cancelled() {
                 return Err(ProviderError::LoginCancelled);
             }
+            runtime.set_step(super::LoginStep::Exchanging).await;
             tokio::select! {
-                _ = cancellation.changed() => Err(ProviderError::LoginCancelled),
+                _ = cancel.wait_cancelled() => Err(ProviderError::LoginCancelled),
                 result = self.exchange_code(&redirect_uri, callback, pkce_verifier) => result,
             }
         }
@@ -887,6 +961,21 @@ mod tests {
             );
             Ok(())
         }
+        async fn set_step(&self, _step: super::super::LoginStep) {}
+        async fn present_device_authorization(
+            &self,
+            _url: &str,
+            _code: &str,
+            _expires_at: Option<String>,
+        ) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+        async fn cancelled(&self) {
+            std::future::pending::<()>().await;
+        }
     }
 
     #[tokio::test]
@@ -909,6 +998,21 @@ mod tests {
             async fn open_browser(&self, url: &str) -> Result<(), ProviderError> {
                 *self.0.lock().await = Some(url.to_owned());
                 Ok(())
+            }
+            async fn set_step(&self, _step: super::super::LoginStep) {}
+            async fn present_device_authorization(
+                &self,
+                _url: &str,
+                _code: &str,
+                _expires_at: Option<String>,
+            ) -> Result<(), ProviderError> {
+                Ok(())
+            }
+            fn is_cancelled(&self) -> bool {
+                false
+            }
+            async fn cancelled(&self) {
+                std::future::pending::<()>().await;
             }
         }
         let capture = CaptureRuntime::default();
@@ -965,6 +1069,27 @@ mod tests {
             async fn open_browser(&self, _: &str) -> Result<(), ProviderError> {
                 let _ = self.cancellation.send(true);
                 Ok(())
+            }
+            async fn set_step(&self, _step: super::super::LoginStep) {}
+            async fn present_device_authorization(
+                &self,
+                _url: &str,
+                _code: &str,
+                _expires_at: Option<String>,
+            ) -> Result<(), ProviderError> {
+                Ok(())
+            }
+            fn is_cancelled(&self) -> bool {
+                *self.cancellation.borrow()
+            }
+            async fn cancelled(&self) {
+                let mut receiver = self.cancellation.subscribe();
+                // Cancel is delivered through `send(true)`; wait for it.
+                while !*receiver.borrow() {
+                    if receiver.changed().await.is_err() {
+                        return;
+                    }
+                }
             }
         }
 

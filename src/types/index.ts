@@ -237,6 +237,8 @@ export interface AuthAccount {
   weight: number;
   email: string | null;
   plan_type: string | null;
+  /** Stable, non-secret reason the account was marked invalid (e.g. "payment_required"). */
+  invalidation_reason: string | null;
   models: AuthModelState[];
   quota: AuthQuotaState | null;
   model_mapping?: Record<string, string | string[]>;
@@ -260,12 +262,48 @@ export interface AuthLoginStart {
   sessionId: string;
 }
 
+export type AuthProviderId = "codex" | "kimi" | (string & {});
+
+export interface AuthProviderInfo {
+  id: AuthProviderId;
+  displayName: string;
+  iconKey: string;
+  loginMode: "browser_callback" | "device_code" | (string & {});
+  supportsImport: boolean;
+  supportsExport: boolean;
+  supportsQuota: boolean;
+}
+
+export interface DeviceVerification {
+  url: string;
+  userCode: string;
+  expiresAt: string | null;
+}
+
 export interface AuthLoginSessionStatus {
   sessionId: string;
+  provider: string;
   state: "pending" | "saving" | "syncing" | "succeeded" | "cancelled" | "failed";
-  step: "listener" | "browser" | "callback" | "saving" | "syncing" | null;
+  step:
+    | "preparing"
+    | "authorizing"
+    | "waiting"
+    | "exchanging"
+    | "saving"
+    | "syncing"
+    | null;
+  verification: DeviceVerification | null;
   result: AuthMutationResult | null;
-  errorCode: "cancelled" | "timeout" | "browser_open" | "callback_state" | "token_exchange" | "login_failed" | null;
+  errorCode:
+    | "cancelled"
+    | "timeout"
+    | "browser_open"
+    | "callback_state"
+    | "device_authorization"
+    | "authorization_denied"
+    | "token_exchange"
+    | "login_failed"
+    | null;
   error: string | null;
 }
 

@@ -38,8 +38,8 @@ mod tests {
     use crate::{
         auth_provider::service::Clock,
         auth_provider::{
-            LoginResult, LoginRuntime, Provider, ProviderError, ProviderKind, ProviderModels,
-            ProviderPayload, ProviderRegistry, ProviderRequest, RefreshedPayload,
+            LoginResult, LoginRuntime, Provider, ProviderError, ProviderKind, ProviderLoginContext,
+            ProviderModels, ProviderPayload, ProviderRegistry, ProviderRequest, RefreshedPayload,
         },
         db::{models::AuthAccount, models::AuthAccountUpsert, repository::Repository},
     };
@@ -53,11 +53,21 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct FakeProvider {
         refreshes: Mutex<HashMap<String, usize>>,
         models: Mutex<HashMap<String, usize>>,
         operations: AtomicUsize,
+        kind: ProviderKind,
+    }
+    impl Default for FakeProvider {
+        fn default() -> Self {
+            Self {
+                refreshes: Mutex::new(HashMap::new()),
+                models: Mutex::new(HashMap::new()),
+                operations: AtomicUsize::new(0),
+                kind: ProviderKind::Codex,
+            }
+        }
     }
 
     impl FakeProvider {
@@ -86,10 +96,14 @@ mod tests {
     #[async_trait]
     impl Provider for FakeProvider {
         fn kind(&self) -> ProviderKind {
-            ProviderKind::Codex
+            self.kind.clone()
         }
 
-        async fn login(&self, _: &dyn LoginRuntime) -> Result<LoginResult, ProviderError> {
+        async fn login(
+            &self,
+            _: &ProviderLoginContext,
+            _: &dyn LoginRuntime,
+        ) -> Result<LoginResult, ProviderError> {
             Err(ProviderError::LoginFailed)
         }
 
@@ -104,6 +118,12 @@ mod tests {
             let token = Self::token(payload);
             Self::count(&self.refreshes, token.clone());
             self.operations.fetch_add(1, Ordering::SeqCst);
+            if token == "unauthorized" {
+                return Err(ProviderError::Unauthorized);
+            }
+            if token == "payment-required" {
+                return Err(ProviderError::PaymentRequired);
+            }
             if token == "fails" {
                 return Err(ProviderError::Retryable);
             }
@@ -140,6 +160,9 @@ mod tests {
             if token == "models-fail" {
                 return Err(ProviderError::Retryable);
             }
+            if token == "models-payment" {
+                return Err(ProviderError::PaymentRequired);
+            }
             Ok(vec![])
         }
     }
@@ -154,8 +177,9 @@ mod tests {
         Arc::new(Repository::new(pool))
     }
 
-    async fn add_account(
+    async fn add_account_for(
         repository: &Repository,
+        provider: &str,
         name: &str,
         expires_at: &str,
         status: &str,
@@ -163,7 +187,7 @@ mod tests {
     ) -> String {
         let account = repository
             .upsert_by_provider_account_id(&AuthAccountUpsert {
-                provider: "codex".into(),
+                provider: provider.into(),
                 label: name.into(),
                 account_id: name.into(),
                 attributes: json!({}),
@@ -175,7 +199,7 @@ mod tests {
             .await
             .unwrap();
         if status == "invalid" {
-            repository.mark_invalid(&account.id, retry).await.unwrap();
+            repository.mark_invalid(&account.id, retry, None).await.unwrap();
         }
         account.id
     }
@@ -207,9 +231,18 @@ mod tests {
     #[tokio::test]
     async fn startup_scan_and_each_twelve_hour_tick_only_process_due_accounts() {
         let repository = repository().await;
-        add_account(&repository, "due", "2026-08-09T00:01:00Z", "active", None).await;
-        add_account(
+        add_account_for(
             &repository,
+            "codex",
+            "due",
+            "2026-08-09T00:01:00Z",
+            "active",
+            None,
+        )
+        .await;
+        add_account_for(
+            &repository,
+            "codex",
             "not-due",
             "2026-08-09T02:00:00Z",
             "active",
@@ -255,32 +288,36 @@ mod tests {
     #[tokio::test]
     async fn invalid_recovery_and_failure_are_isolated_per_account() {
         let repository = repository().await;
-        let recovered = add_account(
+        let recovered = add_account_for(
             &repository,
+            "codex",
             "recover",
             "2026-08-09T03:00:00Z",
             "invalid",
             None,
         )
         .await;
-        let failed = add_account(
+        let failed = add_account_for(
             &repository,
+            "codex",
             "fails",
             "2026-08-09T03:00:00Z",
             "invalid",
             None,
         )
         .await;
-        add_account(
+        add_account_for(
             &repository,
+            "codex",
             "models-fail",
             "2026-08-09T00:01:00Z",
             "active",
             None,
         )
         .await;
-        add_account(
+        add_account_for(
             &repository,
+            "codex",
             "active",
             "2026-08-09T00:01:00Z",
             "active",
@@ -311,5 +348,123 @@ mod tests {
         assert_eq!(provider.refreshes_for("active"), 1);
         assert_eq!(provider.models_for("active"), 1);
         assert_eq!(provider.models_for("models-fail"), 1);
+    }
+
+    // --- C9: Kimi accounts join the same provider-neutral maintenance cycle ---
+
+    #[tokio::test]
+    async fn kimi_active_account_joins_model_sync_maintenance() {
+        let repository = repository().await;
+        let id = add_account_for(
+            &repository,
+            "kimi",
+            "kimi-due",
+            "2026-08-09T00:01:00Z",
+            "active",
+            None,
+        )
+        .await;
+        let provider = Arc::new(FakeProvider {
+            kind: ProviderKind::Kimi,
+            ..FakeProvider::default()
+        });
+        let service = service(repository.clone(), provider.clone());
+
+        // One maintenance pass: the due Kimi account refreshes then lists models.
+        crate::auth_provider::maintenance::run_maintenance_once(&service).await;
+
+        assert_eq!(provider.refreshes_for("kimi-due"), 1);
+        assert_eq!(provider.models_for("kimi-due"), 1);
+        let stored = repository.get_auth_account(&id).await.unwrap();
+        assert_eq!(stored.provider, "kimi");
+        assert_eq!(stored.status, "active");
+    }
+
+    #[tokio::test]
+    async fn kimi_invalid_account_with_due_refresh_recovers() {
+        let repository = repository().await;
+        let id = add_account_for(
+            &repository,
+            "kimi",
+            "kimi-recover",
+            "2026-08-09T03:00:00Z",
+            "invalid",
+            Some("2026-08-08T00:00:00Z"),
+        )
+        .await;
+        let provider = Arc::new(FakeProvider {
+            kind: ProviderKind::Kimi,
+            ..FakeProvider::default()
+        });
+        let service = service(repository.clone(), provider.clone());
+
+        crate::auth_provider::maintenance::run_maintenance_once(&service).await;
+
+        let stored = repository.get_auth_account(&id).await.unwrap();
+        assert_eq!(stored.status, "active");
+        // force refresh (recovery) + lazy refresh inside the follow-up model
+        // sync (token still due under the pinned clock).
+        assert_eq!(provider.refreshes_for("kimi-recover"), 2);
+    }
+
+    #[tokio::test]
+    async fn kimi_refresh_unauthorized_keeps_account_invalid() {
+        let repository = repository().await;
+        // "unauthorized" is the refresh token the fake maps to a Kimi
+        // `ProviderError::Unauthorized` (real Kimi 401/403/invalid_grant →
+        // Unauthorized classification).  The maintenance loop must keep the
+        // account invalid and schedule a retry.
+        let id = add_account_for(
+            &repository,
+            "kimi",
+            "unauthorized",
+            "2026-08-09T03:00:00Z",
+            "invalid",
+            Some("2026-08-08T00:00:00Z"),
+        )
+        .await;
+        let provider = Arc::new(FakeProvider {
+            kind: ProviderKind::Kimi,
+            ..FakeProvider::default()
+        });
+        let service = service(repository.clone(), provider.clone());
+
+        crate::auth_provider::maintenance::run_maintenance_once(&service).await;
+
+        let stored = repository.get_auth_account(&id).await.unwrap();
+        assert_eq!(stored.status, "invalid");
+        assert_eq!(
+            stored.next_retry_after.as_deref(),
+            Some("2026-08-09T12:00:00+00:00")
+        );
+    }
+
+    #[tokio::test]
+    async fn active_account_with_dead_subscription_is_marked_invalid_by_maintenance() {
+        let repository = repository().await;
+        // The account name is both label and refresh token; the fake maps the
+        // "models-payment" token to a PaymentRequired list_models failure.
+        let id = add_account_for(
+            &repository,
+            "kimi",
+            "models-payment",
+            "2026-08-09T00:01:00Z",
+            "active",
+            None,
+        )
+        .await;
+        let provider = Arc::new(FakeProvider {
+            kind: ProviderKind::Kimi,
+            ..FakeProvider::default()
+        });
+        let service = service(repository.clone(), provider.clone());
+
+        crate::auth_provider::maintenance::run_maintenance_once(&service).await;
+
+        // A dead subscription is terminal: the account leaves routing and gets
+        // a backoff, rather than staying active and retrying 12h forever.
+        let stored = repository.get_auth_account(&id).await.unwrap();
+        assert_eq!(stored.status, "invalid");
+        assert!(stored.next_retry_after.is_some());
     }
 }

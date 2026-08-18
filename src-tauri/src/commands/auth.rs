@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::{
     auth_provider::{
         codex_login::{CodexLogin, TauriLoginRuntime, CODEX_IMPORT_NOTICE},
-        AuthAccountSummary, LoginRuntime, ProviderError, ProviderKind, ProviderPayload,
+        AuthAccountSummary, LoginRuntime, LoginStep, ProviderError, ProviderKind, ProviderPayload,
     },
     db::{
         models::{ModelState, QuotaState},
@@ -39,6 +39,10 @@ pub struct AuthAccountDto {
     pub weight: i64,
     pub email: Option<String>,
     pub plan_type: Option<String>,
+    /// Stable, non-secret reason the account was marked invalid (e.g.
+    /// "payment_required" for an unusable subscription).  Written via
+    /// `Repository::mark_invalid` into `attributes_json.invalidation_reason`.
+    pub invalidation_reason: Option<String>,
     pub models: Vec<ModelState>,
     pub quota: Option<QuotaState>,
     pub model_mapping: serde_json::Value,
@@ -67,6 +71,11 @@ impl TryFrom<AuthAccountSummary> for AuthAccountDto {
             .get("plan_type")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let invalidation_reason = value
+            .attributes
+            .get("invalidation_reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         Ok(Self {
             id: value.id,
             provider: value.provider,
@@ -78,6 +87,7 @@ impl TryFrom<AuthAccountSummary> for AuthAccountDto {
             weight: value.weight,
             email,
             plan_type,
+            invalidation_reason,
             models: value.models.models,
             quota: value.quota,
             model_mapping: value.model_mapping,
@@ -137,14 +147,29 @@ pub struct AuthLoginStart {
     pub session_id: String,
 }
 
+/// Device-authorization material surfaced to the renderer during a Kimi login.
+/// It carries ONLY the verification URL + user code the user must see; the
+/// device code, tokens, and raw OAuth response never cross this boundary.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceVerificationDto {
+    pub url: String,
+    pub user_code: String,
+    pub expires_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthLoginSessionStatus {
     pub session_id: String,
+    /// The registered provider string this session is logging into.
+    pub provider: String,
     /// pending | saving | syncing | succeeded | cancelled | failed
     pub state: String,
     /// The UI maps this to a concrete progress item; it is never time-based.
     pub step: Option<String>,
+    /// Present only while the device flow is waiting for authorization.
+    pub verification: Option<DeviceVerificationDto>,
     pub result: Option<AuthMutationResult>,
     /// A stable, non-secret failure category for retry guidance.
     pub error_code: Option<String>,
@@ -166,6 +191,7 @@ struct SessionLoginRuntime {
     inner: TauriLoginRuntime,
     sessions: Arc<LoginSessions>,
     session_id: String,
+    cancellation: watch::Receiver<bool>,
 }
 
 #[async_trait::async_trait]
@@ -173,25 +199,54 @@ impl LoginRuntime for SessionLoginRuntime {
     async fn open_browser(&self, url: &str) -> Result<(), ProviderError> {
         self.inner.open_browser(url).await?;
         // This is an actual opener success, not a timer-driven estimate.
-        let _ = self.sessions.set_step(&self.session_id, "callback").await;
+        self.sessions
+            .set_step(&self.session_id, LoginStep::Authorizing.as_str())
+            .await;
         Ok(())
+    }
+
+    async fn set_step(&self, step: LoginStep) {
+        self.sessions
+            .set_step(&self.session_id, step.as_str())
+            .await;
+    }
+
+    async fn present_device_authorization(
+        &self,
+        verification_url: &str,
+        user_code: &str,
+        expires_at: Option<String>,
+    ) -> Result<(), ProviderError> {
+        self.sessions
+            .set_verification(&self.session_id, verification_url, user_code, expires_at)
+            .await;
+        Ok(())
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.cancellation.borrow()
+    }
+
+    async fn cancelled(&self) {
+        let mut receiver = self.cancellation.clone();
+        while !*receiver.borrow() && receiver.changed().await.is_ok() {}
     }
 }
 
 impl LoginSessions {
     pub fn new() -> Self {
-        Self {
-            sessions: Mutex::new(HashMap::new()),
-        }
+        Self::default()
     }
 
-    pub async fn start(&self) -> (String, watch::Receiver<bool>) {
+    pub async fn start(&self, provider: &str) -> (String, watch::Receiver<bool>) {
         let session_id = Uuid::new_v4().to_string();
         let (cancel, receiver) = watch::channel(false);
         let status = AuthLoginSessionStatus {
             session_id: session_id.clone(),
+            provider: provider.to_owned(),
             state: "pending".into(),
-            step: Some("listener".into()),
+            step: Some("preparing".into()),
+            verification: None,
             result: None,
             error_code: None,
             error: None,
@@ -227,9 +282,35 @@ impl LoginSessions {
         let _ = session.cancel.send(true);
         session.status.state = "cancelled".into();
         session.status.step = None;
+        // A cancelled session must not keep the user code / URL alive.
+        session.status.verification = None;
         session.status.error_code = Some("cancelled".into());
         session.status.error = Some("登录已取消，可以重新开始。".into());
         Ok(session.status.clone())
+    }
+
+    /// Surface device-authorization material while the flow waits.  Only the
+    /// URL + user code are stored; never the device code or tokens.
+    async fn set_verification(
+        &self,
+        session_id: &str,
+        url: &str,
+        user_code: &str,
+        expires_at: Option<String>,
+    ) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_id) else {
+            return false;
+        };
+        if session.status.state != "pending" || *session.cancel.borrow() {
+            return false;
+        }
+        session.status.verification = Some(DeviceVerificationDto {
+            url: url.to_owned(),
+            user_code: user_code.to_owned(),
+            expires_at,
+        });
+        true
     }
 
     async fn set_step(&self, session_id: &str, step: &str) -> bool {
@@ -245,7 +326,8 @@ impl LoginSessions {
     }
 
     /// This transition is the commit gate: cancellation and entering the DB
-    /// write phase are serialized under one mutex.
+    /// write phase are serialized under one mutex.  The verification material
+    /// is cleared here so a terminal session never retains the user code/URL.
     async fn begin_save(&self, session_id: &str) -> bool {
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get_mut(session_id) else {
@@ -256,6 +338,7 @@ impl LoginSessions {
         }
         session.status.state = "saving".into();
         session.status.step = Some("saving".into());
+        session.status.verification = None;
         true
     }
 
@@ -277,6 +360,7 @@ impl LoginSessions {
         if session.status.state == "cancelled" {
             return;
         }
+        session.status.verification = None;
         match result {
             Ok(result) => {
                 session.status.state = "succeeded".into();
@@ -293,6 +377,14 @@ impl LoginSessions {
     }
 }
 
+impl Default for LoginSessions {
+    fn default() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
 fn login_error_code(error: &ProviderError) -> &'static str {
     match error {
         ProviderError::LoginCancelled => "cancelled",
@@ -300,6 +392,7 @@ fn login_error_code(error: &ProviderError) -> &'static str {
         ProviderError::BrowserOpenFailed => "browser_open",
         ProviderError::CallbackFailed => "callback_state",
         ProviderError::TokenExchangeFailed => "token_exchange",
+        ProviderError::AuthorizationDenied => "authorization_denied",
         _ => "login_failed",
     }
 }
@@ -311,6 +404,7 @@ fn login_error_message(error: &ProviderError) -> &'static str {
         "browser_open" => "无法打开浏览器授权页，请检查默认浏览器后重试。",
         "callback_state" => "授权回调无效或被拒绝，请重新开始登录。",
         "token_exchange" => "授权完成，但令牌交换失败，请重新开始登录。",
+        "authorization_denied" => "授权被拒绝，请重新开始登录。",
         _ => "登录未完成，请检查浏览器授权后重试。",
     }
 }
@@ -334,10 +428,11 @@ fn validate_account_id(id: &str) -> Result<(), String> {
 
 fn provider_kind(provider: Option<String>) -> Result<ProviderKind, String> {
     let provider = provider.unwrap_or_else(|| "codex".to_owned());
-    if provider.trim() != "codex" {
-        return Err("Unsupported auth provider".to_owned());
+    let kind = ProviderKind::from(provider.trim());
+    match kind {
+        ProviderKind::Codex | ProviderKind::Kimi => Ok(kind),
+        ProviderKind::Other(_) => Err("Unsupported auth provider".to_owned()),
     }
-    Ok(ProviderKind::Codex)
 }
 
 fn validate_update(input: &AuthUpdateInput) -> Result<(), String> {
@@ -369,10 +464,22 @@ async fn sync_after_login(
     let account = AuthAccountDto::try_from(summary).map_err(safe_error)?;
     let warning = match service.sync_models(&account_id).await {
         Ok(_) => None,
-        Err(_) => Some(
-            "Account saved, but model sync failed; it will not route until sync succeeds."
-                .to_owned(),
-        ),
+        Err(error) => {
+            // Model sync failing is the top diagnostic gap for new accounts: it
+            // can be a bad token, a missing /models endpoint, or an unexpected
+            // payload shape.  Surface the concrete provider error (stable class
+            // only, never credential material) so support can tell these apart.
+            tracing::warn!(
+                account_id = %account_id,
+                provider = %account.provider,
+                error = ?error.failure_class(),
+                "model sync failed after login; account will not route until sync succeeds"
+            );
+            Some(
+                "Account saved, but model sync failed; it will not route until sync succeeds."
+                    .to_owned(),
+            )
+        }
     };
     Ok(AuthMutationResult {
         account,
@@ -381,53 +488,43 @@ async fn sync_after_login(
     })
 }
 
-async fn persist_login_result(
-    repository: &Repository,
-    result: crate::auth_provider::LoginResult,
-) -> Result<AuthAccountSummary, ProviderError> {
-    let account = repository
-        .upsert_by_provider_account_id(&crate::db::models::AuthAccountUpsert {
-            provider: ProviderKind::Codex.to_string(),
-            label: result.label,
-            account_id: result.account_id,
-            attributes: result.attributes,
-            payload: result.payload.into_value(),
-            last_refreshed_at: result.last_refreshed_at,
-            next_refresh_after: result.next_refresh_after,
-            next_retry_after: result.next_retry_after,
-        })
-        .await
-        .map_err(|_| ProviderError::Storage)?;
-    AuthAccountSummary::from_account(&account)
-}
-
-async fn run_codex_login_session(
+/// Generic interactive-login session runner shared by every registered provider.
+///
+/// The flow: resolve the provider kind from the registered spec, start a
+/// session, drive `authenticate` (which never writes), then gate persistence
+/// behind `begin_save` (exactly-once against cancel), `persist_authenticated`
+/// (new-account upsert or locked replacement), model sync, and finish.
+///
+/// The command layer only ever passes a local account id for replacement; it
+/// never reads or forwards `payload_json`.
+async fn run_provider_login_session(
     sessions: Arc<LoginSessions>,
     session_id: String,
-    mut cancellation: watch::Receiver<bool>,
+    provider: ProviderKind,
+    target: crate::auth_provider::LoginTarget,
+    cancellation: watch::Receiver<bool>,
     app: tauri::AppHandle,
-    db: Arc<crate::db::Database>,
     service: Arc<crate::auth_provider::service::AuthService>,
 ) {
     let runtime = SessionLoginRuntime {
         inner: TauriLoginRuntime::new(app),
         sessions: sessions.clone(),
         session_id: session_id.clone(),
+        cancellation,
     };
-    let login = CodexLogin::new();
-    let _ = sessions.set_step(&session_id, "browser").await;
-    let login_result = login.login_cancellable(&runtime, &mut cancellation).await;
-    let result = match login_result {
-        Ok(login_result) => {
-            // The second half of the cancellation guarantee.  A callback or
-            // token response alone can never create an account after cancel.
+    let result = match service.authenticate(provider, target, &runtime).await {
+        Ok(authenticated) => {
+            // The commit gate: a cancel that races persistence (or that happened
+            // before the OAuth finished) makes begin_save return false and the
+            // DB write never happens.
             if !sessions.begin_save(&session_id).await {
                 Err(ProviderError::LoginCancelled)
             } else {
-                let repository = Repository::new(db.pool.clone());
-                match persist_login_result(&repository, login_result).await {
+                runtime.set_step(LoginStep::Saving).await;
+                match service.persist_authenticated(authenticated).await {
                     Ok(summary) => {
                         sessions.set_syncing(&session_id).await;
+                        runtime.set_step(LoginStep::Syncing).await;
                         sync_after_login(&service, summary, None)
                             .await
                             .map_err(|_| ProviderError::Storage)
@@ -501,6 +598,18 @@ pub async fn auth_accounts_list(
         .collect()
 }
 
+/// Pure guard: device-code providers cannot use the synchronous `auth_login`
+/// (no loopback callback).  Returns the stable error so `auth_login` refuses
+/// before any network call and the session API is used instead.
+fn refuse_device_code_login(kind: &ProviderKind) -> Result<(), String> {
+    if crate::auth_provider::spec::provider_spec(kind)
+        .is_some_and(|spec| spec.login_mode == crate::auth_provider::AuthLoginMode::DeviceCode)
+    {
+        return Err("interactive_session_required".to_owned());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn auth_login(
     provider: String,
@@ -508,6 +617,7 @@ pub async fn auth_login(
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<AuthMutationResult, String> {
     let kind = provider_kind(Some(provider))?;
+    refuse_device_code_login(&kind)?;
     let runtime = TauriLoginRuntime::new(app);
     let summary = state
         .auth_service
@@ -517,20 +627,67 @@ pub async fn auth_login(
     sync_after_login(&state.auth_service, summary, None).await
 }
 
+/// Renderer-safe provider capability row for the login picker.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthProviderDto {
+    pub id: String,
+    pub display_name: String,
+    pub icon_key: String,
+    pub login_mode: String,
+    pub supports_import: bool,
+    pub supports_export: bool,
+    pub supports_quota: bool,
+}
+
+/// Registered providers available for interactive login (renderer-safe spec).
+#[tauri::command]
+pub async fn auth_providers_list() -> Result<Vec<AuthProviderDto>, String> {
+    Ok(crate::auth_provider::spec::registered_provider_specs()
+        .iter()
+        .map(|spec| AuthProviderDto {
+            id: spec.kind.to_owned(),
+            display_name: spec.display_name.to_owned(),
+            icon_key: spec.icon_key.to_owned(),
+            login_mode: match spec.login_mode {
+                crate::auth_provider::AuthLoginMode::BrowserCallback => "browser_callback",
+                crate::auth_provider::AuthLoginMode::DeviceCode => "device_code",
+            }
+            .to_owned(),
+            supports_import: spec.supports_import,
+            supports_export: spec.supports_export,
+            supports_quota: spec.supports_quota,
+        })
+        .collect())
+}
+
 #[tauri::command]
 pub async fn auth_login_start(
     provider: String,
+    replace_account_id: Option<String>,
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<AuthLoginStart, String> {
-    provider_kind(Some(provider))?;
-    let (session_id, cancellation) = state.login_sessions.start().await;
+    let kind = provider_kind(Some(provider))?;
+    // Validate the local account id syntactically before spawning so a bad id
+    // fails the command (not a background task).  The payload is never touched.
+    let target = match replace_account_id {
+        Some(id) => {
+            validate_account_id(&id)?;
+            crate::auth_provider::LoginTarget::Replace {
+                local_account_id: id,
+            }
+        }
+        None => crate::auth_provider::LoginTarget::New,
+    };
+    let provider_name = kind.to_string();
+    let (session_id, cancellation) = state.login_sessions.start(&provider_name).await;
     let sessions = state.login_sessions.clone();
-    let db = state.db.clone();
     let service = state.auth_service.clone();
     let task_id = session_id.clone();
     tauri::async_runtime::spawn(async move {
-        run_codex_login_session(sessions, task_id, cancellation, app, db, service).await;
+        run_provider_login_session(sessions, task_id, kind, target, cancellation, app, service)
+            .await;
     });
     Ok(AuthLoginStart { session_id })
 }
@@ -593,7 +750,7 @@ pub async fn auth_refresh_token(
         Ok(summary) => AuthAccountDto::try_from(summary).map_err(safe_error),
         Err(error) => {
             let repository = Repository::new(state.db.pool.clone());
-            let _ = repository.mark_invalid(&id, None).await;
+            let _ = repository.mark_invalid(&id, None, None).await;
             Err(safe_error(error))
         }
     }
@@ -804,6 +961,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn account_dto_surfaces_invalidation_reason_without_credential_material() {
+        let mut account = account_fixture();
+        account.status = "invalid".into();
+        // Reason lives in attributes_json, mirroring Repository::mark_invalid.
+        account.attributes_json = json!({
+            "email": "person@example.test",
+            "invalidation_reason": "payment_required"
+        })
+        .to_string();
+        let dto = dto_from_account(account).unwrap();
+        assert_eq!(dto.invalidation_reason.as_deref(), Some("payment_required"));
+        // The serialized DTO carries the reason but never payload fields.
+        let encoded = serde_json::to_string(&dto).unwrap();
+        assert!(encoded.contains("payment_required"));
+        assert!(!encoded.contains("access_token") && !encoded.contains("refresh_token"));
+    }
+
     async fn test_repository() -> Repository {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -839,7 +1014,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_session_is_idempotent_and_never_enters_persistence() {
         let sessions = LoginSessions::new();
-        let (id, _receiver) = sessions.start().await;
+        let (id, _receiver) = sessions.start("codex").await;
         let first = sessions.cancel(&id).await.unwrap();
         let second = sessions.cancel(&id).await.unwrap();
         assert_eq!(first.state, "cancelled");
@@ -862,7 +1037,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_error_status_is_queryable_and_categorized() {
         let sessions = LoginSessions::new();
-        let (id, _receiver) = sessions.start().await;
+        let (id, _receiver) = sessions.start("codex").await;
         sessions.finish(&id, Err(ProviderError::LoginTimeout)).await;
         let status = sessions.status(&id).await.unwrap();
         assert_eq!(status.state, "failed");
@@ -871,5 +1046,130 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|message| !message.is_empty()));
+    }
+
+    // --- C7: provider-neutral sessions & commands ---
+
+    #[tokio::test]
+    async fn providers_list_contains_codex_and_kimi_with_exact_capabilities() {
+        let providers = auth_providers_list().await.unwrap();
+        let codex = providers.iter().find(|p| p.id == "codex").unwrap();
+        assert_eq!(codex.display_name, "Codex");
+        assert_eq!(codex.icon_key, "codex");
+        assert_eq!(codex.login_mode, "browser_callback");
+        assert!(codex.supports_import);
+        assert!(codex.supports_export);
+        assert!(codex.supports_quota);
+        let kimi = providers.iter().find(|p| p.id == "kimi").unwrap();
+        assert_eq!(kimi.display_name, "Kimi Code");
+        assert_eq!(kimi.icon_key, "moonshot");
+        assert_eq!(kimi.login_mode, "device_code");
+        assert!(!kimi.supports_import);
+        assert!(!kimi.supports_export);
+        assert!(!kimi.supports_quota);
+        assert_eq!(providers.len(), 2);
+    }
+
+    #[test]
+    fn provider_kind_resolves_registered_providers_and_rejects_unknown() {
+        assert_eq!(
+            provider_kind(Some("kimi".into())).unwrap(),
+            ProviderKind::Kimi
+        );
+        assert_eq!(
+            provider_kind(Some("codex".into())).unwrap(),
+            ProviderKind::Codex
+        );
+        assert!(provider_kind(Some("nope".into())).is_err());
+    }
+
+    #[tokio::test]
+    async fn session_stores_the_actual_provider_not_codex() {
+        let sessions = LoginSessions::new();
+        let (id, _receiver) = sessions.start("kimi").await;
+        let status = sessions.status(&id).await.unwrap();
+        assert_eq!(status.provider, "kimi");
+        assert_eq!(status.state, "pending");
+    }
+
+    #[tokio::test]
+    async fn verification_dto_carries_url_and_user_code_but_no_device_code() {
+        let sessions = LoginSessions::new();
+        let (id, _receiver) = sessions.start("kimi").await;
+        sessions
+            .set_verification(&id, "https://auth.example.test/verify", "ABCD-EFGH", None)
+            .await;
+        let status = sessions.status(&id).await.unwrap();
+        let verification = status.verification.expect("verification present");
+        assert_eq!(verification.url, "https://auth.example.test/verify");
+        assert_eq!(verification.user_code, "ABCD-EFGH");
+        let encoded = serde_json::to_string(&verification).unwrap();
+        assert!(!encoded.contains("device_code"), "encoded: {encoded}");
+        assert!(
+            encoded.contains("ABCD-EFGH"),
+            "user code must be visible, got: {encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_is_cleared_on_begin_save_cancel_and_finish() {
+        // begin_save clears it.
+        let sessions = LoginSessions::new();
+        let (id, _receiver) = sessions.start("kimi").await;
+        sessions
+            .set_verification(&id, "https://u", "ABCD", None)
+            .await;
+        assert!(sessions.begin_save(&id).await);
+        assert!(sessions.status(&id).await.unwrap().verification.is_none());
+
+        // cancel clears it.
+        let sessions = LoginSessions::new();
+        let (id2, _receiver) = sessions.start("kimi").await;
+        sessions
+            .set_verification(&id2, "https://u", "ABCD", None)
+            .await;
+        sessions.cancel(&id2).await.unwrap();
+        assert!(sessions.status(&id2).await.unwrap().verification.is_none());
+
+        // finish (success) clears it.
+        let sessions = LoginSessions::new();
+        let (id3, _receiver) = sessions.start("kimi").await;
+        sessions
+            .set_verification(&id3, "https://u", "ABCD", None)
+            .await;
+        sessions
+            .finish(&id3, Err(ProviderError::AuthorizationDenied))
+            .await;
+        assert!(sessions.status(&id3).await.unwrap().verification.is_none());
+    }
+
+    #[test]
+    fn legacy_auth_login_kimi_refuses_before_network_interactive_session_required() {
+        // `provider_kind("kimi")` resolves and the DeviceCode guard in
+        // `auth_login` returns the stable error before any provider call.
+        let kind = provider_kind(Some("kimi".into())).unwrap();
+        assert_eq!(kind, ProviderKind::Kimi);
+        assert_eq!(
+            refuse_device_code_login(&kind),
+            Err("interactive_session_required".to_owned())
+        );
+        // The same guard lets the loopback provider through.
+        assert_eq!(
+            refuse_device_code_login(&ProviderKind::Codex),
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_session_tombstone_is_idempotent() {
+        let sessions = LoginSessions::new();
+        let (id, _receiver) = sessions.start("kimi").await;
+        sessions
+            .finish(&id, Err(ProviderError::AuthorizationDenied))
+            .await;
+        let first = sessions.status(&id).await.unwrap();
+        // Repeated cancel after a terminal state returns the same tombstone.
+        let cancelled = sessions.cancel(&id).await.unwrap();
+        assert_eq!(cancelled.state, first.state);
     }
 }

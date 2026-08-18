@@ -220,6 +220,11 @@ pub struct ModelState {
     pub unavailable: bool,
     pub next_retry_after: Option<String>,
     pub last_error: Option<String>,
+    /// Per-model wire protocol metadata sourced only from the provider's
+    /// `/models` catalog (e.g. `kimi` or `anthropic`).  Backward-compatible:
+    /// old snapshots serialize without this field and deserialize to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -498,4 +503,67 @@ pub struct RequestSecurityFinding {
     pub evidence_hash: Option<String>,
     pub action: Option<String>,
     pub created_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_codex_snapshot_without_protocol_deserializes() {
+        let json = r#"{"id":"gpt-5","status":"available","unavailable":false,"next_retry_after":null,"last_error":null}"#;
+        let model: ModelState = serde_json::from_str(json).expect("old snapshot must parse");
+        assert_eq!(model.id, "gpt-5");
+        assert_eq!(model.protocol, None);
+    }
+
+    #[test]
+    fn model_protocol_serialization_round_trip() {
+        let model = ModelState {
+            id: "kimi-k2.5".into(),
+            status: "available".into(),
+            unavailable: false,
+            next_retry_after: None,
+            last_error: None,
+            protocol: Some("kimi".into()),
+        };
+        let json = serde_json::to_string(&model).unwrap();
+        let parsed: ModelState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.protocol.as_deref(), Some("kimi"));
+    }
+
+    #[test]
+    fn model_protocol_omitted_when_none() {
+        let bare = ModelState {
+            id: "gpt-5".into(),
+            status: "available".into(),
+            unavailable: false,
+            next_retry_after: None,
+            last_error: None,
+            protocol: None,
+        };
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(
+            !json.contains("protocol"),
+            "None protocol must not serialize"
+        );
+    }
+
+    #[test]
+    fn model_states_round_trip_with_protocol() {
+        let states = ModelStates {
+            version: 1,
+            models: vec![ModelState {
+                id: "kimi-a".into(),
+                status: "available".into(),
+                unavailable: false,
+                next_retry_after: None,
+                last_error: None,
+                protocol: Some("anthropic".into()),
+            }],
+        };
+        let json = serde_json::to_string(&states).unwrap();
+        let parsed: ModelStates = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.models[0].protocol.as_deref(), Some("anthropic"));
+    }
 }

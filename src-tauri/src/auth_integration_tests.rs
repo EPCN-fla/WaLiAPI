@@ -92,6 +92,7 @@ fn available_models() -> ModelStates {
             unavailable: false,
             next_retry_after: None,
             last_error: None,
+            protocol: None,
         }],
     }
 }

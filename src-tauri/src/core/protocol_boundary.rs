@@ -45,6 +45,10 @@ pub fn upstream_protocol(protocol: UpstreamProtocol, endpoint: &str) -> Option<P
         (UpstreamProtocol::OpenAI, "chat_completions") => Some(Protocol::Chat),
         (UpstreamProtocol::OpenAI, "responses") => Some(Protocol::Responses),
         (UpstreamProtocol::Anthropic, "messages") => Some(Protocol::Messages),
+        // Kimi Messages beta reuses the standard Messages codec; the fixed
+        // `/v1/messages?beta=true` transport is a Kimi provider concern, not a
+        // new codec.
+        (UpstreamProtocol::Anthropic, "messages_beta") => Some(Protocol::Messages),
         (UpstreamProtocol::Responses, "responses") => Some(Protocol::Responses),
         // Ollama's `api_chat`, CountTokens / Embeddings, unknown endpoint
         // strings, and mismatched transport-endpoint pairs are all outside
