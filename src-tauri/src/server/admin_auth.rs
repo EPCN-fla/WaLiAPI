@@ -121,6 +121,18 @@ pub async fn update_password(pool: &SqlitePool, user_id: &str, new_password: &st
     Ok(())
 }
 
+pub async fn update_username(pool: &SqlitePool, user_id: &str, new_username: &str) -> Result<(), String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query("UPDATE admin_users SET username = ?, updated_at = ? WHERE id = ?")
+        .bind(new_username)
+        .bind(now)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// 首次启动时若无 admin 用户，创建 admin + 随机 16 位密码并写入 INITIAL_PASSWORD 文件。
 pub async fn ensure_initial_admin(pool: &SqlitePool) -> Result<(), String> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_users")

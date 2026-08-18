@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { settingsApi, serverApi, securityApi } from "../lib/api";
 import { isWebRuntime } from "../lib/web";
+import { PanelSettingsSection } from "../components/PanelSettingsSection";
 import type { Settings, BuiltinRule, CustomRule } from "../types";
-import { Save, RotateCcw, Check, Server, SlidersHorizontal, Palette, RefreshCw, ShieldAlert, Plus, Trash2, ListChecks, Pencil, X, AlertCircle, HelpCircle } from "lucide-react";
+import { Save, RotateCcw, Check, Server, SlidersHorizontal, Palette, RefreshCw, ShieldAlert, Plus, Trash2, ListChecks, Pencil, X, AlertCircle, HelpCircle, UserRound, type LucideIcon } from "lucide-react";
 
 const SEVERITY_BADGE: Record<string, string> = {
   critical: "bg-red-50 text-red-700 border-red-200",
@@ -172,14 +173,15 @@ export function SettingsPage() {
   const inputCls = "w-full rounded-2xl border border-border bg-background/70 px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary";
   const helpTooltipCls = "pointer-events-none absolute left-1/2 top-full z-50 mt-2 w-64 max-w-[calc(100vw-3rem)] -translate-x-1/2 rounded-xl border border-border bg-background px-3 py-2 text-xs leading-relaxed text-foreground opacity-0 shadow-lg transition-opacity group-hover/help:opacity-100";
 
-  // Tab 配置
-  const TABS = [
+  // Tab 配置（面板设置为 Web 版专属，桌面端不展示）
+  const TABS: { id: string; label: string; icon: LucideIcon }[] = [
     { id: "security", label: "安全审计", icon: ShieldAlert },
     { id: "server", label: "服务配置", icon: Server },
     { id: "general", label: "通用设置", icon: SlidersHorizontal },
     { id: "appearance", label: "界面设置", icon: Palette },
     { id: "retry", label: "重试策略", icon: RefreshCw },
-  ] as const;
+    ...(isWebRuntime() ? [{ id: "panel", label: "面板设置", icon: UserRound }] : []),
+  ];
 
   return (
     <div className="page-shell space-y-5">
@@ -652,6 +654,9 @@ export function SettingsPage() {
           </div>
         </div>
       )}
+
+      {/* Web 管理面板专属：登录账号/密码（桌面端不渲染） */}
+      {activeTab === "panel" && isWebRuntime() && <PanelSettingsSection />}
     </div>
   );
 }

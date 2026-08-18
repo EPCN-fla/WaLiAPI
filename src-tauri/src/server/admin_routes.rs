@@ -48,6 +48,7 @@ pub fn router(shared: SharedState) -> Router<SharedState> {
         .route("/auth/logout", post(logout))
         .route("/auth/check", get(check))
         .route("/auth/change-password", post(change_password))
+        .route("/auth/change-username", post(change_username))
         .route("/invoke", post(invoke_handler))
         .route("/events", get(events_handler))
         .route_layer(middleware::from_fn_with_state(shared.clone(), require_auth));
@@ -226,6 +227,48 @@ async fn change_password(
         .insert(identity.token.clone(), session);
 
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct ChangeUsernameBody {
+    new_username: String,
+}
+
+async fn change_username(
+    State(shared): State<SharedState>,
+    Extension(identity): Extension<AdminIdentity>,
+    Json(body): Json<ChangeUsernameBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let new_username = body.new_username.trim().to_string();
+    if new_username.len() < 2 || new_username.len() > 32 {
+        return Err(bad_request("用户名长度须为 2-32 个字符".to_string()));
+    }
+    if new_username == identity.session.username {
+        return Ok(Json(json!({ "ok": true, "username": new_username })));
+    }
+    // 唯一性校验（admin_users.username 有 UNIQUE 约束，提前给出友好错误）
+    if admin_auth::find_user_by_username(&shared.state.db.pool, &new_username)
+        .await
+        .map_err(internal_error)?
+        .is_some()
+    {
+        return Err(bad_request("用户名已被占用".to_string()));
+    }
+    admin_auth::update_username(&shared.state.db.pool, &identity.session.user_id, &new_username)
+        .await
+        .map_err(internal_error)?;
+
+    // 同步更新当前会话中的用户名
+    let session = AdminSession {
+        username: new_username.clone(),
+        ..identity.session.clone()
+    };
+    shared
+        .state
+        .admin_sessions
+        .insert(identity.token.clone(), session);
+
+    Ok(Json(json!({ "ok": true, "username": new_username })))
 }
 
 // ?? /events?SSE ?????????????????????????????????????????????????????????

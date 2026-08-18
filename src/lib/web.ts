@@ -49,3 +49,40 @@ export function downloadTextFile(content: string, filename: string) {
   a.remove();
   URL.revokeObjectURL(url);
 }
+
+const ADMIN_TOKEN_KEY = "waliapi_admin_token";
+
+/**
+ * Web 管理面板管理接口请求（仅 Web 运行时调用；桌面端不会触发）。
+ * 自动附带 Authorization 头，非 2xx 时抛出携带服务端 error 信息的 Error。
+ */
+export async function webAdminFetch<T>(path: string, options?: {
+  method?: string;
+  body?: unknown;
+}): Promise<T> {
+  const token = localStorage.getItem(ADMIN_TOKEN_KEY);
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const res = await fetch(`/admin/api${path}`, {
+    method: options?.method ?? "GET",
+    headers,
+    body: options?.body !== undefined ? JSON.stringify(options.body) : undefined,
+  });
+  const text = await res.text();
+  let data: unknown = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+  }
+  if (!res.ok) {
+    const message =
+      data && typeof data === "object" && "error" in data
+        ? String((data as { error: unknown }).error)
+        : `请求失败 (${res.status})`;
+    throw new Error(message);
+  }
+  return data as T;
+}
