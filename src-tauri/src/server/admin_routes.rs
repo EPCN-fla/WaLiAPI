@@ -1,10 +1,10 @@
-//! Web ???? REST ???`/admin/api/*`??
+//! Web 管理面板 REST 路由（`/admin/api/*`）。
 //!
-//! - `/auth/*`??? / ?? / ???? / ?????login ?????????
-//! - `/invoke`?? Tauri invoke ?? 1:1 ????????? cmd ???? commands ??
-//! - `/events`?SSE ??????????? `app.emit` ??
+//! - `/auth/*`：登录 / 登出 / 修改密码 / 会话检查（login 公开，其余需认证）
+//! - `/invoke`：与 Tauri invoke 语义 1:1 对应的单一入口，按 cmd 名分发到 commands 函数
+//! - `/events`：SSE 事件桥，事件名与桌面端 `app.emit` 一致
 //!
-//! ? `/auth/login` ???????????Bearer token ? `waliapi_admin_token` Cookie??
+//! 除 `/auth/login` 外全部要求管理员会话（Bearer token 或 `waliapi_admin_token` Cookie）。
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use crate::AppState;
 const SESSION_COOKIE: &str = "waliapi_admin_token";
 const SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 
-/// ??????? request extensions ??????
+/// 认证通过后注入 request extensions 的身份信息。
 #[derive(Clone)]
 pub struct AdminIdentity {
     pub token: String,
@@ -56,7 +56,7 @@ pub fn router(shared: SharedState) -> Router<SharedState> {
     Router::new().merge(public).merge(protected)
 }
 
-// ?? ????? ????????????????????????????????????????????????????????????????
+// ── 认证中间件 ────────────────────────────────────────────────────────────────
 
 fn extract_token(headers: &HeaderMap) -> Option<String> {
     if let Some(value) = headers.get(header::AUTHORIZATION) {
@@ -105,7 +105,7 @@ async fn require_auth(
 fn unauthorized() -> (StatusCode, Json<Value>) {
     (
         StatusCode::UNAUTHORIZED,
-        Json(json!({ "error": "?????????" })),
+        Json(json!({ "error": "未登录或会话已过期" })),
     )
 }
 
@@ -127,7 +127,7 @@ fn session_cookie_header(token: &str) -> HeaderValue {
     .expect("session token is header-safe")
 }
 
-// ?? /auth/* ???????????????????????????????????????????????????????????????????
+// ── /auth/* ───────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct LoginBody {
@@ -142,10 +142,10 @@ async fn login(
     let user = admin_auth::find_user_by_username(&shared.state.db.pool, body.username.trim())
         .await
         .map_err(internal_error)?
-        .ok_or_else(|| bad_request("????????".to_string()))?;
+        .ok_or_else(|| bad_request("用户名或密码错误".to_string()))?;
 
     if !admin_auth::verify_password(&body.password, &user.password_hash) {
-        return Err(bad_request("????????".to_string()));
+        return Err(bad_request("用户名或密码错误".to_string()));
     }
 
     let token = admin_auth::generate_token();
@@ -203,20 +203,20 @@ async fn change_password(
     Json(body): Json<ChangePasswordBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if body.new_password.len() < 8 {
-        return Err(bad_request("??????? 8 ?".to_string()));
+        return Err(bad_request("新密码长度至少 8 位".to_string()));
     }
     let user = admin_auth::find_user_by_username(&shared.state.db.pool, &identity.session.username)
         .await
         .map_err(internal_error)?
         .ok_or_else(unauthorized)?;
     if !admin_auth::verify_password(&body.old_password, &user.password_hash) {
-        return Err(bad_request("?????".to_string()));
+        return Err(bad_request("原密码错误".to_string()));
     }
     admin_auth::update_password(&shared.state.db.pool, &user.id, &body.new_password)
         .await
         .map_err(internal_error)?;
 
-    // ????????????????
+    // 会话保持有效，仅清除强制改密标记
     let session = AdminSession {
         must_change_password: false,
         ..identity.session.clone()
@@ -271,7 +271,7 @@ async fn change_username(
     Ok(Json(json!({ "ok": true, "username": new_username })))
 }
 
-// ?? /events?SSE ?????????????????????????????????????????????????????????
+// ── /events（SSE 事件桥）─────────────────────────────────────────────────────
 
 async fn events_handler(
     State(shared): State<SharedState>,
@@ -299,7 +299,7 @@ async fn events_handler(
     )
 }
 
-// ?? /invoke?Tauri command ???? ??????????????????????????????????????????
+// ── /invoke：Tauri command 语义分发 ──────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct InvokeRequest {
@@ -318,11 +318,11 @@ async fn invoke_handler(
         .map_err(internal_error)
 }
 
-/// ? args ???? Tauri ? camelCase ??????????????
-/// ????? `null` ???`Option<T>` ?????? `None`??
+/// 从 args 对象中按 Tauri 的 camelCase 键取参并反序列化为目标类型。
+/// 缺失的键按 `null` 处理（`Option<T>` 参数因此得到 `None`）。
 fn arg<T: serde::de::DeserializeOwned>(args: &Value, key: &str) -> Result<T, String> {
     serde_json::from_value(args.get(key).cloned().unwrap_or(Value::Null))
-        .map_err(|e| format!("?? {key} ??: {e}"))
+        .map_err(|e| format!("参数 {key} 无效: {e}"))
 }
 
 fn to_json<T: serde::Serialize>(result: Result<T, String>) -> Result<Value, String> {
@@ -333,7 +333,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
     let app: &'static AppHandle = shared.app_static;
     let state = app.state::<Arc<AppState>>();
     match cmd {
-        // ?? ?? ??
+        // ── 渠道 ──
         "get_channels" => to_json(commands::channel::get_channels(state).await),
         "get_channel" => to_json(commands::channel::get_channel(arg(&args, "id")?, state).await),
         "get_channel_api_key" => {
@@ -388,7 +388,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
             to_json(commands::channel::delete_channel_extra_key(arg(&args, "keyId")?, state).await)
         }
 
-        // ?? API ?? ??
+        // ── API 密钥 ──
         "get_api_keys" => to_json(commands::api_key::get_api_keys(state).await),
         "create_api_key" => {
             to_json(commands::api_key::create_api_key(arg(&args, "input")?, state).await)
@@ -401,7 +401,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         }
         "get_api_key_stats" => to_json(commands::api_key::get_api_key_stats(state).await),
 
-        // ?? ?? ??
+        // ── 日志 ──
         "get_logs" => to_json(commands::log::get_logs(arg(&args, "input")?, state).await),
         "get_log" => to_json(commands::log::get_log(arg(&args, "id")?, state).await),
         "get_log_security_findings" => {
@@ -414,7 +414,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         }
         "delete_all_logs" => to_json(commands::log::delete_all_logs(state).await),
 
-        // ?? Auth ?? ??
+        // ── Auth 账号 ──
         "auth_accounts_list" => to_json(commands::auth::auth_accounts_list(state).await),
         "auth_login" => {
             to_json(commands::auth::auth_login(arg(&args, "provider")?, app.clone(), state).await)
@@ -479,7 +479,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         }
         "auth_update" => to_json(commands::auth::auth_update(arg(&args, "input")?, state).await),
 
-        // ?? ??? / ?? / ???? ??
+        // ── 仪表盘 / 设置 / 服务状态 ──
         "get_dashboard_stats" => to_json(commands::stats::get_dashboard_stats(state).await),
         "get_settings" => to_json(commands::settings::get_settings(app.clone()).await),
         "save_settings" => {
@@ -496,7 +496,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         "restart_server" => to_json(commands::server::restart_server(app.clone(), state).await),
         "get_service_statuses" => to_json(commands::services::get_service_statuses(state).await),
 
-        // ?? ???? ??
+        // ── 安全规则 ──
         "get_builtin_security_rules" => {
             to_json(commands::security::get_builtin_security_rules(state).await)
         }
@@ -538,7 +538,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
             to_json(commands::security::delete_custom_security_rule(arg(&args, "id")?, state).await)
         }
 
-        // ?? ?? / ?? ??
+        // ── 导入 / 导出 ──
         "export_channels" => to_json(commands::import_export::export_channels(state).await),
         "import_walicode_backup" => {
             to_json(
@@ -570,7 +570,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
             )
         }
 
-        // ?? ??? ??
+        // ── 知识库 ──
         "get_knowledge_bases" => {
             to_json(commands::knowledge_base::get_knowledge_bases(state).await)
         }
@@ -702,7 +702,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
             to_json(commands::knowledge_base::drop_kb_index(state, arg(&args, "kbId")?).await)
         }
 
-        // ?? Wiki ??
+        // ── Wiki ──
         "get_wiki_projects" => to_json(commands::wiki::get_wiki_projects(state).await),
         "create_wiki_project" => {
             to_json(commands::wiki::create_wiki_project(state, arg(&args, "input")?).await)
@@ -796,7 +796,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
             )
         }
 
-        // ?? ????????????????????????
+        // ── 应用配置（容器内通常全部不可用，由前端置灰）──
         "get_app_configs" => to_json(commands::app_config::get_app_configs(state).await),
         "apply_app_config" => {
             to_json(
@@ -819,6 +819,6 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
             to_json(commands::app_config::open_config_folder(arg(&args, "appName")?).await)
         }
 
-        _ => Err(format!("????: {cmd}")),
+        _ => Err(format!("未知命令: {cmd}")),
     }
 }
