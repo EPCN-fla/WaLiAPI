@@ -199,16 +199,16 @@ pub fn run() {
                     auth_provider::maintenance::run_maintenance_loop(auth_service).await;
                 });
 
-                // 桌面版默认不启动内嵌服务（Web 面板/网关），
-                // 可在「设置 → 服务配置」开启随应用启动。
-                if state.settings.get_bool("server.auto_start", false) {
-                    let state_clone = state.clone();
-                    let app_clone = app_handle.clone();
-                    let handle = tauri::async_runtime::spawn(async move {
-                        let _ = server::start_server(state_clone, Some(app_clone)).await;
-                    });
-                    *state.server_handle.write().await = Some(handle);
-                }
+                // 桌面版启动即自动拉起内嵌服务（LLM 网关 + /admin/api）；
+                // Web 管理面板 SPA 仅在 embed-web 构建（waliapi-web / Docker）中提供。
+                let state_clone = state.clone();
+                let app_clone = app_handle.clone();
+                let handle = tauri::async_runtime::spawn(async move {
+                    if let Err(e) = server::start_server(state_clone, Some(app_clone)).await {
+                        log::error!("内嵌服务启动失败: {e}");
+                    }
+                });
+                *state.server_handle.write().await = Some(handle);
             });
 
             Ok(())
