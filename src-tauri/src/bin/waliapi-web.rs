@@ -1,7 +1,8 @@
-//! waliapi-web：headless 服务模式（无桌面窗口），供 Docker / 服务器部署。
+//! waliapi-web：headless 服务模式（无桌面窗口），供 Docker / 无显示 Linux 部署。
 //!
 //! 用法：
-//!   waliapi-web start [--host 0.0.0.0] [--port 8777] [--data-dir /data]
+//!   waliapi-web [--host 0.0.0.0] [--port 8777] [--data-dir /data]   （默认即启动服务）
+//!   waliapi-web start [...同上参数...]
 //!
 //! 环境变量：WALIAPI_SERVER_HOST / WALIAPI_SERVER_PORT / WALIAPI_DATA_DIR / XDG_DATA_HOME
 
@@ -12,7 +13,10 @@ fn print_usage() {
         "waliapi-web — WaLiAPI headless 服务模式（LLM 网关 + Web 管理面板）
 
 用法:
-  waliapi-web start [--host <地址>] [--port <端口>] [--data-dir <目录>]
+  waliapi-web [start] [--host <地址>] [--port <端口>] [--data-dir <目录>]
+
+说明:
+  不带任何参数直接启动服务（start 为可选子命令，语义相同）。
 
 选项:
   --host       监听地址（默认读取 WALIAPI_SERVER_HOST 或设置，缺省 127.0.0.1）
@@ -62,9 +66,16 @@ async fn main() {
     tracing_subscriber::fmt().init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("start") => {
-            let cfg = match parse_args(&args[1..]) {
+    // 不带参数、直接带选项（waliapi-web --port 9000）、或显式 start 子命令，均启动服务
+    let start_args: Option<&[String]> = match args.first().map(String::as_str) {
+        None => Some(&[]),
+        Some("start") => Some(&args[1..]),
+        Some(flag) if flag.starts_with("--") => Some(&args[..]),
+        _ => None,
+    };
+    match start_args {
+        Some(rest) => {
+            let cfg = match parse_args(rest) {
                 Ok(cfg) => cfg,
                 Err(e) => {
                     eprintln!("参数错误: {e}\n");
@@ -78,13 +89,14 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some("-h") | Some("--help") | None => {
-            print_usage();
-        }
-        Some(other) => {
-            eprintln!("未知命令: {other}\n");
-            print_usage();
-            std::process::exit(2);
-        }
+        None => match args.first().map(String::as_str) {
+            Some("-h") | Some("--help") => print_usage(),
+            Some(other) => {
+                eprintln!("未知命令: {other}\n");
+                print_usage();
+                std::process::exit(2);
+            }
+            None => unreachable!(),
+        },
     }
 }
