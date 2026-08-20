@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use super::{
     codex_login::CodexLogin, LoginResult, LoginRuntime, Provider, ProviderError, ProviderKind,
-    ProviderModels, ProviderPayload, ProviderRequest, RefreshedPayload,
+    ProviderLoginContext, ProviderModels, ProviderPayload, ProviderRequest, RefreshedPayload,
 };
 use crate::db::models::{AuthAccount, ModelState, QuotaLimit, QuotaState, QuotaWindow};
 
@@ -147,7 +147,11 @@ impl Provider for CodexProvider {
         ProviderKind::Codex
     }
 
-    async fn login(&self, runtime: &dyn LoginRuntime) -> Result<LoginResult, ProviderError> {
+    async fn login(
+        &self,
+        _context: &ProviderLoginContext,
+        runtime: &dyn LoginRuntime,
+    ) -> Result<LoginResult, ProviderError> {
         self.login.login(runtime).await
     }
 
@@ -241,6 +245,7 @@ impl Provider for CodexProvider {
                 unavailable: false,
                 next_retry_after: None,
                 last_error: None,
+                protocol: None,
             })
             .collect();
         Ok(models)
@@ -726,6 +731,9 @@ mod tests {
                 payload: &payload,
                 body: &json!({"model":"gpt-test","input":"hi","stream":false}),
                 headers: &caller,
+                is_stream: true,
+                upstream_protocol: "responses",
+                upstream_endpoint: "responses",
             })
             .await
             .unwrap();
@@ -907,6 +915,9 @@ mod tests {
                     }
                 }),
                 headers: &HeaderMap::new(),
+                is_stream: true,
+                upstream_protocol: "responses",
+                upstream_endpoint: "responses",
             })
             .await
             .unwrap();
@@ -934,6 +945,9 @@ mod tests {
                 payload: &payload,
                 body: &json!({"model":"gpt-test","metadata":{"secret":true}}),
                 headers: &HeaderMap::new(),
+                is_stream: true,
+                upstream_protocol: "responses",
+                upstream_endpoint: "responses",
             })
             .await
             .unwrap();
@@ -1009,7 +1023,14 @@ mod tests {
         registry.register(Arc::new(provider));
         let service = crate::auth_provider::service::AuthService::new(repository.clone(), registry);
         let error = service
-            .outbound(&account.id, &json!({"model":"gpt-test"}), &HeaderMap::new())
+            .outbound(
+                &account.id,
+                &json!({"model":"gpt-test"}),
+                &HeaderMap::new(),
+                true,
+                "responses",
+                "responses",
+            )
             .await
             .unwrap_err();
         assert_eq!(error, ProviderError::Unauthorized);
@@ -1034,7 +1055,14 @@ mod tests {
         registry.register(Arc::new(provider));
         let service = crate::auth_provider::service::AuthService::new(repository.clone(), registry);
         let response = service
-            .outbound(&account.id, &json!({"model":"gpt-test"}), &HeaderMap::new())
+            .outbound(
+                &account.id,
+                &json!({"model":"gpt-test"}),
+                &HeaderMap::new(),
+                true,
+                "responses",
+                "responses",
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1064,6 +1092,7 @@ mod tests {
                 unavailable: false,
                 next_retry_after: None,
                 last_error: None,
+                protocol: None,
             }],
         };
         repository

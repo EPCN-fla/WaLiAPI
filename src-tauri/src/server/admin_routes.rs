@@ -451,6 +451,7 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
 
         // ── Auth 账号 ──
         "auth_accounts_list" => to_json(commands::auth::auth_accounts_list(state).await),
+        "auth_providers_list" => to_json(commands::auth::auth_providers_list().await),
         #[cfg(feature = "desktop-ui")]
         "auth_login" => {
             let app = desktop_app("OAuth 登录")?;
@@ -462,8 +463,13 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         "auth_login_start" => {
             let app = desktop_app("OAuth 登录")?;
             to_json(
-                commands::auth::auth_login_start(arg(&args, "provider")?, app.clone(), state)
-                    .await,
+                commands::auth::auth_login_start(
+                    arg(&args, "provider")?,
+                    arg(&args, "replaceAccountId")?,
+                    app.clone(),
+                    state,
+                )
+                .await,
             )
         }
         #[cfg(not(feature = "desktop-ui"))]

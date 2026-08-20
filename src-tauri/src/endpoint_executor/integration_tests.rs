@@ -11,18 +11,25 @@
 
 #![cfg(test)]
 
+use crate::auth_provider::service::AuthService;
+use crate::auth_provider::ProviderRegistry;
+use crate::core::attempt::{AttemptResult, FailureClass, PreparedAttempt};
 use crate::core::feature_flags::FeatureFlags;
 use crate::core::route_plan::{authorize_and_plan, EndpointKind};
 use crate::core::stream_supervisor::StreamSupervisor;
-use crate::db::models::{ApiKey, Channel};
+use crate::db::models::{ApiKey, AuthAccountUpsert, Channel};
 use crate::db::repository::Repository;
 use crate::endpoint_executor::sse::StreamPumpCore;
+use crate::endpoint_executor::StreamAttemptResult;
 use crate::protocol::codec::{CodecRegistry, Protocol};
 use crate::security::gate::{DownstreamProtocol, RequestEnvelope, RequestFeatures};
 use crate::security::SecurityScanResult;
+use axum::response::IntoResponse;
+use axum::{Json, Router};
 use rand::SeedableRng;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 fn now() -> String {
     crate::utils::time::now_iso()
@@ -49,8 +56,8 @@ fn api_key() -> ApiKey {
         status: 1,
         allowed_models: "[]".into(),
         allowed_channels: "[]".into(),
-            denied_models: "[]".into(),
-            denied_channels: "[]".into(),
+        denied_models: "[]".into(),
+        denied_channels: "[]".into(),
         quota_limit: 0,
         quota_used: 0,
         expires_at: None,
@@ -450,7 +457,11 @@ mod auth_account {
             ProviderKind::Codex
         }
 
-        async fn login(&self, _: &dyn LoginRuntime) -> Result<LoginResult, ProviderError> {
+        async fn login(
+            &self,
+            _: &crate::auth_provider::ProviderLoginContext,
+            _: &dyn LoginRuntime,
+        ) -> Result<LoginResult, ProviderError> {
             Err(ProviderError::LoginFailed)
         }
 
@@ -536,6 +547,7 @@ mod auth_account {
                     unavailable: false,
                     next_retry_after: None,
                     last_error: None,
+                    protocol: None,
                 }],
             },
             &now(),
@@ -1766,4 +1778,434 @@ mod chat_downstream_via_responses_channel {
         );
         assert!(text.contains("data: [DONE]"), "terminal [DONE]");
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// C6: Kimi auth executor framing (Json profile: Chat / Messages beta)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Build a PreparedAttempt with the given framing + a prepared codec.
+/// `protocol` is the codec protocol (Chat or Messages) used to encode the body;
+/// `upstream_protocol`/`upstream_endpoint` are the frozen wire profile values.
+fn kimi_attempt(
+    channel_id: &str,
+    downstream: EndpointKind,
+    body: Value,
+    upstream_protocol: &str,
+    upstream_endpoint: &str,
+    framing: crate::core::route_plan::AuthNonStreamFraming,
+    model: &str,
+) -> PreparedAttempt {
+    use crate::core::protocol_boundary::{
+        downstream_protocol, upstream_protocol as upstream_proto,
+    };
+    let downstream_p = downstream_protocol(downstream).expect("downstream codec");
+    let upstream_p = upstream_proto(
+        match upstream_protocol {
+            "openai" => crate::core::route_plan::UpstreamProtocol::OpenAI,
+            "anthropic" => crate::core::route_plan::UpstreamProtocol::Anthropic,
+            "responses" => crate::core::route_plan::UpstreamProtocol::Responses,
+            _ => crate::core::route_plan::UpstreamProtocol::OpenAI,
+        },
+        upstream_endpoint,
+    )
+    .expect("upstream codec");
+    let prepared = CodecRegistry::prepare_pair(downstream_p, upstream_p, model, &body)
+        .expect("kimi attempt must prepare");
+    PreparedAttempt {
+        channel_id: channel_id.into(),
+        channel_name: "Kimi Code".into(),
+        upstream_type: "auth_account".into(),
+        route_group: format!("{}_g1_native", downstream.as_str()),
+        upstream_protocol: upstream_protocol.to_string(),
+        upstream_endpoint: upstream_endpoint.to_string(),
+        upstream_model: model.to_string(),
+        native_base_url: "http://kimi.invalid/coding".into(),
+        auth_provider: Some("kimi".into()),
+        auth_non_stream_framing: Some(framing),
+        codec_version: Some(prepared.codec.label().to_string()),
+        prepared_codec: Some(prepared.codec),
+        encoded_body: prepared.encoded_request,
+        conversion_report: Some(json!({})),
+        is_retry: false,
+        attempt_no: 1,
+    }
+}
+
+/// A Kimi mock that serves Chat JSON and Messages JSON non-stream/stream.
+#[derive(Clone)]
+struct KimiMock {
+    chat_hits: Arc<AtomicUsize>,
+    messages_hits: Arc<AtomicUsize>,
+    chat_bodies: Arc<Mutex<Vec<Value>>>,
+    messages_bodies: Arc<Mutex<Vec<Value>>>,
+    chat_headers: Arc<Mutex<Vec<axum::http::HeaderMap>>>,
+    messages_headers: Arc<Mutex<Vec<axum::http::HeaderMap>>>,
+    fail_401: Arc<AtomicBool>,
+    /// Fail exactly one /coding/v1/chat/completions request with 401 then go
+    /// back to success, so a test can exercise a real single refresh-replay.
+    fail_chat_once: Arc<AtomicBool>,
+}
+
+impl Default for KimiMock {
+    fn default() -> Self {
+        Self {
+            chat_hits: Arc::new(AtomicUsize::new(0)),
+            messages_hits: Arc::new(AtomicUsize::new(0)),
+            chat_bodies: Arc::new(Mutex::new(Vec::new())),
+            messages_bodies: Arc::new(Mutex::new(Vec::new())),
+            chat_headers: Arc::new(Mutex::new(Vec::new())),
+            messages_headers: Arc::new(Mutex::new(Vec::new())),
+            fail_401: Arc::new(AtomicBool::new(false)),
+            fail_chat_once: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+async fn kimi_mock() -> (
+    Arc<AuthService>,
+    KimiMock,
+    Arc<Repository>,
+    crate::db::models::AuthAccount,
+) {
+    let pool = fresh_db().await;
+    let repo = Arc::new(Repository::new(pool));
+    let state = KimiMock::default();
+    let app_state = state.clone();
+    let app = Router::new()
+        .route(
+            "/oauth/token",
+            axum::routing::post(move |_: axum::extract::State<KimiMock>, _b: axum::body::Bytes| async {
+                (axum::http::StatusCode::OK, Json(json!({
+                    "access_token": "tok",
+                    "refresh_token": "rot",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "scope": ""
+                })))
+            }),
+        )
+        .route(
+            "/coding/v1/chat/completions",
+            axum::routing::post(move |s: axum::extract::State<KimiMock>, h: axum::http::HeaderMap, b: axum::body::Bytes| {
+                let s = s.clone();
+                async move {
+                    s.chat_hits.fetch_add(1, Ordering::SeqCst);
+                    s.chat_bodies.lock().unwrap().push(serde_json::from_slice(&b).unwrap_or(Value::Null));
+                    s.chat_headers.lock().unwrap().push(h.clone());
+                    if s.fail_chat_once.load(Ordering::SeqCst) {
+                        // Consume the one-shot 401 flag; the _next_ request
+                        // replays into the success branch.
+                        s.fail_chat_once.store(false, Ordering::SeqCst);
+                        return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+                    }
+                    if s.fail_401.load(Ordering::SeqCst) {
+                        return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+                    }
+                    let body: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+                    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+                        let stream = "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: [DONE]\n\n";
+                        return (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/event-stream")], stream).into_response();
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        Json(json!({
+                            "id": "1", "object": "chat.completion", "model": body["model"],
+                            "choices": [{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        )
+        .route(
+            "/coding/v1/messages",
+            axum::routing::post(move |s: axum::extract::State<KimiMock>, h: axum::http::HeaderMap, b: axum::body::Bytes| {
+                let s = s.clone();
+                async move {
+                    s.messages_hits.fetch_add(1, Ordering::SeqCst);
+                    s.messages_bodies.lock().unwrap().push(serde_json::from_slice(&b).unwrap_or(Value::Null));
+                    s.messages_headers.lock().unwrap().push(h.clone());
+                    let body: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+                    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+                        let stream = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\"}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+                        return (axum::http::StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/event-stream")], stream).into_response();
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        Json(json!({
+                            "id": "m1", "type": "message", "role": "assistant",
+                            "content": [{"type":"text","text":"hi"}],
+                            "model": body["model"],
+                            "usage": {"input_tokens": 1, "output_tokens": 1}
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        )
+        .with_state(app_state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let account = repo
+        .upsert_by_provider_account_id(&AuthAccountUpsert {
+            provider: "kimi".into(),
+            label: "Kimi fixture".into(),
+            account_id: "kimi-device-id".into(),
+            attributes: json!({}),
+            payload: json!({"access_token":"tok","device_id":"kimi-device-id","expires_at":"2099-01-01T00:00:00Z"}),
+            last_refreshed_at: None,
+            next_refresh_after: None,
+            next_retry_after: None,
+        })
+        .await
+        .unwrap();
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(
+        crate::auth_provider::kimi_backend::KimiProvider::with_endpoints(
+            format!("http://{addr}/coding"),
+            format!("http://{addr}/oauth/device"),
+            format!("http://{addr}/oauth/token"),
+        ),
+    ));
+    let service = Arc::new(AuthService::new(repo.clone(), registry));
+    (service, state, repo, account)
+}
+
+#[tokio::test]
+async fn kimi_chat_non_stream_uses_json_framing_and_decodes_chat() {
+    let (service, state, _repo, account) = kimi_mock().await;
+    let body = json!({
+        "model": "kimi-k2.5",
+        "messages": [{"role":"user","content":"hi"}],
+        "stream": true,
+        "stream_options": {"include_usage": false},
+    });
+    let attempt = kimi_attempt(
+        &account.id,
+        EndpointKind::ChatCompletions,
+        body,
+        "openai",
+        "chat_completions",
+        crate::core::route_plan::AuthNonStreamFraming::Json,
+        "kimi-k2.5",
+    );
+    let result = crate::endpoint_executor::dispatch_auth_account_executor(
+        EndpointKind::ChatCompletions,
+        &attempt,
+        &service,
+        &[],
+    )
+    .await;
+    let AttemptResult::Success(success) = result else {
+        panic!("expected success, got {result:?}");
+    };
+    assert_eq!(success.status, 200);
+    assert!(success.body.get("choices").is_some());
+    // Non-stream body: stream=false, stream_options removed.
+    let sent = state.chat_bodies.lock().unwrap()[0].clone();
+    assert_eq!(sent["stream"], false);
+    assert!(sent.get("stream_options").is_none());
+}
+
+#[tokio::test]
+async fn kimi_chat_stream_injects_include_usage_for_all_entries() {
+    // Chat and Messages downstream convert to Chat; Responses downstream
+    // would need a Responses-shaped body (the codec rejects `messages`),
+    // which is out of scope for this framing assertion.
+    for (downstream, expected_route) in [
+        (EndpointKind::ChatCompletions, "chat.completion"),
+        (EndpointKind::Messages, "chat.completion"),
+    ] {
+        let (service, state, _repo, account) = kimi_mock().await;
+        let body = json!({
+            "model": "kimi-k2.5",
+            "messages": [{"role":"user","content":"hi"}],
+        });
+        let attempt = kimi_attempt(
+            &account.id,
+            downstream,
+            body,
+            "openai",
+            "chat_completions",
+            crate::core::route_plan::AuthNonStreamFraming::Json,
+            "kimi-k2.5",
+        );
+        let result = crate::endpoint_executor::dispatch_auth_account_stream_executor(
+            &attempt,
+            &service,
+            &[],
+        )
+        .await;
+        let StreamAttemptResult::Connected(_) = result else {
+            panic!("{downstream:?} expected connected stream");
+        };
+        let sent = state.chat_bodies.lock().unwrap()[0].clone();
+        assert_eq!(sent["stream"], true, "{downstream:?}");
+        assert_eq!(
+            sent["stream_options"]["include_usage"], true,
+            "{downstream:?} must force include_usage"
+        );
+        let _ = expected_route;
+    }
+}
+
+#[tokio::test]
+async fn kimi_anthropic_stream_has_no_chat_stream_options_and_fixed_betas() {
+    let (service, state, _repo, account) = kimi_mock().await;
+    let body = json!({
+        "model": "kimi-anthropic",
+        "messages": [{"role":"user","content":"hi"}],
+    });
+    let attempt = kimi_attempt(
+        &account.id,
+        EndpointKind::Messages,
+        body,
+        "anthropic",
+        "messages_beta",
+        crate::core::route_plan::AuthNonStreamFraming::Json,
+        "kimi-anthropic",
+    );
+    let result =
+        crate::endpoint_executor::dispatch_auth_account_stream_executor(&attempt, &service, &[])
+            .await;
+    let StreamAttemptResult::Connected(_) = result else {
+        panic!("expected connected");
+    };
+    let sent = state.messages_bodies.lock().unwrap()[0].clone();
+    assert_eq!(sent["stream"], true);
+    // Messages beta: no Chat-only stream_options.
+    assert!(sent.get("stream_options").is_none());
+    // Fixed betas token present exactly once.
+    let betas = sent["betas"].as_array().unwrap();
+    let count = betas
+        .iter()
+        .filter(|b| b.as_str() == Some("interleaved-thinking-2025-05-14"))
+        .count();
+    assert_eq!(count, 1, "fixed beta token must be present exactly once");
+}
+
+#[tokio::test]
+async fn kimi_anthropic_non_stream_keeps_fixed_betas_and_decodes_messages() {
+    let (service, state, _repo, account) = kimi_mock().await;
+    let body = json!({
+        "model": "kimi-anthropic",
+        "messages": [{"role":"user","content":"hi"}],
+    });
+    let attempt = kimi_attempt(
+        &account.id,
+        EndpointKind::Messages,
+        body,
+        "anthropic",
+        "messages_beta",
+        crate::core::route_plan::AuthNonStreamFraming::Json,
+        "kimi-anthropic",
+    );
+    let result = crate::endpoint_executor::dispatch_auth_account_executor(
+        EndpointKind::Messages,
+        &attempt,
+        &service,
+        &[],
+    )
+    .await;
+    let AttemptResult::Success(success) = result else {
+        panic!("expected success, got {result:?}");
+    };
+    assert!(success.body.get("content").is_some());
+    let sent = state.messages_bodies.lock().unwrap()[0].clone();
+    assert_eq!(sent["stream"], false);
+    let betas = sent["betas"].as_array().unwrap();
+    assert_eq!(
+        betas
+            .iter()
+            .filter(|b| b.as_str() == Some("interleaved-thinking-2025-05-14"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn kimi_chat_401_triggers_single_refresh_replay() {
+    let (service, state, repo, account) = kimi_mock().await;
+    state.fail_401.store(true, Ordering::SeqCst);
+    // Give the account a refresh token so the 401 path refreshes via the mock
+    // /oauth/token and replays once.  `fail_401` stays on, so the replay also
+    // returns 401 → ChannelAuthTerminal.
+    repo.update_tokens(
+        &account.id,
+        &json!({"access_token":"tok","refresh_token":"rot","device_id":"d","expires_at":"2099-01-01T00:00:00Z"}),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let body = json!({"model":"kimi-k2.5","messages":[{"role":"user","content":"hi"}]});
+    let attempt = kimi_attempt(
+        &account.id,
+        EndpointKind::ChatCompletions,
+        body,
+        "openai",
+        "chat_completions",
+        crate::core::route_plan::AuthNonStreamFraming::Json,
+        "kimi-k2.5",
+    );
+    let result = crate::endpoint_executor::dispatch_auth_account_executor(
+        EndpointKind::ChatCompletions,
+        &attempt,
+        &service,
+        &[],
+    )
+    .await;
+    // 401 on replay → ChannelAuthTerminal (502 downstream).  Two upstream hits:
+    // the original and the single refresh replay.
+    let AttemptResult::Failure(failure) = result else {
+        panic!("expected auth-terminal failure, got {result:?}");
+    };
+    assert_eq!(failure.failure_class, FailureClass::ChannelAuthTerminal);
+    assert_eq!(state.chat_hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn kimi_chat_401_refreshes_and_replays_once_successfully() {
+    let (service, state, repo, account) = kimi_mock().await;
+    // Full credential so the lazy/force refresh can rotate via the mock
+    // /oauth/token.  The one-shot 401 flag makes only the first chat request
+    // fail; the replay goes through and returns 200.
+    repo.update_tokens(
+        &account.id,
+        &json!({"access_token":"tok","refresh_token":"rot","device_id":"d","expires_at":"2099-01-01T00:00:00Z"}),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    state.fail_chat_once.store(true, Ordering::SeqCst);
+    let body = json!({"model":"kimi-k2.5","messages":[{"role":"user","content":"hi"}]});
+    let attempt = kimi_attempt(
+        &account.id,
+        EndpointKind::ChatCompletions,
+        body,
+        "openai",
+        "chat_completions",
+        crate::core::route_plan::AuthNonStreamFraming::Json,
+        "kimi-k2.5",
+    );
+    let result = crate::endpoint_executor::dispatch_auth_account_executor(
+        EndpointKind::ChatCompletions,
+        &attempt,
+        &service,
+        &[],
+    )
+    .await;
+    // One 401, then a successful replay → Success, exactly two upstream hits.
+    let AttemptResult::Success(success) = result else {
+        panic!("expected success after one refresh replay, got {result:?}");
+    };
+    assert_eq!(success.status, 200);
+    assert_eq!(state.chat_hits.load(Ordering::SeqCst), 2);
 }

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { CircleAlert, KeyRound, Loader2, Upload, X } from "lucide-react";
 import { authApi } from "../lib/api";
 import { downloadTextFile, isWebRuntime, pickFileAsText } from "../lib/web";
-import type { AuthAccount, AuthMutationResult } from "../types";
+import type { AuthAccount, AuthMutationResult, AuthProviderInfo } from "../types";
 import { AccountCard } from "../components/auth/AccountCard";
 import { EditModal } from "../components/auth/EditModal";
 import { LoginModal } from "../components/auth/LoginModal";
@@ -19,23 +19,53 @@ function exportFileName(account: AuthAccount) {
   return `${base || "codex-auth"}.json`;
 }
 
-function EmptyAccountSlot({ onLogin, onImport, busy }: { onLogin: () => void; onImport: () => void; busy: boolean }) {
-  return <section className="flex min-h-80 flex-col items-center justify-center rounded-[24px] border border-dashed border-border bg-card/50 p-6 text-center"><div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-success/10 text-xl font-bold text-success">⌘</div><h2 className="mt-4 font-semibold">＋ 登录 Codex 账号</h2><p className="mt-2 max-w-xs text-sm leading-6 text-muted-foreground">浏览器 OAuth 登录（PKCE）或从本机 ~/.codex/auth.json 导入</p><div className="mt-5 flex flex-wrap justify-center gap-2"><button onClick={onLogin} disabled={busy} className="action-primary"><KeyRound size={16} />登录</button><button onClick={onImport} disabled={busy} className="action-secondary"><Upload size={16} />导入</button></div></section>;
+function EmptyAccountSlot({ provider, onLogin, onImport, busy }: { provider: AuthProviderInfo; onLogin: () => void; onImport: () => void; busy: boolean }) {
+  const isKimi = provider.loginMode === "device_code";
+  const displayName = provider.displayName;
+  return <section className="flex min-h-80 flex-col items-center justify-center rounded-[24px] border border-dashed border-border bg-card/50 p-6 text-center"><div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-success/10 text-xl font-bold text-success">{isKimi ? "☾" : "⌘"}</div><h2 className="mt-4 font-semibold">＋ 登录 {displayName} 账号</h2><p className="mt-2 max-w-xs text-sm leading-6 text-muted-foreground">{isKimi ? "设备码授权：在浏览器确认后返回。" : "浏览器 OAuth 登录（PKCE）或从本机 ~/.codex/auth.json 导入"}</p><div className="mt-5 flex flex-wrap justify-center gap-2"><button onClick={onLogin} disabled={busy} className="action-primary"><KeyRound size={16} />登录</button>{!isKimi && <button onClick={onImport} disabled={busy} className="action-secondary"><Upload size={16} />导入</button>}</div></section>;
 }
 
 function ConfirmationDialog({ confirmation, pending, onCancel, onConfirm }: { confirmation: Confirmation; pending: boolean; onCancel: () => void; onConfirm: () => void }) {
-  return <div className="fixed inset-0 z-50 flex items-center justify-center bg-foreground/35 p-4" role="dialog" aria-modal="true" aria-labelledby="auth-confirm-title"><div className="surface w-full max-w-md rounded-[24px] p-6 shadow-2xl"><div className="flex items-start justify-between gap-3"><div><h2 id="auth-confirm-title" className="text-lg font-semibold">删除 Auth 账号</h2><p className="mt-1 text-sm text-muted-foreground">{confirmation.account.label}</p></div><button onClick={onCancel} aria-label="关闭确认弹窗" className="rounded-lg p-1 text-muted-foreground hover:bg-muted"><X size={18} /></button></div><p className="mt-5 text-sm leading-6 text-muted-foreground">是否删除该账号？删除后此账号不再参与路由。仅从本应用移除，不影响本机 Codex CLI 登录态。</p><div className="mt-6 flex flex-wrap justify-end gap-2"><button onClick={onCancel} className="action-secondary">取消</button><button disabled={pending} onClick={onConfirm} className="inline-flex items-center gap-2 rounded-xl bg-destructive px-4 py-2.5 text-sm font-semibold text-destructive-foreground">{pending ? <Loader2 size={16} className="animate-spin" /> : null}确认删除</button></div></div></div>;
+  return <div className="fixed inset-0 z-50 flex items-center justify-center bg-foreground/35 p-4" role="dialog" aria-modal="true" aria-labelledby="auth-confirm-title"><div className="surface w-full max-w-md rounded-[24px] p-6 shadow-2xl"><div className="flex items-start justify-between gap-3"><div><h2 id="auth-confirm-title" className="text-lg font-semibold">删除 Auth 账号</h2><p className="mt-1 text-sm text-muted-foreground">{confirmation.account.label}</p></div><button onClick={onCancel} aria-label="关闭确认弹窗" className="rounded-lg p-1 text-muted-foreground hover:bg-muted"><X size={18} /></button></div><p className="mt-5 text-sm leading-6 text-muted-foreground">是否删除该账号？删除后此账号不再参与路由。仅从本应用移除，不影响对应 CLI 的登录态。</p><div className="mt-6 flex flex-wrap justify-end gap-2"><button onClick={onCancel} className="action-secondary">取消</button><button disabled={pending} onClick={onConfirm} className="inline-flex items-center gap-2 rounded-xl bg-destructive px-4 py-2.5 text-sm font-semibold text-destructive-foreground">{pending ? <Loader2 size={16} className="animate-spin" /> : null}确认删除</button></div></div></div>;
 }
 
 export function AuthChannelsPage() {
   const [accounts, setAccounts] = useState<AuthAccount[]>([]);
+  const [providers, setProviders] = useState<AuthProviderInfo[]>([]);
+  const [selectedProvider, setSelectedProvider] = useState<string>("codex");
   const [loading, setLoading] = useState(true);
   const [pendingId, setPendingId] = useState<string | null>(null);
   const [showLogin, setShowLogin] = useState(false);
+  const [reloginAccount, setReloginAccount] = useState<AuthAccount | null>(null);
   const [editAccount, setEditAccount] = useState<AuthAccount | null>(null);
   const [syncAccount, setSyncAccount] = useState<AuthAccount | null>(null);
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const [notice, setNotice] = useState<{ kind: "success" | "error" | "warning"; message: string } | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    authApi
+      .providersList()
+      .then((list) => { if (!disposed) setProviders(list); })
+      .catch(() => {});
+    return () => { disposed = true; };
+  }, []);
+
+  const activeProvider = providers.find((p) => p.id === selectedProvider) ?? {
+    id: selectedProvider,
+    displayName: selectedProvider === "kimi" ? "Kimi Code" : "Codex",
+    iconKey: selectedProvider === "kimi" ? "moonshot" : "codex",
+    loginMode: selectedProvider === "kimi" ? "device_code" : "browser_callback",
+    supportsImport: selectedProvider !== "kimi",
+    supportsExport: selectedProvider !== "kimi",
+    supportsQuota: selectedProvider !== "kimi",
+  };
+
+  // The pill selects which provider's accounts are shown.  `load()` re-fetches
+  // the full list after every mutation, so a newly added account of the
+  // currently selected provider appears here (kimi-auth.md §Verification:
+  // "Provider filter 不隐藏新增账号后的刷新结果").
+  const visibleAccounts = accounts.filter((a) => a.provider === selectedProvider);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -54,7 +84,9 @@ export function AuthChannelsPage() {
 
   const completeLogin = (result: AuthMutationResult) => {
     setShowLogin(false);
-    setNotice(result.warning ? { kind: "warning", message: "账号已保存但暂不参与路由：模型同步失败。" } : { kind: "success", message: "Codex 账号登录完成。" });
+    setReloginAccount(null);
+    const displayName = activeProvider.displayName;
+    setNotice(result.warning ? { kind: "warning", message: "账号已保存但暂不参与路由：模型同步失败。" } : { kind: "success", message: `${displayName} 账号登录完成。` });
     void load();
   };
   const importAuth = async () => {
@@ -157,12 +189,12 @@ export function AuthChannelsPage() {
     }
   };
 
-  return <div className="page-shell space-y-3"><div className="page-header sticky top-0 z-30 -mx-7 -mt-7 mb-2 flex-col bg-card/90 px-7 pt-3 backdrop-blur-md"><div className="flex w-full items-start justify-between gap-4 pb-1.5"><div><h1 className="page-title">渠道管理</h1><p className="page-subtitle mt-0.5">登录各厂商订阅账号，作为上游路由候选</p></div><div className="flex items-center gap-2"><button onClick={() => setShowLogin(true)} disabled={pendingId === "import"} className="action-primary"><KeyRound size={16} />登录账号</button><button onClick={importAuth} disabled={pendingId === "import"} className="action-secondary">{pendingId === "import" ? <Loader2 size={16} className="animate-spin" /> : <Upload size={16} />}从 auth.json 导入</button></div></div><ChannelTabs /></div>
+  return <div className="page-shell space-y-3"><div className="page-header sticky top-0 z-30 -mx-7 -mt-7 mb-2 flex-col bg-card/90 px-7 pt-3 backdrop-blur-md"><div className="flex w-full items-start justify-between gap-4 pb-1.5"><div><h1 className="page-title">渠道管理</h1><p className="page-subtitle mt-0.5">登录各厂商订阅账号，作为上游路由候选</p></div><div className="flex items-center gap-2"><button onClick={() => { setReloginAccount(null); setShowLogin(true); }} disabled={pendingId === "import"} className="action-primary"><KeyRound size={16} />登录账号</button>{activeProvider.supportsImport && <button onClick={importAuth} disabled={pendingId === "import"} className="action-secondary">{pendingId === "import" ? <Loader2 size={16} className="animate-spin" /> : <Upload size={16} />}导入 Codex auth.json</button>}</div></div><ChannelTabs /></div>
     {notice && <div role="status" className={`flex items-center justify-between gap-3 rounded-2xl border px-4 py-3 text-sm ${notice.kind === "error" ? "border-destructive/25 bg-destructive/10 text-destructive" : notice.kind === "warning" ? "border-warning/25 bg-warning/10 text-warning" : "border-success/25 bg-success/10 text-success"}`}><span>{notice.message}</span><button onClick={() => setNotice(null)} aria-label="关闭提示"><X size={16} /></button></div>}
-    <ProviderPills /><p className="text-sm text-muted-foreground">登录后作为路由候选并消耗订阅额度；开启 Auth 账号优先后，将优先使用。</p>
+    <ProviderPills selected={selectedProvider} onSelect={setSelectedProvider} /><p className="text-sm text-muted-foreground">登录后作为路由候选并消耗订阅额度；开启 Auth 账号优先后，将优先使用。</p>
     <div className="flex gap-2 rounded-2xl border border-destructive/25 bg-destructive/10 px-4 py-3 text-xs leading-5 text-destructive"><CircleAlert className="mt-0.5 shrink-0" size={16} /><p>⚠️ 风险提示：此提供商使用的订阅 / OAuth 会话未获官方授权用于代理 / 路由器使用。账户可能被限制或封禁。使用风险自负。</p></div>
-    {loading ? <div className="flex min-h-64 items-center justify-center gap-2 text-sm text-muted-foreground"><Loader2 size={18} className="animate-spin" />加载 Auth 账号…</div> : <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">{accounts.map(account => <AccountCard key={account.id} account={account} pending={pendingId === account.id} onEdit={() => setEditAccount(account)} onToggle={() => void runFor(account.id, account.disabled ? "账号已启用。" : "账号已停用。", () => authApi.toggle(account.id, !account.disabled).then(() => undefined))} onDelete={() => setConfirmation({ kind: "delete", account })} onRefresh={() => void runFor(account.id, "令牌刷新完成。", () => authApi.refreshToken(account.id).then(() => undefined))} onSync={() => setSyncAccount(account)} onExport={() => void exportAuth(account)} onRelogin={() => setShowLogin(true)} />)}<EmptyAccountSlot onLogin={() => setShowLogin(true)} onImport={() => void importAuth()} busy={pendingId === "import"} /></div>}
-    {showLogin && <LoginModal onClose={() => setShowLogin(false)} onCompleted={completeLogin} />}
+    {loading ? <div className="flex min-h-64 items-center justify-center gap-2 text-sm text-muted-foreground"><Loader2 size={18} className="animate-spin" />加载 Auth 账号…</div> : <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">{visibleAccounts.map(account => <AccountCard key={account.id} account={account} pending={pendingId === account.id} onEdit={() => setEditAccount(account)} onToggle={() => void runFor(account.id, account.disabled ? "账号已启用。" : "账号已停用。", () => authApi.toggle(account.id, !account.disabled).then(() => undefined))} onDelete={() => setConfirmation({ kind: "delete", account })} onRefresh={() => void runFor(account.id, "令牌刷新完成。", () => authApi.refreshToken(account.id).then(() => undefined))} onSync={() => setSyncAccount(account)} onExport={() => void exportAuth(account)} onRelogin={() => { setReloginAccount(account); setSelectedProvider(account.provider); setShowLogin(true); }} />)}{visibleAccounts.length === 0 && <EmptyAccountSlot provider={activeProvider} onLogin={() => { setReloginAccount(null); setShowLogin(true); }} onImport={() => void importAuth()} busy={pendingId === "import"} />}</div>}
+    {showLogin && <LoginModal provider={activeProvider} replaceAccountId={reloginAccount?.id} onClose={() => { setShowLogin(false); setReloginAccount(null); }} onCompleted={completeLogin} />}
     {editAccount && <EditModal account={editAccount} pending={pendingId === editAccount.id} onClose={() => setEditAccount(null)} onSave={async input => { await runFor(input.id, "账号配置已保存。", () => authApi.update(input).then(() => undefined)); setEditAccount(null); }} />}
     {syncAccount && <ModelSyncModal account={syncAccount} onClose={() => setSyncAccount(null)} onSynced={() => { void load(); setNotice({ kind: "success", message: "模型同步完成。" }); }} />}
     {confirmation && <ConfirmationDialog confirmation={confirmation} pending={pendingId === confirmation.account.id} onCancel={() => setConfirmation(null)} onConfirm={() => void confirmAction()} />}

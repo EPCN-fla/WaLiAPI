@@ -3,8 +3,11 @@
 
 pub mod codex_backend;
 pub mod codex_login;
+pub mod kimi_backend;
+pub mod kimi_login;
 pub mod maintenance;
 pub mod service;
+pub mod spec;
 pub mod types;
 
 use std::{collections::HashMap, sync::Arc};
@@ -12,17 +15,74 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 
 pub use crate::db::models::{AuthAccount, QuotaState};
+pub use spec::{AuthLoginMode, AuthNonStreamFraming, ProviderSpec};
 pub use types::{
-    AuthAccountSummary, LoginResult, ProviderError, ProviderKind, ProviderModels, ProviderPayload,
-    ProviderRequest, RefreshedPayload,
+    AuthAccountSummary, AuthenticatedLogin, LoginResult, ProviderError, ProviderKind,
+    ProviderLoginContext, ProviderModels, ProviderPayload, ProviderRequest, RefreshedPayload,
+    ReplacementContext,
 };
+
+/// Progress marker for an interactive provider login.  Concrete providers map
+/// their real work onto these steps; the command layer never fabricates
+/// progress with timers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginStep {
+    Preparing,
+    Authorizing,
+    Waiting,
+    Exchanging,
+    Saving,
+    Syncing,
+}
+
+impl LoginStep {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Authorizing => "authorizing",
+            Self::Waiting => "waiting",
+            Self::Exchanging => "exchanging",
+            Self::Saving => "saving",
+            Self::Syncing => "syncing",
+        }
+    }
+}
 
 /// Minimal host capability needed by an interactive provider login.  Specific
 /// providers may add their own local callback handling without coupling that
-/// logic to Tauri commands.
+/// logic to Tauri commands.  New methods have no silent no-op default: every
+/// implementation (production runtime and tests) must reconcile them.
 #[async_trait]
 pub trait LoginRuntime: Send + Sync {
     async fn open_browser(&self, url: &str) -> Result<(), ProviderError>;
+
+    /// Persist a non-secret progress step before doing the corresponding work.
+    async fn set_step(&self, step: LoginStep);
+
+    /// Surface device-authorization details (URL + user code) before opening
+    /// the browser, so the user can authorize manually if opening fails.
+    async fn present_device_authorization(
+        &self,
+        verification_url: &str,
+        user_code: &str,
+        expires_at: Option<String>,
+    ) -> Result<(), ProviderError>;
+
+    /// Whether the caller asked this login to stop.
+    fn is_cancelled(&self) -> bool;
+
+    /// Wait until the caller cancels the login.  Used to interrupt HTTP waits
+    /// and interval sleeps promptly rather than at the next poll boundary.
+    async fn cancelled(&self);
+}
+
+/// Where a login result should land.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoginTarget {
+    /// Create a new account, upserting by `(provider, provider_account_id)`.
+    New,
+    /// Overwrite the specified local account (re-login) in place.
+    Replace { local_account_id: String },
 }
 
 /// Object-safe provider contract.  Credentials only cross this boundary as a
@@ -31,7 +91,11 @@ pub trait LoginRuntime: Send + Sync {
 pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
 
-    async fn login(&self, runtime: &dyn LoginRuntime) -> Result<LoginResult, ProviderError>;
+    async fn login(
+        &self,
+        context: &ProviderLoginContext,
+        runtime: &dyn LoginRuntime,
+    ) -> Result<LoginResult, ProviderError>;
 
     async fn import(&self, bytes: &[u8]) -> Result<LoginResult, ProviderError>;
 
@@ -74,6 +138,7 @@ impl Default for ProviderRegistry {
             providers: HashMap::new(),
         };
         registry.register(Arc::new(codex_backend::CodexProvider::new()));
+        registry.register(Arc::new(kimi_backend::KimiProvider::new()));
         registry
     }
 }

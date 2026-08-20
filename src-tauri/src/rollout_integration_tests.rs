@@ -309,8 +309,8 @@ fn api_key() -> ApiKey {
         status: 1,
         allowed_models: "[]".into(),
         allowed_channels: "[]".into(),
-            denied_models: "[]".into(),
-            denied_channels: "[]".into(),
+        denied_models: "[]".into(),
+        denied_channels: "[]".into(),
         quota_limit: 0,
         quota_used: 0,
         expires_at: None,
@@ -2188,6 +2188,73 @@ async fn codec_messages_to_chat_thinking_fail_open_maps_reasoning_effort() {
     let upstream_body: Value =
         serde_json::from_str(&captured[0].body).expect("upstream request body is JSON");
     assert_eq!(upstream_body["reasoning_effort"], "low");
+}
+
+#[tokio::test]
+async fn codec_messages_to_chat_replays_missing_tool_reasoning_as_empty() {
+    // Claude Code can replay an assistant tool-use turn without its original
+    // thinking block. In thinking mode, compatible Chat upstreams require the
+    // reasoning_content field on every such historical turn. We may preserve
+    // an empty field, but must never invent reasoning text.
+    let conv_mock = MockUpstream::start_fixed(
+        br#"{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"from-conv"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
+            .to_vec(),
+        200,
+    )
+    .await;
+    let pool = fresh_db().await;
+    let key = api_key();
+    insert_api_key(&pool, &key).await;
+    let conv = channel(
+        "c1",
+        "openai",
+        "custom",
+        &format!("http://{}", conv_mock.addr),
+        &["chat_completions"],
+        &["m"],
+        1,
+        "{}",
+    );
+    insert_channel(&pool, &conv).await;
+
+    let body = json!({
+        "model": "m",
+        "thinking": {"type": "adaptive"},
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}}]
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}]
+            }
+        ]
+    });
+    let audit = audited(
+        DownstreamProtocol::Messages,
+        "/v1/messages",
+        "m",
+        body.clone(),
+        false,
+    );
+    let plan = plan_for(
+        &pool,
+        &key,
+        EndpointKind::Messages,
+        "m",
+        &flags(true, true, false),
+        &body,
+    )
+    .await
+    .expect("plan");
+    let resp = run_non_stream(&pool, &key, &audit, plan, "chat").await;
+    assert_eq!(resp.status(), 200);
+
+    let captured = conv_mock.captured().await;
+    let upstream_body: Value =
+        serde_json::from_str(&captured[0].body).expect("upstream request body is JSON");
+    assert_eq!(upstream_body["messages"][0]["reasoning_content"], "");
 }
 
 #[tokio::test]

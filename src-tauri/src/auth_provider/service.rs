@@ -5,8 +5,9 @@ use tokio::sync::Mutex;
 
 use crate::{
     auth_provider::{
-        AuthAccountSummary, LoginRuntime, ProviderError, ProviderKind, ProviderPayload,
-        ProviderRegistry, ProviderRequest,
+        AuthAccountSummary, AuthenticatedLogin, LoginRuntime, LoginTarget, ProviderError,
+        ProviderKind, ProviderLoginContext, ProviderPayload, ProviderRegistry, ProviderRequest,
+        ReplacementContext,
     },
     db::{
         models::{AuthAccount, AuthAccountUpsert, ModelStates},
@@ -57,14 +58,136 @@ impl AuthService {
         }
     }
 
+    /// Compatibility entrypoint used by legacy synchronou commands and import.
+    /// It resolves `authenticate` + `persist_authenticated` for a brand-new
+    /// account; interactive replacement logins go through the session runner
+    /// so the commit gate serializes cancel with the DB write.
     pub async fn login(
         &self,
         kind: ProviderKind,
         runtime: &dyn LoginRuntime,
     ) -> Result<AuthAccountSummary, ProviderError> {
+        let authenticated = self.authenticate(kind, LoginTarget::New, runtime).await?;
+        self.persist_authenticated(authenticated).await
+    }
+
+    /// Run the interactive provider login without touching the database.
+    ///
+    /// Replacement targets are resolved here: the service loads the existing
+    /// local account, validates its provider, and hands the provider a
+    /// sanitized [`ReplacementContext`].  The provider itself must refuse to
+    /// start OAuth if, e.g. a Kimi payload carries no usable `device_id`.
+    pub async fn authenticate(
+        &self,
+        kind: ProviderKind,
+        target: LoginTarget,
+        runtime: &dyn LoginRuntime,
+    ) -> Result<AuthenticatedLogin, ProviderError> {
         let provider = self.registry.get(&kind)?;
-        let result = provider.login(runtime).await?;
-        self.upsert_login_result(kind, result).await
+        let replacement = match &target {
+            LoginTarget::New => None,
+            LoginTarget::Replace { local_account_id } => {
+                let account = self.get_account(local_account_id).await?;
+                if account.provider != kind.to_string() {
+                    // Never let a login from one provider overwrite another.
+                    return Err(ProviderError::InvalidPayload);
+                }
+                let previous_payload = Self::payload_for(&account)?;
+                Some(ReplacementContext {
+                    local_account_id: local_account_id.clone(),
+                    provider_account_id: account.account_id.clone(),
+                    previous_payload,
+                })
+            }
+        };
+        let context = ProviderLoginContext { replacement };
+        let result = provider.login(&context, runtime).await?;
+        Ok(AuthenticatedLogin {
+            replacement: context.replacement,
+            kind,
+            result,
+        })
+    }
+
+    /// Persist an authenticated login, either as a new account or as a
+    /// locked in-place replacement that atomically invalidates old models.
+    pub async fn persist_authenticated(
+        &self,
+        authenticated: AuthenticatedLogin,
+    ) -> Result<AuthAccountSummary, ProviderError> {
+        let AuthenticatedLogin {
+            kind,
+            result,
+            replacement,
+        } = authenticated;
+        match replacement {
+            None => self.upsert_login_result(kind, result).await,
+            Some(replacement) => self.persist_replacement(kind, result, replacement).await,
+        }
+    }
+
+    /// Replace an existing account's credentials under the same per-account
+    /// mutex used by refresh-token rotation, with an optimistic precondition on
+    /// `(id, provider, account_id)`.  The write atomically clears the model
+    /// snapshot and last-sync timestamp so a route created against a changed
+    /// model catalog can never use stale models; routing resumes only after a
+    /// successful model sync.  A deleted account, a provider/device change, or
+    /// a concurrent refresh that rotated `account_id` fails closed.
+    async fn persist_replacement(
+        &self,
+        kind: ProviderKind,
+        result: crate::auth_provider::LoginResult,
+        replacement: ReplacementContext,
+    ) -> Result<AuthAccountSummary, ProviderError> {
+        // Re-login keeps the same provider account identity (Kimi: the same
+        // `device_id`).  A different identity means the replacement boundary is
+        // stale or the provider drifted; fail closed rather than create a row
+        // under a new identity.
+        if result.account_id != replacement.provider_account_id {
+            return Err(ProviderError::InvalidPayload);
+        }
+        let lock = {
+            let mut locks = self.refresh_locks.lock().await;
+            locks
+                .entry(replacement.local_account_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+
+        // Re-read and revalidate under the lock: a concurrent refresh may have
+        // rotated the token, or the account may have been deleted meanwhile.
+        // A missing account is a stale replacement boundary, not a generic
+        // storage failure, so fail closed with the same category as other
+        // precondition mismatches.
+        let account = self
+            .get_account(&replacement.local_account_id)
+            .await
+            .map_err(|_| ProviderError::InvalidPayload)?;
+        if account.provider != kind.to_string()
+            || account.account_id != replacement.provider_account_id
+        {
+            return Err(ProviderError::InvalidPayload);
+        }
+        let updated = self
+            .repository
+            .replace_auth_account(
+                &replacement.local_account_id,
+                &replacement.provider_account_id,
+                &AuthAccountUpsert {
+                    provider: kind.to_string(),
+                    label: result.label,
+                    account_id: result.account_id,
+                    attributes: result.attributes,
+                    payload: result.payload.into_value(),
+                    last_refreshed_at: result.last_refreshed_at,
+                    next_refresh_after: result.next_refresh_after,
+                    next_retry_after: result.next_retry_after,
+                },
+            )
+            .await
+            .map_err(|_| ProviderError::InvalidPayload)?;
+        AuthAccountSummary::from_account(&updated)
     }
 
     pub async fn import(
@@ -272,7 +395,19 @@ impl AuthService {
                     // routeability of new models — fresh even for imported /
                     // long-lived tokens (ADR-8, design §7 step 3).
                     if let Err(error) = self.sync_models(&account.id).await {
-                        tracing::warn!(account_id = %account.id, "auth account model sync failed during maintenance: {error}");
+                        if error.is_payment_required() {
+                            // A dead subscription can never be fixed by retrying
+                            // on the maintenance cadence; take the account out
+                            // of routing until the user resolves it.
+                            tracing::warn!(
+                                account_id = %account.id,
+                                "auth account subscription is not usable; marking invalid"
+                            );
+                            self.schedule_maintenance_retry(&account.id, Some("payment_required"))
+                                .await;
+                        } else {
+                            tracing::warn!(account_id = %account.id, "auth account model sync failed during maintenance: {error}");
+                        }
                     }
                     continue;
                 }
@@ -286,7 +421,7 @@ impl AuthService {
             };
 
             if refresh_result.is_err() {
-                self.schedule_maintenance_retry(&account.id).await;
+                self.schedule_maintenance_retry(&account.id, None).await;
                 continue;
             }
 
@@ -300,11 +435,18 @@ impl AuthService {
 
     /// Dispatch with a fresh persisted payload.  Provider-specific HTTP policy
     /// remains in the implementation; callers never parse `payload_json`.
+    ///
+    /// `is_stream` / `upstream_protocol` / `upstream_endpoint` are the trusted,
+    /// immutable values frozen by RoutePlan.  A 401 single replay reuses the
+    /// exact same values so the retry hits the identical fixed endpoint.
     pub async fn outbound(
         &self,
         account_id: &str,
         body: &serde_json::Value,
         headers: &reqwest::header::HeaderMap,
+        is_stream: bool,
+        upstream_protocol: &str,
+        upstream_endpoint: &str,
     ) -> Result<reqwest::Response, ProviderError> {
         // Refresh through the summary-only API, then load raw credentials only
         // inside this module for the provider call.
@@ -312,11 +454,18 @@ impl AuthService {
             // A due refresh is part of preparing this account for outbound use.
             // Never leave a rejected credential in the active route pool, and
             // keep the maintenance retry cadence consistent with its failure path.
-            self.schedule_maintenance_retry(account_id).await;
+            self.schedule_maintenance_retry(account_id, None).await;
             return Err(error);
         }
         let response = self
-            .send_with_persisted_account(account_id, body, headers)
+            .send_with_persisted_account(
+                account_id,
+                body,
+                headers,
+                is_stream,
+                upstream_protocol,
+                upstream_endpoint,
+            )
             .await?;
         if response.status() != reqwest::StatusCode::UNAUTHORIZED {
             self.persist_quota_if_present(account_id, &response).await;
@@ -331,14 +480,21 @@ impl AuthService {
             // Rejected credentials get the same backoff as a failed lazy
             // refresh, so the maintenance loop does not hammer the provider
             // on the very next pass.
-            self.schedule_maintenance_retry(account_id).await;
+            self.schedule_maintenance_retry(account_id, None).await;
             return Err(ProviderError::Unauthorized);
         }
         let retry = self
-            .send_with_persisted_account(account_id, body, headers)
+            .send_with_persisted_account(
+                account_id,
+                body,
+                headers,
+                is_stream,
+                upstream_protocol,
+                upstream_endpoint,
+            )
             .await?;
         if retry.status() == reqwest::StatusCode::UNAUTHORIZED {
-            self.schedule_maintenance_retry(account_id).await;
+            self.schedule_maintenance_retry(account_id, None).await;
             return Err(ProviderError::Unauthorized);
         }
         self.persist_quota_if_present(account_id, &retry).await;
@@ -350,6 +506,9 @@ impl AuthService {
         account_id: &str,
         body: &serde_json::Value,
         headers: &reqwest::header::HeaderMap,
+        is_stream: bool,
+        upstream_protocol: &str,
+        upstream_endpoint: &str,
     ) -> Result<reqwest::Response, ProviderError> {
         let account = self.get_account(account_id).await?;
         let payload = Self::payload_for(&account)?;
@@ -360,15 +519,18 @@ impl AuthService {
                 payload: &payload,
                 body,
                 headers,
+                is_stream,
+                upstream_protocol,
+                upstream_endpoint,
             })
             .await
     }
 
-    async fn schedule_maintenance_retry(&self, account_id: &str) {
+    async fn schedule_maintenance_retry(&self, account_id: &str, reason: Option<&str>) {
         let next_retry_after = (self.clock.now() + Duration::hours(12)).to_rfc3339();
         if self
             .repository
-            .mark_invalid(account_id, Some(&next_retry_after))
+            .mark_invalid(account_id, Some(&next_retry_after), reason)
             .await
             .is_err()
         {
@@ -454,13 +616,17 @@ impl AuthService {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use async_trait::async_trait;
     use reqwest::header::HeaderMap;
     use serde_json::json;
 
     use super::*;
-    use crate::auth_provider::{LoginResult, Provider, ProviderModels, RefreshedPayload};
+    use crate::auth_provider::{
+        LoginResult, LoginStep, LoginTarget, Provider, ProviderLoginContext, ProviderModels,
+        RefreshedPayload,
+    };
     use crate::db::models::QuotaState;
 
     const ACCESS: &str = "fixture-access-token";
@@ -487,7 +653,11 @@ mod tests {
         fn kind(&self) -> ProviderKind {
             ProviderKind::Codex
         }
-        async fn login(&self, _: &dyn LoginRuntime) -> Result<LoginResult, ProviderError> {
+        async fn login(
+            &self,
+            _: &ProviderLoginContext,
+            _: &dyn LoginRuntime,
+        ) -> Result<LoginResult, ProviderError> {
             self.operations.fetch_add(1, Ordering::SeqCst);
             Err(ProviderError::LoginFailed)
         }
@@ -576,6 +746,101 @@ mod tests {
             payload: json!({"access_token": ACCESS, "refresh_token": REFRESH, "id_token": ID, "expires_at": "2026-08-09T00:01:00Z"}),
             last_refreshed_at: None, next_refresh_after: None, next_retry_after: None,
         }).await.unwrap()
+    }
+
+    /// Records steps, device-authorization surfaces and an explicit cancel flag
+    /// so login flows can be asserted without touching a real browser.
+    #[derive(Default)]
+    struct RecordingRuntime {
+        steps: Mutex<Vec<String>>,
+        device_authorizations: Mutex<Vec<String>>,
+        cancelled: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl LoginRuntime for RecordingRuntime {
+        async fn open_browser(&self, _: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn set_step(&self, step: LoginStep) {
+            self.steps.lock().unwrap().push(step.as_str().to_owned());
+        }
+        async fn present_device_authorization(
+            &self,
+            url: &str,
+            _user_code: &str,
+            _expires_at: Option<String>,
+        ) -> Result<(), ProviderError> {
+            self.device_authorizations
+                .lock()
+                .unwrap()
+                .push(url.to_owned());
+            Ok(())
+        }
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+        async fn cancelled(&self) {
+            while !self.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// Provider whose login succeeds with a caller-chosen identity and payload.
+    struct LoginProvider {
+        kind: ProviderKind,
+        login_account_id: String,
+        login_payload: serde_json::Value,
+        login_operations: AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for LoginProvider {
+        fn kind(&self) -> ProviderKind {
+            self.kind.clone()
+        }
+        async fn login(
+            &self,
+            _context: &ProviderLoginContext,
+            _runtime: &dyn LoginRuntime,
+        ) -> Result<LoginResult, ProviderError> {
+            self.login_operations.fetch_add(1, Ordering::SeqCst);
+            Ok(LoginResult {
+                account_id: self.login_account_id.clone(),
+                label: "Codex".into(),
+                attributes: json!({}),
+                payload: ProviderPayload::new(self.login_payload.clone()),
+                last_refreshed_at: Some("2026-08-09T03:00:00Z".into()),
+                next_refresh_after: None,
+                next_retry_after: None,
+            })
+        }
+        async fn import(&self, _: &[u8]) -> Result<LoginResult, ProviderError> {
+            Err(ProviderError::ImportFailed)
+        }
+        async fn refresh(&self, _: &ProviderPayload) -> Result<RefreshedPayload, ProviderError> {
+            Err(ProviderError::Retryable)
+        }
+        async fn outbound(
+            &self,
+            _: ProviderRequest<'_>,
+        ) -> Result<reqwest::Response, ProviderError> {
+            Err(ProviderError::Retryable)
+        }
+        async fn list_models(
+            &self,
+            _account: &crate::db::models::AuthAccount,
+            _payload: &ProviderPayload,
+        ) -> Result<ProviderModels, ProviderError> {
+            Ok(vec![])
+        }
+    }
+
+    fn fresh_login_payload() -> serde_json::Value {
+        json!({
+            "access_token": "fresh-login-access",
+            "refresh_token": "fresh-login-refresh",
+            "expires_at": "2026-08-09T04:00:00Z"
+        })
     }
 
     #[tokio::test]
@@ -737,6 +1002,7 @@ mod tests {
                 unavailable: false,
                 next_retry_after: None,
                 last_error: None,
+                protocol: None,
             }],
         };
         let old_sync = "2026-08-08T00:00:00Z";
@@ -848,6 +1114,7 @@ mod tests {
                         unavailable: false,
                         next_retry_after: None,
                         last_error: None,
+                        protocol: None,
                     }],
                 },
                 "2026-08-09T00:00:00Z",
@@ -875,7 +1142,10 @@ mod tests {
                 .outbound(
                     &account.id,
                     &json!({"model": "gpt-test"}),
-                    &HeaderMap::new()
+                    &HeaderMap::new(),
+                    true,
+                    "responses",
+                    "responses"
                 )
                 .await
                 .unwrap_err(),
@@ -895,5 +1165,506 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticate_runs_provider_without_touching_the_database() {
+        let repository = repository().await;
+        let provider = Arc::new(LoginProvider {
+            kind: ProviderKind::Codex,
+            login_account_id: "account-1".into(),
+            login_payload: fresh_login_payload(),
+            login_operations: AtomicUsize::new(0),
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider.clone());
+        let service = AuthService::new(repository.clone(), registry);
+        let runtime = RecordingRuntime::default();
+
+        let authenticated = service
+            .authenticate(ProviderKind::Codex, LoginTarget::New, &runtime)
+            .await
+            .unwrap();
+        assert_eq!(authenticated.result.account_id, "account-1");
+        assert!(authenticated.replacement.is_none());
+        // Nothing was written by authenticate itself.
+        assert!(repository.list_auth_accounts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticate_resolves_replacement_context_from_existing_account() {
+        let repository = repository().await;
+        let account = account(&repository).await;
+        let provider = Arc::new(LoginProvider {
+            kind: ProviderKind::Codex,
+            login_account_id: account.account_id.clone(),
+            login_payload: fresh_login_payload(),
+            login_operations: AtomicUsize::new(0),
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider.clone());
+        let service = AuthService::new(repository.clone(), registry);
+
+        let authenticated = service
+            .authenticate(
+                ProviderKind::Codex,
+                LoginTarget::Replace {
+                    local_account_id: account.id.clone(),
+                },
+                &RecordingRuntime::default(),
+            )
+            .await
+            .unwrap();
+        let replacement = authenticated.replacement.expect("replacement context");
+        assert_eq!(replacement.local_account_id, account.id);
+        assert_eq!(replacement.provider_account_id, account.account_id);
+        // The provider must see the prior credential material, not raw JSON.
+        assert_eq!(
+            replacement.previous_payload.as_value()["access_token"],
+            ACCESS
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_replacement_when_provider_mismatches() {
+        let repository = repository().await;
+        let account = account(&repository).await;
+        // The login provider is registered under Kimi, but the persisted
+        // account is a `codex` row: the replacement boundary must refuse before
+        // any OAuth request.
+        let provider = Arc::new(LoginProvider {
+            kind: ProviderKind::Kimi,
+            login_account_id: "".into(),
+            login_payload: fresh_login_payload(),
+            login_operations: AtomicUsize::new(0),
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider.clone());
+        let service = AuthService::new(repository.clone(), registry);
+
+        let error = service
+            .authenticate(
+                ProviderKind::Kimi,
+                LoginTarget::Replace {
+                    local_account_id: account.id.clone(),
+                },
+                &RecordingRuntime::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, ProviderError::InvalidPayload);
+        assert_eq!(
+            provider.login_operations.load(Ordering::SeqCst),
+            0,
+            "provider must never be asked to login for a mismatched target"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_authenticated_new_account_writes_by_provider_kind() {
+        let repository = repository().await;
+        let provider = Arc::new(LoginProvider {
+            kind: ProviderKind::Codex,
+            login_account_id: "remote-1".into(),
+            login_payload: fresh_login_payload(),
+            login_operations: AtomicUsize::new(0),
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider.clone());
+        let service = AuthService::new(repository.clone(), registry);
+
+        let authenticated = service
+            .authenticate(
+                ProviderKind::Codex,
+                LoginTarget::New,
+                &RecordingRuntime::default(),
+            )
+            .await
+            .unwrap();
+        let summary = service.persist_authenticated(authenticated).await.unwrap();
+
+        assert_eq!(summary.provider, "codex");
+        assert_eq!(summary.account_id, "remote-1");
+        let stored = repository.get_auth_account(&summary.id).await.unwrap();
+        assert_eq!(stored.provider, "codex");
+    }
+
+    #[tokio::test]
+    async fn persist_replacement_updates_same_account_and_clears_model_snapshot() {
+        let repository = repository().await;
+        let account = account(&repository).await;
+        // Give the account a stale model snapshot + sync time first.
+        let old_models = ModelStates {
+            version: 1,
+            models: vec![crate::db::models::ModelState {
+                id: "gpt-stale".into(),
+                status: "available".into(),
+                unavailable: false,
+                next_retry_after: None,
+                last_error: None,
+                protocol: None,
+            }],
+        };
+        repository
+            .update_models_if_success(&account.id, &old_models, "2026-08-08T00:00:00Z")
+            .await
+            .unwrap();
+
+        let provider = Arc::new(LoginProvider {
+            kind: ProviderKind::Codex,
+            login_account_id: account.account_id.clone(),
+            login_payload: fresh_login_payload(),
+            login_operations: AtomicUsize::new(0),
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider.clone());
+        let service = AuthService::new(repository.clone(), registry);
+
+        let authenticated = service
+            .authenticate(
+                ProviderKind::Codex,
+                LoginTarget::Replace {
+                    local_account_id: account.id.clone(),
+                },
+                &RecordingRuntime::default(),
+            )
+            .await
+            .unwrap();
+        let summary = service.persist_authenticated(authenticated).await.unwrap();
+        assert_eq!(summary.id, account.id, "replacement must reuse local id");
+
+        let stored = repository.get_auth_account(&account.id).await.unwrap();
+        // Fresh credentials replaced the old ones.
+        assert!(stored.payload_json.contains("fresh-login-access"));
+        // Model snapshot was atomically cleared and sync timestamp reset.
+        assert_eq!(stored.model_states().unwrap().models.len(), 0);
+        assert_eq!(stored.last_models_sync_at, None);
+        // The cleared account is not routeable until a sync rewrites models.
+        assert!(repository
+            .list_route_accounts("2026-08-09T00:00:00Z")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn persist_replacement_fails_closed_when_account_was_deleted() {
+        let repository = repository().await;
+        let account = account(&repository).await;
+        let provider = Arc::new(LoginProvider {
+            kind: ProviderKind::Codex,
+            login_account_id: account.account_id.clone(),
+            login_payload: fresh_login_payload(),
+            login_operations: AtomicUsize::new(0),
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider);
+        let service = AuthService::new(repository.clone(), registry);
+
+        let authenticated = service
+            .authenticate(
+                ProviderKind::Codex,
+                LoginTarget::Replace {
+                    local_account_id: account.id.clone(),
+                },
+                &RecordingRuntime::default(),
+            )
+            .await
+            .unwrap();
+        repository.delete_auth_account(&account.id).await.unwrap();
+        assert_eq!(
+            service
+                .persist_authenticated(authenticated)
+                .await
+                .unwrap_err(),
+            ProviderError::InvalidPayload
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_replacement_fails_closed_when_identity_changed() {
+        let repository = repository().await;
+        let account = account(&repository).await;
+        // Login returns a different account id than the persisted one.
+        let provider = Arc::new(LoginProvider {
+            kind: ProviderKind::Codex,
+            login_account_id: "other-identity".into(),
+            login_payload: fresh_login_payload(),
+            login_operations: AtomicUsize::new(0),
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider);
+        let service = AuthService::new(repository.clone(), registry);
+
+        let authenticated = service
+            .authenticate(
+                ProviderKind::Codex,
+                LoginTarget::Replace {
+                    local_account_id: account.id.clone(),
+                },
+                &RecordingRuntime::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .persist_authenticated(authenticated)
+                .await
+                .unwrap_err(),
+            ProviderError::InvalidPayload
+        );
+        // Original credentials are untouched.
+        let stored = repository.get_auth_account(&account.id).await.unwrap();
+        assert!(stored.payload_json.contains("fixture-access-token"));
+    }
+
+    #[tokio::test]
+    async fn replacement_then_forced_refresh_uses_new_refresh_token_not_stale() {
+        // Provider that can BOTH log in with fresh credentials AND refresh,
+        // echoing back which refresh token it was handed so a replacement can
+        // be distinguished from a stale database credential.
+        #[derive(Clone)]
+        struct LoginAndRefresh {
+            login_account_id: String,
+            login_payload: serde_json::Value,
+            refresh_saw: std::sync::Arc<Mutex<Option<String>>>,
+            refreshed_access: String,
+        }
+        #[async_trait]
+        impl Provider for LoginAndRefresh {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Codex
+            }
+            async fn login(
+                &self,
+                _: &ProviderLoginContext,
+                _: &dyn LoginRuntime,
+            ) -> Result<LoginResult, ProviderError> {
+                Ok(LoginResult {
+                    account_id: self.login_account_id.clone(),
+                    label: "Codex".into(),
+                    attributes: json!({}),
+                    payload: ProviderPayload::new(self.login_payload.clone()),
+                    last_refreshed_at: Some("2026-08-09T03:00:00Z".into()),
+                    next_refresh_after: None,
+                    next_retry_after: None,
+                })
+            }
+            async fn import(&self, _: &[u8]) -> Result<LoginResult, ProviderError> {
+                Err(ProviderError::ImportFailed)
+            }
+            async fn refresh(&self, payload: &ProviderPayload) -> Result<RefreshedPayload, ProviderError> {
+                let token = payload
+                    .as_value()
+                    .get("refresh_token")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                *self.refresh_saw.lock().unwrap() = Some(token.clone());
+                Ok(RefreshedPayload {
+                    payload: ProviderPayload::new(json!({
+                        "access_token": self.refreshed_access,
+                        "refresh_token": token,
+                        "expires_at": "2099-01-01T00:00:00Z"
+                    })),
+                    last_refreshed_at: Some("2026-08-09T03:01:00Z".into()),
+                    next_refresh_after: None,
+                    next_retry_after: None,
+                })
+            }
+            async fn outbound(
+                &self,
+                _: ProviderRequest<'_>,
+            ) -> Result<reqwest::Response, ProviderError> {
+                Err(ProviderError::Retryable)
+            }
+            async fn list_models(
+                &self,
+                _: &AuthAccount,
+                _: &ProviderPayload,
+            ) -> Result<ProviderModels, ProviderError> {
+                Ok(vec![])
+            }
+        }
+        let saw = std::sync::Arc::new(Mutex::new(None));
+        let repository = repository().await;
+        let account = account(&repository).await;
+        let provider = Arc::new(LoginAndRefresh {
+            login_account_id: account.account_id.clone(),
+            login_payload: fresh_login_payload(), // refresh_token "fresh-login-refresh"
+            refresh_saw: saw.clone(),
+            refreshed_access: "post-refresh-access".into(),
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider.clone());
+        let service = Arc::new(AuthService::new(repository.clone(), registry));
+
+        // Replacement persists fresh credentials.
+        let authenticated = service
+            .authenticate(
+                ProviderKind::Codex,
+                LoginTarget::Replace {
+                    local_account_id: account.id.clone(),
+                },
+                &RecordingRuntime::default(),
+            )
+            .await
+            .unwrap();
+        service.persist_authenticated(authenticated).await.unwrap();
+
+        // A forced refresh afterwards must hand the provider the NEW refresh
+        // token (fresh-login-refresh), not something stale, and the resulting
+        // access token must be the refreshed one.
+        service.force_refresh_account(&account.id).await.unwrap();
+        assert_eq!(
+            saw.lock().unwrap().as_deref(),
+            Some("fresh-login-refresh"),
+            "refresh must use the replacement's refresh token"
+        );
+        let stored = repository.get_auth_account(&account.id).await.unwrap();
+        assert!(
+            stored.payload_json.contains("post-refresh-access"),
+            "forced refresh result was not persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_records_steps_and_device_authorization() {
+        let repository = repository().await;
+        let provider = Arc::new(LoginProvider {
+            kind: ProviderKind::Codex,
+            login_account_id: "remote-1".into(),
+            login_payload: fresh_login_payload(),
+            login_operations: AtomicUsize::new(0),
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider);
+        let service = AuthService::new(repository, registry);
+
+        let runtime = RecordingRuntime::default();
+        let _ = service
+            .authenticate(ProviderKind::Codex, LoginTarget::New, &runtime)
+            .await;
+        // The provider drives steps; assert the runtime surface is usable.
+        runtime.set_step(LoginStep::Preparing).await;
+        runtime
+            .present_device_authorization("https://auth.example.test", "ABC-DEF", None)
+            .await
+            .unwrap();
+        assert_eq!(*runtime.steps.lock().unwrap(), vec!["preparing"]);
+        assert_eq!(
+            *runtime.device_authorizations.lock().unwrap(),
+            vec!["https://auth.example.test"]
+        );
+        assert!(!runtime.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn persist_replacement_then_sync_restores_routeability_with_new_snapshot() {
+        let repository = repository().await;
+        let account = account(&repository).await;
+        // Provider that can both log in and list a protocol-tagged model.
+        struct SyncProvider {
+            login_account_id: String,
+            login_payload: serde_json::Value,
+            operations: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for SyncProvider {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Codex
+            }
+            async fn login(
+                &self,
+                _context: &ProviderLoginContext,
+                _runtime: &dyn LoginRuntime,
+            ) -> Result<LoginResult, ProviderError> {
+                self.operations.fetch_add(1, Ordering::SeqCst);
+                Ok(LoginResult {
+                    account_id: self.login_account_id.clone(),
+                    label: "Codex".into(),
+                    attributes: json!({}),
+                    payload: ProviderPayload::new(self.login_payload.clone()),
+                    last_refreshed_at: Some("2026-08-09T03:00:00Z".into()),
+                    next_refresh_after: None,
+                    next_retry_after: None,
+                })
+            }
+            async fn import(&self, _: &[u8]) -> Result<LoginResult, ProviderError> {
+                Err(ProviderError::ImportFailed)
+            }
+            async fn refresh(
+                &self,
+                _: &ProviderPayload,
+            ) -> Result<RefreshedPayload, ProviderError> {
+                Err(ProviderError::Retryable)
+            }
+            async fn outbound(
+                &self,
+                _: ProviderRequest<'_>,
+            ) -> Result<reqwest::Response, ProviderError> {
+                Err(ProviderError::Retryable)
+            }
+            async fn list_models(
+                &self,
+                _account: &crate::db::models::AuthAccount,
+                _payload: &ProviderPayload,
+            ) -> Result<ProviderModels, ProviderError> {
+                Ok(vec![crate::db::models::ModelState {
+                    id: "kimi-k2.5".into(),
+                    status: "available".into(),
+                    unavailable: false,
+                    next_retry_after: None,
+                    last_error: None,
+                    protocol: Some("kimi".into()),
+                }])
+            }
+        }
+        let provider = Arc::new(SyncProvider {
+            login_account_id: account.account_id.clone(),
+            login_payload: fresh_login_payload(),
+            operations: AtomicUsize::new(0),
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider);
+        // Pin the clock before the fresh payload's expiry so the sync path does
+        // not decide the token is due and attempt a provider refresh.
+        let service = AuthService::with_clock(
+            repository.clone(),
+            registry,
+            Arc::new(FixedClock("2026-08-08T00:00:00Z".parse().unwrap())),
+        );
+
+        // Replacement atomically clears the old snapshot.
+        let authenticated = service
+            .authenticate(
+                ProviderKind::Codex,
+                LoginTarget::Replace {
+                    local_account_id: account.id.clone(),
+                },
+                &RecordingRuntime::default(),
+            )
+            .await
+            .unwrap();
+        service.persist_authenticated(authenticated).await.unwrap();
+        assert!(repository
+            .list_route_accounts("2026-08-09T03:00:00Z")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // After a successful sync, the new protocol snapshot re-enables routing.
+        service.sync_models(&account.id).await.unwrap();
+        let stored = repository.get_auth_account(&account.id).await.unwrap();
+        assert_eq!(
+            stored.model_states().unwrap().models[0].protocol.as_deref(),
+            Some("kimi")
+        );
+        let routeable = repository
+            .list_route_accounts("2026-08-09T03:30:00Z")
+            .await
+            .unwrap();
+        assert_eq!(routeable.len(), 1);
+        assert_eq!(routeable[0].id, account.id);
     }
 }

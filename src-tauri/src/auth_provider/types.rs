@@ -14,6 +14,7 @@ use crate::{
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ProviderKind {
     Codex,
+    Kimi,
     Other(String),
 }
 
@@ -21,6 +22,7 @@ impl ProviderKind {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Codex => "codex",
+            Self::Kimi => "kimi",
             Self::Other(value) => value,
         }
     }
@@ -30,6 +32,7 @@ impl From<&str> for ProviderKind {
     fn from(value: &str) -> Self {
         match value {
             "codex" => Self::Codex,
+            "kimi" => Self::Kimi,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -114,7 +117,8 @@ impl AuthAccountSummary {
             .map_err(|_| ProviderError::InvalidPayload)?;
         let attributes = serde_json::from_str(&account.attributes_json)
             .map_err(|_| ProviderError::InvalidPayload)?;
-        let model_mapping = account.model_mapping()
+        let model_mapping = account
+            .model_mapping()
             .map_err(|_| ProviderError::InvalidPayload)?;
         Ok(Self {
             id: account.id.clone(),
@@ -201,13 +205,56 @@ pub struct RefreshedPayload {
     pub next_retry_after: Option<String>,
 }
 
+/// Where a login result should land.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoginTarget {
+    /// Create a new account, upserting by `(provider, provider_account_id)`.
+    New,
+    /// Overwrite the specified local account (re-login) in place.
+    Replace { local_account_id: String },
+}
+
+/// Bound context passed to a provider login.  The command layer never passes
+/// raw `payload_json`; replacement details live in a sanitized boundary object
+/// with only the fields a provider legitimately needs.
+#[derive(Clone, Debug)]
+pub struct ProviderLoginContext {
+    pub replacement: Option<ReplacementContext>,
+}
+
+/// Sanitized replacement material.  `previous_payload` is the only credential
+/// reference a provider may read during a replacement login.
+#[derive(Clone, Debug)]
+pub struct ReplacementContext {
+    pub local_account_id: String,
+    pub provider_account_id: String,
+    pub previous_payload: ProviderPayload,
+}
+
+/// Result of an OAuth/import flow before any persistence.  It carries the
+/// resolved target so a caller cannot swap the account after authentication.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedLogin {
+    pub kind: ProviderKind,
+    pub result: LoginResult,
+    pub replacement: Option<ReplacementContext>,
+}
+
 /// A non-secret outbound request.  The service injects the persisted account
 /// and decrypted-in-memory provider payload immediately before dispatch.
+///
+/// `is_stream` / `upstream_protocol` / `upstream_endpoint` are trusted values
+/// frozen by the RoutePlan and carried immutably through the attempt; providers
+/// rely on them to pick the fixed URL, headers and framing.  They are never
+/// guessed from the body or Content-Type, and never read from renderer input.
 pub struct ProviderRequest<'a> {
     pub account: &'a crate::db::models::AuthAccount,
     pub payload: &'a ProviderPayload,
     pub body: &'a Value,
     pub headers: &'a reqwest::header::HeaderMap,
+    pub is_stream: bool,
+    pub upstream_protocol: &'a str,
+    pub upstream_endpoint: &'a str,
 }
 
 impl fmt::Debug for ProviderRequest<'_> {
@@ -217,6 +264,9 @@ impl fmt::Debug for ProviderRequest<'_> {
             .field("account_id", &self.account.id)
             .field("provider", &self.account.provider)
             .field("body", &"<caller payload omitted>")
+            .field("is_stream", &self.is_stream)
+            .field("upstream_protocol", &self.upstream_protocol)
+            .field("upstream_endpoint", &self.upstream_endpoint)
             .finish()
     }
 }
@@ -233,9 +283,15 @@ pub enum ProviderError {
     LoginTimeout,
     BrowserOpenFailed,
     CallbackFailed,
+    DeviceAuthorizationFailed,
     TokenExchangeFailed,
+    AuthorizationDenied,
     ImportFailed,
     Unauthorized,
+    /// Provider reports the subscription cannot be used (e.g. Kimi 402
+    /// "membership benefits").  Terminal: retrying on a maintenance cadence
+    /// never fixes an inactive membership.
+    PaymentRequired,
     UnsupportedFeatures { pointer: String },
     Retryable,
     Storage,
@@ -246,7 +302,11 @@ impl ProviderError {
     pub fn failure_class(&self) -> FailureClass {
         match self {
             Self::UnsupportedFeatures { .. } | Self::InvalidPayload => FailureClass::CallerTerminal,
+            Self::AuthorizationDenied | Self::DeviceAuthorizationFailed => {
+                FailureClass::CallerTerminal
+            }
             Self::Unauthorized => FailureClass::ChannelAuthTerminal,
+            Self::PaymentRequired => FailureClass::CallerTerminal,
             Self::Protocol => FailureClass::UpstreamProtocolError,
             Self::UnknownProvider { .. }
             | Self::LoginFailed
@@ -259,6 +319,14 @@ impl ProviderError {
             | Self::Retryable
             | Self::Storage => FailureClass::Retryable,
         }
+    }
+}
+
+impl ProviderError {
+    /// Whether this error means the account's paid subscription is unusable
+    /// (e.g. Kimi 402).  Terminal: maintenance retries cannot fix it.
+    pub fn is_payment_required(&self) -> bool {
+        matches!(self, Self::PaymentRequired)
     }
 }
 
@@ -275,8 +343,15 @@ impl fmt::Display for ProviderError {
             Self::BrowserOpenFailed => formatter.write_str("could not open provider login browser"),
             Self::CallbackFailed => formatter.write_str("provider login callback failed"),
             Self::TokenExchangeFailed => formatter.write_str("provider token exchange failed"),
+            Self::DeviceAuthorizationFailed => {
+                formatter.write_str("provider device authorization failed")
+            }
+            Self::AuthorizationDenied => formatter.write_str("provider authorization was denied"),
             Self::ImportFailed => formatter.write_str("provider credential import failed"),
             Self::Unauthorized => formatter.write_str("provider credentials were rejected"),
+            Self::PaymentRequired => {
+                formatter.write_str("provider subscription is not usable")
+            }
             Self::UnsupportedFeatures { pointer } => {
                 write!(formatter, "unsupported provider request field at {pointer}")
             }
@@ -297,3 +372,41 @@ impl fmt::Debug for ProviderError {
 impl std::error::Error for ProviderError {}
 
 pub type ProviderModels = Vec<ModelState>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_kind_codex_round_trip() {
+        let kind = ProviderKind::Codex;
+        assert_eq!(kind.as_str(), "codex");
+        assert_eq!(ProviderKind::from("codex"), ProviderKind::Codex);
+        assert_eq!(kind.to_string(), "codex");
+    }
+
+    #[test]
+    fn provider_kind_kimi_round_trip() {
+        let kind = ProviderKind::Kimi;
+        assert_eq!(kind.as_str(), "kimi");
+        assert_eq!(ProviderKind::from("kimi"), ProviderKind::Kimi);
+        assert_eq!(kind.to_string(), "kimi");
+    }
+
+    #[test]
+    fn provider_kind_unknown_goes_to_other() {
+        let kind = ProviderKind::from("unknown-provider");
+        assert_eq!(kind, ProviderKind::Other("unknown-provider".to_owned()));
+        assert_eq!(kind.as_str(), "unknown-provider");
+        assert_eq!(kind.to_string(), "unknown-provider");
+    }
+
+    #[test]
+    fn provider_kind_other_is_not_a_known_spec() {
+        // The registry decides availability; spec lookup must be conservative.
+        assert!(
+            crate::auth_provider::spec::provider_spec(&ProviderKind::Other("nope".into()))
+                .is_none()
+        );
+    }
+}

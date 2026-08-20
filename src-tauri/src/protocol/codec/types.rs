@@ -1,7 +1,7 @@
 //! Public value objects for selecting and preparing protocol codecs.
 
 use super::direction::CodecDirection;
-use super::ports::{LegacyNonStreamDecoder, LegacyStreamDecoder, NonStreamDecoder, StreamDecoder};
+use super::ports::{NonStreamDecoder, StreamDecoder};
 use super::report::{ConversionContext, ConversionReport};
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
@@ -133,15 +133,6 @@ pub struct PreparedConversion {
     pub encoded_request: Value,
     pub report: ConversionReport,
     pub codec: PreparedCodec,
-    /// Compatibility view for legacy callers; new consumers should use
-    /// `codec.context()` so decoder construction cannot be bypassed.
-    pub context: ConversionContext,
-    /// Deprecated one-shot adapter retained for pre-factory callers. New code
-    /// must construct a fresh decoder through [`PreparedCodec`].
-    pub non_stream: Box<dyn LegacyNonStreamDecoder + Send + Sync>,
-    /// Deprecated one-shot adapter retained for pre-factory callers. New code
-    /// must construct a fresh decoder through [`PreparedCodec`].
-    pub streaming: Box<dyn LegacyStreamDecoder + Send + Sync>,
 }
 
 impl fmt::Debug for PreparedConversion {

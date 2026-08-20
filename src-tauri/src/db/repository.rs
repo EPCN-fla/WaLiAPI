@@ -555,7 +555,10 @@ impl Repository {
 
     /// Get all extra API keys for a channel (excluding the primary key stored
     /// in channels.api_key). Returns enabled keys first, ordered by weight desc.
-    pub async fn get_channel_api_keys(&self, channel_id: &str) -> Result<Vec<ChannelApiKey>, sqlx::Error> {
+    pub async fn get_channel_api_keys(
+        &self,
+        channel_id: &str,
+    ) -> Result<Vec<ChannelApiKey>, sqlx::Error> {
         sqlx::query_as::<_, ChannelApiKey>(
             "SELECT * FROM channel_api_keys WHERE channel_id = ? ORDER BY status DESC, weight DESC, created_at ASC",
         )
@@ -677,9 +680,8 @@ impl Repository {
         let allowed_channels =
             serde_json::to_string(&input.allowed_channels.clone().unwrap_or_default())
                 .unwrap_or_else(|_| "[]".to_string());
-        let denied_models =
-            serde_json::to_string(&input.denied_models.clone().unwrap_or_default())
-                .unwrap_or_else(|_| "[]".to_string());
+        let denied_models = serde_json::to_string(&input.denied_models.clone().unwrap_or_default())
+            .unwrap_or_else(|_| "[]".to_string());
         let denied_channels =
             serde_json::to_string(&input.denied_channels.clone().unwrap_or_default())
                 .unwrap_or_else(|_| "[]".to_string());
@@ -718,7 +720,11 @@ impl Repository {
         Ok(())
     }
 
-    pub async fn update_api_key_allowed_models(&self, id: &str, models: &[String]) -> Result<(), sqlx::Error> {
+    pub async fn update_api_key_allowed_models(
+        &self,
+        id: &str,
+        models: &[String],
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
         let json = serde_json::to_string(models).unwrap_or_else(|_| "[]".to_string());
         sqlx::query("UPDATE api_keys SET allowed_models = ?, updated_at = ? WHERE id = ?")
@@ -730,7 +736,11 @@ impl Repository {
         Ok(())
     }
 
-    pub async fn update_api_key_allowed_channels(&self, id: &str, channels: &[String]) -> Result<(), sqlx::Error> {
+    pub async fn update_api_key_allowed_channels(
+        &self,
+        id: &str,
+        channels: &[String],
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
         let json = serde_json::to_string(channels).unwrap_or_else(|_| "[]".to_string());
         sqlx::query("UPDATE api_keys SET allowed_channels = ?, updated_at = ? WHERE id = ?")
@@ -742,7 +752,11 @@ impl Repository {
         Ok(())
     }
 
-    pub async fn update_api_key_denied_models(&self, id: &str, models: &[String]) -> Result<(), sqlx::Error> {
+    pub async fn update_api_key_denied_models(
+        &self,
+        id: &str,
+        models: &[String],
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
         let json = serde_json::to_string(models).unwrap_or_else(|_| "[]".to_string());
         sqlx::query("UPDATE api_keys SET denied_models = ?, updated_at = ? WHERE id = ?")
@@ -754,7 +768,11 @@ impl Repository {
         Ok(())
     }
 
-    pub async fn update_api_key_denied_channels(&self, id: &str, channels: &[String]) -> Result<(), sqlx::Error> {
+    pub async fn update_api_key_denied_channels(
+        &self,
+        id: &str,
+        channels: &[String],
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
         let json = serde_json::to_string(channels).unwrap_or_else(|_| "[]".to_string());
         sqlx::query("UPDATE api_keys SET denied_channels = ?, updated_at = ? WHERE id = ?")
@@ -777,7 +795,11 @@ impl Repository {
         Ok(())
     }
 
-    pub async fn update_api_key_quota(&self, id: &str, quota_limit: i64) -> Result<(), sqlx::Error> {
+    pub async fn update_api_key_quota(
+        &self,
+        id: &str,
+        quota_limit: i64,
+    ) -> Result<(), sqlx::Error> {
         let now = now_iso();
         sqlx::query("UPDATE api_keys SET quota_limit = ?, updated_at = ? WHERE id = ?")
             .bind(quota_limit)
@@ -954,6 +976,58 @@ impl Repository {
         Ok(())
     }
 
+    /// Atomically overwrite re-login credentials on an existing local account.
+    ///
+    /// Unlike the generic `(provider, account_id)` conflict upsert, this update
+    /// is keyed by true local `id` and guarded by optimistic preconditions on
+    /// `provider` and `account_id`.  A zero-row update means the account was
+    /// deleted or its identity moved concurrently (e.g. by refresh rotation),
+    /// which the caller must treat as a fail-closed precondition failure.
+    ///
+    /// The same statement clears `model_states_json` and `last_models_sync_at`
+    /// so a successfully re-logged account cannot route against a stale model
+    /// catalog until the follow-up `/models` sync succeeds and rewrites the
+    /// snapshot.
+    pub async fn replace_auth_account(
+        &self,
+        id: &str,
+        expected_account_id: &str,
+        input: &AuthAccountUpsert,
+    ) -> Result<AuthAccount, sqlx::Error> {
+        let now = now_iso();
+        let attributes_json = serde_json::to_string(&input.attributes)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let payload_json = serde_json::to_string(&input.payload)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let result = sqlx::query(
+            "UPDATE auth_accounts
+             SET provider = ?, label = ?, account_id = ?, payload_json = ?, attributes_json = ?,
+                 model_states_json = ?, last_models_sync_at = NULL,
+                 last_refreshed_at = ?, next_refresh_after = ?, next_retry_after = ?,
+                 status = 'active', updated_at = ?
+             WHERE id = ? AND provider = ? AND account_id = ?",
+        )
+        .bind(&input.provider)
+        .bind(&input.label)
+        .bind(&input.account_id)
+        .bind(payload_json)
+        .bind(attributes_json)
+        .bind(serde_json::to_string(&ModelStates::default()).unwrap())
+        .bind(&input.last_refreshed_at)
+        .bind(&input.next_refresh_after)
+        .bind(&input.next_retry_after)
+        .bind(&now)
+        .bind(id)
+        .bind(&input.provider)
+        .bind(expected_account_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        self.get_auth_account(id).await
+    }
+
     /// This is only called after a successful provider sync. Keeping the
     /// update separate makes failures naturally preserve the old snapshot and
     /// its timestamp.
@@ -999,11 +1073,36 @@ impl Repository {
         &self,
         id: &str,
         next_retry_after: Option<&str>,
+        reason: Option<&str>,
     ) -> Result<(), sqlx::Error> {
+        // Persist a stable, non-secret reason for the invalidation (e.g.
+        // "payment_required" for an unusable subscription) alongside the status
+        // flip.  Stored in attributes_json so no schema migration is needed,
+        // and merged (not overwriting) so login metadata like email/plan_type
+        // survives.  The DTO surfaces it again as `invalidation_reason`.
+        let merged_attributes: Option<String> = if reason.is_some() {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT attributes_json FROM auth_accounts WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+            row.map(|(attributes_json,)| {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(&attributes_json).unwrap_or(serde_json::Value::Object(
+                        serde_json::Map::new(),
+                    ));
+                value["invalidation_reason"] = reason.unwrap().into();
+                serde_json::to_string(&value).unwrap_or(attributes_json)
+            })
+        } else {
+            None
+        };
         sqlx::query(
-            "UPDATE auth_accounts SET status = 'invalid', next_retry_after = ?, updated_at = ? WHERE id = ?",
+            "UPDATE auth_accounts SET status = 'invalid', next_retry_after = ?, attributes_json = COALESCE(?, attributes_json), updated_at = ? WHERE id = ?",
         )
         .bind(next_retry_after)
+        .bind(merged_attributes.as_deref())
         .bind(now_iso())
         .bind(id)
         .execute(&self.pool)

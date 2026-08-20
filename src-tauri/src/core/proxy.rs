@@ -14,7 +14,10 @@ use std::time::Instant;
 /// primary `api_key` participates with the channel-level `weight`.
 async fn select_key_for_channel(channel: &Channel, repo: &Arc<Repository>) -> Channel {
     let extra_keys = match repo.get_channel_api_keys(&channel.id).await {
-        Ok(keys) => keys.into_iter().filter(|k| k.status == 1).collect::<Vec<_>>(),
+        Ok(keys) => keys
+            .into_iter()
+            .filter(|k| k.status == 1)
+            .collect::<Vec<_>>(),
         Err(_) => return channel.clone(),
     };
     if extra_keys.is_empty() {

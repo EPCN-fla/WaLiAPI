@@ -41,7 +41,7 @@ use crate::core::attempt::{
     PreparedAttempt, TokenUsage,
 };
 use crate::core::channel_identity::ChannelIdentity;
-use crate::core::route_plan::EndpointKind;
+use crate::core::route_plan::{AuthNonStreamFraming, EndpointKind};
 use crate::db::models::Channel;
 use futures_util::StreamExt;
 use reqwest::header;
@@ -66,20 +66,90 @@ pub enum StreamAttemptResult {
 }
 
 /// Dispatch an Auth Account attempt.  Account providers intentionally own their
-/// request policy (including the forced `stream: true` backend contract,
-/// credential headers, 401 refresh/retry, and quota persistence); this module
-/// only converts the provider result into the executor's common attempt shape.
+/// request policy (credential headers, 401 refresh/retry, and quota persistence);
+/// this module only converts the provider result into the executor's common
+/// attempt shape.
+///
+/// Non-stream framing comes exclusively from the RoutePlan-frozen
+/// [`PreparedAttempt::auth_non_stream_framing`]:
+///
+/// * `ForcedResponsesSse` — Codex: force `stream:true`, aggregate the upstream
+///   Responses SSE into a complete document, then decode.
+/// * `Json` — Kimi Chat/Anthropic: force `stream:false`, drop `stream_options`,
+///   send the encoded Chat/Messages body, parse the provider-native JSON and
+///   decode through the prepared codec.
+///
+/// The executor never guesses framing from the body, Content-Type, or a
+/// database row — the attempt is the only source of truth.
 pub async fn dispatch_auth_account_executor(
     downstream: EndpointKind,
     attempt: &PreparedAttempt,
     auth_service: &crate::auth_provider::service::AuthService,
     safe_headers: &[(String, String)],
 ) -> AttemptResult {
+    let headers = &header_map(safe_headers);
+    let framing = attempt
+        .auth_non_stream_framing
+        .unwrap_or(AuthNonStreamFraming::ForcedResponsesSse);
+
+    // Non-stream: both profiles send JSON.  Only the Responses accumulator
+    // path needs the forced `stream:true` body.
+    if framing == AuthNonStreamFraming::Json {
+        let body = non_stream_json_body(&attempt.encoded_body, attempt);
+        let response = match auth_service
+            .outbound(
+                &attempt.channel_id,
+                &body,
+                headers,
+                false,
+                &attempt.upstream_protocol,
+                &attempt.upstream_endpoint,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => return AttemptResult::Failure(provider_failure(error)),
+        };
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let text = response.text().await.unwrap_or_default();
+            return AttemptResult::Failure(failure_from_upstream(status, &text));
+        }
+        let response_headers = safe_response_headers(response.headers());
+        let bytes = response.bytes().await.unwrap_or_default();
+        let body: Value = match serde_json::from_slice(&bytes) {
+            Ok(body) => body,
+            Err(error) => {
+                return AttemptResult::Failure(AttemptFailure {
+                    failure_class: FailureClass::UpstreamProtocolError,
+                    message: format!("Kimi non-stream body failed JSON decode: {error}"),
+                    status_code: Some(502),
+                    retry_after: None,
+                })
+            }
+        };
+        return match decode_non_stream(downstream, attempt, &body) {
+            Ok((body, usage)) => AttemptResult::Success(AttemptSuccess {
+                status,
+                body,
+                usage,
+                downstream_events: None,
+                upstream_model: Some(attempt.upstream_model.clone()),
+                response_headers,
+            }),
+            Err(failure) => AttemptResult::Failure(failure),
+        };
+    }
+
+    // Codex forced Responses SSE path (existing behavior).
     let response = match auth_service
         .outbound(
             &attempt.channel_id,
             &force_responses_stream(&attempt.encoded_body),
-            &header_map(safe_headers),
+            headers,
+            true,
+            &attempt.upstream_protocol,
+            &attempt.upstream_endpoint,
         )
         .await
     {
@@ -114,19 +184,37 @@ pub async fn dispatch_auth_account_executor(
     }
 }
 
-/// Connect an Auth Account's forced Responses SSE stream without committing
-/// downstream bytes.  The driver retains the same first-frame commit barrier
-/// used for Channels, so a malformed first event can still fail over.
+/// Connect an Auth Account stream without committing downstream bytes.  The
+/// driver retains the same first-frame commit barrier used for Channels, so a
+/// malformed first event can still fail over.
+///
+/// Framing comes from the RoutePlan-frozen attempt: Codex forces Responses SSE;
+/// Kimi Chat forces `stream:true` and injects `stream_options.include_usage`;
+/// Kimi Messages beta forces `stream:true` with no Chat-only fields.
 pub async fn dispatch_auth_account_stream_executor(
     attempt: &PreparedAttempt,
     auth_service: &crate::auth_provider::service::AuthService,
     safe_headers: &[(String, String)],
 ) -> StreamAttemptResult {
+    let headers = &header_map(safe_headers);
+    let framing = attempt
+        .auth_non_stream_framing
+        .unwrap_or(AuthNonStreamFraming::ForcedResponsesSse);
+
+    let body = if framing == AuthNonStreamFraming::Json {
+        streaming_json_body(&attempt.encoded_body, attempt)
+    } else {
+        force_responses_stream(&attempt.encoded_body)
+    };
+
     let response = match auth_service
         .outbound(
             &attempt.channel_id,
-            &force_responses_stream(&attempt.encoded_body),
-            &header_map(safe_headers),
+            &body,
+            headers,
+            true,
+            &attempt.upstream_protocol,
+            &attempt.upstream_endpoint,
         )
         .await
     {
@@ -162,6 +250,65 @@ fn force_responses_stream(body: &Value) -> Value {
     }
     body
 }
+
+/// Kimi Chat / Anthropic Messages non-stream body: explicitly `stream:false`,
+/// `stream_options` removed (Chat clients may send `stream_options` even when
+/// not streaming, and the fixed Kimi transport must not echo it), and the
+/// fixed Messages beta `betas` token ensured on the Anthropic profile.
+fn non_stream_json_body(body: &Value, attempt: &PreparedAttempt) -> Value {
+    let mut body = body.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.insert("stream".to_owned(), Value::Bool(false));
+        object.remove("stream_options");
+    }
+    ensure_messages_betas(&mut body, attempt);
+    body
+}
+
+/// Anthropic Messages beta: ensure the fixed `betas` list contains the
+/// official transport's default token, without duplicates.  This is part of
+/// the Kimi endpoint transport contract, not a codec conversion, and can
+/// never be overridden by renderer/headers/attributes.
+fn ensure_messages_betas(body: &mut Value, attempt: &PreparedAttempt) {
+    if attempt.upstream_protocol != "anthropic" || attempt.upstream_endpoint != "messages_beta" {
+        return;
+    }
+    if let Some(object) = body.as_object_mut() {
+        let betas = object
+            .entry("betas")
+            .or_insert_with(|| Value::Array(Default::default()));
+        if let Some(array) = betas.as_array_mut() {
+            if !array.iter().any(|v| v.as_str() == Some(KIMI_BETAS_DEFAULT)) {
+                array.push(Value::String(KIMI_BETAS_DEFAULT.to_owned()));
+            }
+        }
+    }
+}
+
+/// Kimi streaming body: `stream:true`, and for the Chat profile only inject
+/// `stream_options.include_usage` so every downstream Chat/Responses/Messages
+/// entry (even those that never asked) still gets usage.  The Messages beta
+/// profile gets no Chat-only `stream_options`.
+fn streaming_json_body(body: &Value, attempt: &PreparedAttempt) -> Value {
+    let mut body = body.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.insert("stream".to_owned(), Value::Bool(true));
+        if attempt.upstream_endpoint == "chat_completions" && attempt.upstream_protocol == "openai"
+        {
+            let options = object
+                .entry("stream_options")
+                .or_insert_with(|| Value::Object(Default::default()));
+            if let Some(options) = options.as_object_mut() {
+                options.insert("include_usage".to_owned(), Value::Bool(true));
+            }
+        }
+    }
+    ensure_messages_betas(&mut body, attempt);
+    body
+}
+
+/// Official Kimi Anthropic beta transport default (kimi-code kosong/anthropic).
+const KIMI_BETAS_DEFAULT: &str = "interleaved-thinking-2025-05-14";
 
 fn header_map(headers: &[(String, String)]) -> reqwest::header::HeaderMap {
     let mut map = reqwest::header::HeaderMap::new();

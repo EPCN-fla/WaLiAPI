@@ -15,7 +15,8 @@
 
 use crate::core::protocol_boundary::downstream_protocol;
 use crate::core::route_plan::{
-    resolve_upstream_model, GroupTier, RouteGroup, RouteGroupCandidate, RoutePlan,
+    resolve_upstream_model, AuthNonStreamFraming, GroupTier, RouteGroup, RouteGroupCandidate,
+    RoutePlan,
 };
 use crate::protocol::codec::{CodecRegistry, PreparedCodec};
 use crate::security::gate::AuditedRequest;
@@ -125,6 +126,12 @@ pub struct PreparedAttempt {
     /// Single source of truth for body / logs / stats (design 11.4).
     pub upstream_model: String,
     pub native_base_url: String,
+    /// Registered provider string for auth attempts (`codex`, `kimi`); `None`
+    /// for regular channels.  The executor never re-derives provider/framing.
+    pub auth_provider: Option<String>,
+    /// Non-stream framing frozen by RoutePlan for auth attempts; `None` for
+    /// channels.  The executor branches solely on this value.
+    pub auth_non_stream_framing: Option<AuthNonStreamFraming>,
     /// Compatibility label for persisted observability.  Runtime consumers use
     /// `prepared_codec` exclusively; this label is derived once at prepare time
     /// and is never used to select a decoder.
@@ -207,7 +214,9 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
     // group-level fields only mirror the first candidate.
     let upstream_protocol = candidate.upstream_protocol.as_str().to_string();
     let upstream_endpoint = candidate.upstream_endpoint.clone();
-    let native_base_url = candidate.candidate.native_base_url();
+    let native_base_url = candidate.native_base_url.clone();
+    let auth_provider = candidate.auth_provider.clone();
+    let auth_non_stream_framing = candidate.auth_non_stream_framing;
 
     // The typed matrix owns every route-plan protocol pair it understands,
     // including identity pairs.  A route-plan-approved Native candidate such
@@ -231,6 +240,8 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
                     upstream_endpoint,
                     upstream_model,
                     native_base_url,
+                    auth_provider,
+                    auth_non_stream_framing,
                     is_retry,
                     attempt_no,
                 ));
@@ -273,6 +284,8 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
                 upstream_endpoint,
                 upstream_model,
                 native_base_url,
+                auth_provider,
+                auth_non_stream_framing,
                 codec_version,
                 prepared_codec: Some(prepared.codec),
                 encoded_body: prepared.encoded_request,
@@ -291,6 +304,8 @@ pub fn build_prepared_attempt<R: Rng + ?Sized>(
             upstream_endpoint,
             upstream_model,
             native_base_url,
+            auth_provider,
+            auth_non_stream_framing,
             is_retry,
             attempt_no,
         )),
@@ -308,6 +323,8 @@ fn native_attempt(
     upstream_endpoint: String,
     upstream_model: String,
     native_base_url: String,
+    auth_provider: Option<String>,
+    auth_non_stream_framing: Option<AuthNonStreamFraming>,
     is_retry: bool,
     attempt_no: usize,
 ) -> PreparedAttempt {
@@ -324,6 +341,8 @@ fn native_attempt(
         upstream_endpoint,
         upstream_model,
         native_base_url,
+        auth_provider,
+        auth_non_stream_framing,
         codec_version: None,
         prepared_codec: None,
         encoded_body: body,

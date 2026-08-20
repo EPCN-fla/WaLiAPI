@@ -3,38 +3,6 @@
 use super::types::CodecId;
 use serde::Serialize;
 
-/// Stable, versioned identifier of the codec implementation.
-///
-/// The pair of functions (e.g. `chat_to_messages_v1`) share one codec version
-/// because the request encoder and the response decoder must be deployed
-/// together and always agree on semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-pub struct CodecVersion {
-    pub major: u32,
-    pub minor: u32,
-}
-
-impl CodecVersion {
-    pub const fn new(major: u32, minor: u32) -> Self {
-        Self { major, minor }
-    }
-    pub fn label(&self) -> String {
-        format!("{}.{}.0", self.major, self.minor)
-    }
-}
-
-/// Per-field audit status inside the report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FieldStatus {
-    /// The field was validated and mapped 1:1 with no information loss.
-    Preserved,
-    /// A lossless annotation was stripped (e.g. Anthropic `cache_control`).
-    Normalized,
-    /// The field was rejected with an error before any upstream access.
-    Rejected,
-}
-
 /// What the codec did to the request/response it converted.
 /// Token usage observed from a real upstream response.
 ///
@@ -70,12 +38,6 @@ pub struct RejectedReportEntry {
 }
 
 impl ConversionReport {
-    /// Legacy constructor. New preparation code must record its selected codec
-    /// with [`Self::for_codec`].
-    pub fn new(rejected: Vec<RejectedReportEntry>, normalized: Vec<String>) -> Self {
-        Self::for_codec(CodecId::Native, rejected, normalized)
-    }
-
     pub fn for_codec(
         codec_id: CodecId,
         rejected: Vec<RejectedReportEntry>,
@@ -87,19 +49,8 @@ impl ConversionReport {
             codec_id,
         }
     }
-
-    pub fn ok() -> Self {
-        Self::for_codec(CodecId::Native, vec![], vec![])
-    }
 }
 
-/// Result of a request conversion: the encoded upstream body plus the report.
-#[derive(Debug, Clone)]
-pub struct ConvertedRequest {
-    pub encoded_request: serde_json::Value,
-    pub context: ConversionContext,
-    pub report: ConversionReport,
-}
 /// Context handed to the response decoder so the response can be expressed in
 /// the downstream protocol (message ids, mapped upstream model, stream flag).
 #[derive(Debug, Clone, Default, Serialize)]

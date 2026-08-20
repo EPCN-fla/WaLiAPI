@@ -1,4 +1,4 @@
-use super::{CodecId, CodecRegistry, Downstream, Protocol, Upstream, Version};
+use super::{CodecId, CodecRegistry, Protocol};
 use serde_json::json;
 
 #[test]
@@ -20,35 +20,6 @@ fn identity_replaces_only_the_mapped_model_and_reports_native() {
     assert_eq!(prepared.encoded_request["messages"], request["messages"]);
     assert_eq!(prepared.encoded_request["metadata"], request["metadata"]);
     assert_eq!(prepared.report.codec_id, CodecId::Native);
-}
-
-#[allow(deprecated)]
-#[test]
-fn legacy_prepare_signature_and_decoder_fields_remain_usable() {
-    let request = json!({
-        "model": "caller-model",
-        "messages": [{"role": "user", "content": "hello"}]
-    });
-    let prepared = CodecRegistry::prepare(
-        Downstream::ChatCompletions,
-        Upstream::Messages,
-        &Version::v1_0(),
-        "mapped-model",
-        &request,
-    )
-    .expect("legacy prepare must remain available");
-
-    assert_eq!(prepared.encoded_request["model"], "mapped-model");
-    let decoded = super::registry::NonStreamDecoder::decode(
-        &*prepared.non_stream,
-        &json!({
-            "id": "msg_1", "type": "message", "role": "assistant", "model": "mapped-model",
-            "content": [{"type": "text", "text": "hello"}], "stop_reason": "end_turn",
-            "usage": {"input_tokens": 2, "output_tokens": 1}
-        }),
-    )
-    .expect("legacy decoder adapter must decode");
-    assert_eq!(decoded["choices"][0]["message"]["content"], "hello");
 }
 
 #[test]

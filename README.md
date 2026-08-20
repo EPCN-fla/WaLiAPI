@@ -4,7 +4,7 @@
 
 ### 本地 LLM API 网关 · 多协议接入 · 知识库 RAG · MCP 工具服务
 
-[![Version](https://img.shields.io/badge/version-0.1.9-blue.svg)](./src-tauri/tauri.conf.json)
+[![Version](https://img.shields.io/badge/version-0.2.1-blue.svg)](./src-tauri/tauri.conf.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)](#-安装使用)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app)
@@ -40,8 +40,8 @@
 
 | | 贡献者 | GitHub | 提交 | 代码变更 | 主要贡献 |
 |:---:|:---|:---|:---:|:---|:---|
-| 🏆 | **小傅哥** | [@fuzhengwei](https://github.com/fuzhengwei) | 217 | `+73,838 / -15,280` | 项目创建者 · 核心架构 · 多渠道网关 · 协议转换 · 安全审计 · 知识库引擎 · Wiki 知识引擎 · MCP Server |
-| ⚡ | **xian** | [@zsxink](https://github.com/zsxink) | 95 | `+70,112 / -9,074` | Anthropic Messages 协议兼容 · 渠道协议重构（T01-T14）· codec 加固 · SSRF 防护 · SSE 帧重组 · models 接口 |
+| 🏆 | **小傅哥** | [@fuzhengwei](https://github.com/fuzhengwei) | 234 | `+75,320 / -15,431` | 项目创建者 · 核心架构 · 多渠道网关 · 协议转换 · 安全审计 · 知识库引擎 · Wiki 知识引擎 · MCP Server |
+| ⚡ | **xian** | [@zsxink](https://github.com/zsxink) | 128 | `+92,693 / -23,802` | Anthropic Messages 协议兼容 · 渠道协议重构（T01-T14）· codec 加固 · SSRF 防护 · SSE 帧重组 · models 接口 · Kimi Code Auth · protocol 模块结构化重构 |
 | 🔧 | **mw** | [@maowei0427](https://github.com/maowei0427) | 6 | `+1,105 / -197` | 日志响应内容记录 · Trace ID 追踪 · 详情页体验优化 · 知识库 embedding 批次配置 |
 | 🐛 | **lianggq** | [@GQingL](https://github.com/GQingL) | 1 | `+91 / -9` | 日志日期筛选修复 · macOS 渠道删除按钮修复 |
 
@@ -390,12 +390,16 @@ WaLiAPI/
 │   │   │   ├── deepseek.rs           # DeepSeek 适配器
 │   │   │   ├── gemini.rs             # Gemini 适配器
 │   │   │   └── custom.rs            # 自定义适配器
-│   │   ├── protocol/                 # 协议转换层
+│   │   ├── protocol/                 # 协议转换层 (v0.2.1 结构化重构)
 │   │   │   ├── mod.rs                # 双向格式转换
 │   │   │   ├── sse_bridge.rs         # SSE 流桥接 (字节级重组 · CJK 安全)
-│   │   │   ├── codec/                # 编解码器
-│   │   │   │   ├── chat_messages_codec.rs  # Chat↔Messages 严格 codec
-│   │   │   │   └── messages.rs       # Anthropic Messages 转换
+│   │   │   ├── codec/                # 编解码器 (目录化)
+│   │   │   │   ├── chat/             # Chat 协议编解码
+│   │   │   │   ├── messages/         # Anthropic Messages 编解码
+│   │   │   │   ├── responses_codec/  # Responses API 编解码
+│   │   │   │   └── directions/       # 跨协议方向转换
+│   │   │   │       ├── messages_to_responses/
+│   │   │   │       └── responses_to_messages/
 │   │   │   └── responses.rs          # Responses SSE 流式
 │   │   ├── core/                     # 核心逻辑
 │   │   │   ├── proxy.rs              # 代理转发 + 安全扫描 + 重试
@@ -408,7 +412,11 @@ WaLiAPI/
 │   │   │       ├── service.rs        # Auth 服务
 │   │   │       ├── maintenance.rs    # Token 维护/刷新
 │   │   │       ├── codex_login.rs    # Codex 登录流程
-│   │   │       └── codex_backend.rs  # Codex 后端对接
+│   │   │       ├── codex_backend.rs  # Codex 后端对接
+│   │   │       ├── kimi_login.rs     # Kimi 设备 OAuth 登录
+│   │   │       ├── kimi_backend.rs   # Kimi 后端对接
+│   │   │       ├── spec.rs           # Provider 元数据与协议快照
+│   │   │       └── types.rs          # Auth 通用类型
 │   │   ├── security/                 # 安全审计
 │   │   │   ├── scanner.rs            # 风险扫描引擎
 │   │   │   ├── rules.rs              # 规则定义
@@ -469,6 +477,41 @@ WaLiAPI/
 ---
 
 ## 📌 版本历史
+
+### v0.2.1 (2026-08-18)
+
+#### 协议转换层结构化重构
+
+- 🔧 **protocol 模块目录化**：将 protocol 根转换逻辑拆分为独立子模块——codec/chat、codec/messages、codec/responses_codec、directions（messages_to_responses / responses_to_messages），每个方向独立 encode/decode/stream/test，消除 1500 行巨型文件
+- 🔧 **死代码清理与 API 收敛**：清理 protocol 模块遗留 API 和死代码，clippy 告警归零，完成模块结构与 re-export 审计
+- 🔧 **codec 加固**：移植 tool-call 回放保留空 reasoning_content 兼容性优化，修复测试编译问题，全仓 cargo fmt 格式化
+
+#### Kimi Code Auth 账号接入
+
+- ✨ **Kimi 设备 OAuth 登录**：实现 Kimi 设备授权流程（device code → 授权 → token），支持 token 自动刷新
+- ✨ **Provider 中立认证框架**：新增 provider metadata + model protocol snapshot，支持多登录方式扩展
+- ✨ **认证路由集成**：model-level auth profiles 传入 prepared attempts，executor 注册 Kimi 认证尝试
+- ✨ **登录会话管理**：provider-neutral login sessions and commands，通用 login context 与 locked replacement 持久化
+- ✨ **协议感知模型发现**：Kimi 后端协议感知的模型发现与注册
+- ✨ **前端 Auth 面板**：Kimi auth login UI + provider-aware accounts 页面
+- 🐛 **402 订阅无效终态处理**：402 订阅无效分为终态，不再 12h 死循环重试
+- 🐛 **令牌失效原因记录**：invalidation_reason 记录并透出到 DTO，失效账号卡片显示具体失效原因
+- 🐛 **渠道页账号过滤修复**：渠道页按 provider 过滤账号卡片，不再混显
+- ✅ **测试覆盖**：Kimi routing replacement refresh 与协议流程测试
+
+#### 审计日志流式响应修复
+
+- 🐛 **流式响应内容记录修复**：流式请求的审计日志中 `response_choices` 字段此前始终为空，现已正确记录响应内容（content / reasoning_content / tool_calls），与非流式路径行为一致
+- 🔧 **多协议流式累积**：新增 SSE 事件解析器，支持三种流式协议的响应内容累积：
+  - OpenAI Chat Completions（`choices[].delta.content` / `reasoning_content` / `tool_calls`）
+  - Anthropic Messages（`content_block_delta` 的 `text_delta` / `thinking_delta` / `input_json_delta`）
+  - OpenAI Responses API（`response.output_text.delta` / `response.completed`）
+- 🔧 **StreamPumpCore 扩展**：新增 `accumulated_reasoning`、`response_role`、`finish_reason`、`tool_calls_map` 字段，`build_response_choices()` 方法从累积内容构建标准 JSON
+
+#### 其他
+
+- 121 个文件变更，+22,616 / -14,462 行代码
+- 版本号统一升级至 0.2.1（package.json / Cargo.toml / tauri.conf.json）
 
 ### v0.1.9 (2026-08-13)
 
