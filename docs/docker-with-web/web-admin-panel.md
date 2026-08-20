@@ -28,17 +28,18 @@ waliapi-web（headless 进程, :8777）
 
 ## 启动方式
 
-### 桌面版（默认不启动内嵌服务）
+### 桌面版（自动启动服务 + 桌面窗口，不含 Web 管理面板）
 
 ```bash
-waliapi        # 桌面窗口；内嵌服务默认不启动
+waliapi        # 桌面窗口；启动时自动拉起内嵌后端服务（网关 + /admin/api）
 ```
 
-桌面版默认**不启动** HTTP 服务（网关 + Web 面板）。需要时在「设置 → 服务配置」勾选「随应用启动内嵌服务」，或点「重启服务」手动启动一次。
+桌面版包含桌面前端 + 后端服务，启动即自动运行。**Web 管理面板 SPA 不随桌面版提供**（桌面构建不含 `embed-web`，浏览器访问桌面实例的 `/` 返回 404）；如需浏览器管理，请使用 `waliapi-web` 或 Docker。
 
 ### 独立 Web 服务（headless）
 
 ```bash
+waliapi-web                                    # 直接启动（无需子命令）
 waliapi-web start [--host 0.0.0.0] [--port 8777] [--data-dir /data]
 ```
 
@@ -46,6 +47,8 @@ waliapi-web start [--host 0.0.0.0] [--port 8777] [--data-dir /data]
 数据目录缺省解析：`--data-dir` > `WALIAPI_DATA_DIR` > `$XDG_DATA_HOME/waliapi.xiaofuge.cn` > 平台应用数据目录（与桌面端一致，数据互通）。
 
 ### Docker（默认启动 Web 服务）
+
+镜像内只含 `waliapi-web`（`ENTRYPOINT ["waliapi-web"] CMD ["start"]`），`docker run` 无需任何参数即启动完整服务（后端 + Web 管理面板），不含桌面前端与显示服务器。
 
 ```bash
 docker build -t waliapi:local .
