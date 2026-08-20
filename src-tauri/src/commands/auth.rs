@@ -188,7 +188,11 @@ pub struct LoginSessions {
 }
 
 struct SessionLoginRuntime {
-    inner: TauriLoginRuntime,
+    /// Desktop-only browser opener; headless builds have no shell to open a
+    /// browser with, so device-code flows rely on the URL + code already
+    /// surfaced in the polled session status.
+    #[cfg(feature = "desktop-ui")]
+    inner: Option<TauriLoginRuntime>,
     sessions: Arc<LoginSessions>,
     session_id: String,
     cancellation: watch::Receiver<bool>,
@@ -197,12 +201,19 @@ struct SessionLoginRuntime {
 #[async_trait::async_trait]
 impl LoginRuntime for SessionLoginRuntime {
     async fn open_browser(&self, url: &str) -> Result<(), ProviderError> {
-        self.inner.open_browser(url).await?;
-        // This is an actual opener success, not a timer-driven estimate.
-        self.sessions
-            .set_step(&self.session_id, LoginStep::Authorizing.as_str())
-            .await;
-        Ok(())
+        #[cfg(feature = "desktop-ui")]
+        if let Some(inner) = &self.inner {
+            inner.open_browser(url).await?;
+            // This is an actual opener success, not a timer-driven estimate.
+            self.sessions
+                .set_step(&self.session_id, LoginStep::Authorizing.as_str())
+                .await;
+            return Ok(());
+        }
+        // Headless (or no shell handle): opening a browser on the server is
+        // impossible/undesired; the user authorizes manually on any device.
+        // Kimi treats this failure as non-fatal by design.
+        Err(ProviderError::BrowserOpenFailed)
     }
 
     async fn set_step(&self, step: LoginStep) {
@@ -503,11 +514,16 @@ async fn run_provider_login_session(
     provider: ProviderKind,
     target: crate::auth_provider::LoginTarget,
     cancellation: watch::Receiver<bool>,
-    app: tauri::AppHandle,
+    app: Option<tauri::AppHandle>,
     service: Arc<crate::auth_provider::service::AuthService>,
 ) {
+    // Headless builds never construct the desktop opener; the AppHandle is
+    // only meaningful when the desktop shell exists.
+    #[cfg(not(feature = "desktop-ui"))]
+    let _ = &app;
     let runtime = SessionLoginRuntime {
-        inner: TauriLoginRuntime::new(app),
+        #[cfg(feature = "desktop-ui")]
+        inner: app.map(TauriLoginRuntime::new),
         sessions: sessions.clone(),
         session_id: session_id.clone(),
         cancellation,
@@ -669,6 +685,51 @@ pub async fn auth_providers_list() -> Result<Vec<AuthProviderDto>, String> {
         .collect())
 }
 
+/// Pure gate: browser-callback OAuth needs the desktop shell (loopback
+/// listener + system browser); device-code providers also work headless
+/// because the verification URL + user code travel through the polled
+/// session status instead.
+fn login_requires_desktop_shell(kind: &ProviderKind) -> bool {
+    crate::auth_provider::spec::provider_spec(kind)
+        .is_some_and(|spec| spec.login_mode == crate::auth_provider::AuthLoginMode::BrowserCallback)
+}
+
+/// Shared core behind the `auth_login_start` command and the headless admin
+/// dispatch.  `app` is the desktop shell handle; headless callers pass `None`,
+/// which restricts the flow to device-code providers.
+pub(crate) async fn auth_login_start_with(
+    provider: String,
+    replace_account_id: Option<String>,
+    app: Option<tauri::AppHandle>,
+    state: &Arc<AppState>,
+) -> Result<AuthLoginStart, String> {
+    let kind = provider_kind(Some(provider))?;
+    if app.is_none() && login_requires_desktop_shell(&kind) {
+        return Err("OAuth 登录仅桌面版可用，请使用 auth.json 导入".to_string());
+    }
+    // Validate the local account id syntactically before spawning so a bad id
+    // fails the command (not a background task).  The payload is never touched.
+    let target = match replace_account_id {
+        Some(id) => {
+            validate_account_id(&id)?;
+            crate::auth_provider::LoginTarget::Replace {
+                local_account_id: id,
+            }
+        }
+        None => crate::auth_provider::LoginTarget::New,
+    };
+    let provider_name = kind.to_string();
+    let (session_id, cancellation) = state.login_sessions.start(&provider_name).await;
+    let sessions = state.login_sessions.clone();
+    let service = state.auth_service.clone();
+    let task_id = session_id.clone();
+    tauri::async_runtime::spawn(async move {
+        run_provider_login_session(sessions, task_id, kind, target, cancellation, app, service)
+            .await;
+    });
+    Ok(AuthLoginStart { session_id })
+}
+
 #[tauri::command]
 pub async fn auth_login_start(
     provider: String,
@@ -676,36 +737,7 @@ pub async fn auth_login_start(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<AuthLoginStart, String> {
-    #[cfg(not(feature = "desktop-ui"))]
-    {
-        let _ = (&provider, &replace_account_id, &app, &state);
-        return Err("OAuth 登录仅桌面版可用，请使用 auth.json 导入".to_string());
-    }
-    #[cfg(feature = "desktop-ui")]
-    {
-        let kind = provider_kind(Some(provider))?;
-        // Validate the local account id syntactically before spawning so a bad id
-        // fails the command (not a background task).  The payload is never touched.
-        let target = match replace_account_id {
-            Some(id) => {
-                validate_account_id(&id)?;
-                crate::auth_provider::LoginTarget::Replace {
-                    local_account_id: id,
-                }
-            }
-            None => crate::auth_provider::LoginTarget::New,
-        };
-        let provider_name = kind.to_string();
-        let (session_id, cancellation) = state.login_sessions.start(&provider_name).await;
-        let sessions = state.login_sessions.clone();
-        let service = state.auth_service.clone();
-        let task_id = session_id.clone();
-        tauri::async_runtime::spawn(async move {
-            run_provider_login_session(sessions, task_id, kind, target, cancellation, app, service)
-                .await;
-        });
-        Ok(AuthLoginStart { session_id })
-    }
+    auth_login_start_with(provider, replace_account_id, Some(app), state.inner()).await
 }
 
 #[tauri::command]
@@ -1143,6 +1175,15 @@ mod tests {
             ProviderKind::Codex
         );
         assert!(provider_kind(Some("nope".into())).is_err());
+    }
+
+    #[test]
+    fn login_shell_gate_only_blocks_browser_callback_providers() {
+        // Device-code providers (Kimi) must be allowed headless (Docker/web
+        // admin panel); browser-callback providers (Codex) still require the
+        // desktop shell for the loopback listener + system browser.
+        assert!(!login_requires_desktop_shell(&ProviderKind::Kimi));
+        assert!(login_requires_desktop_shell(&ProviderKind::Codex));
     }
 
     #[tokio::test]

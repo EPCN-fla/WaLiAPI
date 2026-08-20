@@ -459,21 +459,23 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         }
         #[cfg(not(feature = "desktop-ui"))]
         "auth_login" => Err("OAuth 登录仅桌面版可用，请使用 auth.json 导入".to_string()),
-        #[cfg(feature = "desktop-ui")]
+        // 设备码提供商（Kimi）无需桌面壳即可登录：verification URL + user code
+        // 通过轮询的会话状态下发；browser-callback 提供商仍在命令内按 app 缺失拒绝。
         "auth_login_start" => {
-            let app = desktop_app("OAuth 登录")?;
+            #[cfg(feature = "desktop-ui")]
+            let app = shared.desktop_app.cloned();
+            #[cfg(not(feature = "desktop-ui"))]
+            let app: Option<tauri::AppHandle> = None;
             to_json(
-                commands::auth::auth_login_start(
+                commands::auth::auth_login_start_with(
                     arg(&args, "provider")?,
                     arg(&args, "replaceAccountId")?,
-                    app.clone(),
-                    state,
+                    app,
+                    state.inner(),
                 )
                 .await,
             )
         }
-        #[cfg(not(feature = "desktop-ui"))]
-        "auth_login_start" => Err("OAuth 登录仅桌面版可用，请使用 auth.json 导入".to_string()),
         "auth_login_status" => {
             to_json(commands::auth::auth_login_status(arg(&args, "sessionId")?, state).await)
         }
