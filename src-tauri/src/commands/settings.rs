@@ -12,9 +12,6 @@ pub struct Settings {
     pub server_port: u16,
     #[serde(default = "default_host")]
     pub server_host: String,
-    /// 随应用启动内嵌服务（网关 + Web 面板）；桌面版默认 false。
-    #[serde(default = "default_false")]
-    pub auto_start_server: bool,
     #[serde(default = "default_theme")]
     pub ui_theme: String,
     #[serde(default = "default_language")]
@@ -87,7 +84,6 @@ impl Default for Settings {
         Settings {
             server_port: default_port(),
             server_host: default_host(),
-            auto_start_server: default_false(),
             ui_theme: default_theme(),
             ui_language: default_language(),
             minimize_to_tray: default_true(),
@@ -155,7 +151,6 @@ pub async fn get_settings(state: tauri::State<'_, Arc<AppState>>) -> Result<Sett
     let settings = Settings {
         server_port: get_u64(store, "server.port", 8777) as u16,
         server_host: get_str(store, "server.host", "127.0.0.1"),
-        auto_start_server: get_bool(store, "server.auto_start", false),
         ui_theme: get_str(store, "ui.theme", "dark"),
         ui_language: get_str(store, "ui.language", "zh-CN"),
         minimize_to_tray: get_bool(store, "general.minimize_to_tray", true),
@@ -185,7 +180,6 @@ pub async fn save_settings(
     state.settings.set_many(&[
         ("server.port".to_string(), serde_json::json!(settings.server_port)),
         ("server.host".to_string(), serde_json::json!(settings.server_host)),
-        ("server.auto_start".to_string(), serde_json::json!(settings.auto_start_server)),
         ("ui.theme".to_string(), serde_json::json!(settings.ui_theme)),
         ("ui.language".to_string(), serde_json::json!(settings.ui_language)),
         ("general.minimize_to_tray".to_string(), serde_json::json!(settings.minimize_to_tray)),
