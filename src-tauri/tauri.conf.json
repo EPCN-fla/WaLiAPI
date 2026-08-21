@@ -3,6 +3,7 @@
   "productName": "WaLiAPI",
   "version": "0.2.1",
   "identifier": "waliapi.xiaofuge.cn",
+  "mainBinaryName": "waliapi",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
