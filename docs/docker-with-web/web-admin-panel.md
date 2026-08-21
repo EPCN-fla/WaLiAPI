@@ -48,16 +48,180 @@ waliapi-web start [--host 0.0.0.0] [--port 8777] [--data-dir /data]
 
 ### Docker（默认启动 Web 服务）
 
-镜像内只含 `waliapi-web`（`ENTRYPOINT ["waliapi-web"] CMD ["start"]`），`docker run` 无需任何参数即启动完整服务（后端 + Web 管理面板），不含桌面前端与显示服务器。
+镜像内只含 `waliapi-web`（`ENTRYPOINT ["waliapi-web"] CMD ["start"]`），`docker run` 无需任何参数即启动完整服务（后端 + Web 管理面板），不含桌面前端与显示服务器。访问 `http://localhost:8777`。
 
 ```bash
 docker build -t waliapi:local .
 docker run -d -p 8777:8777 -v waliapi-data:/data --name waliapi waliapi:local
 ```
 
-镜像内只含 `waliapi-web`（`ENTRYPOINT ["waliapi-web"] CMD ["start"]`），不含桌面前端与显示服务器。访问 `http://localhost:8777`。
+#### 构建参考（阿里源加速）
 
-docker-compose（HTTPS）：`cd docs/docker-with-web && docker compose up -d`，访问 `https://<host>:8443`。
+```bash
+docker build --build-arg NODE_IMAGE=docker.m.daocloud.io/library/node:22-bookworm --build-arg RUNTIME_IMAGE=docker.m.daocloud.io/library/debian:bookworm-slim --build-arg DEBIAN_MIRROR=http://mirrors.aliyun.com/debian --build-arg DEBIAN_SECURITY_MIRROR=http://mirrors.aliyun.com/debian-security -t waliapi:local .
+```
+
+#### 镜像导出 / 导入（离线分发）
+
+```bash
+docker save waliapi:local -o waliapi.tar
+docker load -i waliapi.tar
+```
+
+#### docker-compose（HTTPS 反代）参考
+
+将以下两个文件保存到同一目录（另需同级 `certs/` 目录存放 `fullchain.pem` / `privkey.pem`），然后 `docker compose up -d`。
+
+`docker-compose.yml`（按实际需求修改 `ports`）：
+
+```yaml
+services:
+  waliapi:
+    image: waliapi:local
+    restart: unless-stopped
+    environment:
+      WALIAPI_SERVER_HOST: 0.0.0.0
+      WALIAPI_SERVER_PORT: 8777
+      XDG_DATA_HOME: /data
+      TZ: Asia/Shanghai
+    ports:
+      - "8777:8777"
+    volumes:
+      - waliapi-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8777/health >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      waliapi:
+        condition: service_healthy
+    ports:
+      - "8443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+
+networks:
+  default:
+    name: waliapi_network
+
+volumes:
+  waliapi-data:
+```
+
+`nginx.conf`（`/admin/api/` 已关闭代理缓冲以支持 SSE 事件桥；按实际域名修改 `server_name`）：
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+upstream waliapi_api {
+    server waliapi:8777;
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name yourdomain.com;
+
+    ssl_certificate /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    client_max_body_size 50m;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+
+    location ^~ /v1/ {
+        proxy_pass http://waliapi_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header Connection "";
+    }
+
+    location = /health {
+        proxy_pass http://waliapi_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header Connection "";
+    }
+
+    location ^~ /mcp {
+        proxy_pass http://waliapi_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header Connection "";
+    }
+
+    location ^~ /admin/api/ {
+        proxy_pass http://waliapi_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header Connection "";
+        # SSE 事件桥（/admin/api/events）需要关闭代理缓冲
+        proxy_buffering off;
+        proxy_cache off;
+    }
+
+    location / {
+        proxy_pass http://waliapi_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header Connection "";
+    }
+}
+```
+
+#### 常用命令：
+
+```bash
+docker compose up -d                  # 启动
+docker compose up -d --force-recreate # 强制重建
+docker compose logs -f waliapi nginx  # 跟踪日志
+docker compose down                   # 停止并移除
+```
+
+#### 访问地址（按实际部署调整）：
+
+- 公网 API: `https://yourdomain.com/health`
+- 局域网 API: `https://lanip:8443/health`
+- Web 管理面板: `https://lanip:8443/`（或直连 `http://lanip:8777`）
+
+#### 备注：
+
+- 管理面板随 API 同源开放，无独立 UI 端口；首次登录的临时密码见 `docker logs waliapi` 或容器内 `/data/waliapi.xiaofuge.cn/INITIAL_PASSWORD`。
+- 如果 `443` 端口已被占用，先改宿主端口映射，再同步调整穿透配置。
 
 ## 安全模型
 
@@ -100,7 +264,7 @@ cd web && pnpm dev
 ## 故障排查
 
 - **无法登录 / 忘记密码**：`docker exec -it waliapi sqlite3 /data/waliapi.xiaofuge.cn/waliapi.db "DELETE FROM admin_users;"`，重启容器后重新生成临时密码。
-- **SSE 进度不更新**：确认经 nginx 访问；`docker/nginx.conf` 已对 `/admin/api/` 关闭缓冲。浏览器直连 8777 时无此问题。
+- **SSE 进度不更新**：确认经 nginx 访问；上方 nginx 配置已对 `/admin/api/` 关闭缓冲。浏览器直连 8777 时无此问题。
 - **静态资源 404 / 白屏**：镜像是用 `--features embed-web` 构建的；本地 `cargo run` 需先 `cd web && pnpm build` 生成 `web/dist`，否则 `/` 返回 404。
 - **会话频繁失效**：会话存于内存，进程重启后需重新登录，属预期行为。
 - **CSRF 校验失败 (403)**：自定义脚本调用 `/admin/api` 时需加请求头 `X-Requested-With: XMLHttpRequest`。
