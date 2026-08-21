@@ -66,8 +66,17 @@ async fn main() {
     tracing_subscriber::fmt().init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // 帮助优先于参数路由：-h/--help（含 start 子命令后）打印用法并正常退出
+    let first = args.first().map(String::as_str);
+    let help_requested = matches!(first, Some("-h") | Some("--help"))
+        || (first == Some("start")
+            && matches!(args.get(1).map(String::as_str), Some("-h") | Some("--help")));
+    if help_requested {
+        print_usage();
+        return;
+    }
     // 不带参数、直接带选项（waliapi-web --port 9000）、或显式 start 子命令，均启动服务
-    let start_args: Option<&[String]> = match args.first().map(String::as_str) {
+    let start_args: Option<&[String]> = match first {
         None => Some(&[]),
         Some("start") => Some(&args[1..]),
         Some(flag) if flag.starts_with("--") => Some(&args[..]),
@@ -89,14 +98,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        None => match args.first().map(String::as_str) {
-            Some("-h") | Some("--help") => print_usage(),
-            Some(other) => {
-                eprintln!("未知命令: {other}\n");
-                print_usage();
-                std::process::exit(2);
-            }
-            None => unreachable!(),
-        },
+        None => {
+            // 帮助已在上方拦截；到这里的只会是非选项的未知子命令
+            let other = first.expect("start_args 为 None 时必存在首参数");
+            eprintln!("未知命令: {other}\n");
+            print_usage();
+            std::process::exit(2);
+        }
     }
 }
