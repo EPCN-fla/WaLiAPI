@@ -1042,7 +1042,11 @@ fn classify_channel(
             }
         }
         EndpointKind::Embeddings => {
-            if id.protocol == "openai" && has("embeddings") {
+            // 旧 Gemini 执行器固定调用 generateContent，无法发送 /embeddings。
+            if id.protocol == "openai"
+                && has("embeddings")
+                && id.legacy_executor_override.as_deref() != Some("gemini_native")
+            {
                 Some((
                     GroupTier::Native,
                     UpstreamProtocol::OpenAI,
@@ -1241,6 +1245,40 @@ pub fn authorize_and_plan_with_accounts<R: Rng + ?Sized>(
         return Err(PlanError::NoCandidateForModel(model.to_string()));
     }
     build_route_plan(endpoint, model, candidates, flags, body, rng)
+}
+
+/// 知识库内部建库/查询的 Embedding 路由入口，调用身份是受信任的内部服务。
+/// 不伪造 API Key，也不接受外部请求；外部调用仍必须先执行 authorize_and_plan。
+/// 模型匹配、显式端点能力、渠道身份和故障切换预算复用网关同一实现。
+pub(crate) fn plan_internal_embeddings<R: Rng + ?Sized>(
+    model: &str,
+    channels: &[Channel],
+    body: &Value,
+    rng: &mut R,
+) -> Result<RoutePlan, PlanError> {
+    if channels.is_empty() {
+        return Err(PlanError::NoChannels);
+    }
+    let candidates: Vec<_> = channels
+        .iter()
+        .filter(|channel| channel.status == 1 && channel_accepts_model(channel, model))
+        .map(|channel| RouteCandidate::Channel {
+            identity: resolve_channel_identity(&ChannelIdentityRow::from(channel)),
+            channel: channel.clone(),
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Err(PlanError::NoCandidateForModel(model.to_string()));
+    }
+    // Embeddings 只允许原生 OpenAI 端点，不受聊天协议转换或 Auth 账号偏好影响。
+    build_route_plan(
+        EndpointKind::Embeddings,
+        model,
+        candidates,
+        &FeatureFlags::default(),
+        body,
+        rng,
+    )
 }
 
 impl RoutePlan {

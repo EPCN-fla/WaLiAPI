@@ -328,18 +328,34 @@ async fn mcp_limits_tools_exposure_and_legacy_sessions() {
 }
 
 async fn mock_model(state: &AppState) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    mock_model_with_answer(state, "BCD").await
+}
+
+async fn mock_model_with_answer(
+    state: &AppState,
+    answer_text: &'static str,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    mock_model_with_delay(state, answer_text, std::time::Duration::ZERO).await
+}
+
+async fn mock_model_with_delay(
+    state: &AppState,
+    answer_text: &'static str,
+    embedding_delay: std::time::Duration,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let embed_calls = calls.clone();
     let chat_calls = calls.clone();
     let upstream = Router::new()
         .route("/v1/embeddings", post(move || { let calls = embed_calls.clone(); async move {
             calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(embedding_delay).await;
             Json(json!({"object":"list","data":[{"object":"embedding","index":0,"embedding":[1.0,0.0,0.0]}],"model":"embed-test","usage":{"prompt_tokens":7,"total_tokens":7}}))
         }}))
         .route("/v1/chat/completions", post(move |Json(body): Json<Value>| { let calls = chat_calls.clone(); async move {
             calls.fetch_add(1, Ordering::SeqCst);
             let system = body["messages"][0]["content"].as_str().unwrap_or("");
-            let answer = if system.contains("改写器") { "alpha" } else if system.contains("重排器") { "[1,0]" } else { "BCD" };
+            let answer = if system.contains("改写器") { "alpha" } else if system.contains("重排器") { "[1,0]" } else { answer_text };
             Json(json!({"id":"test-answer","object":"chat.completion","model":"chat-test","choices":[{"index":0,"message":{"role":"assistant","content":answer},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}))
         }}));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -536,8 +552,7 @@ async fn embedding_spend_is_checked_before_answer_generation() {
         .execute(&state.db.pool)
         .await
         .unwrap();
-    let input =
-        json!({"kb_id":first.id,"question":"alpha","model":"chat-test","search_mode":"vector"});
+    let input = json!({"kb_id":first.id,"question":"alpha","model":"chat-test","search_mode":"vector","diagnostics":true});
     let response = app
         .oneshot(json_request(
             "POST",
@@ -548,6 +563,11 @@ async fn embedding_spend_is_checked_before_answer_generation() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let result = body(response).await;
+    assert_eq!(result["error"]["stage"], "answer");
+    assert_eq!(result["error"]["code"], "quota_or_rate_limited");
+    assert_eq!(result["diagnostics"]["stages"][1]["status"], "passed");
+    assert_eq!(result["diagnostics"]["stages"][3]["status"], "failed");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     task.abort();
 }
@@ -590,5 +610,268 @@ async fn connection_test_checks_real_rest_and_mcp_authorization() {
     assert_eq!(result["rest_status"], 403);
     assert_eq!(result["rest_ok"], false);
     assert_eq!(result["mcp_ok"], false);
+    task.abort();
+}
+
+#[tokio::test]
+async fn rag_diagnostics_cover_real_stages_and_correlate_gateway_logs() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, calls, task) = mock_model(&state).await;
+    document(&state, &first.id, "alpha answer is BCD").await;
+    let input = json!({"kb_id":first.id,"question":"alpha","model":"chat-test","search_mode":"vector","diagnostics":true});
+    let mut request = json_request("POST", "/api/kb/ask", Some(&key.key), &input.to_string());
+    request
+        .headers_mut()
+        .insert("x-request-id", "sk-untrusted-client-value".parse().unwrap());
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = body(response).await;
+    assert_eq!(result["answer"], "BCD");
+    assert!(!result["sources"].as_array().unwrap().is_empty());
+    let diagnostics = &result["diagnostics"];
+    let request_id = diagnostics["request_id"].as_str().unwrap();
+    assert!(uuid::Uuid::parse_str(request_id).is_ok());
+    let stages = diagnostics["stages"].as_array().unwrap();
+    assert_eq!(
+        stages
+            .iter()
+            .map(|s| s["stage"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "permission",
+            "embedding",
+            "retrieval",
+            "answer",
+            "validation"
+        ]
+    );
+    assert!(stages
+        .iter()
+        .all(|s| s["status"] == "passed" && s["elapsed_ms"].is_u64()));
+    let logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs WHERE api_key_id = ? AND trace_id = ? AND status_code = 200")
+        .bind(&key.id).bind(request_id).fetch_one(&state.db.pool).await.unwrap();
+    assert_eq!(logs, 2, "诊断编号必须对应实际网关日志");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(!result.to_string().contains("sk-untrusted-client-value"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn rag_diagnostics_identify_missing_embedding_capability_without_calling_upstream() {
+    let (state, key, first, _, app) = setup().await;
+    let (channel, calls, task) = mock_model(&state).await;
+    document(&state, &first.id, "alpha answer is BCD").await;
+    sqlx::query("UPDATE channels SET native_endpoints = '[\"chat_completions\"]' WHERE id = ?")
+        .bind(&channel)
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+    for mode in ["hybrid", "vector"] {
+        let input = json!({"kb_id":first.id,"question":"alpha","model":"chat-test","search_mode":mode,"diagnostics":true});
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/kb/ask",
+                Some(&key.key),
+                &input.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let result = body(response).await;
+        assert_eq!(result["error"]["stage"], "embedding");
+        assert_eq!(result["error"]["code"], "endpoint_not_configured");
+        assert_eq!(result["diagnostics"]["stages"][0]["status"], "passed");
+        assert_eq!(result["diagnostics"]["stages"][1]["status"], "failed");
+        let trace = result["error"]["request_id"].as_str().unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_logs WHERE trace_id = ? AND status_code = 501",
+        )
+        .bind(trace)
+        .fetch_one(&state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let input = json!({"kb_id":first.id,"question":"alpha","model":"chat-test","search_mode":"keyword","diagnostics":true});
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/api/kb/ask",
+            Some(&key.key),
+            &input.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = body(response).await;
+    assert_eq!(result["diagnostics"]["stages"][1]["stage"], "embedding");
+    assert_eq!(result["diagnostics"]["stages"][1]["status"], "skipped");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn rag_diagnostics_reject_empty_retrieval_without_changing_regular_ask() {
+    let (_, key, first, _, app) = setup().await;
+    for diagnostics in [false, true] {
+        let input = json!({"kb_id":first.id,"question":"alpha","model":"chat-test","search_mode":"keyword","diagnostics":diagnostics});
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/kb/ask",
+                Some(&key.key),
+                &input.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if diagnostics {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::OK
+            }
+        );
+        let result = body(response).await;
+        if diagnostics {
+            assert_eq!(result["error"]["code"], "retrieval_empty");
+            assert_eq!(result["error"]["stage"], "retrieval");
+            assert_eq!(result["diagnostics"]["stages"][2]["status"], "failed");
+        } else {
+            assert!(result["sources"].as_array().unwrap().is_empty());
+            assert!(result.get("diagnostics").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn rag_diagnostics_reject_empty_answers_and_missing_sources() {
+    for (answer_text, history, content, expected_status, expected_code) in [
+        (
+            "   ",
+            "",
+            "alpha answer is BCD",
+            StatusCode::BAD_GATEWAY,
+            "answer_empty",
+        ),
+        (
+            "BCD",
+            "x",
+            "alpha answer is BCD",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "sources_empty",
+        ),
+        (
+            "BCD",
+            "",
+            "   ",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "sources_empty",
+        ),
+    ] {
+        let (state, key, first, _, app) = setup().await;
+        let (_, calls, task) = mock_model_with_answer(&state, answer_text).await;
+        document(&state, &first.id, content).await;
+        let mut input = json!({"kb_id":first.id,"question":"alpha","model":"chat-test","search_mode":"vector","diagnostics":true});
+        if !history.is_empty() {
+            input["history"] = json!([{"role":"user","content":history.repeat(40000)}]);
+        }
+        let response = app
+            .oneshot(json_request(
+                "POST",
+                "/api/kb/ask",
+                Some(&key.key),
+                &input.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status);
+        let result = body(response).await;
+        assert_eq!(result["error"]["code"], expected_code);
+        assert_eq!(result["error"]["stage"], "validation");
+        assert_eq!(result["diagnostics"]["stages"][4]["status"], "failed");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn rag_regular_ask_preserves_empty_answer_while_diagnostics_rejects_it() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, _, task) = mock_model_with_answer(&state, "").await;
+    document(&state, &first.id, "alpha answer is BCD").await;
+    for diagnostics in [false, true] {
+        let input = json!({"kb_id":first.id,"question":"alpha","model":"chat-test","search_mode":"vector","diagnostics":diagnostics});
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/kb/ask",
+                Some(&key.key),
+                &input.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if diagnostics {
+                StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::OK
+            }
+        );
+        let result = body(response).await;
+        if diagnostics {
+            assert_eq!(result["error"]["code"], "answer_empty");
+        } else {
+            assert_eq!(result["answer"], "");
+        }
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn rag_diagnostics_identify_real_upstream_timeout_without_changing_status() {
+    let (state, key, first, _, app) = setup().await;
+    let (channel, calls, task) =
+        mock_model_with_delay(&state, "BCD", std::time::Duration::from_secs(3)).await;
+    sqlx::query("UPDATE channels SET timeout_secs = 1 WHERE id = ?")
+        .bind(channel)
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+    state
+        .settings
+        .set_many(&[("retry.enabled".into(), json!(false))])
+        .unwrap();
+    document(&state, &first.id, "alpha answer is BCD").await;
+    let input = json!({"kb_id":first.id,"question":"alpha","model":"chat-test","search_mode":"vector","diagnostics":true});
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/api/kb/ask",
+            Some(&key.key),
+            &input.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let result = body(response).await;
+    assert_eq!(result["error"]["stage"], "embedding");
+    assert_eq!(result["error"]["code"], "model_timeout");
+    assert_eq!(result["diagnostics"]["stages"][1]["status"], "failed");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "关闭重试后只进行一次真实模型请求"
+    );
+    let request_id = result["error"]["request_id"].as_str().unwrap();
+    let logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs WHERE api_key_id = ? AND trace_id = ? AND status_code = 502")
+        .bind(&key.id).bind(request_id).fetch_one(&state.db.pool).await.unwrap();
+    assert_eq!(logs, 1);
     task.abort();
 }

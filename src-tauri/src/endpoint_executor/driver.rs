@@ -77,7 +77,7 @@ fn extract_reasoning_effort(audited: &AuditedRequest) -> Option<String> {
 /// weighted sampling without replacement.  The returned `Channel` copies are
 /// intentionally request-local: credential values never enter PreparedAttempt,
 /// request logs, or tracing fields.
-async fn channel_key_slots(channel: &Channel, repo: &Arc<Repository>) -> Vec<Channel> {
+async fn channel_key_slots(channel: &Channel, repo: &Repository) -> Vec<Channel> {
     let extra_keys = match repo.get_channel_api_keys(&channel.id).await {
         Ok(keys) => keys
             .into_iter()
@@ -127,14 +127,14 @@ async fn channel_key_slots(channel: &Channel, repo: &Arc<Repository>) -> Vec<Cha
 /// Try every frozen credential slot only while the failure is retryable.
 /// This makes capacity envelopes useful for a channel with multiple keys while
 /// retaining the route planner's terminal/auth boundaries.
-async fn dispatch_channel_with_key_failover(
+pub(crate) async fn dispatch_channel_with_key_failover(
     endpoint: EndpointKind,
     attempt: &crate::core::attempt::PreparedAttempt,
     channel: &Channel,
     identity: &crate::core::channel_identity::ChannelIdentity,
     safe_headers: &[(String, String)],
     query: Option<&str>,
-    repo: &Arc<Repository>,
+    repo: &Repository,
 ) -> crate::core::attempt::AttemptResult {
     let slots = channel_key_slots(channel, repo).await;
     let mut last = None;
@@ -207,8 +207,8 @@ fn affects_mode_health(failure: &AttemptFailure) -> bool {
                 .starts_with("upstream first frame could not be converted"))
 }
 
-async fn record_channel_mode_outcome(
-    repo: &Arc<Repository>,
+pub(crate) async fn record_channel_mode_outcome(
+    repo: &Repository,
     channel_id: &str,
     endpoint: &str,
     is_stream: bool,
@@ -410,6 +410,15 @@ pub(crate) async fn route_plan_response_with_auth_service(
     let mut builder = axum::response::Response::builder()
         .status(code)
         .header(header::CONTENT_TYPE, "application/json");
+    // 只使用执行器的类型化失败原因，不从上游正文/自定义错误码猜测超时。
+    // 耗尽预算后的 HTTP 仍由 AttemptFlow 决定（Retryable => 502）。
+    if execution.last_failure.as_ref().is_some_and(|failure| {
+        failure.failure_class == FailureClass::Retryable && failure.status_code == Some(504)
+    }) {
+        builder = builder.extension(
+            crate::services::knowledge::model_client::GatewayFailureCode("model_timeout"),
+        );
+    }
     for (name, value) in &execution.response_headers {
         if name.eq_ignore_ascii_case("content-type")
             || name.eq_ignore_ascii_case("content-length")

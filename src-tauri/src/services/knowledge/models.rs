@@ -117,6 +117,22 @@ pub struct RagAnswer {
     pub usage: Option<UsageInfo>,
     #[serde(default)]
     pub retrieval_details: Option<Vec<RetrievalDetail>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<RagDiagnostics>,
+}
+
+/// 仅显式诊断请求返回阶段结果，不包含提示词、渠道地址或凭据。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RagDiagnostics {
+    pub request_id: String,
+    pub stages: Vec<RagDiagnosticStage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RagDiagnosticStage {
+    pub stage: String,
+    pub status: String,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +217,9 @@ pub struct AskInput {
     pub keyword_weight: Option<f32>,
     #[serde(default)]
     pub search_mode: Option<String>,
+    /// 启用严格健康检测：必须有检索片段、有效答案和来源。
+    #[serde(default)]
+    pub diagnostics: bool,
 }
 
 fn default_top_k() -> usize {

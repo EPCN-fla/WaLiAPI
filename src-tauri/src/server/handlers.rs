@@ -189,15 +189,21 @@ async fn maybe_route_plan(
                 )
                 .await;
             }
-            return Ok(Some(
-                (
-                    StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
-                    Json(serde_json::json!({
-                        "error": { "message": e.message(), "type": "route_plan_error", "code": code }
-                    })),
-                )
-                    .into_response(),
-            ));
+            let mut response = (
+                StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
+                Json(serde_json::json!({
+                    "error": { "message": e.message(), "type": "route_plan_error", "code": code }
+                })),
+            )
+                .into_response();
+            if matches!(e, route_plan::PlanError::NoEndpointSupported(..)) {
+                response.extensions_mut().insert(
+                    crate::services::knowledge::model_client::GatewayFailureCode(
+                        "endpoint_not_configured",
+                    ),
+                );
+            }
+            return Ok(Some(response));
         }
     };
     // GAP-08：重试策略设置对主路径生效——映射为 RoutePlan 尝试预算（组内
@@ -5114,6 +5120,7 @@ mod list_models_tests {
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         let repo = Repository::new(pool.clone());
         repo.create_channel(&CreateChannelInput {
+            test_models: None,
             model_mapping_disabled: None,
             // v0.3.3 为该结构体新增了自定义请求头字段，测试构造点需同步补齐。
             request_headers: None,

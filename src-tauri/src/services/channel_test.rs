@@ -31,7 +31,7 @@ use crate::endpoint_executor::dispatch_executor;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -83,6 +83,9 @@ pub struct DraftChannelTestInput {
     #[serde(default)]
     pub clear_api_key: Option<bool>,
     pub models: Vec<String>,
+    /// 按端点选择本次探测模型；仅用于测试与保存回执校验，不持久化。
+    #[serde(default)]
+    pub test_models: Option<BTreeMap<String, String>>,
     pub priority: Option<i64>,
     pub weight: Option<i64>,
     pub config: Option<Value>,
@@ -154,6 +157,55 @@ pub fn compute_draft_fingerprint(
     hex::encode(h.finalize())
 }
 
+/// 将有序的端点模型选择绑定到回执；无选择时保留旧客户端的指纹语义。
+fn fingerprint_with_test_models(
+    fingerprint: String,
+    test_models: Option<&BTreeMap<String, String>>,
+) -> String {
+    let Some(models) = test_models.filter(|models| !models.is_empty()) else {
+        return fingerprint;
+    };
+    let mut h = Sha256::new();
+    h.update(fingerprint.as_bytes());
+    h.update(b"\ntest_models\n");
+    h.update(serde_json::to_vec(models).expect("string map is serializable"));
+    hex::encode(h.finalize())
+}
+
+/// 混合聊天/向量渠道不能推断模型能力，必须由调用者明确选择探测模型。
+fn resolve_test_models(
+    endpoints: &[String],
+    models: &[String],
+    selected: Option<&BTreeMap<String, String>>,
+) -> Result<BTreeMap<String, String>, String> {
+    if let Some(selected) = selected {
+        for (endpoint, model) in selected {
+            if !endpoints.contains(endpoint) {
+                return Err(format!("测试模型指定了未勾选的端点：{endpoint}"));
+            }
+            if !models.contains(model) {
+                return Err(format!("端点 {endpoint} 的测试模型必须属于当前模型列表"));
+            }
+        }
+    }
+    let mixed = models.len() > 1
+        && endpoints.iter().any(|ep| ep == "embeddings")
+        && endpoints.iter().any(|ep| ep != "embeddings");
+    let mut resolved = BTreeMap::new();
+    for endpoint in endpoints {
+        if let Some(model) = selected.and_then(|selected| selected.get(endpoint)) {
+            resolved.insert(endpoint.clone(), model.clone());
+        } else if mixed {
+            return Err(format!(
+                "聊天与 Embeddings 混合渠道请为端点 {endpoint} 选择测试模型"
+            ));
+        } else if let Some(model) = models.first() {
+            resolved.insert(endpoint.clone(), model.clone());
+        }
+    }
+    Ok(resolved)
+}
+
 // ---------------------------------------------------------------------------
 // Draft identity (mirrors the repository's plan_channel_identity semantics)
 // ---------------------------------------------------------------------------
@@ -220,6 +272,7 @@ pub fn fingerprint_for_draft(
     legacy_base_url: &str,
     config: &Value,
     legacy_override: Option<&str>,
+    test_models: Option<&BTreeMap<String, String>>,
 ) -> String {
     let identity = build_draft_identity(
         &protocol.map(|s| s.to_string()),
@@ -231,7 +284,7 @@ pub fn fingerprint_for_draft(
         config,
         &legacy_override.map(|s| s.to_string()),
     );
-    compute_draft_fingerprint(
+    let fingerprint = compute_draft_fingerprint(
         &identity.protocol,
         &identity.provider,
         &identity.native_base_url,
@@ -239,7 +292,8 @@ pub fn fingerprint_for_draft(
         models,
         timeout_secs,
         api_key,
-    )
+    );
+    fingerprint_with_test_models(fingerprint, test_models)
 }
 
 // ---------------------------------------------------------------------------
@@ -419,9 +473,9 @@ pub async fn resolve_draft_api_key(
     Ok(String::new())
 }
 
-/// The minimal upstream probe request per endpoint (stream=false, first model,
+/// The minimal upstream probe request per endpoint (stream=false, selected model,
 /// minimum output).  These are REAL inference requests for Chat / Responses /
-/// Messages / /api/chat — never a `/models` substitute (T07 test strategy).
+/// Messages / Embeddings / /api/chat — never a `/models` substitute (T07 test strategy).
 fn probe_body(endpoint: &str, model: &str) -> Value {
     match endpoint {
         "chat_completions" => json!({
@@ -752,6 +806,21 @@ async fn probe_endpoint(
             &channel.api_key,
             true,
         ),
+        Ok(AttemptResult::Success(success))
+            if endpoint == "embeddings"
+                && super::knowledge::embedder::parse_embedding_response(&success.body, 1)
+                    .is_err() =>
+        {
+            failed_result(
+                endpoint,
+                Some(model),
+                "protocol",
+                "Embedding 响应缺少有效向量，请检查模型与端点是否匹配",
+                elapsed,
+                &channel.api_key,
+                true,
+            )
+        }
         Ok(AttemptResult::Success(_)) => DraftEndpointTestResult {
             endpoint: endpoint.to_string(),
             status: "passed".to_string(),
@@ -858,7 +927,7 @@ pub fn validate_save_receipt(
     };
     if recv_fp != computed_fingerprint || receipt.draft_fingerprint != computed_fingerprint {
         return Err(
-            "草稿已改变（protocol/provider/URL/模型/端点/Key/timeout 与测试时不一致），请重新测试后再保存"
+            "草稿已改变（protocol/provider/URL/模型/端点/测试模型/Key/timeout 与测试时不一致），请重新测试后再保存"
                 .to_string(),
         );
     }
@@ -931,7 +1000,7 @@ pub async fn run_draft_test(
     // 保存时 receipt 校验不会被误判为「草稿已改变」。
     endpoints.retain(|ep| ep != "count_tokens");
 
-    // OpenAI local rejection (T07): at least one of Chat / Responses must be
+    // OpenAI local rejection (T07): at least one supported endpoint must be
     // selected, otherwise reject WITHOUT testing.  The check honors the draft's
     // explicit endpoint list when present (an explicitly-empty list is a
     // rejection, never silently re-inferred).
@@ -942,21 +1011,23 @@ pub async fn run_draft_test(
             .unwrap_or_else(|| endpoints.clone());
         if !selected
             .iter()
-            .any(|e| e == "chat_completions" || e == "responses")
+            .any(|e| e == "chat_completions" || e == "responses" || e == "embeddings")
         {
             return Err(
-                "OpenAI 协议必须至少勾选 Chat Completions 或 Responses 才能测试".to_string(),
+                "OpenAI 协议必须至少勾选 Chat Completions、Responses 或 Embeddings 才能测试"
+                    .to_string(),
             );
         }
     }
 
     let models = normalize_models(&input.models);
+    let test_models = resolve_test_models(&endpoints, &models, input.test_models.as_ref())?;
     let channel = draft_channel(input, api_key, config.per_probe_timeout.as_secs() as i64);
 
     let probe_loop = async {
         let mut results = Vec::with_capacity(endpoints.len());
         for endpoint in &endpoints {
-            if models.is_empty() {
+            let Some(model) = test_models.get(endpoint) else {
                 results.push(DraftEndpointTestResult {
                     endpoint: endpoint.clone(),
                     status: "skipped".to_string(),
@@ -968,8 +1039,8 @@ pub async fn run_draft_test(
                     cost_possible: false,
                 });
                 continue;
-            }
-            results.push(probe_endpoint(endpoint, &identity, &channel, &models[0], config).await);
+            };
+            results.push(probe_endpoint(endpoint, &identity, &channel, model, config).await);
         }
         results
     };
@@ -985,7 +1056,7 @@ pub async fn run_draft_test(
                     category: Some("timeout".to_string()),
                     message: "测试总时间超过上限，已跳过后续端点".to_string(),
                     latency_ms: 0,
-                    tested_model: models.first().cloned(),
+                    tested_model: test_models.get(endpoint).cloned(),
                     cost_possible: false,
                 });
             }
@@ -1002,6 +1073,7 @@ pub async fn run_draft_test(
         input.timeout_secs.unwrap_or(60),
         api_key,
     );
+    let fingerprint = fingerprint_with_test_models(fingerprint, input.test_models.as_ref());
     let test_run_id = uuid::Uuid::new_v4().to_string();
     let tested_at = now_iso();
     let all_passed = !results.is_empty() && results.iter().all(|r| r.status == "passed");
@@ -1041,6 +1113,7 @@ mod channel_draft_test {
     struct CapturedRequest {
         path_and_query: String,
         headers: Vec<(String, String)>,
+        body: Value,
     }
 
     struct MockUpstream {
@@ -1127,6 +1200,8 @@ mod channel_draft_test {
                     recv.lock().await.push(CapturedRequest {
                         path_and_query,
                         headers,
+                        body: serde_json::from_slice(&buf[body_start..body_start + content_length])
+                            .unwrap_or(Value::Null),
                     });
                     let reason = if status == 200 { "OK" } else { "Error" };
                     let _ = socket
@@ -1202,6 +1277,7 @@ mod channel_draft_test {
             api_key: key.to_string(),
             clear_api_key: None,
             models: models.iter().map(|s| s.to_string()).collect(),
+            test_models: None,
             priority: None,
             weight: None,
             config: None,
@@ -1214,6 +1290,200 @@ mod channel_draft_test {
             preset_revision: None,
             legacy_executor_override: None,
         }
+    }
+
+    fn embedding_success() -> Vec<u8> {
+        br#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.25,0.75]}],"usage":{"prompt_tokens":1,"total_tokens":1}}"#.to_vec()
+    }
+
+    #[tokio::test]
+    async fn embeddings_only_channel_probes_and_has_valid_save_receipt() {
+        let mock = start_mock(|_| Box::pin(async { (200, embedding_success()) })).await;
+        let base = format!("http://{}/v1", mock.addr);
+        let input = draft(
+            "openai",
+            "custom",
+            &base,
+            &["embeddings"],
+            &["embed-model"],
+            "sk-test",
+        );
+        let store = store();
+        let result = run_draft_test(&input, "sk-test", &store, &cfg())
+            .await
+            .unwrap();
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].status, "passed");
+        let requests = mock.captured().await;
+        assert_eq!(requests[0].path_and_query, "/v1/embeddings");
+        assert_eq!(requests[0].body["model"], "embed-model");
+        assert!(requests[0].body.get("input").is_some());
+        validate_save_receipt(
+            &store,
+            Some(&result.test_run_id),
+            Some(&result.draft_fingerprint),
+            &result.draft_fingerprint,
+            false,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn embeddings_probe_rejects_success_status_without_valid_vector() {
+        let mock = start_mock(|_| {
+            Box::pin(async { (200, br#"{"data":[{"index":0,"embedding":[]}]}"#.to_vec()) })
+        })
+        .await;
+        let base = format!("http://{}/v1", mock.addr);
+        let input = draft(
+            "openai",
+            "custom",
+            &base,
+            &["embeddings"],
+            &["embed-model"],
+            "sk-test",
+        );
+        let store = store();
+        let result = run_draft_test(&input, "sk-test", &store, &cfg())
+            .await
+            .unwrap();
+        assert_eq!(result.results[0].status, "failed");
+        assert_eq!(result.results[0].category.as_deref(), Some("protocol"));
+        assert!(!store.lookup(&result.test_run_id).unwrap().all_passed);
+    }
+
+    #[tokio::test]
+    async fn mixed_endpoints_use_selected_models_and_bind_them_to_save_receipt() {
+        let mock = start_mock(|path| {
+            if path.ends_with("/embeddings") {
+                Box::pin(async { (200, embedding_success()) })
+            } else {
+                Box::pin(async { (200, openai_chat_success()) })
+            }
+        })
+        .await;
+        let base = format!("http://{}/v1", mock.addr);
+        let mut input = draft(
+            "openai",
+            "custom",
+            &base,
+            &["chat_completions", "embeddings"],
+            &["chat-model", "embed-model"],
+            "sk-test",
+        );
+        input.test_models = Some(BTreeMap::from([
+            ("chat_completions".into(), "chat-model".into()),
+            ("embeddings".into(), "embed-model".into()),
+        ]));
+        let store = store();
+        let result = run_draft_test(&input, "sk-test", &store, &cfg())
+            .await
+            .unwrap();
+        assert!(result
+            .results
+            .iter()
+            .all(|result| result.status == "passed"));
+        let requests = mock.captured().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests
+                .iter()
+                .find(|request| request.path_and_query.ends_with("/chat/completions"))
+                .unwrap()
+                .body["model"],
+            "chat-model"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .find(|request| request.path_and_query.ends_with("/embeddings"))
+                .unwrap()
+                .body["model"],
+            "embed-model"
+        );
+        let save_fingerprint = fingerprint_for_draft(
+            input.protocol.as_deref(),
+            input.provider.as_deref(),
+            input.native_base_url.as_deref(),
+            input.native_endpoints.as_deref(),
+            &input.models,
+            30,
+            "sk-test",
+            &input.channel_type,
+            &input.base_url,
+            &json!({}),
+            None,
+            input.test_models.as_ref(),
+        );
+        assert_eq!(result.draft_fingerprint, save_fingerprint);
+        validate_save_receipt(
+            &store,
+            Some(&result.test_run_id),
+            Some(&result.draft_fingerprint),
+            &save_fingerprint,
+            false,
+        )
+        .unwrap();
+        input
+            .test_models
+            .as_mut()
+            .unwrap()
+            .insert("embeddings".into(), "chat-model".into());
+        let changed = fingerprint_for_draft(
+            input.protocol.as_deref(),
+            input.provider.as_deref(),
+            input.native_base_url.as_deref(),
+            input.native_endpoints.as_deref(),
+            &input.models,
+            30,
+            "sk-test",
+            &input.channel_type,
+            &input.base_url,
+            &json!({}),
+            None,
+            input.test_models.as_ref(),
+        );
+        assert_ne!(save_fingerprint, changed);
+        assert!(validate_save_receipt(
+            &store,
+            Some(&result.test_run_id),
+            Some(&result.draft_fingerprint),
+            &changed,
+            true
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_or_ambiguous_test_models_are_rejected_before_upstream_request() {
+        let mock = start_mock(|_| Box::pin(async { (200, embedding_success()) })).await;
+        let base = format!("http://{}/v1", mock.addr);
+        let mut input = draft(
+            "openai",
+            "custom",
+            &base,
+            &["chat_completions", "embeddings"],
+            &["chat-model", "embed-model"],
+            "sk-test",
+        );
+        let ambiguous = run_draft_test(&input, "sk-test", &store(), &cfg())
+            .await
+            .unwrap_err();
+        assert!(ambiguous.contains("选择测试模型"));
+        input.test_models = Some(BTreeMap::from([(
+            "embeddings".into(),
+            "not-configured".into(),
+        )]));
+        let invalid = run_draft_test(&input, "sk-test", &store(), &cfg())
+            .await
+            .unwrap_err();
+        assert!(invalid.contains("必须属于当前模型列表"));
+        input.test_models = Some(BTreeMap::from([("responses".into(), "chat-model".into())]));
+        let inactive = run_draft_test(&input, "sk-test", &store(), &cfg())
+            .await
+            .unwrap_err();
+        assert!(inactive.contains("未勾选的端点"));
+        assert!(mock.captured().await.is_empty());
     }
 
     // --- dual-endpoint / per-endpoint probes ---
@@ -1664,6 +1934,7 @@ data: {"type":"message_stop"}
             "claude",
             "https://api.anthropic.com/v1",
             &json!({}),
+            None,
             None,
         );
         assert!(!fp.is_empty());

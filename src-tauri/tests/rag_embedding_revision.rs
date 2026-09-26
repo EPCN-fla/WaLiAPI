@@ -74,7 +74,9 @@ async fn model_switch_reembeds_unchanged_text_and_rebuilds_vector_space() {
         .create_channel(
             &serde_json::from_value(json!({
                 "name": "local-embedding-test", "type": "openai", "base_url": base_url,
-                "api_key": "test-only", "models": ["embed-a", "embed-b", "embed-c"]
+                "api_key": "test-only", "models": ["embed-a", "embed-b", "embed-c"],
+                "protocol": "openai", "provider": "custom", "native_base_url": base_url,
+                "native_endpoints": ["embeddings"]
             }))
             .unwrap(),
         )

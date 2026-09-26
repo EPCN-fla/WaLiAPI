@@ -181,6 +181,8 @@ async fn start_model(shared: &SharedState) -> tokio::task::JoinHandle<()> {
         .create_channel(
             &serde_json::from_value(json!({
                 "name":"search-mode-test", "type":"openai", "base_url":base_url,
+                "protocol":"openai", "provider":"custom", "native_base_url":base_url,
+                "native_endpoints":["embeddings"],
                 "api_key":"test-only", "models":["embed-test", "text-embedding-3-small"]
             }))
             .unwrap(),

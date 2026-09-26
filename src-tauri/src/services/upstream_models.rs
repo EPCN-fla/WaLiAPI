@@ -198,6 +198,7 @@ mod tests {
             api_key: "k".to_string(),
             clear_api_key: None,
             models: vec![],
+            test_models: None,
             priority: None,
             weight: None,
             config: Some(json!({})),

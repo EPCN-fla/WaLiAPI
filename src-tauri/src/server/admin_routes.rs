@@ -502,6 +502,16 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
             )
             .await,
         ),
+        "test_api_key_knowledge_health" => to_json(
+            commands::api_key::test_api_key_knowledge_health(
+                state,
+                arg(&args, "id")?,
+                arg(&args, "kbId")?,
+                arg(&args, "model")?,
+                arg(&args, "question")?,
+                arg(&args, "searchMode")?,
+            ).await,
+        ),
         "get_api_keys" => to_json(commands::api_key::get_api_keys(state).await),
         "get_api_key_full" => {
             to_json(commands::api_key::get_api_key_full(state, arg(&args, "id")?).await)
@@ -760,6 +770,9 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
         "get_knowledge_bases" => {
             to_json(commands::knowledge_base::get_knowledge_bases(state).await)
         }
+        "get_knowledge_embedding_capability" => to_json(
+            commands::knowledge_base::get_knowledge_embedding_capability(state, arg(&args, "model")?).await,
+        ),
         "create_knowledge_base" => to_json(
             commands::knowledge_base::create_knowledge_base(state, arg(&args, "input")?).await,
         ),

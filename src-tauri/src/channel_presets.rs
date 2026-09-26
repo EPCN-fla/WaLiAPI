@@ -261,7 +261,11 @@ fn model(id: &str, verified_at: &str, source_url: &str) -> ModelSuggestion {
 fn custom_preset(protocol: ChannelProtocol) -> ChannelPreset {
     let (native_endpoints, default_checked, auth, strategy) = match protocol {
         ChannelProtocol::OpenAI => (
-            vec![NativeEndpoint::ChatCompletions, NativeEndpoint::Responses],
+            vec![
+                NativeEndpoint::ChatCompletions,
+                NativeEndpoint::Responses,
+                NativeEndpoint::Embeddings,
+            ],
             vec![NativeEndpoint::ChatCompletions],
             AuthScheme::Bearer,
             EndpointTestStrategy::ProbeFirstModel,
@@ -751,6 +755,18 @@ mod tests {
                 .iter()
                 .all(|p| p.provider != ChannelProvider::Moonshot),
             "Anthropic 不得包含 Moonshot"
+        );
+    }
+
+    #[test]
+    fn custom_openai_allows_embeddings_without_enabling_them_by_default() {
+        let preset = custom_preset(ChannelProtocol::OpenAI);
+        assert!(preset
+            .native_endpoints
+            .contains(&NativeEndpoint::Embeddings));
+        assert_eq!(
+            preset.default_checked_endpoints,
+            vec![NativeEndpoint::ChatCompletions]
         );
     }
 

@@ -93,6 +93,8 @@ export interface CreateChannelInput {
   // draft when present; force_save saves despite failed/skipped tests as long
   // as the same draft was tested at least once. ---
   test_run_id?: string;
+  /** 本次按端点选择的测试模型，用于回执校验。 */
+  test_models?: Partial<Record<ChannelEndpoint, string>>;
   draft_fingerprint?: string;
   force_save?: boolean;
   /** Multi-key: additional API keys for load balancing. */
@@ -128,6 +130,8 @@ export interface UpdateChannelInput {
   clear_api_key?: boolean;
   // --- T07 draft-test receipt (see CreateChannelInput). ---
   test_run_id?: string;
+  /** 本次按端点选择的测试模型，用于回执校验。 */
+  test_models?: Partial<Record<ChannelEndpoint, string>>;
   draft_fingerprint?: string;
   force_save?: boolean;
   /** Multi-key: replacement for extra keys (full replace semantics). */
@@ -671,6 +675,7 @@ export interface DraftChannelTestInput {
   /** 显式清除已保存 Key（T02）：为 true 时后端把留空的 Key 解析为空串，而非沿用已存 Key。 */
   clear_api_key?: boolean;
   models: string[];
+  test_models?: Partial<Record<ChannelEndpoint, string>>;
   priority?: number;
   weight?: number;
   config?: Record<string, unknown>;

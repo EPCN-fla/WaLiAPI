@@ -1,6 +1,6 @@
 import { KnowledgeConnectionPanel } from "../components/KnowledgeConnectionPanel";
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
-import { useLocation } from "react-router-dom";
+import { Link as RouterLink, useLocation } from "react-router-dom";
 import {
   KnowledgeBase,
   KbDocument,
@@ -2491,6 +2491,8 @@ function SettingsTab({ kb, onUpdated }: { kb: KnowledgeBase; onUpdated: (kb: Kno
   const [name, setName] = useState(kb.name);
   const [description, setDescription] = useState(kb.description || "");
   const [embeddingModel, setEmbeddingModel] = useState(kb.embedding_model || "text-embedding-3-small");
+  const [embeddingCapability, setEmbeddingCapability] = useState<{ available: boolean; message: string } | null>(null);
+  const [capabilityRevision, setCapabilityRevision] = useState(0);
   const [embeddingChannelId, setEmbeddingChannelId] = useState(kb.embedding_channel_id || "");
   const [status, setStatus] = useState(kb.status);
   const [mcpEnabled, setMcpEnabled] = useState(kb.mcp_enabled ?? 1);
@@ -2515,6 +2517,17 @@ function SettingsTab({ kb, onUpdated }: { kb: KnowledgeBase; onUpdated: (kb: Kno
   useEffect(() => {
     channelApi.getAll().then(setChannels).catch(console.error);
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    setEmbeddingCapability(null);
+    kbApi.getEmbeddingCapability(embeddingModel).then(result => {
+      if (active) setEmbeddingCapability(result);
+    }).catch(() => {
+      if (active) setEmbeddingCapability({ available: false, message: "无法检查渠道能力，请刷新后重试" });
+    });
+    return () => { active = false; };
+  }, [embeddingModel, capabilityRevision]);
 
   const activeChannels = channels.filter(c => c.status === 1);
   const selectedEmbeddingChannel = activeChannels.find(c => c.id === embeddingChannelId);
@@ -2619,6 +2632,13 @@ function SettingsTab({ kb, onUpdated }: { kb: KnowledgeBase; onUpdated: (kb: Kno
             <p className="mt-1 text-xs text-slate-400">
               默认提供 OpenAI 系模型，已配置渠道声明的模型也会出现在列表中；请确保所选渠道支持 /embeddings 接口（DeepSeek 不提供 Embedding）
             </p>
+            <div role="status" className={`mt-2 rounded-lg p-3 text-xs ${embeddingCapability?.available ? "bg-emerald-50 text-emerald-700" : "bg-amber-50 text-amber-800"}`}>
+              <p>{embeddingCapability?.message || "正在检查 Embeddings 渠道配置…"}</p>
+              <div className="mt-2 flex gap-3">
+                <RouterLink to="/channels" className="underline">前往渠道配置</RouterLink>
+                <button type="button" onClick={() => setCapabilityRevision(value => value + 1)} className="underline">刷新能力检查</button>
+              </div>
+            </div>
           </div>
 
           <div>
@@ -2910,7 +2930,7 @@ function McpTab({ kb }: { kb: KnowledgeBase }) {
         </div>
       </div>
 
-      <KnowledgeConnectionPanel kbId={kb.id} />
+      <KnowledgeConnectionPanel key={kb.id} kbId={kb.id} />
 
       {/* 可用工具列表 */}
       <div className="surface data-card rounded-2xl">

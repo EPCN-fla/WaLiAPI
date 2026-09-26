@@ -391,6 +391,14 @@ pub async fn ask(
             Err(error) => error.into_response(),
         };
     }
+    if input.diagnostics {
+        return super::model_client::QueryError::new(
+            StatusCode::BAD_REQUEST,
+            "知识库健康检测需要使用普通 API Key，以覆盖真实权限、额度和安全审计",
+        )
+        .at_stage("permission", "diagnostics_requires_api_key")
+        .into_response();
+    }
     let kb_id = input.kb_id.clone().unwrap_or_default();
 
     let emb_model = if !kb_id.is_empty() {

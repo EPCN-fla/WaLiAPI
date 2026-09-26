@@ -38,6 +38,14 @@ impl MockUpstream {
     /// Boot a mock that responds with `response_body` (raw bytes) on every
     /// request.  `response_status` defaults to 200.
     async fn start(response_body: Vec<u8>, response_status: u16) -> MockUpstream {
+        Self::start_with_body_delay(response_body, response_status, std::time::Duration::ZERO).await
+    }
+
+    async fn start_with_body_delay(
+        response_body: Vec<u8>,
+        response_status: u16,
+        body_delay: std::time::Duration,
+    ) -> MockUpstream {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let received = Arc::new(Mutex::new(Vec::new()));
@@ -123,6 +131,9 @@ impl MockUpstream {
                             .as_bytes(),
                         )
                         .await;
+                    if !body_delay.is_zero() {
+                        tokio::time::sleep(body_delay).await;
+                    }
                     let _ = socket.write_all(&response_body).await;
                 });
             }
@@ -635,6 +646,39 @@ async fn openai_stream_native_passthrough() {
 }
 
 // ── Error fidelity ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn response_body_timeout_retains_retryable_class_and_timeout_reason() {
+    use crate::core::attempt::{terminal_status, AttemptResult, FailureClass};
+
+    let mock = MockUpstream::start_with_body_delay(
+        br#"{"data":[{"index":0,"embedding":[1.0]}]}"#.to_vec(),
+        200,
+        std::time::Duration::from_secs(3),
+    )
+    .await;
+    let base = format!("http://{}/v1", mock.addr);
+    let attempt = prepared(
+        &base,
+        "openai",
+        "embeddings",
+        "embed-test",
+        json!({"model":"embed-test","input":["document"]}),
+        None,
+    );
+    let id = identity("openai", &["embeddings"], None);
+    let mut ch = channel(&base, "local-test");
+    ch.timeout_secs = 1;
+    let result = dispatch_executor(EndpointKind::Embeddings, &attempt, &ch, &id, &[], None).await;
+    let AttemptResult::Failure(failure) = result else {
+        panic!("延迟正文必须触发 reqwest 总超时");
+    };
+    assert_eq!(mock.captured().await.len(), 1);
+    assert_eq!(failure.failure_class, FailureClass::Retryable);
+    assert!(failure.failure_class.is_degradable());
+    assert_eq!(failure.status_code, Some(504));
+    assert_eq!(terminal_status(failure.failure_class), 502);
+}
 
 #[tokio::test]
 async fn upstream_401_is_channel_auth_not_local_key_error() {
