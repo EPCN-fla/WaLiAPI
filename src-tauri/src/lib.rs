@@ -313,6 +313,7 @@ pub fn run() {
             commands::api_key::get_api_key_knowledge_access,
             commands::api_key::set_api_key_knowledge_access,
             commands::api_key::test_api_key_knowledge_access,
+            commands::api_key::test_api_key_knowledge_health,
             commands::api_key::get_api_key_full,
             commands::api_key::create_api_key,
             commands::api_key::update_api_key,
@@ -380,6 +381,7 @@ pub fn run() {
             commands::import_export::save_export_file,
             // Knowledge Base
             commands::knowledge_base::get_knowledge_bases,
+            commands::knowledge_base::get_knowledge_embedding_capability,
             commands::knowledge_base::create_knowledge_base,
             commands::knowledge_base::update_knowledge_base,
             commands::knowledge_base::delete_knowledge_base,

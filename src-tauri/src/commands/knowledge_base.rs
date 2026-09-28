@@ -4,6 +4,27 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tauri::State;
 
+/// 配置预检复用内部 Embedding 路由规划，不发送请求，也不自动补授权。
+#[tauri::command]
+pub async fn get_knowledge_embedding_capability(
+    state: State<'_, Arc<AppState>>,
+    model: String,
+) -> Result<serde_json::Value, String> {
+    use crate::core::route_plan::{plan_internal_embeddings, PlanError};
+    let channels = crate::db::repository::Repository::new(state.db.pool.clone())
+        .get_enabled_channels()
+        .await
+        .map_err(|_| "无法读取渠道配置")?;
+    let body = serde_json::json!({"model": model.trim(), "input": ["capability check"]});
+    let result = plan_internal_embeddings(model.trim(), &channels, &body, &mut rand::rng());
+    let (available, message) = match result {
+        Ok(_) => (true, "已配置支持此模型的 Embeddings 渠道；实际连接、Key 权限和额度请运行 RAG 健康检测"),
+        Err(PlanError::NoEndpointSupported(..)) => (false, "模型已有渠道，但未声明 Embeddings 能力。请编辑对应 OpenAI 渠道，勾选 Embeddings 并选择向量模型测试后保存"),
+        Err(_) => (false, "没有支持此 Embedding 模型的已启用渠道。请检查模型名称、映射和 Embeddings 能力配置"),
+    };
+    Ok(serde_json::json!({"available": available, "message": message}))
+}
+
 #[tauri::command]
 pub async fn get_knowledge_bases(
     state: State<'_, Arc<AppState>>,

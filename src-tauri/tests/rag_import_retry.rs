@@ -115,7 +115,9 @@ async fn local_import_recovers_after_embedding_channel_is_configured() {
         .create_channel(
             &serde_json::from_value(json!({
                 "name":"retry-channel", "type":"openai", "base_url":base_url,
-                "api_key":"test-only", "models":["embed-test"]
+                "api_key":"test-only", "models":["embed-test"],
+                "protocol":"openai", "provider":"custom", "native_base_url":base_url,
+                "native_endpoints":["embeddings"]
             }))
             .unwrap(),
         )

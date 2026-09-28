@@ -843,7 +843,9 @@ fn transport_failure(e: reqwest::Error) -> AttemptFailure {
     AttemptFailure {
         failure_class: FailureClass::Retryable,
         message: format!("upstream connection failed: {e}"),
-        status_code: Some(502),
+        // 保留 reqwest 的类型化超时原因；AttemptFlow 对 Retryable 的最终 HTTP
+        // 仍统一返回 502，504 只用于网关内部诊断，不改变重试/跨渠道规则。
+        status_code: Some(if e.is_timeout() { 504 } else { 502 }),
         retry_after: None,
     }
 }
@@ -1152,7 +1154,14 @@ pub async fn dispatch_executor(
         .map(|s| s.to_string());
     // Read the raw bytes once; parse JSON ourselves so the bytes stay available
     // for diagnostics when the decode fails.
-    let bytes = resp.bytes().await.unwrap_or_default();
+    let bytes = match resp.bytes().await {
+        Ok(bytes) => bytes,
+        // 总超时也可能发生在收到响应头后，不能吞掉后误判为 JSON 格式错误。
+        Err(error) if error.is_timeout() => {
+            return AttemptResult::Failure(transport_failure(error));
+        }
+        Err(_) => bytes::Bytes::new(),
+    };
     let body: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {

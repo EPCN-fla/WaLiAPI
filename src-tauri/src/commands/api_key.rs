@@ -214,6 +214,181 @@ pub struct KnowledgeConnectionTest {
     mcp_ok: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KnowledgeHealthTest {
+    status: u16,
+    ok: bool,
+    elapsed_ms: u64,
+    answer: String,
+    sources: Vec<crate::services::knowledge::models::SourceInfo>,
+    error: Option<serde_json::Value>,
+    diagnostics: Option<crate::services::knowledge::models::RagDiagnostics>,
+}
+
+/// 用户主动触发的真实 RAG 检测；通过本机 HTTP 入口保留 Key 权限、额度和审计。
+#[tauri::command]
+pub async fn test_api_key_knowledge_health(
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+    id: String,
+    kb_id: String,
+    model: String,
+    question: String,
+    search_mode: String,
+) -> Result<KnowledgeHealthTest, String> {
+    if !state
+        .server_running
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("请先启动 WaLiAPI 服务".into());
+    }
+    if kb_id.trim().is_empty() || model.trim().is_empty() || question.trim().is_empty() {
+        return Err("请选择知识库并填写回答模型和测试问题".into());
+    }
+    if !matches!(search_mode.as_str(), "hybrid" | "vector" | "keyword") {
+        return Err("不支持的检索模式".into());
+    }
+    let key = Repository::new(state.db.pool.clone())
+        .get_api_key_by_id(&id)
+        .await
+        .map_err(|_| "密钥不存在")?;
+    let port = *state.server_port.read().await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "无法创建健康检测")?;
+    let started = std::time::Instant::now();
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/api/kb/ask"))
+        .bearer_auth(&key.key)
+        .json(&serde_json::json!({
+            "kb_id": kb_id, "model": model.trim(), "question": question.trim(),
+            "search_mode": search_mode, "top_k": 5, "diagnostics": true,
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                "RAG 检测超时，请检查本机网关日志".to_string()
+            } else {
+                "无法连接本机 WaLiAPI 服务".to_string()
+            }
+        })?;
+    let status = response.status().as_u16();
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|_| "健康检测响应格式无效")?;
+    Ok(knowledge_health_result(
+        status,
+        body,
+        started.elapsed().as_millis() as u64,
+        &search_mode,
+    ))
+}
+
+fn knowledge_health_result(
+    status: u16,
+    body: serde_json::Value,
+    elapsed_ms: u64,
+    search_mode: &str,
+) -> KnowledgeHealthTest {
+    let answer = body["answer"].as_str().unwrap_or_default().to_string();
+    let sources: Vec<crate::services::knowledge::models::SourceInfo> =
+        serde_json::from_value(body["sources"].clone()).unwrap_or_default();
+    let diagnostics: Option<crate::services::knowledge::models::RagDiagnostics> =
+        serde_json::from_value(body["diagnostics"].clone()).ok();
+    // 旧服务或不完整响应不能仅凭 HTTP 200 冒充完整链路通过。
+    let stages_ok = diagnostics.as_ref().is_some_and(|diagnostics| {
+        let stages = &diagnostics.stages;
+        !diagnostics.request_id.is_empty()
+            && !stages.iter().any(|item| item.status == "failed")
+            && ["permission", "retrieval", "answer", "validation"]
+                .iter()
+                .all(|stage| {
+                    stages
+                        .iter()
+                        .any(|item| item.stage == *stage && item.status == "passed")
+                })
+            && stages.iter().any(|item| {
+                item.stage == "embedding"
+                    && item.status
+                        == if search_mode == "keyword" {
+                            "skipped"
+                        } else {
+                            "passed"
+                        }
+            })
+    });
+    let ok = (200..300).contains(&status)
+        && !answer.trim().is_empty()
+        && sources
+            .iter()
+            .any(|source| !source.snippet.trim().is_empty())
+        && stages_ok
+        && body.get("error").is_none_or(serde_json::Value::is_null);
+    let error = body.get("error").filter(|value| value.is_object()).map(|value| {
+        let mut safe = serde_json::Map::new();
+        for field in ["message", "stage", "code", "request_id"] {
+            if let Some(text) = value[field].as_str() { safe.insert(field.into(), text.into()); }
+        }
+        serde_json::Value::Object(safe)
+    }).or_else(|| (!ok).then(|| serde_json::json!({"message": "未取得完整阶段记录、有效答案和来源，不能判定 RAG 检测通过"})));
+    KnowledgeHealthTest {
+        status,
+        ok,
+        elapsed_ms,
+        answer,
+        sources,
+        error,
+        diagnostics,
+    }
+}
+
+#[cfg(test)]
+mod knowledge_health_tests {
+    use super::knowledge_health_result;
+    use serde_json::json;
+
+    #[test]
+    fn health_requires_complete_pipeline_and_valid_evidence() {
+        let mut response = json!({
+            "answer": "测试答案", "sources": [{"filename":"test.md", "snippet":"检索依据", "score":1.0}],
+            "diagnostics": {"request_id":"test-trace", "stages":
+                (["permission", "embedding", "retrieval", "answer", "validation"].map(|stage|
+                    json!({"stage":stage,"status":"passed","elapsed_ms":1})))}
+        });
+        assert!(knowledge_health_result(200, response.clone(), 5, "hybrid").ok);
+        response["diagnostics"]["stages"][1]["status"] = json!("skipped");
+        assert!(!knowledge_health_result(200, response.clone(), 5, "hybrid").ok);
+        assert!(knowledge_health_result(200, response.clone(), 5, "keyword").ok);
+        response["answer"] = json!("  ");
+        assert!(!knowledge_health_result(200, response.clone(), 5, "keyword").ok);
+        response["answer"] = json!("测试答案");
+        response["sources"] = json!([]);
+        assert!(!knowledge_health_result(200, response, 5, "keyword").ok);
+        assert!(!knowledge_health_result(200, json!({"answer":"旧服务答案"}), 5, "hybrid").ok);
+    }
+
+    #[test]
+    fn health_keeps_safe_error_fields_and_never_passes_failure_status() {
+        let result = knowledge_health_result(
+            501,
+            json!({"error": {
+                "message":"请配置 Embeddings", "stage":"embedding", "code":"endpoint_not_configured",
+                "request_id":"test-trace", "upstream_body":"must not be forwarded"
+            }}),
+            5,
+            "hybrid",
+        );
+        assert!(!result.ok);
+        let error = result.error.unwrap();
+        assert_eq!(error["code"], "endpoint_not_configured");
+        assert!(error.get("upstream_body").is_none());
+    }
+}
+
 /// 经实际监听端口验证授权，不调用模型，也不回传密钥。
 #[tauri::command]
 pub async fn test_api_key_knowledge_access(

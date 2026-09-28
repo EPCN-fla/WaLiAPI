@@ -72,10 +72,25 @@ export const channelApi = {
 };
 
 // API Key commands
+export interface KnowledgeHealthTest {
+  status: number;
+  ok: boolean;
+  elapsed_ms: number;
+  answer: string;
+  sources: { filename: string; snippet: string; score: number }[];
+  error?: { message?: string; stage?: string; code?: string; request_id?: string };
+  diagnostics?: {
+    request_id: string;
+    stages: { stage: string; status: string; elapsed_ms: number }[];
+  };
+}
+
 export const apiKeyApi = {
   getKnowledgeAccess: (id: string) => invoke<string[]>("get_api_key_knowledge_access", { id }),
   setKnowledgeAccess: (id: string, kbIds: string[]) => invoke<void>("set_api_key_knowledge_access", { id, kbIds }),
   testKnowledgeAccess: (id: string, kbId: string) => invoke<{ rest_status: number; rest_ok: boolean; mcp_status: number; mcp_ok: boolean }>("test_api_key_knowledge_access", { id, kbId }),
+  testKnowledgeHealth: (id: string, kbId: string, model: string, question: string, searchMode: string) =>
+    invoke<KnowledgeHealthTest>("test_api_key_knowledge_health", { id, kbId, model, question, searchMode }),
   getAll: () => invoke<ApiKey[]>("get_api_keys"),
   // FIX-13：列表只回掩码，复制/示例代码等显式动作经此按需取全量。
   getFull: (id: string) => invoke<string>("get_api_key_full", { id }),
@@ -382,6 +397,7 @@ export interface KbTag {
 
 // Knowledge Base commands
 export const kbApi = {
+  getEmbeddingCapability: (model: string) => invoke<{ available: boolean; message: string }>("get_knowledge_embedding_capability", { model }),
   getAll: () => invoke<KnowledgeBase[]>("get_knowledge_bases"),
   create: (input: { name: string; description?: string; embedding_model?: string; ocr_model?: string | null }) =>
     invoke<KnowledgeBase>("create_knowledge_base", { input }),

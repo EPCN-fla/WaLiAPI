@@ -25,7 +25,9 @@ async fn model(response: Value) -> (Repository, Arc<Mutex<Value>>, tokio::task::
     repo.create_channel(
         &serde_json::from_value(json!({
             "name": "embedding-response-test", "type": "openai", "base_url": base_url,
-            "api_key": "test-only", "models": ["embed-test"]
+            "api_key": "test-only", "models": ["embed-test"],
+            "protocol": "openai", "provider": "custom", "native_base_url": base_url,
+            "native_endpoints": ["embeddings"]
         }))
         .unwrap(),
     )
@@ -133,7 +135,9 @@ async fn malformed_primary_response_still_allows_channel_failover() {
     repo.create_channel(
         &serde_json::from_value(json!({
             "name":"fallback", "type":"openai", "base_url":url,
-            "api_key":"test-only", "models":["embed-test"], "priority":-1
+            "api_key":"test-only", "models":["embed-test"], "priority":-1,
+            "protocol":"openai", "provider":"custom", "native_base_url":url,
+            "native_endpoints":["embeddings"]
         }))
         .unwrap(),
     )

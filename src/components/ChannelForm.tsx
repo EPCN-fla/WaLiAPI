@@ -20,13 +20,13 @@ import { ModelSyncModal } from "./channel-form/ModelSyncModal";
 import { ProviderDropdown } from "./channel-form/ProviderDropdown";
 
 // ─── 协议级结构（UI 结构常量，非厂商模板副本）────────────────────────────────
-// 这些描述的是「协议本身的语义」（设计 3.2）：OpenAI 有两个可选端点，
+// 这些描述的是「协议本身的语义」（设计 3.2）：OpenAI 可选择聊天、Responses 与 Embeddings 端点，
 // Anthropic 固定 Messages，Ollama 固定 /api/chat。厂商 URL/模型模板唯一来源
 // 是后端 registry（get_channel_presets）。
 const PROTOCOLS: ChannelProtocol[] = ["openai", "anthropic", "ollama"];
 
 const PROTOCOL_ENDPOINT_OPTIONS: Record<ChannelProtocol, ChannelEndpoint[]> = {
-  openai: ["chat_completions", "responses"],
+  openai: ["chat_completions", "responses", "embeddings"],
   anthropic: ["messages"],
   ollama: ["api_chat"],
 };
@@ -117,6 +117,7 @@ interface FormState {
   api_key: string;
   models: string[];
   native_endpoints: ChannelEndpoint[];
+  test_models: Partial<Record<ChannelEndpoint, string>>;
   model_mapping: Record<string, string | string[]>;
   /** 被关闭的映射对（迁移 041）：[from, to][] */
   model_mapping_disabled: string[][];
@@ -164,6 +165,7 @@ function initForm(editing: Channel | null, duplicate = false): FormState {
       // 复制模式：清空 api_key（列表中是脱敏的），用户需重新输入
       api_key: duplicate ? "" : (editing.api_key || ""),
       models: editing.models ?? [],
+      test_models: {},
       native_endpoints: endpoints.length > 0 ? endpoints : defaultEndpointsFor(protocol),
       model_mapping: editing.model_mapping ?? {},
       model_mapping_disabled: editing.model_mapping_disabled ?? [],
@@ -201,6 +203,7 @@ function initForm(editing: Channel | null, duplicate = false): FormState {
     native_base_url: "",
     api_key: "",
     models: [],
+    test_models: {},
     native_endpoints: defaultEndpointsFor("openai"),
     model_mapping: {},
     model_mapping_disabled: [],
@@ -289,8 +292,12 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
 
   const authScheme: ChannelAuthScheme = currentPreset?.auth_scheme ?? PROTOCOL_DEFAULT_AUTH[form.protocol];
   const keyRequired = authScheme !== "optional_bearer";
+  const probeEndpoints = form.native_endpoints.filter(ep => ep !== "count_tokens");
+  const requiresTestModels = form.models.length > 1
+    && probeEndpoints.includes("embeddings")
+    && probeEndpoints.some(ep => ep !== "embeddings");
 
-  // ── receipt 失效规则（T07）：protocol/provider/URL/Key/模型/端点/timeout 变更即失效；
+  // ── receipt 失效规则（T07）：protocol/provider/URL/Key/模型/端点/测试模型/timeout 变更即失效；
   //    name/priority/weight/映射 变更不失效。 ───────────────────────────────
   function invalidateReceipt() {
     setReceipt(null);
@@ -324,6 +331,7 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
           native_base_url: preset.native_base_url,
           native_endpoints: endpointsForPreset(preset),
           models: preset.model_suggestions.map(m => m.id),
+          test_models: {},
         } : {}),
       };
     });
@@ -339,6 +347,7 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
       native_base_url: "",
       native_endpoints: defaultEndpointsFor(protocol),
       models: [],
+      test_models: {},
     }));
     invalidateReceipt();
   }
@@ -374,7 +383,11 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
     invalidateReceipt();
   }
   function onModelListChange(nextModels: string[]) {
-    setForm(prev => ({ ...prev, models: nextModels }));
+    setForm(prev => ({
+      ...prev,
+      models: nextModels,
+      test_models: Object.fromEntries(Object.entries(prev.test_models).filter(([, model]) => nextModels.includes(model))),
+    }));
     invalidateReceipt();
   }
   function toggleEndpoint(ep: ChannelEndpoint, checked: boolean) {
@@ -382,7 +395,20 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
     const next = checked
       ? (has ? form.native_endpoints : [...form.native_endpoints, ep])
       : form.native_endpoints.filter(e => e !== ep);
-    setForm(prev => ({ ...prev, native_endpoints: next }));
+    setForm(prev => ({
+      ...prev,
+      native_endpoints: next,
+      test_models: Object.fromEntries(Object.entries(prev.test_models).filter(([endpoint]) => next.includes(endpoint as ChannelEndpoint))),
+    }));
+    invalidateReceipt();
+  }
+  function onTestModelChange(endpoint: ChannelEndpoint, model: string) {
+    setForm(prev => {
+      const test_models = { ...prev.test_models };
+      if (model) test_models[endpoint] = model;
+      else delete test_models[endpoint];
+      return { ...prev, test_models };
+    });
     invalidateReceipt();
   }
   function requestClearKey() {
@@ -551,6 +577,7 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
       // 编辑留空未清除 → 沿用已存 Key；显式清除 → 空 Key。
       clear_api_key: clearKeyRequested || undefined,
       models: form.models,
+      test_models: form.test_models,
       priority: form.priority,
       weight: form.weight,
       model_mapping: form.model_mapping,
@@ -592,6 +619,7 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
       preset_revision: null,
       native_base_url: parsed.baseUrl,
       native_endpoints: parsed.endpoint ? [parsed.endpoint] : defaultEndpointsFor(parsed.protocol),
+      test_models: {},
       models: parsed.model && !prev.models.includes(parsed.model) ? [...prev.models, parsed.model] : prev.models,
       api_key: parsed.apiKey || prev.api_key,
     }));
@@ -669,6 +697,7 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
       base_url: legacyBaseUrl(),
       api_key: form.api_key,
       models: form.models,
+      test_models: form.test_models,
       priority: form.priority,
       weight: form.weight,
       model_mapping: form.model_mapping,
@@ -701,6 +730,7 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
       id: editing!.id,
       name: form.name,
       models: form.models,
+      test_models: form.test_models,
       priority: form.priority,
       weight: form.weight,
       model_mapping: form.model_mapping,
@@ -743,13 +773,16 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
       return "Base URL 必须是 http(s) 地址";
     }
     if (form.protocol === "openai" && form.native_endpoints.length === 0) {
-      return "OpenAI 协议至少勾选一个端点（Chat Completions 或 Responses）";
+      return "OpenAI 协议至少勾选一个端点（Chat Completions、Responses 或 Embeddings）";
     }
     if (form.protocol === "anthropic" && !form.native_endpoints.includes("messages")) {
       return "Anthropic 协议必须包含 /messages 端点";
     }
     if (form.protocol === "ollama" && !form.native_endpoints.includes("api_chat")) {
       return "Ollama 协议必须包含 /api/chat 端点";
+    }
+    if (requiresTestModels && probeEndpoints.some(ep => !form.test_models[ep])) {
+      return "聊天与 Embeddings 混合渠道请为每个端点选择测试模型";
     }
     if ((!editing || duplicate) && keyRequired && !form.api_key.trim()) {
       return "API Key 不能为空";
@@ -1301,6 +1334,32 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
               <p className="mt-1.5 text-xs text-muted-foreground">空模型列表表示「接受所有模型」（通配）。</p>
             )}
           </div>
+
+          {form.models.length > 0 && probeEndpoints.length > 0 && (
+            <div>
+              <label className="mb-2 block text-sm font-medium">端点测试模型</label>
+              <p className="mb-3 text-xs text-muted-foreground">
+                为每个端点选择当前模型列表中的模型。聊天与向量模型应分别选择，保存时将发起真实请求，可能产生费用。
+              </p>
+              <div className="space-y-2">
+                {probeEndpoints.map(ep => (
+                  <label key={ep} className="flex flex-wrap items-center gap-3 text-sm">
+                    <span className="w-36 shrink-0">{ENDPOINT_LABELS[ep]}</span>
+                    <select
+                      value={form.test_models[ep] ?? ""}
+                      onChange={e => onTestModelChange(ep, e.target.value)}
+                      className={`${SELECT_CLS} min-w-0 flex-1`}
+                      aria-label={`${ENDPOINT_LABELS[ep]} 测试模型`}
+                      required={requiresTestModels}
+                    >
+                      <option value="">{requiresTestModels ? "请选择该端点的测试模型" : `默认：${form.models[0]}`}</option>
+                      {form.models.map(model => <option key={model} value={model}>{model}</option>)}
+                    </select>
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* 模型映射 */}
           <MappingSection

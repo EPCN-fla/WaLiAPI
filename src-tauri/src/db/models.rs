@@ -187,6 +187,9 @@ pub struct CreateChannelInput {
     // as the same draft was tested at least once. Legacy payloads omit them. ---
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_run_id: Option<String>,
+    /// 本次按端点选择的测试模型，仅校验回执，不持久化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_models: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,6 +241,9 @@ pub struct UpdateChannelInput {
     // --- T07 draft-test receipt (see CreateChannelInput). ---
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_run_id: Option<String>,
+    /// 本次按端点选择的测试模型，仅校验回执，不持久化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_models: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

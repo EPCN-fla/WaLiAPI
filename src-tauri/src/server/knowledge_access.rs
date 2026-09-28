@@ -15,7 +15,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 #[derive(Clone)]
 pub struct KnowledgeAccess {
@@ -58,6 +58,40 @@ pub async fn set_grants(
 }
 
 pub async fn authenticate(
+    shared: &SharedState,
+    headers: &HeaderMap,
+) -> Result<KnowledgeAccess, QueryError> {
+    // 使用服务端生成的编号，避免客户端把凭据等敏感内容伪装成关联编号。
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let result = authenticate_inner(shared, headers).await;
+    match result {
+        Ok(mut access) => {
+            access.headers.insert(
+                "x-request-id",
+                request_id.parse().expect("UUID is a valid header"),
+            );
+            Ok(access)
+        }
+        Err(error) => {
+            let code = match error.status {
+                StatusCode::UNAUTHORIZED => "authentication_failed",
+                StatusCode::FORBIDDEN => "knowledge_access_denied",
+                _ => "permission_check_failed",
+            };
+            tracing::warn!(
+                request_id,
+                code,
+                status = error.status.as_u16(),
+                "知识库认证失败"
+            );
+            Err(error
+                .at_stage("permission", code)
+                .with_request_id(&request_id))
+        }
+    }
+}
+
+async fn authenticate_inner(
     shared: &SharedState,
     headers: &HeaderMap,
 ) -> Result<KnowledgeAccess, QueryError> {
@@ -226,23 +260,60 @@ pub async fn ask(
     input: AskInput,
     mcp: bool,
 ) -> Result<RagAnswer, QueryError> {
+    let permission_started = Instant::now();
+    let request_id = access
+        .headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let mut stages = Vec::new();
     let kb_id = input.kb_id.as_deref().unwrap_or("");
-    let kb = access.require_kb(shared, kb_id, mcp).await?;
+    let kb = access
+        .require_kb(shared, kb_id, mcp)
+        .await
+        .map_err(|error| {
+            rag::diagnostic_failure(
+                error.at_stage("permission", "knowledge_access_denied"),
+                "permission",
+                permission_started,
+                &stages,
+                request_id,
+                input.diagnostics,
+            )
+        })?;
     if input.deep_research {
-        return Err(QueryError::new(
-            StatusCode::FORBIDDEN,
-            "API Key 查询暂不支持 deep_research，请使用普通 RAG 问答",
+        return Err(rag::diagnostic_failure(
+            QueryError::new(
+                StatusCode::FORBIDDEN,
+                "API Key 查询暂不支持 deep_research，请使用普通 RAG 问答",
+            )
+            .at_stage("permission", "unsupported_query_mode"),
+            "permission",
+            permission_started,
+            &stages,
+            request_id,
+            input.diagnostics,
         ));
     }
     let mode = input.search_mode.as_deref().unwrap_or("hybrid");
     let vw = input.vector_weight.unwrap_or(0.7);
     let kw = input.keyword_weight.unwrap_or(0.3);
-    validate_query(&input.question, input.top_k, mode, vw, kw)?;
+    validate_query(&input.question, input.top_k, mode, vw, kw).map_err(|error| {
+        rag::diagnostic_failure(
+            error.at_stage("permission", "invalid_query"),
+            "permission",
+            permission_started,
+            &stages,
+            request_id,
+            input.diagnostics,
+        )
+    })?;
+    rag::record_stage(&mut stages, "permission", "passed", permission_started);
     let client = ModelClient::ApiKey {
         shared,
         headers: &access.headers,
     };
-    rag::ask_with_client(
+    let result = rag::ask_with_client(
         &client,
         &shared.state.db.pool,
         kb_id,
@@ -258,8 +329,24 @@ pub async fn ask(
         vw,
         kw,
         mode,
+        input.diagnostics,
     )
-    .await
+    .await;
+    match result {
+        Ok(mut answer) => {
+            if let Some(diagnostics) = &mut answer.diagnostics {
+                diagnostics.stages.splice(0..0, stages);
+            }
+            tracing::info!(request_id, "知识库问答完成");
+            Ok(answer)
+        }
+        Err(mut error) => {
+            if let Some(diagnostics) = &mut error.diagnostics {
+                diagnostics.stages.splice(0..0, stages);
+            }
+            Err(error)
+        }
+    }
 }
 
 pub async fn search(

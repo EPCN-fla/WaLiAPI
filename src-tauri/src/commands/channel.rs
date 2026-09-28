@@ -301,6 +301,7 @@ pub async fn update_channel_impl(
             &serde_json::from_str::<serde_json::Value>(&existing.config)
                 .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
             eff_override.as_deref(),
+            input.test_models.as_ref(),
         );
         validate_save_receipt(&state, &input, &computed)?
     };
@@ -348,6 +349,7 @@ fn validate_create_receipt(
             .as_ref()
             .unwrap_or(&serde_json::Value::Object(Default::default())),
         input.legacy_executor_override.as_deref(),
+        input.test_models.as_ref(),
     );
     validate_save_receipt(state, input, &computed)
 }
