@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.3.7 (2026-09-28)
+
+### 知识库与 RAG
+
+- ✨ **RAG 链路分阶段诊断**：`/api/kb/ask` 支持 `diagnostics=true`，按 permission / embedding / retrieval / answer / validation 各阶段返回状态与失败原因；健康检测不再仅凭 HTTP 200 冒充完整链路通过，需各阶段逐一校验（PR #140，@Zhengmingming1）
+- ✨ **API Key 知识库健康检测**：新增 `test_api_key_knowledge_health` 命令，经本机真实 HTTP 入口携带指定 API Key 请求 `/api/kb/ask`，验证 Key 权限、额度与完整 RAG 检测链路，返回耗时、答案、引用来源与诊断详情（PR #140，@Zhengmingming1）
+- ✨ **Embeddings 配置预检**：新增 Embedding 能力预检命令，复用网关内部 Embedding 路由规划且不发请求，可区分「渠道未声明 Embeddings 能力」与「无支持该模型的渠道」并给出修复指引（PR #140，@Zhengmingming1）
+- 🐛 **内部知识库 Embedding 复用统一网关路由**：知识库建库/查询的向量调用不再自行拼接 `/embeddings` 直连上游，改为复用网关的路由规划、渠道身份、Key 轮换与故障切换语义，模型匹配与端点能力判定与外部请求一致（PR #140，@Zhengmingming1）
+- 🐛 **旧 Gemini 执行器不再误判支持 Embeddings**：`gemini_native` 执行器固定调用 generateContent 无法发送 `/embeddings`，路由规划排除其 Embeddings 原生资格，向量请求由 OpenAI 兼容渠道承接（PR #140，@Zhengmingming1）
+
+### 前端
+
+- ✨ **知识库连接检查接入预检与健康检测**：知识库连接面板展示配置预检结论与真实 RAG 健康检测结果，知识库页同步诊断展示；渠道表单补充 Embeddings 能力配置提示（PR #140，@Zhengmingming1）
+
+### 其他
+
+- 🧪 **新增 RAG Embedding 路由集成测试**：`rag_embedding_routing` 等测试覆盖内部 Embedding 路由规划、渠道模式过滤与诊断响应（PR #140，@Zhengmingming1）
+- 📝 **README 贡献者数据同步**：更新 Nelson（@Zhengmingming1，PR #140）提交数与代码变更统计
+- 🔧 **版本号统一升级至 0.3.7**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
+
 ## v0.3.6 (2026-09-23)
 
 ### 协议转换（codec）

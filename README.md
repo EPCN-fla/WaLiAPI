@@ -4,7 +4,7 @@
 
 ### 本地 LLM API 网关 · 多协议接入 · 知识库 RAG · MCP 工具服务
 
-[![Version](https://img.shields.io/badge/version-0.3.6-blue.svg)](./src-tauri/tauri.conf.json)
+[![Version](https://img.shields.io/badge/version-0.3.7-blue.svg)](./src-tauri/tauri.conf.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)](#-使用方式)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app)
@@ -46,7 +46,7 @@
 | 🚀 | **GululuCopa** | [@GululuCopa](https://github.com/GululuCopa) | 24 | `+13,087 / -475` | Grok OAuth 登录（PR #122）· Antigravity OAuth Gemini 登录（PR #121）与 v0.3.6 修复（PR #128）· Grok 与 Antigravity namespace 工具兼容修复 · 网关客户端适配（流式出站无总超时、Grok 工具白名单与加密推理约束对齐、采样字段兼容、OpenCode/OpenClaw/Hermes 配置生成修正，PR #135）· codec 响应格式与防护修复（response_format 映射、safeguards fail-open、Gemini JSON Schema / Gemini 3 工具签名兼容、function_call fc_ 前缀修复，PR #136） |
 | 🐳 | **Fla1337** | [@Fla1337](https://github.com/Fla1337) | 15 | `+4,978 / -1,143` | Web 管理面板 · Docker / headless 部署 · waliapi-web 二进制 · 多阶段镜像构建 · Web 管理面板用户设置 |
 | 🔧 | **mw** | [@maowei0427](https://github.com/maowei0427) | 10 | `+1,228 / -244` | 日志响应内容记录 · Trace ID 追踪 · 详情页体验优化 · 知识库 embedding 批次配置 |
-| 🔧 | **Nelson** | [@Zhengmingming1](https://github.com/Zhengmingming1) | 20 | `+7,247 / -634` | 知识库扫描版 PDF VLM OCR（方案A）· 中文 PDF 与检索修复 · 知识库访问授权与连接检查 · RAG 检索回归修复（管理搜索模式/权重、失败重导、索引落后回退、向量校验）· Token 配额标签澄清 · 修复 Claude 渠道协议适配 · pdfium macOS 打包路径修复 |
+| 🔧 | **Nelson** | [@Zhengmingming1](https://github.com/Zhengmingming1) | 21 | `+9,371 / -903` | 知识库扫描版 PDF VLM OCR（方案A）· 中文 PDF 与检索修复 · 知识库访问授权与连接检查 · RAG 检索回归修复（管理搜索模式/权重、失败重导、索引落后回退、向量校验）· Token 配额标签澄清 · 修复 Claude 渠道协议适配 · pdfium macOS 打包路径修复 · Embeddings 配置补齐与 RAG 链路诊断（内部 Embedding 统一网关路由、分阶段诊断、API Key 健康检测，PR #140） |
 | 🐞 | **xerina** | [@jiangnuonnuo](https://github.com/jiangnuonnuo) | 4 | `+257 / -82` | Wiki Unicode 文本切片 panic 进程崩溃修复 · 新增字符边界安全切片工具（utils/text.rs）· RAG/Wiki 设置保存后状态未即时更新修复（PR #60）|
 | 🐛 | **Jason** | [@freakojc](https://github.com/freakojc) | 8 | `+2,538 / -105` | 新增「简要」日志级别，请求消息列表只留最新 3 条（PR #119）· 日志统计覆盖索引优化 · 探测日志降噪与恢复状态就地更新 · 流式日志 499 误记修复 + Token 用量恢复 · 仪表盘 cached_tokens 聚合覆盖索引消除 2 秒加载 |
 | 🔧 | **yuanqixun** | [@yuanqixun](https://github.com/yuanqixun) | 9 | `+2,745 / -665` | 审计日志存储与加载优化 · Codex 设备码登录 · Codex 剩余额度展示 · 手动刷新 Codex 额度 · 大响应 SSE 帧兼容修复 |
@@ -680,6 +680,26 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 ---
 
 ## 📌 版本历史
+
+### v0.3.7 (2026-09-28)
+
+#### 知识库与 RAG
+
+- ✨ **RAG 链路分阶段诊断**：`/api/kb/ask` 支持 `diagnostics=true`，按 permission / embedding / retrieval / answer / validation 各阶段返回状态与失败原因；健康检测不再仅凭 HTTP 200 冒充完整链路通过，需各阶段逐一校验（PR #140，@Zhengmingming1）
+- ✨ **API Key 知识库健康检测**：新增 `test_api_key_knowledge_health` 命令，经本机真实 HTTP 入口携带指定 API Key 请求 `/api/kb/ask`，验证 Key 权限、额度与完整 RAG 检测链路，返回耗时、答案、引用来源与诊断详情（PR #140，@Zhengmingming1）
+- ✨ **Embeddings 配置预检**：新增 Embedding 能力预检命令，复用网关内部 Embedding 路由规划且不发请求，可区分「渠道未声明 Embeddings 能力」与「无支持该模型的渠道」并给出修复指引（PR #140，@Zhengmingming1）
+- 🐛 **内部知识库 Embedding 复用统一网关路由**：知识库建库/查询的向量调用不再自行拼接 `/embeddings` 直连上游，改为复用网关的路由规划、渠道身份、Key 轮换与故障切换语义，模型匹配与端点能力判定与外部请求一致（PR #140，@Zhengmingming1）
+- 🐛 **旧 Gemini 执行器不再误判支持 Embeddings**：`gemini_native` 执行器固定调用 generateContent 无法发送 `/embeddings`，路由规划排除其 Embeddings 原生资格，向量请求由 OpenAI 兼容渠道承接（PR #140，@Zhengmingming1）
+
+#### 前端
+
+- ✨ **知识库连接检查接入预检与健康检测**：知识库连接面板展示配置预检结论与真实 RAG 健康检测结果，知识库页同步诊断展示；渠道表单补充 Embeddings 能力配置提示（PR #140，@Zhengmingming1）
+
+#### 其他
+
+- 🧪 **新增 RAG Embedding 路由集成测试**：`rag_embedding_routing` 等测试覆盖内部 Embedding 路由规划、渠道模式过滤与诊断响应（PR #140，@Zhengmingming1）
+- 📝 **README 贡献者数据同步**：更新 Nelson（@Zhengmingming1，PR #140）提交数与代码变更统计
+- 🔧 **版本号统一升级至 0.3.7**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
 ### v0.3.6 (2026-09-23)
 
