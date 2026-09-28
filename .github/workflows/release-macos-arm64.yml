@@ -3,7 +3,7 @@ name: Release macOS ARM64
 on:
   push:
     tags:
-      - 'macos-arm64-v*'
+      - 'all-v*'
   workflow_dispatch:
 
 jobs:

@@ -3,7 +3,7 @@ name: Release Linux
 on:
   push:
     tags:
-      - 'linux-v*'
+      - 'all-v*'
   workflow_dispatch:
 
 jobs:

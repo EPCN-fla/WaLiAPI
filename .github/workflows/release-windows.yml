@@ -3,7 +3,7 @@ name: Release Windows
 on:
   push:
     tags:
-      - 'all-win-v*'
+      - 'all-v*'
   workflow_dispatch:
 
 jobs:
