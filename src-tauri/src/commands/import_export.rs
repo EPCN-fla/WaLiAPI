@@ -91,6 +91,8 @@ pub struct ExportedChannel {
 impl From<Channel> for ExportedChannel {
     fn from(c: Channel) -> Self {
         let identity: ChannelIdentity = resolve_channel_identity(&ChannelIdentityRow::from(&c));
+        let model_mapping = c.normalized_model_mapping();
+        let model_mapping_disabled = c.normalized_model_mapping_disabled();
         ExportedChannel {
             name: c.name,
             channel_type: c.channel_type,
@@ -103,13 +105,8 @@ impl From<Channel> for ExportedChannel {
             config: Some(
                 serde_json::from_str(&c.config).unwrap_or(Value::Object(Default::default())),
             ),
-            model_mapping: Some(
-                serde_json::from_str(&c.model_mapping).unwrap_or(Value::Object(Default::default())),
-            ),
-            model_mapping_disabled: Some(
-                serde_json::from_str(&c.model_mapping_disabled)
-                    .unwrap_or(Value::Array(Default::default())),
-            ),
+            model_mapping: Some(model_mapping),
+            model_mapping_disabled: Some(model_mapping_disabled),
             timeout_secs: Some(c.timeout_secs),
             last_test_at: c.last_test_at,
             last_test_ok: c.last_test_ok,

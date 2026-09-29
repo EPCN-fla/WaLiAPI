@@ -85,6 +85,8 @@ impl From<ChannelApiKey> for ChannelKeyDto {
 impl From<Channel> for ChannelDto {
     fn from(c: Channel) -> Self {
         let identity: ChannelIdentity = resolve_channel_identity(&ChannelIdentityRow::from(&c));
+        let model_mapping = c.normalized_model_mapping();
+        let model_mapping_disabled = c.normalized_model_mapping_disabled();
         ChannelDto {
             id: c.id,
             name: c.name,
@@ -97,10 +99,8 @@ impl From<Channel> for ChannelDto {
             weight: c.weight,
             config: serde_json::from_str(&c.config)
                 .unwrap_or(serde_json::Value::Object(Default::default())),
-            model_mapping: serde_json::from_str(&c.model_mapping)
-                .unwrap_or(serde_json::Value::Object(Default::default())),
-            model_mapping_disabled: serde_json::from_str(&c.model_mapping_disabled)
-                .unwrap_or(serde_json::Value::Array(Default::default())),
+            model_mapping,
+            model_mapping_disabled,
             timeout_secs: c.timeout_secs,
             protocol: identity.protocol,
             provider: identity.provider,
@@ -519,8 +519,7 @@ pub async fn test_channel_impl(
         base_url: channel.base_url.clone(),
         api_key: channel.api_key.clone(),
         models: serde_json::from_str(&channel.models).unwrap_or_default(),
-        model_mapping: serde_json::from_str(&channel.model_mapping)
-            .unwrap_or(serde_json::Value::Object(Default::default())),
+        model_mapping: channel.active_model_mapping(),
         extra: serde_json::from_str(&channel.config)
             .unwrap_or(serde_json::Value::Object(Default::default())),
         timeout_secs: channel.timeout_secs.max(1) as u64,
@@ -618,4 +617,50 @@ pub async fn delete_channel_extra_key(
     repo.delete_channel_api_key(&key_id)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn channel_fixture() -> Channel {
+        Channel {
+            id: "channel-1".into(),
+            name: "Channel".into(),
+            channel_type: "openai".into(),
+            base_url: "https://example.test/v1".into(),
+            api_key: "secret".into(),
+            models: "[]".into(),
+            status: 1,
+            priority: 0,
+            weight: 1,
+            config: "{}".into(),
+            model_mapping: json!({" alias ": " upstream "}).to_string(),
+            model_mapping_disabled: json!([[" alias ", " upstream "]]).to_string(),
+            timeout_secs: 60,
+            protocol: Some("openai".into()),
+            provider: Some("custom".into()),
+            native_base_url: Some("https://example.test/v1".into()),
+            native_endpoints: Some(json!(["chat_completions"]).to_string()),
+            preset_revision: None,
+            identity_revision: 1,
+            legacy_executor_override: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_test_at: None,
+            last_test_ok: None,
+            last_probe_at: None,
+            last_probe_ok: None,
+            probe_latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn channel_dto_normalizes_historical_model_mapping_names() {
+        let dto = ChannelDto::from(channel_fixture());
+
+        assert_eq!(dto.model_mapping, json!({"alias": "upstream"}));
+        assert_eq!(dto.model_mapping_disabled, json!([["alias", "upstream"]]));
+    }
 }

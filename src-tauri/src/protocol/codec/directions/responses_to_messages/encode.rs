@@ -124,6 +124,14 @@ pub fn encode_request(
                     continue;
                 }
                 Some("reasoning") => messages.push(reasoning_message(item, &pointer)?),
+                Some("additional_tools")
+                    if item
+                        .get("tools")
+                        .and_then(Value::as_array)
+                        .is_some_and(Vec::is_empty) =>
+                {
+                    normalized.push(pointer);
+                }
                 Some(other) => {
                     return Err(unsupported(
                         FeatureKind::UnknownBlock,

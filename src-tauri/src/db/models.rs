@@ -76,14 +76,120 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// 返回规范化但尚未应用禁用列表的原始模型映射，供管理面与导出使用。
+    pub fn normalized_model_mapping(&self) -> serde_json::Value {
+        let mut mapping: serde_json::Value =
+            serde_json::from_str(&self.model_mapping).unwrap_or_default();
+        normalize_model_mapping(&mut mapping);
+        mapping
+    }
+
+    /// 返回规范化后的禁用映射对，供管理面与导出使用。
+    pub fn normalized_model_mapping_disabled(&self) -> serde_json::Value {
+        let mut disabled =
+            serde_json::from_str::<serde_json::Value>(if self.model_mapping_disabled.is_empty() {
+                "[]"
+            } else {
+                &self.model_mapping_disabled
+            })
+            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+        normalize_model_mapping_disabled(&mut disabled);
+        disabled
+    }
+
     /// 解析 `model_mapping` 并剔除被关闭的映射对（迁移 041）。
     /// 返回「当前生效」的映射 JSON；路由匹配、上游模型解析、
     /// `/v1/models` 聚合都必须使用本方法而非直接读原始列。
     pub fn active_model_mapping(&self) -> serde_json::Value {
-        let mapping: serde_json::Value =
-            serde_json::from_str(&self.model_mapping).unwrap_or_default();
-        filter_disabled_mapping(mapping, &self.model_mapping_disabled)
+        let mapping = self.normalized_model_mapping();
+        let disabled = self.normalized_model_mapping_disabled();
+        filter_disabled_mapping(
+            mapping,
+            &serde_json::to_string(&disabled).unwrap_or_else(|_| "[]".to_owned()),
+        )
     }
+}
+
+/// 规范化模型映射 JSON 中的模型名。
+///
+/// * 去除 key 与字符串 value 两端空格；
+/// * 删除空 key 与去空格后为空的 value；
+/// * 数组 value 逐项处理，只剩一项时折叠为字符串。
+pub fn normalize_model_mapping(mapping: &mut serde_json::Value) {
+    let Some(obj) = mapping.as_object_mut() else {
+        return;
+    };
+    let keys: Vec<String> = obj.keys().cloned().collect();
+    let mut trimmed_entries: Vec<(String, serde_json::Value)> = Vec::new();
+    for key in &keys {
+        let trimmed_key = key.trim().to_string();
+        if trimmed_key.is_empty() {
+            obj.remove(key);
+            continue;
+        }
+        if let Some(value) = obj.remove(key) {
+            let new_value = match value {
+                serde_json::Value::String(s) => {
+                    let ts = s.trim().to_string();
+                    if ts.is_empty() {
+                        continue;
+                    }
+                    serde_json::Value::String(ts)
+                }
+                serde_json::Value::Array(arr) => {
+                    let trimmed: Vec<serde_json::Value> = arr
+                        .into_iter()
+                        .filter_map(|v| {
+                            v.as_str()
+                                .map(|s| {
+                                    let ts = s.trim().to_string();
+                                    if ts.is_empty() {
+                                        None
+                                    } else {
+                                        Some(serde_json::Value::String(ts))
+                                    }
+                                })
+                                .unwrap_or(Some(v))
+                        })
+                        .collect();
+                    match trimmed.len() {
+                        0 => continue,
+                        1 => trimmed.into_iter().next().unwrap(),
+                        _ => serde_json::Value::Array(trimmed),
+                    }
+                }
+                other => other,
+            };
+            trimmed_entries.push((trimmed_key, new_value));
+        }
+    }
+    for (k, v) in trimmed_entries {
+        obj.insert(k, v);
+    }
+}
+
+/// 去除禁用映射对两端空格，并删除空映射对。
+pub fn normalize_model_mapping_disabled(mapping: &mut serde_json::Value) {
+    let Some(pairs) = mapping.as_array_mut() else {
+        return;
+    };
+    pairs.retain_mut(|pair| {
+        let Some(pair) = pair.as_array_mut() else {
+            return true;
+        };
+        for value in pair.iter_mut() {
+            if let Some(name) = value.as_str() {
+                *value = serde_json::Value::String(name.trim().to_owned());
+            }
+        }
+        pair.len() == 2
+            && pair.iter().all(|value| {
+                value
+                    .as_str()
+                    .map(|name| !name.trim().is_empty())
+                    .unwrap_or(true)
+            })
+    });
 }
 
 /// 从映射 JSON 中剔除被关闭的 [from, to] 对。
@@ -453,12 +559,36 @@ impl AuthAccount {
         serde_json::from_str(&self.model_mapping_json)
     }
 
+    /// 返回规范化但尚未应用禁用列表的原始模型映射，供管理面使用。
+    pub fn normalized_model_mapping(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let mut mapping = self.model_mapping()?;
+        normalize_model_mapping(&mut mapping);
+        Ok(mapping)
+    }
+
+    /// 返回规范化后的禁用映射对，供管理面使用。
+    pub fn normalized_model_mapping_disabled(&self) -> serde_json::Value {
+        let mut disabled =
+            serde_json::from_str::<serde_json::Value>(if self.model_mapping_disabled.is_empty() {
+                "[]"
+            } else {
+                &self.model_mapping_disabled
+            })
+            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+        normalize_model_mapping_disabled(&mut disabled);
+        disabled
+    }
+
     /// 解析 `model_mapping` 并剔除被关闭的映射对（迁移 042，与渠道
     /// `Channel::active_model_mapping` 对齐）。路由匹配、别名目标解析、
     /// `/v1/models` 聚合都必须使用本方法而非直接读原始列。
     pub fn active_model_mapping(&self) -> serde_json::Value {
-        let mapping = self.model_mapping().unwrap_or_default();
-        filter_disabled_mapping(mapping, &self.model_mapping_disabled)
+        let mapping = self.normalized_model_mapping().unwrap_or_default();
+        let disabled = self.normalized_model_mapping_disabled();
+        filter_disabled_mapping(
+            mapping,
+            &serde_json::to_string(&disabled).unwrap_or_else(|_| "[]".to_owned()),
+        )
     }
 }
 
@@ -831,6 +961,24 @@ mod mapping_disabled_tests {
     }
 
     #[test]
+    fn normalize_model_mapping_trims_keys_and_values() {
+        let mut mapping = serde_json::json!({
+            " alias ": " upstream-a ",
+            " array ": [" upstream-a ", " upstream-b ", " ", 1],
+            " empty ": " ",
+            " ": "ignored"
+        });
+        crate::db::models::normalize_model_mapping(&mut mapping);
+        assert_eq!(mapping["alias"], "upstream-a");
+        assert_eq!(
+            mapping["array"],
+            serde_json::json!(["upstream-a", "upstream-b", 1])
+        );
+        assert!(mapping.get("empty").is_none());
+        assert!(mapping.get(" ").is_none());
+    }
+
+    #[test]
     fn active_model_mapping_excludes_disabled_pairs() {
         let mut ch = Channel {
             id: "c1".into(),
@@ -869,5 +1017,10 @@ mod mapping_disabled_tests {
             ch.active_model_mapping()["auto"],
             serde_json::json!(["m-a", "m-b"])
         );
+
+        // 历史数据即使保存了首尾空格，也必须按规范化后的名称参与路由。
+        ch.model_mapping = serde_json::json!({" auto ": [" m-a ", " m-b "]}).to_string();
+        ch.model_mapping_disabled = r#"[[" auto "," m-a "]]"#.into();
+        assert_eq!(ch.active_model_mapping()["auto"], "m-b");
     }
 }

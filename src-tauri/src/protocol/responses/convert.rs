@@ -2,6 +2,18 @@ use serde_json::Value;
 
 use super::state::{next_seq, StreamState, ToolCallState};
 
+fn custom_tool_input(arguments: &str) -> String {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("input")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| arguments.to_owned())
+}
+
 /// Convert an OpenAI SSE chunk (Chat Completions stream) to Responses API SSE events.
 ///
 /// This function is called repeatedly for each upstream SSE chunk and must be stateful.
@@ -230,7 +242,12 @@ pub fn convert_openai_sse_to_responses(
                                 // 条目 id 必须带 `fc_` 前缀；上游 Chat 的 tool_call id
                                 // 是关联 id，只能进 `call_id`（写进 `id` 会让官方上游
                                 // 在回放旧会话时报 "Expected an ID that begins with 'fc'"）。
-                                let item_id = format!("fc_{}", uuid::Uuid::new_v4().simple());
+                                let is_custom = state.custom_tool_names.contains(name);
+                                let item_id = format!(
+                                    "{}_{}",
+                                    if is_custom { "ctc" } else { "fc" },
+                                    uuid::Uuid::new_v4().simple()
+                                );
 
                                 state.tool_calls.insert(
                                     tc_index,
@@ -243,6 +260,7 @@ pub fn convert_openai_sse_to_responses(
                                         item_added_sent: false,
                                         arguments_done_sent: false,
                                         output_item_done_sent: false,
+                                        is_custom,
                                     },
                                 );
                                 state.next_output_index += 1;
@@ -257,6 +275,7 @@ pub fn convert_openai_sse_to_responses(
                             }
                             if tc_state.name.is_empty() && !name.is_empty() {
                                 tc_state.name = name.to_string();
+                                tc_state.is_custom = state.custom_tool_names.contains(name);
                             }
 
                             // Emit output_item.added for function_call if not yet sent
@@ -281,14 +300,25 @@ pub fn convert_openai_sse_to_responses(
                                     tc_state.name = effective_name.clone();
                                 }
 
-                                let fc_item = serde_json::json!({
-                                    "id": tc_state.item_id,
-                                    "type": "function_call",
-                                    "status": "in_progress",
-                                    "call_id": tc_state.call_id,
-                                    "name": tc_state.name,
-                                    "arguments": ""
-                                });
+                                let fc_item = if tc_state.is_custom {
+                                    serde_json::json!({
+                                        "id": tc_state.item_id,
+                                        "type": "custom_tool_call",
+                                        "status": "in_progress",
+                                        "call_id": tc_state.call_id,
+                                        "name": tc_state.name,
+                                        "input": ""
+                                    })
+                                } else {
+                                    serde_json::json!({
+                                        "id": tc_state.item_id,
+                                        "type": "function_call",
+                                        "status": "in_progress",
+                                        "call_id": tc_state.call_id,
+                                        "name": tc_state.name,
+                                        "arguments": ""
+                                    })
+                                };
                                 // Increment seq before borrowing tc_state
                                 state.sequence_number += 1;
                                 let seq = state.sequence_number;
@@ -313,17 +343,19 @@ pub fn convert_openai_sse_to_responses(
 
                                 state.sequence_number += 1;
                                 let seq = state.sequence_number;
-                                let delta_event = serde_json::json!({
-                                    "type": "response.function_call_arguments.delta",
-                                    "item_id": tc_state.item_id,
-                                    "output_index": tc_state.output_index,
-                                    "delta": arguments,
-                                    "sequence_number": seq
-                                });
-                                events.push(format!(
-                                    "event: response.function_call_arguments.delta\ndata: {}\n\n",
-                                    delta_event
-                                ));
+                                if !tc_state.is_custom {
+                                    let delta_event = serde_json::json!({
+                                        "type": "response.function_call_arguments.delta",
+                                        "item_id": tc_state.item_id,
+                                        "output_index": tc_state.output_index,
+                                        "delta": arguments,
+                                        "sequence_number": seq
+                                    });
+                                    events.push(format!(
+                                        "event: response.function_call_arguments.delta\ndata: {}\n\n",
+                                        delta_event
+                                    ));
+                                }
                             }
                         }
                     }
@@ -474,6 +506,7 @@ pub fn convert_openai_sse_to_responses(
                             bool,
                             bool,
                             bool,
+                            bool,
                         )> = state
                             .tool_calls
                             .iter()
@@ -487,6 +520,7 @@ pub fn convert_openai_sse_to_responses(
                                     tc.item_added_sent,
                                     tc.arguments_done_sent,
                                     tc.output_item_done_sent,
+                                    tc.is_custom,
                                 )
                             })
                             .collect();
@@ -500,34 +534,73 @@ pub fn convert_openai_sse_to_responses(
                             _item_added,
                             arguments_done,
                             output_item_done,
+                            is_custom,
                         ) in &tool_calls_data
                         {
                             if !arguments_done {
                                 let seq = next_seq(state);
-                                let args_done = serde_json::json!({
-                                    "type": "response.function_call_arguments.done",
-                                    "item_id": item_id,
-                                    "output_index": output_index,
-                                    "name": name,
-                                    "arguments": accumulated_args,
-                                    "sequence_number": seq
-                                });
-                                events.push(format!(
-                                    "event: response.function_call_arguments.done\ndata: {}\n\n",
-                                    args_done
-                                ));
+                                if *is_custom {
+                                    let input = custom_tool_input(accumulated_args);
+                                    let delta = serde_json::json!({
+                                        "type": "response.custom_tool_call_input.delta",
+                                        "item_id": item_id,
+                                        "output_index": output_index,
+                                        "delta": input,
+                                        "sequence_number": seq
+                                    });
+                                    events.push(format!(
+                                        "event: response.custom_tool_call_input.delta\ndata: {}\n\n",
+                                        delta
+                                    ));
+                                    let seq = next_seq(state);
+                                    let done = serde_json::json!({
+                                        "type": "response.custom_tool_call_input.done",
+                                        "item_id": item_id,
+                                        "output_index": output_index,
+                                        "input": input,
+                                        "sequence_number": seq
+                                    });
+                                    events.push(format!(
+                                        "event: response.custom_tool_call_input.done\ndata: {}\n\n",
+                                        done
+                                    ));
+                                } else {
+                                    let args_done = serde_json::json!({
+                                        "type": "response.function_call_arguments.done",
+                                        "item_id": item_id,
+                                        "output_index": output_index,
+                                        "name": name,
+                                        "arguments": accumulated_args,
+                                        "sequence_number": seq
+                                    });
+                                    events.push(format!(
+                                        "event: response.function_call_arguments.done\ndata: {}\n\n",
+                                        args_done
+                                    ));
+                                }
                             }
 
                             if !output_item_done {
                                 let seq = next_seq(state);
-                                let fc_completed = serde_json::json!({
-                                    "id": item_id,
-                                    "type": "function_call",
-                                    "status": "completed",
-                                    "call_id": call_id,
-                                    "name": name,
-                                    "arguments": accumulated_args
-                                });
+                                let fc_completed = if *is_custom {
+                                    serde_json::json!({
+                                        "id": item_id,
+                                        "type": "custom_tool_call",
+                                        "status": "completed",
+                                        "call_id": call_id,
+                                        "name": name,
+                                        "input": custom_tool_input(accumulated_args)
+                                    })
+                                } else {
+                                    serde_json::json!({
+                                        "id": item_id,
+                                        "type": "function_call",
+                                        "status": "completed",
+                                        "call_id": call_id,
+                                        "name": name,
+                                        "arguments": accumulated_args
+                                    })
+                                };
                                 let item_done = serde_json::json!({
                                     "type": "response.output_item.done",
                                     "output_index": output_index,
