@@ -31,6 +31,8 @@ impl KbRepository {
     pub async fn create_kb(&self, input: &CreateKbInput) -> Result<KbKnowledgeBase, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_iso();
+        // 新知识库默认授权全部已有密钥；事务保证授权失败时创建也回滚。
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO kb_knowledge_bases (id, name, description, status, doc_count, chunk_count, total_tokens, embedding_model, embedding_channel_id, mcp_enabled, chunk_size, chunk_overlap, excluded_dirs, excluded_files, included_files, embedding_dim, index_status, embedding_batch_size, ocr_model, created_at, updated_at)
              VALUES (?, ?, ?, 1, 0, 0, 0, ?, ?, 1, 512, 64, '', '', '', 0, 'none', 32, ?, ?, ?)"
@@ -43,10 +45,24 @@ impl KbRepository {
         .bind(&input.ocr_model)
         .bind(&now)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
-        self.get_kb(&id).await
+        sqlx::query(
+            "INSERT INTO api_key_knowledge_access (api_key_id, kb_id)
+             SELECT id, ? FROM api_keys",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+
+        let kb =
+            sqlx::query_as::<_, KbKnowledgeBase>("SELECT * FROM kb_knowledge_bases WHERE id = ?")
+                .bind(&id)
+                .fetch_one(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        Ok(kb)
     }
 
     pub async fn update_kb(

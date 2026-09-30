@@ -325,6 +325,7 @@ function KnowledgeAccessDialog({ apiKey, onClose }: { apiKey: ApiKey; onClose: (
           <h2 id="knowledge-access-title" className="font-semibold">知识库查询权限 · {apiKey.name}</h2>
           <button onClick={onClose} disabled={saving} aria-label="关闭"><X size={18} /></button>
         </div>
+        <p className="mb-4 text-xs text-slate-500">新建密钥默认授权全部现有 RAG；新建 RAG 默认授权全部已有密钥。可取消勾选并保存以撤销查询权限。</p>
         <p className="mb-4 text-sm text-slate-500">允许该 Key 通过 REST / MCP 查询勾选的 RAG。未勾选即无权限；不能上传、删除或修改知识库。MCP 还需开启该库的 MCP 开关。</p>
         <p className="mb-4 text-xs text-slate-500">向量检索和问答沿用该 Key 的模型、渠道权限及额度，请同时放行知识库使用的 Embedding 模型和答题模型。</p>
         <div className="max-h-72 space-y-2 overflow-y-auto">
@@ -702,6 +703,9 @@ function ApiKeyForm({ editKey, onClose, onSaved }: { editKey?: ApiKey; onClose: 
           <button onClick={onClose} className="action-secondary px-3 py-2"><X size={18} /></button>
         </div>
         <form onSubmit={handleSubmit} className="space-y-5 p-5" onKeyDown={e => { if (e.key === "Enter" && (e.nativeEvent.isComposing || e.keyCode === 229)) e.preventDefault(); }}>
+          {!isEdit && (
+            <p className="text-sm text-muted-foreground">新建密钥默认拥有全部现有知识库的查询权限。创建后可在“知识库查询权限”中撤销授权；模型、渠道限制及额度仍生效。</p>
+          )}
           {/* 名称 + 配额 */}
           <div className="flex gap-4">
             <div className="flex-1">

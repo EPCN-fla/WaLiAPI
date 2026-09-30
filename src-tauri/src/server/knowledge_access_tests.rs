@@ -104,6 +104,104 @@ async fn document(state: &AppState, kb_id: &str, content: &str) -> String {
 }
 
 #[tokio::test]
+async fn newly_created_key_can_list_all_existing_kbs_over_rest_and_mcp() {
+    let (state, _, first, second, app) = setup().await;
+    let key = Repository::new(state.db.pool.clone())
+        .create_api_key(&serde_json::from_value(json!({"name":"default-grants"})).unwrap())
+        .await
+        .unwrap();
+    let result = body(
+        app.clone()
+            .oneshot(request("GET", "/api/kb", Some(&key.key)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let ids = result["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|kb| kb["id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids, [first.id.as_str(), second.id.as_str()].into());
+    let result = body(
+        app.oneshot(rpc(&key.key, "list_knowledge_bases", json!({})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(result["result"]["isError"], false);
+    assert!(result.to_string().contains(&first.id));
+    assert!(result.to_string().contains(&second.id));
+}
+
+#[tokio::test]
+async fn newly_created_kb_is_visible_to_existing_keys_and_can_be_revoked() {
+    let (state, key, first, private, app) = setup().await;
+    let kb = KbRepository::new(state.db.pool.clone())
+        .create_kb(&serde_json::from_value(json!({"name":"new-shared"})).unwrap())
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/api/kb/{}/stats", kb.id),
+            Some(&key.key),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = body(
+        app.clone()
+            .oneshot(rpc(
+                &key.key,
+                "get_knowledge_base_stats",
+                json!({"kb_id":kb.id}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(result["result"]["isError"], false);
+    // 新库的默认授权不恢复此前被显式撤销的其他库。
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/api/kb/{}/stats", private.id),
+            Some(&key.key),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    set_grants(&state.db.pool, &key.id, &[first.id])
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/api/kb/{}/stats", kb.id),
+            Some(&key.key),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let result = body(
+        app.oneshot(rpc(
+            &key.key,
+            "get_knowledge_base_stats",
+            json!({"kb_id":kb.id}),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(result["result"]["isError"], true);
+}
+
+#[tokio::test]
 async fn grants_filter_lists_and_block_management_and_cross_kb_reads() {
     let (state, key, first, second, app) = setup().await;
     let foreign_doc = document(&state, &second.id, "private secret").await;
