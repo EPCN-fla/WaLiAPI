@@ -7,7 +7,6 @@ use crate::services::knowledge::{
     models::*,
     rag,
     repository::KbRepository,
-    retriever,
 };
 use axum::{
     body::Body,
@@ -266,19 +265,32 @@ pub async fn ask(
         .headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let budget = input
-        .timeout_ms
-        .map(|ms| Budget::new(ms, request_id.clone()));
+        .unwrap_or("");
+    run_request(
+        request_id,
+        input.timeout_ms,
+        input.diagnostics,
+        Box::pin(ask_inner(shared, access, input, mcp)),
+    )
+    .await
+}
+
+/// 所有显式预算知识请求共用取消终态与绝对截止；HTTP handler 不另起后台请求。
+pub(crate) async fn run_request<T>(
+    request_id: &str,
+    timeout_ms: Option<u64>,
+    diagnostics: bool,
+    work: impl std::future::Future<Output = Result<T, QueryError>>,
+) -> Result<T, QueryError> {
+    let request_id = request_id.to_string();
+    let budget = timeout_ms.map(|ms| Budget::new(ms, request_id.clone()));
     let mut trace = RagRequestTrace {
         request_id: request_id.clone(),
         budget: budget.clone(),
         finished: false,
         started: Instant::now(),
     };
-    let diagnostics = input.diagnostics;
-    let work = Box::pin(ask_inner(shared, access, input, mcp));
+    let work = Box::pin(work);
     let result = if let Some(budget) = &budget {
         budget
             .scope(async {
@@ -404,10 +416,9 @@ async fn ask_inner(
             input.diagnostics,
         )
     })?;
-    crate::services::knowledge::exam::validate_request(&input).map_err(|message| {
+    rag::validate_candidate_k(input.top_k, input.candidate_k).map_err(|error| {
         rag::diagnostic_failure(
-            QueryError::new(StatusCode::BAD_REQUEST, message)
-                .at_stage("permission", "invalid_exam_request"),
+            error,
             "permission",
             permission_started,
             &stages,
@@ -439,7 +450,6 @@ async fn ask_inner(
         input.diagnostics,
         input.allow_keyword_fallback,
         input.candidate_k,
-        input.exam.as_ref(),
         input.reasoning_effort.as_deref(),
     ))
     .await;
@@ -460,56 +470,142 @@ async fn ask_inner(
     }
 }
 
+/// MCP 保留历史数组结果；HTTP 新参数使用同一流程的完整元数据。
 pub async fn search(
     shared: &SharedState,
     access: &KnowledgeAccess,
     input: AskInput,
     mcp: bool,
 ) -> Result<Vec<SearchResult>, QueryError> {
+    search_with_details(shared, access, input, mcp)
+        .await
+        .map(|result| result.data)
+}
+
+pub async fn search_with_details(
+    shared: &SharedState,
+    access: &KnowledgeAccess,
+    input: AskInput,
+    mcp: bool,
+) -> Result<SearchResponse, QueryError> {
+    let request_id = access
+        .headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    run_request(
+        request_id,
+        input.timeout_ms,
+        input.diagnostics,
+        Box::pin(search_inner(shared, access, input, mcp)),
+    )
+    .await
+}
+
+async fn search_inner(
+    shared: &SharedState,
+    access: &KnowledgeAccess,
+    input: AskInput,
+    mcp: bool,
+) -> Result<SearchResponse, QueryError> {
+    let permission_started = Instant::now();
+    let request_id = access
+        .headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let kb_id = input.kb_id.as_deref().unwrap_or("");
-    let kb = access.require_kb(shared, kb_id, mcp).await?;
+    let kb = access
+        .require_kb(shared, kb_id, mcp)
+        .await
+        .map_err(|error| {
+            rag::diagnostic_failure(
+                error.at_stage("permission", "knowledge_access_denied"),
+                "permission",
+                permission_started,
+                &[],
+                request_id,
+                input.diagnostics,
+            )
+        })?;
     let mode = input.search_mode.as_deref().unwrap_or("hybrid");
     let vw = input.vector_weight.unwrap_or(0.7);
     let kw = input.keyword_weight.unwrap_or(0.3);
-    validate_query(&input.question, input.top_k, mode, vw, kw)?;
-    let pool = &shared.state.db.pool;
-    if mode == "keyword" {
-        return retriever::keyword_only_search(pool, kb_id, &input.question, input.top_k)
-            .await
-            .map_err(Into::into);
-    }
+    validate_query(&input.question, input.top_k, mode, vw, kw)
+        .and_then(|_| rag::validate_candidate_k(input.top_k, input.candidate_k))
+        .map_err(|error| {
+            rag::diagnostic_failure(
+                error.at_stage("permission", "invalid_query"),
+                "permission",
+                permission_started,
+                &[],
+                request_id,
+                input.diagnostics,
+            )
+        })?;
+    let mut permission_stages = Vec::new();
+    rag::record_stage(
+        &mut permission_stages,
+        "permission",
+        "passed",
+        permission_started,
+    );
     let client = ModelClient::ApiKey {
         shared,
         headers: &access.headers,
     };
-    let vectors = client
-        .embed(
-            &input.question,
-            kb.embedding_model
-                .as_deref()
-                .unwrap_or("text-embedding-3-small"),
-        )
-        .await?;
-    let vector = vectors.first().ok_or("Missing query embedding")?;
-    if mode == "vector" {
-        retriever::search(pool, kb_id, vector, input.top_k)
-            .await
-            .map_err(Into::into)
-    } else {
-        let fusion =
-            retriever::FusionMode::parse(&shared.state.settings.get_str("kb.fusion_mode", "rrf"));
-        retriever::hybrid_search_with_details(
-            pool,
-            kb_id,
-            &input.question,
-            vector,
-            input.top_k,
-            vw,
-            kw,
-            fusion,
-        )
-        .await
-        .map(|results| results.into_iter().map(|r| r.result).collect())
-        .map_err(Into::into)
+    let result = Box::pin(rag::retrieve_with_client(
+        &client,
+        &shared.state.db.pool,
+        kb_id,
+        &input.question,
+        kb.embedding_model
+            .as_deref()
+            .unwrap_or("text-embedding-3-small"),
+        input.candidate_k.unwrap_or(input.top_k),
+        mcp,
+        &shared.state.settings,
+        vw,
+        kw,
+        mode,
+        input.diagnostics,
+        input.allow_keyword_fallback,
+        false,
+    ))
+    .await;
+    let mut retrieved = result.map_err(|mut error| {
+        if let Some(diagnostics) = &mut error.diagnostics {
+            diagnostics.stages.splice(0..0, permission_stages.clone());
+        }
+        error
+    })?;
+    permission_stages.append(&mut retrieved.stages);
+    let mut data: Vec<_> = retrieved
+        .scored_results
+        .into_iter()
+        .map(|result| result.result)
+        .collect();
+    data.truncate(input.top_k);
+    if data.is_empty() {
+        rag::record_stage(
+            &mut permission_stages,
+            "retrieval",
+            "empty",
+            retrieved.retrieval_started,
+        );
     }
+    let extended = input.timeout_ms.is_some()
+        || input.allow_keyword_fallback
+        || input.diagnostics
+        || input.candidate_k.is_some();
+    Ok(SearchResponse {
+        data,
+        request_id: extended.then(|| request_id.to_string()),
+        retrieval_mode: extended.then_some(retrieved.actual_mode),
+        degradation_reason: retrieved.degradation_reason,
+        diagnostics: input.diagnostics.then_some(RagDiagnostics {
+            request_id: request_id.to_string(),
+            stages: permission_stages,
+        }),
+    })
 }

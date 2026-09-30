@@ -81,7 +81,6 @@ pub async fn ask_with_config(
         false,
         None,
         None,
-        None,
     )
     .await
     .map_err(|e| e.to_string())
@@ -106,49 +105,386 @@ pub(crate) async fn ask_with_client(
     diagnostics_enabled: bool,
     allow_keyword_fallback: bool,
     candidate_k: Option<usize>,
-    exam: Option<&super::exam::ExamQuestion>,
     reasoning_effort: Option<&str>,
 ) -> Result<RagAnswer, QueryError> {
     let reasoning_effort = validate_reasoning_request(reasoning_effort, false)?;
     let mut stages = Vec::new();
-    let strict = diagnostics_enabled
-        || allow_keyword_fallback
-        || budget::current().is_some()
-        || exam.is_some();
+    let strict = diagnostics_enabled || allow_keyword_fallback || budget::current().is_some();
     let request_id = client.request_id().unwrap_or_default();
 
     let kb_repo = KbRepository::new(pool.clone());
-    let ordered_context = candidate_k.is_some() || exam.is_some();
-    let retrieval_k = candidate_k.unwrap_or(if exam.is_some() { top_k.max(20) } else { top_k });
-    // 每个选项先取得自己的查询份额，不能让长题干挤掉末尾选项。
-    let anchors = if let Some(exam) = exam {
-        exam.options
-            .iter()
-            .map(|option| option.text.clone())
-            .chain(super::exam::retrieval_anchors(exam))
-            .collect::<Vec<_>>()
-    } else if ordered_context {
+    validate_candidate_k(top_k, candidate_k)?;
+    let ordered_context = candidate_k.is_some();
+    let retrieval_k = candidate_k.unwrap_or(top_k);
+    let anchors = if ordered_context {
         super::text::query_tokens(query)
     } else {
         Vec::new()
     };
-    // 融合模式（C-06/R3）：RRF 默认（消量纲），weighted 保留可配回退
-    let fusion_mode = retriever::FusionMode::parse(&settings.get_str("kb.fusion_mode", "rrf"));
 
     // C-06/R2：可选多轮查询改写（kb.query_rewrite，默认关）。
     // 多轮对话的指代型问题（「上面说的方案呢」）直接送检索必然 miss——
     // 开启时先用渠道模型把「近几轮对话 + 当前问题」改写成独立完整的检索查询。
     // 失败/超时静默回退原查询（best-effort），多一次 LLM 调用的成本由开关控制。
-    let query =
-        if exam.is_none() && settings.get_bool("kb.query_rewrite", false) && !history.is_empty() {
-            rewrite_query_with_llm(client, pool, chat_model, query, history).await?
-        } else {
-            query.to_string()
-        };
+    let query = if settings.get_bool("kb.query_rewrite", false) && !history.is_empty() {
+        rewrite_query_with_llm(client, pool, chat_model, query, history).await?
+    } else {
+        query.to_string()
+    };
 
+    let retrieved = Box::pin(retrieve_with_client(
+        client,
+        pool,
+        kb_id,
+        &query,
+        embedding_model,
+        retrieval_k,
+        mcp_only,
+        settings,
+        vector_weight,
+        keyword_weight,
+        search_mode,
+        diagnostics_enabled,
+        allow_keyword_fallback,
+        true,
+    ))
+    .await?;
+    stages.extend(retrieved.stages);
+    let retrieval_started = retrieved.retrieval_started;
+    let actual_mode = retrieved.actual_mode;
+    let degradation_reason = retrieved.degradation_reason;
+    let fallback_enabled = allow_keyword_fallback && search_mode == "hybrid" && !kb_id.is_empty();
+    let scored_results = retrieved.scored_results;
+    // C-06/R3 第二步：可选 LLM listwise 重排（`kb.rerank_enabled`，默认关）。
+    // 走网关自身的渠道跑渠道（proxy::handle_request，kb-internal 路由组），
+    // 重排调用的 token 消耗自动计入请求日志；失败静默回退原序（best-effort）。
+    let mut scored_results =
+        if settings.get_bool("kb.rerank_enabled", false) && scored_results.len() > 1 {
+            rerank_with_llm(
+                client,
+                chat_model,
+                &query,
+                scored_results,
+                ordered_context.then_some(anchors.as_slice()),
+            )
+            .await?
+        } else {
+            scored_results
+        };
+    let retrieval_candidates = scored_results.clone();
+    scored_results.truncate(top_k);
+
+    // Extract plain results for context building
+    let results: Vec<super::models::SearchResult> =
+        scored_results.iter().map(|s| s.result.clone()).collect();
+
+    if strict && results.is_empty() {
+        return Err(diagnostic_failure(
+            QueryError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "未检索到相关片段，请检查知识库内容、索引和检测问题",
+            )
+            .at_stage("retrieval", "retrieval_empty"),
+            "retrieval",
+            retrieval_started,
+            &stages,
+            &request_id,
+            diagnostics_enabled,
+        ));
+    }
+    if results.is_empty() {
+        // Save to conversation history
+        if client.is_internal() && !kb_id.is_empty() {
+            let answer = "RAG 中没有找到相关内容。".to_string();
+            kb_repo
+                .add_conversation(kb_id, "user", &query, None, Some(chat_model), 0)
+                .await
+                .ok();
+            kb_repo
+                .add_conversation(kb_id, "assistant", &answer, None, Some(chat_model), 0)
+                .await
+                .ok();
+            return Ok(RagAnswer {
+                answer,
+                sources: vec![],
+                usage: None,
+                retrieval_details: Some(vec![]),
+                diagnostics: None,
+                retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
+                degradation_reason: degradation_reason.clone(),
+                reasoning: reasoning_info(reasoning_effort, ReasoningStatus::NotSent),
+            });
+        }
+        return Ok(RagAnswer {
+            answer: "RAG 中没有找到相关内容。".to_string(),
+            sources: vec![],
+            usage: None,
+            retrieval_details: Some(vec![]),
+            diagnostics: None,
+            retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
+            degradation_reason: degradation_reason.clone(),
+            reasoning: reasoning_info(reasoning_effort, ReasoningStatus::NotSent),
+        });
+    }
+
+    let rag_system_prompt = prompt_templates::load(pool, prompt_templates::KEY_RAG_SYSTEM).await;
+
+    // 3. Build context
+    let context = build_context(&results);
+
+    // 4. Build prompt with history
+    let prompt = build_rag_prompt(&context, &query, history);
+
+    // 5. Token estimation and fallback
+    let estimated_tokens = retriever::estimate_tokens(&prompt);
+    let model_limit = retriever::get_model_context_limit(chat_model);
+    let context_limit = ((model_limit as f64 * 0.7) as usize)
+        .saturating_sub(retriever::estimate_tokens(&rag_system_prompt));
+
+    let (final_prompt, context_results) = if estimated_tokens > context_limit {
+        // Stage 1: Trim context (remove lowest-scoring chunks)
+        let trimmed =
+            trim_context_with_order(&results, &query, history, context_limit, ordered_context);
+        if retriever::estimate_tokens(&trimmed.0) > context_limit {
+            // Stage 2: Remove history, keep only latest message
+            let no_history = build_rag_prompt(
+                &context,
+                &query,
+                &history[history.len().saturating_sub(2)..],
+            );
+            if retriever::estimate_tokens(&no_history) > context_limit {
+                // Stage 3: Remove context entirely
+                let bare = format!(
+                    "注意：由于 token 限制，无法附上 RAG 上下文。\n\n问题: {}",
+                    query
+                );
+                (bare, vec![])
+            } else {
+                (no_history, results.clone())
+            }
+        } else {
+            trimmed
+        }
+    } else {
+        (prompt, results.clone())
+    };
+
+    tracing::info!(
+        "RAG prompt: estimated {} tokens, limit {}, context_used: {}",
+        retriever::estimate_tokens(&final_prompt),
+        context_limit,
+        !context_results.is_empty()
+    );
+
+    // 6. Call LLM via proxy
+    let mut chat_request = serde_json::json!({
+        "model": chat_model,
+        "messages": [
+            {"role": "system", "content": rag_system_prompt},
+            {"role": "user", "content": final_prompt}
+        ],
+        "stream": false
+    });
+    let reasoning = apply_reasoning_effort(&mut chat_request, reasoning_effort)?;
+    let answer_started = Instant::now();
+    client
+        .ensure_knowledge_access(kb_id, mcp_only)
+        .await
+        .map_err(|mut error| {
+            error.stage = Some("answer".to_string());
+            diagnostic_failure(
+                error,
+                "answer",
+                answer_started,
+                &stages,
+                &request_id,
+                diagnostics_enabled,
+            )
+        })?;
+    let proxy_result = run_stage("answer", 1.0, 0.01, client.chat(chat_request, "RAG"))
+        .await
+        .map_err(|error| {
+            diagnostic_failure(
+                error,
+                "answer",
+                answer_started,
+                &stages,
+                &request_id,
+                diagnostics_enabled,
+            )
+        });
+
+    match proxy_result {
+        Ok(result) => {
+            let answer = result
+                .body
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str());
+            record_stage(&mut stages, "answer", "passed", answer_started);
+            let validation_started = Instant::now();
+            client
+                .ensure_knowledge_access_after_answer(kb_id, mcp_only)
+                .await
+                .map_err(|error| {
+                    diagnostic_failure(
+                        error,
+                        "validation",
+                        validation_started,
+                        &stages,
+                        &request_id,
+                        diagnostics_enabled,
+                    )
+                })?;
+            if strict && answer.unwrap_or("").trim().is_empty() {
+                return Err(diagnostic_failure(
+                    QueryError::new(axum::http::StatusCode::BAD_GATEWAY, "回答模型返回了空答案")
+                        .at_stage("validation", "answer_empty"),
+                    "validation",
+                    validation_started,
+                    &stages,
+                    &request_id,
+                    diagnostics_enabled,
+                ));
+            }
+            // 普通请求保留空字符串；只有缺少 content 时沿用原有回退文案。
+            let answer = answer.unwrap_or("生成回答失败").to_string();
+            let usage = result.usage;
+
+            // 来源只来自最终发送给模型的切片，裁掉的检索命中仅保留在检索详情。
+            let sources: Vec<SourceInfo> = context_results
+                .iter()
+                .map(|r| source_info(r, &anchors, ordered_context, ordered_context))
+                .collect();
+
+            if strict
+                && !sources
+                    .iter()
+                    .any(|source| !source.snippet.trim().is_empty())
+            {
+                return Err(diagnostic_failure(
+                    QueryError::new(
+                        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                        "回答没有可核验的知识库来源，请缩短问题或调整上下文限制",
+                    )
+                    .at_stage("validation", "sources_empty"),
+                    "validation",
+                    validation_started,
+                    &stages,
+                    &request_id,
+                    diagnostics_enabled,
+                ));
+            }
+            record_stage(&mut stages, "validation", "passed", validation_started);
+
+            // Build retrieval details for visualization
+            let retrieval_details: Vec<RetrievalDetail> = retrieval_candidates
+                .iter()
+                .map(|s| {
+                    let meta = &s.result.metadata;
+                    RetrievalDetail {
+                        chunk_id: s.result.chunk_id.clone(),
+                        filename: s.result.filename.clone(),
+                        score: s.result.score,
+                        vector_score: s.vector_score,
+                        keyword_score: s.keyword_score,
+                        snippet: if ordered_context {
+                            retriever::evidence_window(&s.result.content, &anchors, 200).0
+                        } else {
+                            s.result.content.chars().take(200).collect()
+                        },
+                        symbol_name: meta
+                            .get("symbol_name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        symbol_kind: meta
+                            .get("symbol_kind")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                    }
+                })
+                .collect();
+
+            // Save to conversation history
+            if client.is_internal() && !kb_id.is_empty() {
+                let sources_json = serde_json::to_string(&sources).ok();
+                let tokens = usage.as_ref().map(|u| u.total_tokens as i64).unwrap_or(0);
+                kb_repo
+                    .add_conversation(kb_id, "user", &query, None, Some(chat_model), 0)
+                    .await
+                    .ok();
+                kb_repo
+                    .add_conversation(
+                        kb_id,
+                        "assistant",
+                        &answer,
+                        sources_json.as_deref(),
+                        Some(chat_model),
+                        tokens,
+                    )
+                    .await
+                    .ok();
+            }
+
+            Ok(RagAnswer {
+                answer,
+                sources,
+                usage,
+                retrieval_details: Some(retrieval_details),
+                diagnostics: diagnostics_enabled.then_some(RagDiagnostics { request_id, stages }),
+                retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
+                degradation_reason,
+                reasoning,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) struct RetrievedChunks {
+    pub scored_results: Vec<retriever::ScoredSearchResult>,
+    pub stages: Vec<RagDiagnosticStage>,
+    pub actual_mode: String,
+    pub degradation_reason: Option<String>,
+    pub retrieval_started: Instant,
+}
+
+/// Ask 和 Search 共用通用检索；不包含生成、业务题型或客户端答案判断。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn retrieve_with_client(
+    client: &ModelClient<'_>,
+    pool: &SqlitePool,
+    kb_id: &str,
+    query: &str,
+    embedding_model: &str,
+    retrieval_k: usize,
+    mcp_only: bool,
+    settings: &SettingsStore,
+    vector_weight: f32,
+    keyword_weight: f32,
+    search_mode: &str,
+    diagnostics_enabled: bool,
+    allow_keyword_fallback: bool,
+    reserve_answer: bool,
+) -> Result<RetrievedChunks, QueryError> {
+    let mut stages = Vec::new();
+    let request_id = client.request_id().unwrap_or_default();
+    let fusion_mode = retriever::FusionMode::parse(&settings.get_str("kb.fusion_mode", "rrf"));
     // 显式降级请求允许 FTS 与 Embedding 重叠；历史请求沿用原来的检索流程。
     let fallback_enabled = allow_keyword_fallback && search_mode == "hybrid" && !kb_id.is_empty();
     let embedding_started = Instant::now();
+    let (embedding_fraction, embedding_reserve) = if reserve_answer {
+        (0.4, 0.55)
+    } else {
+        (0.7, 0.2)
+    };
+    let (retrieval_fraction, retrieval_reserve) = if reserve_answer {
+        (0.2, 0.35)
+    } else {
+        (0.3, 0.0)
+    };
     let mut degradation_reason = None;
     let mut keyword_results = None;
     let query_emb_opt = if search_mode != "keyword" {
@@ -173,33 +509,20 @@ pub(crate) async fn ask_with_client(
         }
         let embedding_future = run_stage(
             "embedding",
-            0.4,
-            0.55,
+            embedding_fraction,
+            embedding_reserve,
             Box::pin(client.embed(&query, embedding_model)),
         );
         let embeddings = if fallback_enabled {
             let mut embedding_future = Box::pin(embedding_future);
             let mut keywords = Box::pin(run_stage(
                 "retrieval",
-                0.2,
-                0.35,
+                retrieval_fraction,
+                retrieval_reserve,
                 Box::pin(async {
-                    if let Some(exam) = exam {
-                        retriever::keyword_search_with_anchors(
-                            pool,
-                            kb_id,
-                            &query,
-                            &anchors,
-                            &exam.stem,
-                            retrieval_k * 2,
-                        )
+                    retriever::keyword_only_search(pool, kb_id, &query, retrieval_k * 2)
                         .await
                         .map_err(Into::into)
-                    } else {
-                        retriever::keyword_only_search(pool, kb_id, &query, retrieval_k * 2)
-                            .await
-                            .map_err(Into::into)
-                    }
                 }),
             ));
             tokio::select! {
@@ -287,8 +610,8 @@ pub(crate) async fn ask_with_client(
     let retrieval_started = Instant::now();
     let scored_results = run_stage(
         "retrieval",
-        0.2,
-        0.35,
+        retrieval_fraction,
+        retrieval_reserve,
         Box::pin(async {
             Ok::<_, QueryError>(if actual_mode == "keyword" {
                 // Keyword-only search
@@ -301,7 +624,7 @@ pub(crate) async fn ask_with_client(
                         kb_id,
                         &query,
                         &embeddings[0],
-                        top_k,
+                        retrieval_k,
                         vector_weight,
                         keyword_weight,
                         fusion_mode,
@@ -311,20 +634,7 @@ pub(crate) async fn ask_with_client(
                     let kw = match keyword_results.take() {
                         Some(results) => results?,
                         None => {
-                            if let Some(exam) = exam {
-                                retriever::keyword_search_with_anchors(
-                                    pool,
-                                    kb_id,
-                                    &query,
-                                    &anchors,
-                                    &exam.stem,
-                                    retrieval_k,
-                                )
-                                .await?
-                            } else {
-                                retriever::keyword_only_search(pool, kb_id, &query, retrieval_k)
-                                    .await?
-                            }
+                            retriever::keyword_only_search(pool, kb_id, &query, retrieval_k).await?
                         }
                     };
                     let kw = kw.into_iter();
@@ -381,20 +691,10 @@ pub(crate) async fn ask_with_client(
                         })
                         .collect()
                 } else {
-                    if keyword_results.is_some() || exam.is_some() {
+                    if keyword_results.is_some() {
                         let keywords = match keyword_results.take() {
                             Some(results) => results?,
-                            None => {
-                                retriever::keyword_search_with_anchors(
-                                    pool,
-                                    kb_id,
-                                    &query,
-                                    &anchors,
-                                    &exam.expect("exam branch").stem,
-                                    retrieval_k * 2,
-                                )
-                                .await?
-                            }
+                            None => unreachable!("keyword_results was checked"),
                         };
                         let vectors = retriever::search(pool, kb_id, query_emb, retrieval_k * 2)
                             .await
@@ -402,11 +702,7 @@ pub(crate) async fn ask_with_client(
                         retriever::fuse_scored(
                             &vectors,
                             &keywords,
-                            if exam.is_some() {
-                                vectors.len() + keywords.len()
-                            } else {
-                                retrieval_k
-                            },
+                            retrieval_k,
                             vector_weight,
                             keyword_weight,
                             fusion_mode,
@@ -450,17 +746,11 @@ pub(crate) async fn ask_with_client(
         )
     })?;
 
-    let mut scored_results = if let Some(exam) = exam {
-        run_stage(
-            "retrieval",
-            0.2,
-            0.35,
-            Box::pin(async {
-                retriever::rank_exam_candidates_bounded(scored_results, exam)
-                    .await
-                    .map_err(QueryError::from)
-            }),
-        )
+    let mut scored_results = scored_results;
+    scored_results.truncate(retrieval_k);
+
+    client
+        .ensure_knowledge_access_after_answer(kb_id, mcp_only)
         .await
         .map_err(|error| {
             diagnostic_failure(
@@ -471,359 +761,32 @@ pub(crate) async fn ask_with_client(
                 &request_id,
                 diagnostics_enabled,
             )
-        })?
-    } else {
-        scored_results
-    };
-    scored_results.truncate(retrieval_k);
-    // C-06/R3 第二步：可选 LLM listwise 重排（`kb.rerank_enabled`，默认关）。
-    // 走网关自身的渠道跑渠道（proxy::handle_request，kb-internal 路由组），
-    // 重排调用的 token 消耗自动计入请求日志；失败静默回退原序（best-effort）。
-    let mut scored_results =
-        if settings.get_bool("kb.rerank_enabled", false) && scored_results.len() > 1 {
-            rerank_with_llm(
-                client,
-                chat_model,
-                &query,
-                scored_results,
-                ordered_context.then_some(anchors.as_slice()),
-            )
-            .await?
-        } else {
-            scored_results
-        };
-    let retrieval_candidates = scored_results.clone();
-    scored_results.truncate(top_k);
-
-    // Extract plain results for context building
-    let results: Vec<super::models::SearchResult> =
-        scored_results.iter().map(|s| s.result.clone()).collect();
-
-    if strict && results.is_empty() {
-        return Err(diagnostic_failure(
-            QueryError::new(
-                axum::http::StatusCode::NOT_FOUND,
-                "未检索到相关片段，请检查知识库内容、索引和检测问题",
-            )
-            .at_stage("retrieval", "retrieval_empty"),
-            "retrieval",
-            retrieval_started,
-            &stages,
-            &request_id,
-            diagnostics_enabled,
-        ));
-    }
-    record_stage(&mut stages, "retrieval", "passed", retrieval_started);
-
-    if results.is_empty() {
-        // Save to conversation history
-        if client.is_internal() && !kb_id.is_empty() {
-            let answer = "RAG 中没有找到相关内容。".to_string();
-            kb_repo
-                .add_conversation(kb_id, "user", &query, None, Some(chat_model), 0)
-                .await
-                .ok();
-            kb_repo
-                .add_conversation(kb_id, "assistant", &answer, None, Some(chat_model), 0)
-                .await
-                .ok();
-            return Ok(RagAnswer {
-                answer,
-                sources: vec![],
-                usage: None,
-                retrieval_details: Some(vec![]),
-                diagnostics: None,
-                retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
-                degradation_reason: degradation_reason.clone(),
-                exam: None,
-                reasoning: reasoning_info(reasoning_effort, ReasoningStatus::NotSent),
-            });
-        }
-        return Ok(RagAnswer {
-            answer: "RAG 中没有找到相关内容。".to_string(),
-            sources: vec![],
-            usage: None,
-            retrieval_details: Some(vec![]),
-            diagnostics: None,
-            retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
-            degradation_reason: degradation_reason.clone(),
-            exam: None,
-            reasoning: reasoning_info(reasoning_effort, ReasoningStatus::NotSent),
-        });
-    }
-
-    // 普通请求沿用激活模板；考试合同使用专门的逐项证据约束。
-    let rag_system_prompt = if exam.is_some() {
-        super::exam::SYSTEM_PROMPT.to_string()
-    } else {
-        prompt_templates::load(pool, prompt_templates::KEY_RAG_SYSTEM).await
-    };
-
-    // 3. Build context
-    let context = build_context(&results);
-
-    // 4. Build prompt with history
-    let prompt = build_rag_prompt(&context, &query, history);
-
-    // 5. Token estimation and fallback
-    let estimated_tokens = retriever::estimate_tokens(&prompt);
-    let model_limit = retriever::get_model_context_limit(chat_model);
-    let context_limit = ((model_limit as f64 * 0.7) as usize)
-        .saturating_sub(retriever::estimate_tokens(&rag_system_prompt));
-
-    let (final_prompt, context_results) = if let Some(question) = exam {
-        let mut used = results.clone();
-        let mut prompt = super::exam::prepare_prompt(question, &used, &query);
-        // 按最终证据优先级裁剪，估算的是实际发送的JSON合同和系统提示。
-        while retriever::estimate_tokens(&prompt) > context_limit && !used.is_empty() {
-            used.pop();
-            prompt = super::exam::prepare_prompt(question, &used, &query);
-        }
-        if used.is_empty() || retriever::estimate_tokens(&prompt) > context_limit {
-            let answer = super::exam::abstain(question, "题面与证据超过模型上下文预算");
-            record_stage(&mut stages, "answer", "skipped", Instant::now());
-            record_stage(&mut stages, "validation", "abstain", Instant::now());
-            return Ok(RagAnswer {
-                answer: super::exam::display_answer(question, &answer),
-                sources: vec![],
-                usage: None,
-                retrieval_details: Some(vec![]),
-                diagnostics: diagnostics_enabled.then_some(RagDiagnostics { request_id, stages }),
-                retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
-                degradation_reason,
-                exam: Some(answer),
-                reasoning: reasoning_info(reasoning_effort, ReasoningStatus::NotSent),
-            });
-        }
-        (prompt, used)
-    } else if estimated_tokens > context_limit {
-        // Stage 1: Trim context (remove lowest-scoring chunks)
-        let trimmed =
-            trim_context_with_order(&results, &query, history, context_limit, ordered_context);
-        if retriever::estimate_tokens(&trimmed.0) > context_limit {
-            // Stage 2: Remove history, keep only latest message
-            let no_history = build_rag_prompt(
-                &context,
-                &query,
-                &history[history.len().saturating_sub(2)..],
-            );
-            if retriever::estimate_tokens(&no_history) > context_limit {
-                // Stage 3: Remove context entirely
-                let bare = format!(
-                    "注意：由于 token 限制，无法附上 RAG 上下文。\n\n问题: {}",
-                    query
-                );
-                (bare, vec![])
-            } else {
-                (no_history, results.clone())
-            }
-        } else {
-            trimmed
-        }
-    } else {
-        (prompt, results.clone())
-    };
-
-    tracing::info!(
-        "RAG prompt: estimated {} tokens, limit {}, context_used: {}",
-        retriever::estimate_tokens(&final_prompt),
-        context_limit,
-        !context_results.is_empty()
-    );
-
-    // 6. Call LLM via proxy
-    let mut chat_request = serde_json::json!({
-        "model": chat_model,
-        "messages": [
-            {"role": "system", "content": rag_system_prompt},
-            {"role": "user", "content": final_prompt}
-        ],
-        "stream": false
-    });
-    if let Some(question) = exam {
-        // 为逐项JSON和短引用留足空间，同时避免供应商默认的超长输出。
-        chat_request["max_tokens"] =
-            serde_json::json!((question.options.len() * 384 + 256).clamp(1024, 8192));
-    }
-    let reasoning = apply_reasoning_effort(&mut chat_request, reasoning_effort)?;
-    let answer_started = Instant::now();
-    client
-        .ensure_knowledge_access(kb_id, mcp_only)
-        .await
-        .map_err(|mut error| {
-            error.stage = Some("answer".to_string());
-            diagnostic_failure(
-                error,
-                "answer",
-                answer_started,
-                &stages,
-                &request_id,
-                diagnostics_enabled,
-            )
         })?;
-    let purpose = if exam.is_some() { "RAG-exam" } else { "RAG" };
-    let proxy_result = run_stage("answer", 1.0, 0.01, client.chat(chat_request, purpose))
-        .await
-        .map_err(|error| {
-            diagnostic_failure(
-                error,
-                "answer",
-                answer_started,
-                &stages,
-                &request_id,
-                diagnostics_enabled,
-            )
-        });
-
-    match proxy_result {
-        Ok(result) => {
-            let answer = result
-                .body
-                .get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str());
-            record_stage(&mut stages, "answer", "passed", answer_started);
-            let validation_started = Instant::now();
-            client
-                .ensure_knowledge_access_after_answer(kb_id, mcp_only)
-                .await
-                .map_err(|error| {
-                    diagnostic_failure(
-                        error,
-                        "validation",
-                        validation_started,
-                        &stages,
-                        &request_id,
-                        diagnostics_enabled,
-                    )
-                })?;
-            if strict && answer.unwrap_or("").trim().is_empty() {
-                return Err(diagnostic_failure(
-                    QueryError::new(axum::http::StatusCode::BAD_GATEWAY, "回答模型返回了空答案")
-                        .at_stage("validation", "answer_empty"),
-                    "validation",
-                    validation_started,
-                    &stages,
-                    &request_id,
-                    diagnostics_enabled,
-                ));
-            }
-            // 普通请求保留空字符串；只有缺少 content 时沿用原有回退文案。
-            let answer = answer.unwrap_or("生成回答失败").to_string();
-            let exam_answer = exam
-                .map(|question| super::exam::validate_answer(question, &context_results, &answer));
-            let answer = match (exam, exam_answer.as_ref()) {
-                (Some(question), Some(contract)) => super::exam::display_answer(question, contract),
-                _ => answer,
-            };
-
-            let usage = result.usage;
-
-            // 来源只来自最终发送给模型的切片，裁掉的检索命中仅保留在检索详情。
-            let sources: Vec<SourceInfo> = context_results
-                .iter()
-                .map(|r| source_info(r, &anchors, ordered_context, exam.is_some()))
-                .collect();
-
-            if strict
-                && !sources
-                    .iter()
-                    .any(|source| !source.snippet.trim().is_empty())
-            {
-                return Err(diagnostic_failure(
-                    QueryError::new(
-                        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-                        "回答没有可核验的知识库来源，请缩短问题或调整上下文限制",
-                    )
-                    .at_stage("validation", "sources_empty"),
-                    "validation",
-                    validation_started,
-                    &stages,
-                    &request_id,
-                    diagnostics_enabled,
-                ));
-            }
-            record_stage(
-                &mut stages,
-                "validation",
-                if exam_answer
-                    .as_ref()
-                    .is_some_and(|answer| answer.status == super::exam::ExamStatus::Abstain)
-                {
-                    "abstain"
-                } else {
-                    "passed"
-                },
-                validation_started,
-            );
-
-            // Build retrieval details for visualization
-            let retrieval_details: Vec<RetrievalDetail> = retrieval_candidates
-                .iter()
-                .map(|s| {
-                    let meta = &s.result.metadata;
-                    RetrievalDetail {
-                        chunk_id: s.result.chunk_id.clone(),
-                        filename: s.result.filename.clone(),
-                        score: s.result.score,
-                        vector_score: s.vector_score,
-                        keyword_score: s.keyword_score,
-                        snippet: if ordered_context {
-                            retriever::evidence_window(&s.result.content, &anchors, 200).0
-                        } else {
-                            s.result.content.chars().take(200).collect()
-                        },
-                        symbol_name: meta
-                            .get("symbol_name")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        symbol_kind: meta
-                            .get("symbol_kind")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                    }
-                })
-                .collect();
-
-            // Save to conversation history
-            if client.is_internal() && !kb_id.is_empty() {
-                let sources_json = serde_json::to_string(&sources).ok();
-                let tokens = usage.as_ref().map(|u| u.total_tokens as i64).unwrap_or(0);
-                kb_repo
-                    .add_conversation(kb_id, "user", &query, None, Some(chat_model), 0)
-                    .await
-                    .ok();
-                kb_repo
-                    .add_conversation(
-                        kb_id,
-                        "assistant",
-                        &answer,
-                        sources_json.as_deref(),
-                        Some(chat_model),
-                        tokens,
-                    )
-                    .await
-                    .ok();
-            }
-
-            Ok(RagAnswer {
-                answer,
-                sources,
-                usage,
-                retrieval_details: Some(retrieval_details),
-                diagnostics: diagnostics_enabled.then_some(RagDiagnostics { request_id, stages }),
-                retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
-                degradation_reason,
-                exam: exam_answer,
-                reasoning,
-            })
-        }
-        Err(error) => Err(error),
+    if !scored_results.is_empty() {
+        record_stage(&mut stages, "retrieval", "passed", retrieval_started);
     }
+    Ok(RetrievedChunks {
+        scored_results,
+        stages,
+        actual_mode: actual_mode.to_string(),
+        degradation_reason,
+        retrieval_started,
+    })
 }
 
+pub(crate) fn validate_candidate_k(
+    top_k: usize,
+    candidate_k: Option<usize>,
+) -> Result<(), QueryError> {
+    if candidate_k.is_some_and(|count| count < top_k || count > 100) {
+        return Err(QueryError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "candidate_k必须介于top_k与100之间",
+        )
+        .at_stage("permission", "invalid_query"));
+    }
+    Ok(())
+}
 /// 返回规范档位；默认不注入参数。深研究有多次生成，首版不虚称整条链路已发送。
 pub(crate) fn validate_reasoning_request(
     effort: Option<&str>,
@@ -1053,7 +1016,7 @@ fn source_info(
     result: &super::models::SearchResult,
     anchors: &[String],
     windowed: bool,
-    exam: bool,
+    include_content: bool,
 ) -> SourceInfo {
     let (snippet, start) = if windowed {
         retriever::evidence_window(&result.content, anchors, 200)
@@ -1081,8 +1044,8 @@ fn source_info(
             .then(|| result.metadata.get("page_no").and_then(|v| v.as_i64()))
             .flatten(),
         snippet_start: windowed.then_some(start),
-        // 仅考试合同需要完整引用校验；来源始终来自最终实际使用的上下文。
-        evidence_text: exam.then(|| result.content.clone()),
+        // 原文始终来自最终实际使用的上下文，供客户端核对引用。
+        evidence_text: include_content.then(|| result.content.clone()),
     }
 }
 
@@ -1237,7 +1200,7 @@ mod context_tests {
     }
 
     #[test]
-    fn exam_source_window_points_into_exact_final_content() {
+    fn source_window_points_into_exact_final_content() {
         let content = format!(
             "{}3.2.2. 【强制】不支持 FETCH 控制语句。{}",
             "页眉\n".repeat(100),
@@ -1592,7 +1555,6 @@ pub async fn deep_research(
                 diagnostics: None,
                 retrieval_mode: None,
                 degradation_reason: None,
-                exam: None,
                 reasoning: None,
             })
         }

@@ -1,7 +1,6 @@
 pub mod budget;
 pub mod code_parser;
 pub mod embedder;
-pub mod exam;
 pub mod handlers;
 pub mod import_guard;
 pub mod importer;

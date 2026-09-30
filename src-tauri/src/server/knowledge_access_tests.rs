@@ -61,25 +61,16 @@ async fn setup() -> (
 }
 
 #[tokio::test]
-async fn exam_contract_validates_ids_and_candidate_limits_before_model_call() {
+async fn candidate_limits_are_validated_before_model_call() {
     let (_, key, first, _, app) = setup().await;
-    for exam in [
-        json!({"type":"single","stem":"备份要求","polarity":"positive","options":[{"id":"A","text":"开启备份"},{"id":"A","text":"不备份"}]}),
-        json!({"type":"single","stem":"","polarity":"positive","options":[{"id":"A","text":"开启备份"},{"id":"B","text":"不备份"}]}),
-        json!({"type":"judgment","stem":"备份要求","polarity":"positive","options":[{"id":"A","text":"正确"}]}),
-    ] {
-        let response = app.clone().oneshot(json_request("POST", "/api/kb/ask", Some(&key.key),
-            &json!({"kb_id":first.id,"question":"备份要求","exam":exam,"search_mode":"keyword"}).to_string())).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body(response).await["error"]["code"],
-            "invalid_exam_request"
-        );
-    }
-    for count in [4, 101] {
+    for count in [0, 4, 101] {
         let response = app.clone().oneshot(json_request("POST", "/api/kb/ask", Some(&key.key),
             &json!({"kb_id":first.id,"question":"备份要求","top_k":5,"candidate_k":count,"search_mode":"keyword"}).to_string())).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = app.clone().oneshot(request("GET", &format!(
+            "/api/kb/search?q=alpha&kb_id={}&search_mode=keyword&top_k=5&candidate_k={count}", first.id), Some(&key.key))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body(response).await["error"]["code"], "invalid_query");
     }
 }
 
@@ -574,30 +565,9 @@ async fn rag_reasoning_levels_reach_the_canonical_gateway_body_without_claiming_
             assert!(sent.get(provider_field).is_none());
         }
     }
-    // 生成已发送但考试合同无效时是 requested；不能伪称未发送或已执行。
-    let input = json!({"kb_id":first.id,"question":"alpha","model":"chat-test","search_mode":"keyword","reasoning_effort":"high", "exam":{"type":"single","stem":"alpha","polarity":"positive","options":[{"id":"A","text":"BCD"},{"id":"B","text":"EFG"}]}});
-    let response = app
-        .oneshot(json_request(
-            "POST",
-            "/api/kb/ask",
-            Some(&key.key),
-            &input.to_string(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let result = body(response).await;
-    assert_eq!(result["exam"]["status"], "abstain");
-    assert_eq!(
-        result["reasoning"],
-        json!({"requested":"high","status":"requested"})
-    );
-    let sent = captured.lock().unwrap()[6].clone();
-    assert_eq!(sent["reasoning_effort"], "high");
-    assert_eq!(sent["max_tokens"], 1024);
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        7,
+        6,
         "每个请求仅一次生成，不重试或换模型"
     );
     task.abort();
@@ -1390,5 +1360,327 @@ async fn rag_explicit_budget_rejects_empty_answers_without_diagnostics() {
     assert_eq!(result["error"]["code"], "answer_empty");
     assert!(result.get("diagnostics").is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+    task.abort();
+}
+
+#[tokio::test]
+async fn generic_search_preserves_legacy_data_and_returns_authorized_original_content() {
+    let (state, key, first, second, app) = setup().await;
+    let original = "alpha 规范原文：值是 'a\u{a0}b'，运算符 !=；😀保持原文。";
+    let doc_id = document(&state, &first.id, original).await;
+    document(&state, &second.id, "alpha PRIVATE MATERIAL").await;
+    for extended in [false, true] {
+        let suffix = if extended {
+            "&candidate_k=20&timeout_ms=2000&allow_keyword_fallback=true&diagnostics=true"
+        } else {
+            ""
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!(
+                    "/api/kb/search?q=alpha&kb_id={}&search_mode=keyword&top_k=5{suffix}",
+                    first.id
+                ),
+                Some(&key.key),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id = response.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let result = body(response).await;
+        let data = result["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["doc_id"], doc_id);
+        assert_eq!(data[0]["content"], original, "原文不是摘要或业务加工文本");
+        assert!(!data[0]["chunk_id"].as_str().unwrap().is_empty());
+        assert!(!result.to_string().contains("PRIVATE MATERIAL"));
+        if extended {
+            assert_eq!(result["request_id"], request_id);
+            assert_eq!(result["retrieval_mode"], "keyword");
+            assert_eq!(result["diagnostics"]["request_id"], request_id);
+            assert_eq!(result["diagnostics"]["stages"][1]["status"], "skipped");
+            assert_eq!(result["diagnostics"]["stages"][2]["stage"], "retrieval");
+        } else {
+            assert_eq!(
+                result.as_object().unwrap().len(),
+                1,
+                "旧 search 只包含 data"
+            );
+        }
+    }
+    let response = app
+        .oneshot(request(
+            "GET",
+            &format!(
+                "/api/kb/search?q=missing&kb_id={}&search_mode=keyword&diagnostics=true",
+                first.id
+            ),
+            Some(&key.key),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = body(response).await;
+    assert_eq!(result["data"], json!([]));
+    assert_eq!(result["diagnostics"]["stages"][2]["status"], "empty");
+}
+
+#[tokio::test]
+async fn generic_search_uses_only_embedding_even_when_generation_features_are_enabled() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, calls, task) = mock_model(&state).await;
+    document(&state, &first.id, "alpha original first paragraph").await;
+    document(&state, &first.id, "alpha original second paragraph").await;
+    state
+        .settings
+        .set_many(&[
+            ("kb.query_rewrite".into(), json!(true)),
+            ("kb.rerank_enabled".into(), json!(true)),
+        ])
+        .unwrap();
+    for mode in ["vector", "hybrid"] {
+        let response = app.clone().oneshot(request("GET", &format!(
+            "/api/kb/search?q=alpha&kb_id={}&search_mode={mode}&top_k=1&candidate_k=20&timeout_ms=3000&diagnostics=true", first.id),
+            Some(&key.key))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = body(response).await;
+        assert_eq!(result["data"].as_array().unwrap().len(), 1);
+        assert_eq!(result["retrieval_mode"], mode);
+        let stages = result["diagnostics"]["stages"].as_array().unwrap();
+        assert_eq!(
+            stages
+                .iter()
+                .map(|s| s["stage"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["permission", "embedding", "retrieval"]
+        );
+        assert!(result.get("answer").is_none());
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "Search 不调用回答/改写/重排模型"
+    );
+    let quota: i64 = sqlx::query_scalar("SELECT quota_used FROM api_keys WHERE id = ?")
+        .bind(&key.id)
+        .fetch_one(&state.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(quota, 14, "每次仅计一次 Embedding 用量");
+    task.abort();
+}
+
+#[tokio::test]
+async fn generic_search_budget_and_opt_in_fallback_share_the_retrieval_path() {
+    for fallback in [false, true] {
+        let (state, key, first, _, app) = setup().await;
+        let (_, calls, task) =
+            mock_model_with_delay(&state, "unused", std::time::Duration::from_secs(3)).await;
+        document(&state, &first.id, "alpha usable original evidence").await;
+        // 预热确切非流式客户端；不将冷初始化误当作目标网络超时。
+        let _ = crate::adaptor::blocking_client(60, None);
+        let started = std::time::Instant::now();
+        let response = app.oneshot(request("GET", &format!(
+            "/api/kb/search?q=alpha&kb_id={}&search_mode=hybrid&top_k=5&candidate_k=20&timeout_ms=1000&allow_keyword_fallback={fallback}&diagnostics=true", first.id),
+            Some(&key.key))).await.unwrap();
+        assert_eq!(
+            response.status(),
+            if fallback {
+                StatusCode::OK
+            } else {
+                StatusCode::GATEWAY_TIMEOUT
+            }
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(1400));
+        let request_id = response.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let result = body(response).await;
+        if fallback {
+            assert_eq!(result["retrieval_mode"], "keyword");
+            assert_eq!(result["degradation_reason"], "rag_deadline_exceeded");
+            assert_eq!(
+                result["data"][0]["content"],
+                "alpha usable original evidence"
+            );
+            assert_eq!(result["diagnostics"]["stages"][1]["status"], "degraded");
+        } else {
+            assert_eq!(result["error"]["code"], "rag_deadline_exceeded");
+            assert_eq!(result["error"]["request_id"], request_id);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "超时不换 Key 或调用生成模型"
+        );
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn generic_search_fallback_cannot_bypass_model_permission_or_quota() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, calls, task) = mock_model(&state).await;
+    document(&state, &first.id, "alpha original evidence").await;
+    for quota in [false, true] {
+        sqlx::query(if quota {
+            "UPDATE api_keys SET quota_used = quota_limit, denied_models = '[]' WHERE id = ?"
+        } else {
+            "UPDATE api_keys SET denied_models = '[\"embed-test\"]' WHERE id = ?"
+        })
+        .bind(&key.id)
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+        let response = app.clone().oneshot(request("GET", &format!(
+            "/api/kb/search?q=alpha&kb_id={}&search_mode=hybrid&timeout_ms=1000&allow_keyword_fallback=true&diagnostics=true", first.id),
+            Some(&key.key))).await.unwrap();
+        assert_eq!(
+            response.status(),
+            if quota {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::FORBIDDEN
+            }
+        );
+        let result = body(response).await;
+        assert!(result.get("data").is_none());
+        assert_eq!(result["error"]["stage"], "permission");
+        assert_eq!(
+            result["error"]["code"],
+            if quota {
+                "quota_exceeded"
+            } else {
+                "access_denied"
+            }
+        );
+        assert_eq!(result["diagnostics"]["stages"][1]["stage"], "embedding");
+        assert_eq!(result["diagnostics"]["stages"][1]["status"], "failed");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn generic_search_rechecks_revocation_after_the_embedding_await() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, calls, task) =
+        mock_model_with_delay(&state, "unused", std::time::Duration::from_millis(150)).await;
+    document(&state, &first.id, "alpha original evidence").await;
+    let input = request(
+        "GET",
+        &format!(
+            "/api/kb/search?q=alpha&kb_id={}&search_mode=vector&timeout_ms=2000&diagnostics=true",
+            first.id
+        ),
+        Some(&key.key),
+    );
+    let search = tokio::spawn(async move { app.oneshot(input).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    set_grants(&state.db.pool, &key.id, &[]).await.unwrap();
+    let response = search.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let result = body(response).await;
+    assert!(result.get("data").is_none());
+    assert_eq!(result["error"]["code"], "knowledge_access_denied");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn generic_search_future_abort_does_not_start_another_request() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, calls, task) =
+        mock_model_with_delay(&state, "unused", std::time::Duration::from_millis(250)).await;
+    document(&state, &first.id, "alpha original evidence").await;
+    let input = request("GET", &format!(
+        "/api/kb/search?q=alpha&kb_id={}&search_mode=hybrid&timeout_ms=2000&allow_keyword_fallback=true", first.id), Some(&key.key));
+    let search = tokio::spawn(async move { app.oneshot(input).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    search.abort();
+    assert!(search.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn admin_search_new_options_keep_cross_kb_vector_fallback_without_expanding_api_key_access() {
+    let (state, key, first, second, _) = setup().await;
+    let (channel, calls, task) = mock_model(&state).await;
+    sqlx::query("UPDATE channels SET models = '[\"chat-test\",\"embed-test\",\"text-embedding-3-small\"]' WHERE id = ?")
+        .bind(channel).execute(&state.db.pool).await.unwrap();
+    document(&state, &first.id, "alpha first original material").await;
+    document(&state, &second.id, "alpha second original material").await;
+    let admin = "test-admin-0123456789abcdef0123456789abcdef";
+    let app = build_router(state.clone(), test_shared(&state, Some(admin), None));
+    let legacy = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/api/kb/search?q=alpha&search_mode=keyword&top_k=2",
+            Some(admin),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(legacy.status(), StatusCode::OK);
+    let legacy = body(legacy).await;
+    assert_eq!(legacy["data"].as_array().unwrap().len(), 2);
+    let mut expected: Vec<_> = legacy["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["chunk_id"].as_str().unwrap().to_string())
+        .collect();
+    expected.sort();
+    for mode in ["keyword", "hybrid", "vector"] {
+        let response = app.clone().oneshot(request("GET", &format!(
+            "/api/kb/search?q=alpha&search_mode={mode}&top_k=2&candidate_k=20&timeout_ms=2000&allow_keyword_fallback=true"), Some(admin))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = body(response).await;
+        assert_eq!(result["retrieval_mode"], "vector", "报告实际跨库检索方式");
+        let mut actual: Vec<_> = result["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["chunk_id"].as_str().unwrap().to_string())
+            .collect();
+        actual.sort();
+        assert_eq!(actual, expected, "新参数不改变管理员原有跨库结果");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 4, "各次检索仅一次Embedding");
+    let response = app
+        .oneshot(request(
+            "GET",
+            "/api/kb/search?q=alpha&search_mode=keyword&top_k=2&candidate_k=20&timeout_ms=2000",
+            Some(&key.key),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "API Key 仍必须指定单个已授权KB"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
     task.abort();
 }
