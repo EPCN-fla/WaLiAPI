@@ -429,6 +429,11 @@ pub async fn ask(
 }
 
 async fn ask_internal(shared: &SharedState, input: AskInput) -> Response {
+    if let Err(message) = super::exam::validate_request(&input) {
+        return super::model_client::QueryError::new(StatusCode::BAD_REQUEST, message)
+            .at_stage("permission", "invalid_exam_request")
+            .into_response();
+    }
     if input.diagnostics {
         return super::model_client::QueryError::new(
             StatusCode::BAD_REQUEST,
@@ -500,6 +505,8 @@ async fn ask_internal(shared: &SharedState, input: AskInput) -> Response {
             search_mode,
             false,
             input.allow_keyword_fallback,
+            input.candidate_k,
+            input.exam.as_ref(),
         )
         .await
         {

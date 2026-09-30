@@ -124,6 +124,9 @@ pub struct RagAnswer {
     pub retrieval_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degradation_reason: Option<String>,
+    /// 可选考试合同；省略时保留普通知识问答的返回格式。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exam: Option<super::exam::ExamAnswer>,
 }
 
 /// 仅显式诊断请求返回阶段结果，不包含提示词、渠道地址或凭据。
@@ -157,6 +160,19 @@ pub struct SourceInfo {
     pub filename: String,
     pub score: f32,
     pub snippet: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_no: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet_start: Option<usize>,
+    /// 仅考试请求提供最终上下文正文，供客户端按 Unicode 码点校验引用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +247,11 @@ pub struct AskInput {
     /// 授权通过后的可恢复向量查询失败，允许使用关键词检索。
     #[serde(default)]
     pub allow_keyword_fallback: bool,
+    /// 最终截断前的候选池；省略时保持普通请求原有行为。
+    #[serde(default)]
+    pub candidate_k: Option<usize>,
+    #[serde(default)]
+    pub exam: Option<super::exam::ExamQuestion>,
 }
 
 fn default_top_k() -> usize {

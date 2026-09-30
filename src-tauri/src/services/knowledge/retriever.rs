@@ -754,6 +754,13 @@ async fn fts5_search(
     if tokens.is_empty() || top_k == 0 {
         return Ok(Vec::new());
     }
+    backfill_fts_projection(pool, kb_id).await?;
+    let fts_query = build_fts_query(&tokens);
+
+    fts5_expression_search(pool, kb_id, &fts_query, top_k).await
+}
+
+async fn backfill_fts_projection(pool: &SqlitePool, kb_id: &str) -> Result<(), String> {
     let backfill_started = std::time::Instant::now();
     let updated = KbRepository::new(pool.clone())
         .backfill_search_text_for_kb(kb_id)
@@ -766,8 +773,15 @@ async fn fts5_search(
         updated,
         "RAG SQL stage"
     );
-    let fts_query = build_fts_query(&tokens);
+    Ok(())
+}
 
+async fn fts5_expression_search(
+    pool: &SqlitePool,
+    kb_id: &str,
+    fts_query: &str,
+    top_k: usize,
+) -> Result<Vec<SearchResult>, String> {
     let pool_started = std::time::Instant::now();
     let mut connection = pool
         .acquire()
@@ -779,6 +793,15 @@ async fn fts5_search(
         elapsed_ms = pool_started.elapsed().as_millis() as u64,
         "RAG SQL stage"
     );
+    fts5_expression_search_on(&mut connection, kb_id, fts_query, top_k).await
+}
+
+async fn fts5_expression_search_on(
+    connection: &mut sqlx::SqliteConnection,
+    kb_id: &str,
+    fts_query: &str,
+    top_k: usize,
+) -> Result<Vec<SearchResult>, String> {
     let sql_started = std::time::Instant::now();
     let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
         "SELECT c.id, c.content, c.metadata, d.filename, c.doc_id \
@@ -790,9 +813,9 @@ async fn fts5_search(
          LIMIT ?",
     )
     .bind(kb_id)
-    .bind(&fts_query)
+    .bind(fts_query)
     .bind(top_k as i64)
-    .fetch_all(&mut *connection)
+    .fetch_all(connection)
     .await
     .map_err(|e| format!("FTS5 search failed: {}", e))?;
     tracing::debug!(
@@ -1012,6 +1035,312 @@ pub async fn keyword_only_search(
     top_k: usize,
 ) -> Result<Vec<SearchResult>, String> {
     fts5_search(pool, kb_id, query, top_k).await
+}
+
+/// 考试模式保留宽 OR 召回，再合并少量精确锚点；不改变普通关键词路径。
+pub async fn keyword_search_with_anchors(
+    pool: &SqlitePool,
+    kb_id: &str,
+    query: &str,
+    anchors: &[String],
+    anchor_context: &str,
+    candidate_k: usize,
+) -> Result<Vec<SearchResult>, String> {
+    let tokens = tokenize_query(query);
+    let expressions = exact_anchor_queries(anchors, anchor_context);
+    if candidate_k == 0 || (tokens.is_empty() && expressions.is_empty()) {
+        return Ok(Vec::new());
+    }
+    backfill_fts_projection(pool, kb_id).await?;
+    let pool_started = std::time::Instant::now();
+    let mut connection = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("FTS5 connection failed: {e}"))?;
+    tracing::debug!(
+        kb_id,
+        stage = "fts_pool_acquire",
+        elapsed_ms = pool_started.elapsed().as_millis() as u64,
+        "RAG SQL stage"
+    );
+    // 宽召回与全部锚点共用读快照，避免文档替换期间混入新旧正文。
+    let mut snapshot = connection
+        .begin()
+        .await
+        .map_err(|e| format!("FTS5 snapshot failed: {e}"))?;
+    let mut results = if tokens.is_empty() {
+        Vec::new()
+    } else {
+        fts5_expression_search_on(&mut snapshot, kb_id, &build_fts_query(&tokens), candidate_k)
+            .await?
+    };
+    let mut seen: std::collections::HashSet<_> =
+        results.iter().map(|r| r.chunk_id.clone()).collect();
+    for expression in &expressions {
+        for result in
+            fts5_expression_search_on(&mut snapshot, kb_id, expression, candidate_k.min(8)).await?
+        {
+            if seen.insert(result.chunk_id.clone()) {
+                results.push(result);
+            }
+        }
+    }
+    snapshot
+        .commit()
+        .await
+        .map_err(|e| format!("FTS5 snapshot failed: {e}"))?;
+    tracing::debug!(
+        stage = "fts_anchors",
+        queries = expressions.len(),
+        rows = results.len(),
+        "RAG SQL stage"
+    );
+    Ok(results)
+}
+
+fn exact_anchor_queries(anchors: &[String], context: &str) -> Vec<String> {
+    let condition = ["不支持", "禁止", "不得", "必须"]
+        .into_iter()
+        .find(|term| context.contains(term))
+        .map(super::text::query_tokens)
+        .unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    anchors
+        .iter()
+        .filter_map(|anchor| {
+            let tokens: Vec<_> = super::text::query_tokens(anchor)
+                .into_iter()
+                .filter(|t| t.chars().count() >= 2)
+                .take(4)
+                .collect();
+            if tokens.is_empty() {
+                return None;
+            }
+            let expression = tokens
+                .iter()
+                .chain(condition.iter())
+                .map(|t| format!("\"{}\"", t.replace('"', "")))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            seen.insert(expression.clone()).then_some(expression)
+        })
+        .take(26)
+        .collect()
+}
+
+/// 按尚未覆盖的选项 / 规范句贪心排序，避免重复条款挤掉其他选项依据。
+/// 同分按检索分数、切片 ID 排序；普通请求不调用此函数。
+pub fn rank_exam_candidates(
+    candidates: Vec<ScoredSearchResult>,
+    exam: &super::exam::ExamQuestion,
+) -> Vec<ScoredSearchResult> {
+    rank_exam_candidates_with_cancel(candidates, exam, &|| false)
+        .expect("uncancelled ranking cannot fail")
+}
+
+/// 请求路径的文本计算进入有界后台线程，并响应请求 drop / 阶段截止。
+pub async fn rank_exam_candidates_bounded(
+    candidates: Vec<ScoredSearchResult>,
+    exam: &super::exam::ExamQuestion,
+) -> Result<Vec<ScoredSearchResult>, String> {
+    let exam = exam.clone();
+    retrieval_blocking("exam_ranking", move |cancel| {
+        rank_exam_candidates_with_cancel(candidates, &exam, &|| cancel.cancelled())
+    })
+    .await
+}
+
+fn rank_exam_candidates_with_cancel(
+    candidates: Vec<ScoredSearchResult>,
+    exam: &super::exam::ExamQuestion,
+    cancelled: &impl Fn() -> bool,
+) -> Result<Vec<ScoredSearchResult>, String> {
+    let option_tokens: Vec<_> = exam
+        .options
+        .iter()
+        .map(|option| {
+            super::text::query_tokens(&option.text)
+                .into_iter()
+                .filter(|t| t.chars().count() >= 2)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut remaining = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if cancelled() {
+            return Err("retrieval cancelled".into());
+        }
+        let content = super::text::normalize_radicals(&candidate.result.content);
+        let rules = normative_passages(&content);
+        let mut rule_hits = Vec::with_capacity(exam.options.len());
+        let mut option_hits = Vec::with_capacity(exam.options.len());
+        for (option, tokens) in exam.options.iter().zip(&option_tokens) {
+            let full = exact_anchor_match(&content, option.text.trim());
+            let in_rule = rules.iter().any(|(_, rule)| {
+                exact_anchor_match(rule, option.text.trim())
+                    || (!tokens.is_empty()
+                        && tokens
+                            .iter()
+                            .filter(|t| exact_anchor_match(rule, t))
+                            .count()
+                            * 2
+                            >= tokens.len())
+            });
+            rule_hits.push(in_rule);
+            option_hits.push(full);
+        }
+        remaining.push((candidate, rule_hits, option_hits));
+    }
+    let mut covered_rules = vec![false; exam.options.len()];
+    let mut covered_options = vec![false; exam.options.len()];
+    let mut ranked = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        if cancelled() {
+            return Err("retrieval cancelled".into());
+        }
+        let coverage = |hits: &[bool], covered: &[bool]| {
+            hits.iter()
+                .zip(covered)
+                .filter(|(hit, seen)| **hit && !**seen)
+                .count()
+        };
+        let key = |entry: &(ScoredSearchResult, Vec<bool>, Vec<bool>)| {
+            (
+                coverage(&entry.1, &covered_rules),
+                coverage(&entry.2, &covered_options),
+                entry.1.iter().filter(|hit| **hit).count(),
+                entry.2.iter().filter(|hit| **hit).count(),
+            )
+        };
+        let best = (0..remaining.len())
+            .max_by(|&left, &right| {
+                key(&remaining[left])
+                    .cmp(&key(&remaining[right]))
+                    .then_with(|| {
+                        remaining[left]
+                            .0
+                            .result
+                            .score
+                            .total_cmp(&remaining[right].0.result.score)
+                    })
+                    .then_with(|| {
+                        remaining[right]
+                            .0
+                            .result
+                            .chunk_id
+                            .cmp(&remaining[left].0.result.chunk_id)
+                    })
+            })
+            .expect("remaining candidates are nonempty");
+        let (candidate, rule_hits, option_hits) = remaining.remove(best);
+        for (covered, hit) in covered_rules.iter_mut().zip(rule_hits) {
+            *covered |= hit;
+        }
+        for (covered, hit) in covered_options.iter_mut().zip(option_hits) {
+            *covered |= hit;
+        }
+        ranked.push(candidate);
+    }
+    Ok(ranked)
+}
+
+pub(crate) fn exact_anchor_match(content: &str, anchor: &str) -> bool {
+    if anchor.is_empty() {
+        return false;
+    }
+    let content = content.to_lowercase();
+    let anchor = super::text::normalize_radicals(anchor).to_lowercase();
+    content.match_indices(&anchor).any(|(offset, _)| {
+        if !anchor.is_ascii() || !anchor.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return true;
+        }
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        !content[..offset].chars().next_back().is_some_and(is_word)
+            && !content[offset + anchor.len()..]
+                .chars()
+                .next()
+                .is_some_and(is_word)
+    })
+}
+
+/// 每个明确标记的规范句最多取 400 字，避免反例中的大量 SQL 词压过规则正文。
+fn normative_passages(content: &str) -> Vec<(usize, String)> {
+    let mut passages = Vec::new();
+    let mut offset = 0;
+    let lines: Vec<_> = content.split_inclusive('\n').collect();
+    for (i, raw_line) in lines.iter().enumerate() {
+        let line = raw_line.trim_end_matches(['\r', '\n']);
+        if line.contains('【') {
+            let mut passage = line.to_string();
+            for raw_next in lines.iter().skip(i + 1) {
+                let next = raw_next.trim_end_matches(['\r', '\n']);
+                if next.contains('【')
+                    || next.contains("正例")
+                    || next.contains("反例")
+                    || next.contains("检查方式")
+                {
+                    break;
+                }
+                passage.push('\n');
+                passage.push_str(next);
+                if passage.chars().count() >= 400 {
+                    break;
+                }
+            }
+            passages.push((offset, passage.chars().take(400).collect()));
+        }
+        // split_inclusive 保留真实 CRLF / LF 字符，偏移仍对应原始正文。
+        offset += raw_line.chars().count();
+    }
+    passages
+}
+
+/// 窗口优先展示匹配具体锚点的规范句；来源与可选重排共用。
+pub fn evidence_window(content: &str, anchors: &[String], limit: usize) -> (String, usize) {
+    let normalized = super::text::normalize_radicals(content);
+    let mut passages = normative_passages(&normalized);
+    passages.sort_by_cached_key(|(_, passage)| {
+        std::cmp::Reverse(
+            anchors
+                .iter()
+                .filter(|a| exact_anchor_match(passage, a))
+                .count(),
+        )
+    });
+    if let Some((start, _)) = passages
+        .first()
+        .filter(|(_, passage)| anchors.iter().any(|a| exact_anchor_match(passage, a)))
+    {
+        let chars: Vec<_> = content.chars().collect();
+        let start = (*start).min(chars.len());
+        return (chars.iter().skip(start).take(limit).collect(), start);
+    }
+    super::text::match_window(content, anchors, limit)
+}
+
+pub fn section_at(content: &str, character_offset: usize) -> Option<String> {
+    let mut section = None;
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        if offset > character_offset {
+            break;
+        }
+        let number: String = line
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let parts: Vec<_> = number.trim_end_matches('.').split('.').collect();
+        if parts.len() >= 2
+            && parts
+                .iter()
+                .all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        {
+            section = Some(number.trim_end_matches('.').to_string());
+        }
+        offset += line.chars().count();
+    }
+    section
 }
 
 // ════════════════════════════════════════════════════════

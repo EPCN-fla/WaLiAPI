@@ -373,8 +373,8 @@ impl KbRepository {
         let symbol_kind = meta.get("symbol_kind").and_then(|v| v.as_str());
 
         sqlx::query(
-            "INSERT INTO kb_chunks (id, doc_id, kb_id, chunk_index, content, token_count, embedding, embedding_dim, metadata, symbol_name, symbol_kind, content_hash, created_at, search_text)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO kb_chunks (id, doc_id, kb_id, chunk_index, content, token_count, embedding, embedding_dim, metadata, symbol_name, symbol_kind, content_hash, created_at, search_text, search_text_version)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&chunk.id)
         .bind(&chunk.doc_id)
@@ -390,12 +390,13 @@ impl KbRepository {
         .bind(&chunk.content_hash)
         .bind(&chunk.created_at)
         .bind(super::text::search_projection(&chunk.content))
+        .bind(super::text::SEARCH_PROJECTION_VERSION)
         .execute(connection)
         .await?;
         Ok(())
     }
 
-    /// 升级旧数据/正文变更后补建检索投影。NULL 有部分索引，正常检索只做空检查。
+    /// 升级旧数据/正文变更后补建检索投影。待升级版本和 NULL 共用部分索引。
     /// 分批提交可中断续跑；CAS 防止覆盖并发修改，正文、哈希和向量均不变。
     pub async fn backfill_search_text(&self) -> Result<u64, sqlx::Error> {
         self.backfill_search_text_scope(None).await
@@ -409,30 +410,50 @@ impl KbRepository {
     async fn backfill_search_text_scope(&self, kb_id: Option<&str>) -> Result<u64, sqlx::Error> {
         let mut updated = 0;
         loop {
-            let rows: Vec<(String, String)> = if let Some(kb_id) = kb_id {
-                sqlx::query_as("SELECT id, content FROM kb_chunks WHERE kb_id = ? AND search_text IS NULL ORDER BY id LIMIT 128")
+            let rows: Vec<(String, String, Option<String>, i64)> = if let Some(kb_id) = kb_id {
+                sqlx::query_as("SELECT id, content, search_text, search_text_version FROM kb_chunks WHERE kb_id = ? AND (search_text IS NULL OR search_text_version < 2) ORDER BY id LIMIT 128")
                     .bind(kb_id).fetch_all(&self.pool).await?
             } else {
-                sqlx::query_as("SELECT id, content FROM kb_chunks WHERE search_text IS NULL ORDER BY id LIMIT 128")
+                sqlx::query_as("SELECT id, content, search_text, search_text_version FROM kb_chunks WHERE search_text IS NULL OR search_text_version < 2 ORDER BY id LIMIT 128")
                     .fetch_all(&self.pool).await?
             };
             if rows.is_empty() {
                 return Ok(updated);
             }
             let mut tx = self.pool.begin().await?;
-            for (id, content) in rows {
-                updated += sqlx::query(
-                    "UPDATE kb_chunks SET search_text = ? WHERE id = ? AND content = ? AND search_text IS NULL",
+            for (id, content, old_projection, old_version) in rows {
+                updated += Self::update_search_projection(
+                    &mut tx,
+                    &id,
+                    &content,
+                    old_projection.as_deref(),
+                    old_version,
                 )
-                .bind(super::text::search_projection(&content))
-                .bind(id)
-                .bind(content)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
+                .await?;
             }
             tx.commit().await?;
         }
+    }
+
+    async fn update_search_projection(
+        connection: &mut sqlx::SqliteConnection,
+        id: &str,
+        content: &str,
+        old_projection: Option<&str>,
+        old_version: i64,
+    ) -> Result<u64, sqlx::Error> {
+        Ok(sqlx::query(
+            "UPDATE kb_chunks SET search_text = ?, search_text_version = ? WHERE id = ? AND content = ? AND search_text IS ? AND search_text_version = ?",
+        )
+        .bind(super::text::search_projection(content))
+        .bind(super::text::SEARCH_PROJECTION_VERSION)
+        .bind(id)
+        .bind(content)
+        .bind(old_projection)
+        .bind(old_version)
+        .execute(connection)
+        .await?
+        .rows_affected())
     }
 
     /// 新切片全部准备好后一次替换；失败时事务回滚，旧文档仍可检索。
@@ -911,4 +932,70 @@ pub struct SearchChunkContent {
     pub metadata: String,
     pub filename: String,
     pub doc_id: String,
+}
+
+#[cfg(test)]
+mod projection_cas_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stale_projection_snapshot_cannot_overwrite_new_content_or_projection() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO kb_knowledge_bases (id,name,created_at,updated_at) VALUES ('kb','kb','now','now')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO kb_documents (id,kb_id,filename,file_type,content_hash,status,created_at,updated_at) VALUES ('doc','kb','rules.pdf','pdf','hash','ready','now','now')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO kb_chunks (id,doc_id,kb_id,chunk_index,content,created_at,search_text,search_text_version) VALUES ('chunk','doc','kb',0,'旧分⻚规范','now','old',1)")
+            .execute(&pool).await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        // 回填 SELECT 之后，另一个写入先改了正文；使用真实 CAS 更新函数核验竞争。
+        sqlx::query("UPDATE kb_chunks SET content='新⻓度规范' WHERE id='chunk'")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            KbRepository::update_search_projection(
+                &mut connection,
+                "chunk",
+                "旧分⻚规范",
+                Some("old"),
+                1
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let pending: (String, Option<String>, i64) = sqlx::query_as(
+            "SELECT content,search_text,search_text_version FROM kb_chunks WHERE id='chunk'",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+        assert_eq!(pending, ("新⻓度规范".into(), None, 0));
+        // 正文未变、另一回填已升级版本时，旧快照也不能覆盖较新投影。
+        sqlx::query(
+            "UPDATE kb_chunks SET search_text='newer',search_text_version=3 WHERE id='chunk'",
+        )
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            KbRepository::update_search_projection(&mut connection, "chunk", "新⻓度规范", None, 0)
+                .await
+                .unwrap(),
+            0
+        );
+        let latest: (String, i64) = sqlx::query_as(
+            "SELECT search_text,search_text_version FROM kb_chunks WHERE id='chunk'",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+        assert_eq!(latest, ("newer".into(), 3));
+    }
 }

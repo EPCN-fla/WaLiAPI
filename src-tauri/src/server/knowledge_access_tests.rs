@@ -60,6 +60,29 @@ async fn setup() -> (
     (state, key, first, second, app)
 }
 
+#[tokio::test]
+async fn exam_contract_validates_ids_and_candidate_limits_before_model_call() {
+    let (_, key, first, _, app) = setup().await;
+    for exam in [
+        json!({"type":"single","stem":"备份要求","polarity":"positive","options":[{"id":"A","text":"开启备份"},{"id":"A","text":"不备份"}]}),
+        json!({"type":"single","stem":"","polarity":"positive","options":[{"id":"A","text":"开启备份"},{"id":"B","text":"不备份"}]}),
+        json!({"type":"judgment","stem":"备份要求","polarity":"positive","options":[{"id":"A","text":"正确"}]}),
+    ] {
+        let response = app.clone().oneshot(json_request("POST", "/api/kb/ask", Some(&key.key),
+            &json!({"kb_id":first.id,"question":"备份要求","exam":exam,"search_mode":"keyword"}).to_string())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body(response).await["error"]["code"],
+            "invalid_exam_request"
+        );
+    }
+    for count in [4, 101] {
+        let response = app.clone().oneshot(json_request("POST", "/api/kb/ask", Some(&key.key),
+            &json!({"kb_id":first.id,"question":"备份要求","top_k":5,"candidate_k":count,"search_mode":"keyword"}).to_string())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
 async fn body(response: Response) -> Value {
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()

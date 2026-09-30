@@ -79,6 +79,8 @@ pub async fn ask_with_config(
         search_mode,
         false,
         false,
+        None,
+        None,
     )
     .await
     .map_err(|e| e.to_string())
@@ -102,12 +104,31 @@ pub(crate) async fn ask_with_client(
     search_mode: &str,
     diagnostics_enabled: bool,
     allow_keyword_fallback: bool,
+    candidate_k: Option<usize>,
+    exam: Option<&super::exam::ExamQuestion>,
 ) -> Result<RagAnswer, QueryError> {
     let mut stages = Vec::new();
-    let strict = diagnostics_enabled || allow_keyword_fallback || budget::current().is_some();
+    let strict = diagnostics_enabled
+        || allow_keyword_fallback
+        || budget::current().is_some()
+        || exam.is_some();
     let request_id = client.request_id().unwrap_or_default();
 
     let kb_repo = KbRepository::new(pool.clone());
+    let ordered_context = candidate_k.is_some() || exam.is_some();
+    let retrieval_k = candidate_k.unwrap_or(if exam.is_some() { top_k.max(20) } else { top_k });
+    // 每个选项先取得自己的查询份额，不能让长题干挤掉末尾选项。
+    let anchors = if let Some(exam) = exam {
+        exam.options
+            .iter()
+            .map(|option| option.text.clone())
+            .chain(super::exam::retrieval_anchors(exam))
+            .collect::<Vec<_>>()
+    } else if ordered_context {
+        super::text::query_tokens(query)
+    } else {
+        Vec::new()
+    };
     // 融合模式（C-06/R3）：RRF 默认（消量纲），weighted 保留可配回退
     let fusion_mode = retriever::FusionMode::parse(&settings.get_str("kb.fusion_mode", "rrf"));
 
@@ -115,11 +136,12 @@ pub(crate) async fn ask_with_client(
     // 多轮对话的指代型问题（「上面说的方案呢」）直接送检索必然 miss——
     // 开启时先用渠道模型把「近几轮对话 + 当前问题」改写成独立完整的检索查询。
     // 失败/超时静默回退原查询（best-effort），多一次 LLM 调用的成本由开关控制。
-    let query = if settings.get_bool("kb.query_rewrite", false) && !history.is_empty() {
-        rewrite_query_with_llm(client, pool, chat_model, query, history).await?
-    } else {
-        query.to_string()
-    };
+    let query =
+        if exam.is_none() && settings.get_bool("kb.query_rewrite", false) && !history.is_empty() {
+            rewrite_query_with_llm(client, pool, chat_model, query, history).await?
+        } else {
+            query.to_string()
+        };
 
     // 显式降级请求允许 FTS 与 Embedding 重叠；历史请求沿用原来的检索流程。
     let fallback_enabled = allow_keyword_fallback && search_mode == "hybrid" && !kb_id.is_empty();
@@ -159,9 +181,22 @@ pub(crate) async fn ask_with_client(
                 0.2,
                 0.35,
                 Box::pin(async {
-                    retriever::keyword_only_search(pool, kb_id, &query, top_k * 2)
+                    if let Some(exam) = exam {
+                        retriever::keyword_search_with_anchors(
+                            pool,
+                            kb_id,
+                            &query,
+                            &anchors,
+                            &exam.stem,
+                            retrieval_k * 2,
+                        )
                         .await
                         .map_err(Into::into)
+                    } else {
+                        retriever::keyword_only_search(pool, kb_id, &query, retrieval_k * 2)
+                            .await
+                            .map_err(Into::into)
+                    }
                 }),
             ));
             tokio::select! {
@@ -272,9 +307,24 @@ pub(crate) async fn ask_with_client(
                 } else {
                     let kw = match keyword_results.take() {
                         Some(results) => results?,
-                        None => retriever::keyword_only_search(pool, kb_id, &query, top_k).await?,
+                        None => {
+                            if let Some(exam) = exam {
+                                retriever::keyword_search_with_anchors(
+                                    pool,
+                                    kb_id,
+                                    &query,
+                                    &anchors,
+                                    &exam.stem,
+                                    retrieval_k,
+                                )
+                                .await?
+                            } else {
+                                retriever::keyword_only_search(pool, kb_id, &query, retrieval_k)
+                                    .await?
+                            }
+                        }
                     };
-                    let kw = kw.into_iter().take(top_k);
+                    let kw = kw.into_iter();
                     kw.map(|r| {
                         let score = r.score;
                         retriever::ScoredSearchResult {
@@ -292,9 +342,9 @@ pub(crate) async fn ask_with_client(
                     .as_ref()
                     .ok_or("Embedding required for vector search")?;
                 let v_results = if kb_id.is_empty() {
-                    retriever::search_all(pool, query_emb, top_k, mcp_only).await?
+                    retriever::search_all(pool, query_emb, retrieval_k, mcp_only).await?
                 } else {
-                    retriever::search(pool, kb_id, query_emb, top_k).await?
+                    retriever::search(pool, kb_id, query_emb, retrieval_k).await?
                 };
                 v_results
                     .into_iter()
@@ -314,7 +364,8 @@ pub(crate) async fn ask_with_client(
                     .ok_or("Embedding required for hybrid search")?;
                 if kb_id.is_empty() {
                     // Cross-KB: use search_all then compute details
-                    let results = retriever::search_all(pool, query_emb, top_k, mcp_only).await?;
+                    let results =
+                        retriever::search_all(pool, query_emb, retrieval_k, mcp_only).await?;
                     results
                         .into_iter()
                         .map(|r| {
@@ -327,14 +378,32 @@ pub(crate) async fn ask_with_client(
                         })
                         .collect()
                 } else {
-                    if let Some(keywords) = keyword_results.take() {
-                        let vectors = retriever::search(pool, kb_id, query_emb, top_k * 2)
+                    if keyword_results.is_some() || exam.is_some() {
+                        let keywords = match keyword_results.take() {
+                            Some(results) => results?,
+                            None => {
+                                retriever::keyword_search_with_anchors(
+                                    pool,
+                                    kb_id,
+                                    &query,
+                                    &anchors,
+                                    &exam.expect("exam branch").stem,
+                                    retrieval_k * 2,
+                                )
+                                .await?
+                            }
+                        };
+                        let vectors = retriever::search(pool, kb_id, query_emb, retrieval_k * 2)
                             .await
                             .unwrap_or_default();
                         retriever::fuse_scored(
                             &vectors,
-                            &keywords?,
-                            top_k,
+                            &keywords,
+                            if exam.is_some() {
+                                vectors.len() + keywords.len()
+                            } else {
+                                retrieval_k
+                            },
                             vector_weight,
                             keyword_weight,
                             fusion_mode,
@@ -345,7 +414,7 @@ pub(crate) async fn ask_with_client(
                             kb_id,
                             &query,
                             query_emb,
-                            top_k,
+                            retrieval_k,
                             vector_weight,
                             keyword_weight,
                             fusion_mode,
@@ -378,15 +447,50 @@ pub(crate) async fn ask_with_client(
         )
     })?;
 
+    let mut scored_results = if let Some(exam) = exam {
+        run_stage(
+            "retrieval",
+            0.2,
+            0.35,
+            Box::pin(async {
+                retriever::rank_exam_candidates_bounded(scored_results, exam)
+                    .await
+                    .map_err(QueryError::from)
+            }),
+        )
+        .await
+        .map_err(|error| {
+            diagnostic_failure(
+                error,
+                "retrieval",
+                retrieval_started,
+                &stages,
+                &request_id,
+                diagnostics_enabled,
+            )
+        })?
+    } else {
+        scored_results
+    };
+    scored_results.truncate(retrieval_k);
     // C-06/R3 第二步：可选 LLM listwise 重排（`kb.rerank_enabled`，默认关）。
     // 走网关自身的渠道跑渠道（proxy::handle_request，kb-internal 路由组），
     // 重排调用的 token 消耗自动计入请求日志；失败静默回退原序（best-effort）。
-    let scored_results =
+    let mut scored_results =
         if settings.get_bool("kb.rerank_enabled", false) && scored_results.len() > 1 {
-            rerank_with_llm(client, chat_model, &query, scored_results).await?
+            rerank_with_llm(
+                client,
+                chat_model,
+                &query,
+                scored_results,
+                ordered_context.then_some(anchors.as_slice()),
+            )
+            .await?
         } else {
             scored_results
         };
+    let retrieval_candidates = scored_results.clone();
+    scored_results.truncate(top_k);
 
     // Extract plain results for context building
     let results: Vec<super::models::SearchResult> =
@@ -428,6 +532,7 @@ pub(crate) async fn ask_with_client(
                 diagnostics: None,
                 retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
                 degradation_reason: degradation_reason.clone(),
+                exam: None,
             });
         }
         return Ok(RagAnswer {
@@ -438,8 +543,16 @@ pub(crate) async fn ask_with_client(
             diagnostics: None,
             retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
             degradation_reason: degradation_reason.clone(),
+            exam: None,
         });
     }
+
+    // 普通请求沿用激活模板；考试合同使用专门的逐项证据约束。
+    let rag_system_prompt = if exam.is_some() {
+        super::exam::SYSTEM_PROMPT.to_string()
+    } else {
+        prompt_templates::load(pool, prompt_templates::KEY_RAG_SYSTEM).await
+    };
 
     // 3. Build context
     let context = build_context(&results);
@@ -450,11 +563,37 @@ pub(crate) async fn ask_with_client(
     // 5. Token estimation and fallback
     let estimated_tokens = retriever::estimate_tokens(&prompt);
     let model_limit = retriever::get_model_context_limit(chat_model);
-    let context_limit = (model_limit as f64 * 0.7) as usize; // Reserve 30% for response
+    let context_limit = ((model_limit as f64 * 0.7) as usize)
+        .saturating_sub(retriever::estimate_tokens(&rag_system_prompt));
 
-    let (final_prompt, context_results) = if estimated_tokens > context_limit {
+    let (final_prompt, context_results) = if let Some(question) = exam {
+        let mut used = results.clone();
+        let mut prompt = super::exam::prepare_prompt(question, &used, &query);
+        // 按最终证据优先级裁剪，估算的是实际发送的JSON合同和系统提示。
+        while retriever::estimate_tokens(&prompt) > context_limit && !used.is_empty() {
+            used.pop();
+            prompt = super::exam::prepare_prompt(question, &used, &query);
+        }
+        if used.is_empty() || retriever::estimate_tokens(&prompt) > context_limit {
+            let answer = super::exam::abstain(question, "题面与证据超过模型上下文预算");
+            record_stage(&mut stages, "answer", "skipped", Instant::now());
+            record_stage(&mut stages, "validation", "abstain", Instant::now());
+            return Ok(RagAnswer {
+                answer: super::exam::display_answer(question, &answer),
+                sources: vec![],
+                usage: None,
+                retrieval_details: Some(vec![]),
+                diagnostics: diagnostics_enabled.then_some(RagDiagnostics { request_id, stages }),
+                retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
+                degradation_reason,
+                exam: Some(answer),
+            });
+        }
+        (prompt, used)
+    } else if estimated_tokens > context_limit {
         // Stage 1: Trim context (remove lowest-scoring chunks)
-        let trimmed = trim_context(&results, &query, history, context_limit);
+        let trimmed =
+            trim_context_with_order(&results, &query, history, context_limit, ordered_context);
         if retriever::estimate_tokens(&trimmed.0) > context_limit {
             // Stage 2: Remove history, keep only latest message
             let no_history = build_rag_prompt(
@@ -486,8 +625,7 @@ pub(crate) async fn ask_with_client(
         !context_results.is_empty()
     );
 
-    // 6. Call LLM via proxy（系统提示词走模板表：激活版本优先，回退编译期默认）
-    let rag_system_prompt = prompt_templates::load(pool, prompt_templates::KEY_RAG_SYSTEM).await;
+    // 6. Call LLM via proxy
     let chat_request = serde_json::json!({
         "model": chat_model,
         "messages": [
@@ -561,17 +699,19 @@ pub(crate) async fn ask_with_client(
             }
             // 普通请求保留空字符串；只有缺少 content 时沿用原有回退文案。
             let answer = answer.unwrap_or("生成回答失败").to_string();
+            let exam_answer = exam
+                .map(|question| super::exam::validate_answer(question, &context_results, &answer));
+            let answer = match (exam, exam_answer.as_ref()) {
+                (Some(question), Some(contract)) => super::exam::display_answer(question, contract),
+                _ => answer,
+            };
 
             let usage = result.usage;
 
             // 来源只来自最终发送给模型的切片，裁掉的检索命中仅保留在检索详情。
             let sources: Vec<SourceInfo> = context_results
                 .iter()
-                .map(|r| SourceInfo {
-                    filename: r.filename.clone(),
-                    score: r.score,
-                    snippet: r.content.chars().take(200).collect(),
-                })
+                .map(|r| source_info(r, &anchors, ordered_context, exam.is_some()))
                 .collect();
 
             if strict
@@ -592,10 +732,22 @@ pub(crate) async fn ask_with_client(
                     diagnostics_enabled,
                 ));
             }
-            record_stage(&mut stages, "validation", "passed", validation_started);
+            record_stage(
+                &mut stages,
+                "validation",
+                if exam_answer
+                    .as_ref()
+                    .is_some_and(|answer| answer.status == super::exam::ExamStatus::Abstain)
+                {
+                    "abstain"
+                } else {
+                    "passed"
+                },
+                validation_started,
+            );
 
             // Build retrieval details for visualization
-            let retrieval_details: Vec<RetrievalDetail> = scored_results
+            let retrieval_details: Vec<RetrievalDetail> = retrieval_candidates
                 .iter()
                 .map(|s| {
                     let meta = &s.result.metadata;
@@ -605,7 +757,11 @@ pub(crate) async fn ask_with_client(
                         score: s.result.score,
                         vector_score: s.vector_score,
                         keyword_score: s.keyword_score,
-                        snippet: s.result.content.chars().take(200).collect(),
+                        snippet: if ordered_context {
+                            retriever::evidence_window(&s.result.content, &anchors, 200).0
+                        } else {
+                            s.result.content.chars().take(200).collect()
+                        },
                         symbol_name: meta
                             .get("symbol_name")
                             .and_then(|v| v.as_str())
@@ -647,6 +803,7 @@ pub(crate) async fn ask_with_client(
                 diagnostics: diagnostics_enabled.then_some(RagDiagnostics { request_id, stages }),
                 retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
                 degradation_reason,
+                exam: exam_answer,
             })
         }
         Err(error) => Err(error),
@@ -761,6 +918,43 @@ pub(crate) fn diagnostic_failure(
     error
 }
 
+fn source_info(
+    result: &super::models::SearchResult,
+    anchors: &[String],
+    windowed: bool,
+    exam: bool,
+) -> SourceInfo {
+    let (snippet, start) = if windowed {
+        retriever::evidence_window(&result.content, anchors, 200)
+    } else {
+        (result.content.chars().take(200).collect(), 0)
+    };
+    SourceInfo {
+        filename: result.filename.clone(),
+        score: result.score,
+        snippet,
+        chunk_id: windowed.then(|| result.chunk_id.clone()),
+        doc_id: windowed.then(|| result.doc_id.clone()),
+        section: windowed
+            .then(|| {
+                retriever::section_at(&result.content, start).or_else(|| {
+                    result
+                        .metadata
+                        .get("heading")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+            })
+            .flatten(),
+        page_no: windowed
+            .then(|| result.metadata.get("page_no").and_then(|v| v.as_i64()))
+            .flatten(),
+        snippet_start: windowed.then_some(start),
+        // 仅考试合同需要完整引用校验；来源始终来自最终实际使用的上下文。
+        evidence_text: exam.then(|| result.content.clone()),
+    }
+}
+
 /// Build context string from search results
 /// Enhanced with symbol metadata (name, kind, signature)
 fn build_context(results: &[super::models::SearchResult]) -> String {
@@ -843,19 +1037,34 @@ fn build_rag_prompt(context: &str, query: &str, history: &[ConversationMessage])
 }
 
 /// Trim context to fit token limit (remove lowest-scoring chunks first)
+#[cfg(test)]
 fn trim_context(
     results: &[super::models::SearchResult],
     query: &str,
     history: &[ConversationMessage],
     target_tokens: usize,
 ) -> (String, Vec<super::models::SearchResult>) {
+    trim_context_with_order(results, query, history, target_tokens, false)
+}
+
+fn trim_context_with_order(
+    results: &[super::models::SearchResult],
+    query: &str,
+    history: &[ConversationMessage],
+    target_tokens: usize,
+    ordered: bool,
+) -> (String, Vec<super::models::SearchResult>) {
     // 按低分顺序移除，但保留剩余切片原来的展示顺序。
     let mut indexed: Vec<_> = results.iter().enumerate().collect();
-    indexed.sort_by(|a, b| {
-        a.1.score
-            .partial_cmp(&b.1.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    if ordered {
+        indexed.reverse();
+    } else {
+        indexed.sort_by(|a, b| {
+            a.1.score
+                .partial_cmp(&b.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
     let mut removed = std::collections::HashSet::new();
     let mut remaining = results.to_vec();
     let mut prompt = build_rag_prompt(&build_context(&remaining), query, history);
@@ -879,6 +1088,46 @@ fn trim_context(
 #[cfg(test)]
 mod context_tests {
     use super::*;
+
+    #[test]
+    fn ordered_trim_keeps_rerank_priority_even_when_old_scores_disagree() {
+        let mut high_priority = result("selected", 0.1, &"证据".repeat(200));
+        high_priority.metadata = serde_json::json!({});
+        let low_priority = result("discarded", 0.9, &"背景".repeat(200));
+        let budget = retriever::estimate_tokens(&build_rag_prompt(
+            &build_context(&[high_priority.clone()]),
+            "query",
+            &[],
+        ));
+        let (_, used) =
+            trim_context_with_order(&[high_priority, low_priority], "query", &[], budget, true);
+        assert_eq!(used.len(), 1);
+        assert_eq!(used[0].chunk_id, "selected");
+    }
+
+    #[test]
+    fn exam_source_window_points_into_exact_final_content() {
+        let content = format!(
+            "{}3.2.2. 【强制】不支持 FETCH 控制语句。{}",
+            "页眉\n".repeat(100),
+            "尾注\n".repeat(100)
+        );
+        let search_result = result("actual", 0.1, &content);
+        let source = source_info(&search_result, &["FETCH".into()], true, true);
+        assert!(source.snippet.contains("不支持 FETCH"));
+        assert_eq!(source.section.as_deref(), Some("3.2.2"));
+        assert_eq!(source.evidence_text.as_deref(), Some(content.as_str()));
+        assert_eq!(
+            source.snippet,
+            content
+                .chars()
+                .skip(source.snippet_start.unwrap())
+                .take(200)
+                .collect::<String>()
+        );
+        let ordinary = source_info(&search_result, &[], false, false);
+        assert!(ordinary.chunk_id.is_none() && ordinary.evidence_text.is_none());
+    }
 
     fn result(id: &str, score: f32, content: &str) -> super::super::models::SearchResult {
         super::super::models::SearchResult {
@@ -1180,11 +1429,7 @@ pub async fn deep_research(
             let sources: Vec<SourceInfo> = all_sources
                 .iter()
                 .filter(|r| seen.insert(r.chunk_id.clone()))
-                .map(|r| SourceInfo {
-                    filename: r.filename.clone(),
-                    score: r.score,
-                    snippet: r.content.chars().take(200).collect(),
-                })
+                .map(|r| source_info(r, &[], false, false))
                 .collect();
 
             // Save to conversation history
@@ -1216,6 +1461,7 @@ pub async fn deep_research(
                 diagnostics: None,
                 retrieval_mode: None,
                 degradation_reason: None,
+                exam: None,
             })
         }
         Err((code, msg)) => Err(format!("Final synthesis failed ({}): {}", code, msg)),
@@ -1422,16 +1668,23 @@ async fn rerank_with_llm(
     chat_model: &str,
     query: &str,
     candidates: Vec<retriever::ScoredSearchResult>,
+    window_anchors: Option<&[String]>,
 ) -> Result<Vec<retriever::ScoredSearchResult>, QueryError> {
     let mut listing = String::new();
     for (i, c) in candidates.iter().enumerate() {
-        let excerpt: String = c
-            .result
-            .content
-            .chars()
-            .take(200)
-            .collect::<String>()
-            .replace('\n', " ");
+        let excerpt = if let Some(anchors) = window_anchors {
+            let query_anchors;
+            let anchors = if anchors.is_empty() {
+                query_anchors = super::text::query_tokens(query);
+                query_anchors.as_slice()
+            } else {
+                anchors
+            };
+            retriever::evidence_window(&c.result.content, anchors, 400).0
+        } else {
+            c.result.content.chars().take(200).collect()
+        }
+        .replace('\n', " ");
         listing.push_str(&format!("[{}] {}: {}\n", i, c.result.filename, excerpt));
     }
     let prompt = format!(

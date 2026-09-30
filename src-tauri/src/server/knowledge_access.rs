@@ -393,6 +393,17 @@ async fn ask_inner(
             input.diagnostics,
         )
     })?;
+    crate::services::knowledge::exam::validate_request(&input).map_err(|message| {
+        rag::diagnostic_failure(
+            QueryError::new(StatusCode::BAD_REQUEST, message)
+                .at_stage("permission", "invalid_exam_request"),
+            "permission",
+            permission_started,
+            &stages,
+            request_id,
+            input.diagnostics,
+        )
+    })?;
     rag::record_stage(&mut stages, "permission", "passed", permission_started);
     let client = ModelClient::ApiKey {
         shared,
@@ -416,6 +427,8 @@ async fn ask_inner(
         mode,
         input.diagnostics,
         input.allow_keyword_fallback,
+        input.candidate_k,
+        input.exam.as_ref(),
     ))
     .await;
     match result {
