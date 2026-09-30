@@ -847,6 +847,9 @@ mod rag_budget_tests {
         (repo, key, plan, audit)
     }
 
+    #[derive(Clone, Copy)]
+    struct RequestElapsed(Duration);
+
     async fn request(mock: &SlowUpstream, timeout_ms: Option<u64>) -> Response {
         let (repo, key, plan, audit) = setup(&mock.base).await;
         let future = route_plan_response(
@@ -859,27 +862,41 @@ mod rag_budget_tests {
             "{}",
             Some("budget-test".into()),
         );
-        match timeout_ms {
+        // 仅测量预算建立后的请求；真实数据库迁移不属于请求预算。
+        let started = Instant::now();
+        let mut response = match timeout_ms {
             Some(timeout) => {
                 budget::Budget::new(timeout, "budget-test")
                     .scope(future)
                     .await
             }
             None => future.await,
-        }
+        };
+        response
+            .extensions_mut()
+            .insert(RequestElapsed(started.elapsed()));
+        response
     }
 
     const VECTOR: &str = r#"{"data":[{"index":0,"embedding":[1.0,0.0]}],"usage":{"prompt_tokens":1,"total_tokens":1}}"#;
 
+    async fn warm_request_path() {
+        // 独立快速上游预热真实客户端；目标请求的 150ms 只测试已经可达的网络路径。
+        let warmup = SlowUpstream::start(200, false, Duration::ZERO, "", VECTOR).await;
+        assert_eq!(request(&warmup, None).await.status(), StatusCode::OK);
+        assert_eq!(warmup.calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn rag_deadline_covers_headers_and_body_without_key_or_channel_replay() {
+        warm_request_path().await;
         for delay_headers in [true, false] {
             let mock =
                 SlowUpstream::start(200, delay_headers, Duration::from_secs(2), "", VECTOR).await;
-            let started = Instant::now();
             let response = request(&mock, Some(150)).await;
             assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-            assert!(started.elapsed() < Duration::from_secs(1));
+            let elapsed = response.extensions().get::<RequestElapsed>().unwrap().0;
+            assert!(elapsed < Duration::from_secs(1), "请求耗时：{elapsed:?}");
             tokio::time::sleep(Duration::from_millis(50)).await;
             assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
             assert_eq!(
@@ -900,6 +917,7 @@ mod rag_budget_tests {
 
     #[tokio::test]
     async fn rag_retry_after_shares_the_same_deadline_for_rate_limits_and_server_errors() {
+        warm_request_path().await;
         for status in [429, 503] {
             let mock = SlowUpstream::start(
                 status,
@@ -909,12 +927,10 @@ mod rag_budget_tests {
                 r#"{"error":{"code":"rate_limit_exceeded"}}"#,
             )
             .await;
-            let started = Instant::now();
-            assert_eq!(
-                request(&mock, Some(150)).await.status(),
-                StatusCode::GATEWAY_TIMEOUT
-            );
-            assert!(started.elapsed() < Duration::from_secs(1));
+            let response = request(&mock, Some(150)).await;
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            let elapsed = response.extensions().get::<RequestElapsed>().unwrap().0;
+            assert!(elapsed < Duration::from_secs(1), "请求耗时：{elapsed:?}");
             assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
         }
     }

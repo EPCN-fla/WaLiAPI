@@ -127,6 +127,22 @@ pub struct RagAnswer {
     /// 可选考试合同；省略时保留普通知识问答的返回格式。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exam: Option<super::exam::ExamAnswer>,
+    /// 只确认已请求思考档位，不表示上游接受或执行。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<RagReasoning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RagReasoning {
+    pub requested: String,
+    pub status: ReasoningStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningStatus {
+    Requested,
+    NotSent,
 }
 
 /// 仅显式诊断请求返回阶段结果，不包含提示词、渠道地址或凭据。
@@ -252,6 +268,9 @@ pub struct AskInput {
     pub candidate_k: Option<usize>,
     #[serde(default)]
     pub exam: Option<super::exam::ExamQuestion>,
+    /// 省略或 default 不覆盖网关 / 模型默认；其他档位使用通用协议参数。
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 fn default_top_k() -> usize {

@@ -1,7 +1,7 @@
 use super::model_client::{ModelClient, QueryError};
 use super::models::{
-    ConversationMessage, RagAnswer, RagDiagnosticStage, RagDiagnostics, RetrievalDetail,
-    SourceInfo, UsageInfo,
+    ConversationMessage, RagAnswer, RagDiagnosticStage, RagDiagnostics, RagReasoning,
+    ReasoningStatus, RetrievalDetail, SourceInfo, UsageInfo,
 };
 use super::repository::KbRepository;
 use super::retriever;
@@ -81,6 +81,7 @@ pub async fn ask_with_config(
         false,
         None,
         None,
+        None,
     )
     .await
     .map_err(|e| e.to_string())
@@ -106,7 +107,9 @@ pub(crate) async fn ask_with_client(
     allow_keyword_fallback: bool,
     candidate_k: Option<usize>,
     exam: Option<&super::exam::ExamQuestion>,
+    reasoning_effort: Option<&str>,
 ) -> Result<RagAnswer, QueryError> {
+    let reasoning_effort = validate_reasoning_request(reasoning_effort, false)?;
     let mut stages = Vec::new();
     let strict = diagnostics_enabled
         || allow_keyword_fallback
@@ -533,6 +536,7 @@ pub(crate) async fn ask_with_client(
                 retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
                 degradation_reason: degradation_reason.clone(),
                 exam: None,
+                reasoning: reasoning_info(reasoning_effort, ReasoningStatus::NotSent),
             });
         }
         return Ok(RagAnswer {
@@ -544,6 +548,7 @@ pub(crate) async fn ask_with_client(
             retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
             degradation_reason: degradation_reason.clone(),
             exam: None,
+            reasoning: reasoning_info(reasoning_effort, ReasoningStatus::NotSent),
         });
     }
 
@@ -587,6 +592,7 @@ pub(crate) async fn ask_with_client(
                 retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
                 degradation_reason,
                 exam: Some(answer),
+                reasoning: reasoning_info(reasoning_effort, ReasoningStatus::NotSent),
             });
         }
         (prompt, used)
@@ -626,7 +632,7 @@ pub(crate) async fn ask_with_client(
     );
 
     // 6. Call LLM via proxy
-    let chat_request = serde_json::json!({
+    let mut chat_request = serde_json::json!({
         "model": chat_model,
         "messages": [
             {"role": "system", "content": rag_system_prompt},
@@ -634,6 +640,12 @@ pub(crate) async fn ask_with_client(
         ],
         "stream": false
     });
+    if let Some(question) = exam {
+        // 为逐项JSON和短引用留足空间，同时避免供应商默认的超长输出。
+        chat_request["max_tokens"] =
+            serde_json::json!((question.options.len() * 384 + 256).clamp(1024, 8192));
+    }
+    let reasoning = apply_reasoning_effort(&mut chat_request, reasoning_effort)?;
     let answer_started = Instant::now();
     client
         .ensure_knowledge_access(kb_id, mcp_only)
@@ -649,7 +661,8 @@ pub(crate) async fn ask_with_client(
                 diagnostics_enabled,
             )
         })?;
-    let proxy_result = run_stage("answer", 1.0, 0.01, client.chat(chat_request, "RAG"))
+    let purpose = if exam.is_some() { "RAG-exam" } else { "RAG" };
+    let proxy_result = run_stage("answer", 1.0, 0.01, client.chat(chat_request, purpose))
         .await
         .map_err(|error| {
             diagnostic_failure(
@@ -804,9 +817,127 @@ pub(crate) async fn ask_with_client(
                 retrieval_mode: fallback_enabled.then(|| actual_mode.to_string()),
                 degradation_reason,
                 exam: exam_answer,
+                reasoning,
             })
         }
         Err(error) => Err(error),
+    }
+}
+
+/// 返回规范档位；默认不注入参数。深研究有多次生成，首版不虚称整条链路已发送。
+pub(crate) fn validate_reasoning_request(
+    effort: Option<&str>,
+    deep_research: bool,
+) -> Result<Option<&str>, QueryError> {
+    let effort = match effort {
+        None | Some("default") => return Ok(None),
+        Some(effort @ ("none" | "low" | "medium" | "high")) => effort,
+        Some(_) => {
+            return Err(QueryError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "reasoning_effort只允许default、none、low、medium、high",
+            )
+            .at_stage("permission", "invalid_reasoning_effort"));
+        }
+    };
+    if deep_research {
+        return Err(QueryError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "deep_research暂不支持显式reasoning_effort档位，请省略或使用default",
+        )
+        .at_stage("permission", "invalid_reasoning_effort"));
+    }
+    Ok(Some(effort))
+}
+
+fn reasoning_info(effort: Option<&str>, status: ReasoningStatus) -> Option<RagReasoning> {
+    effort.map(|requested| RagReasoning {
+        requested: requested.to_string(),
+        status,
+    })
+}
+
+/// 只写网关已有的通用协议字段，不从模型别名推断供应商能力。
+fn apply_reasoning_effort(
+    request: &mut serde_json::Value,
+    effort: Option<&str>,
+) -> Result<Option<RagReasoning>, QueryError> {
+    let effort = validate_reasoning_request(effort, false)?;
+    if let Some(effort) = effort {
+        request["reasoning_effort"] = serde_json::json!(effort);
+    }
+    Ok(reasoning_info(effort, ReasoningStatus::Requested))
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_leave_the_request_unchanged_and_explicit_levels_use_only_canonical_field() {
+        for effort in [
+            None,
+            Some("default"),
+            Some("none"),
+            Some("low"),
+            Some("medium"),
+            Some("high"),
+        ] {
+            let mut request =
+                serde_json::json!({"model":"opaque-alias","max_tokens":123,"stream":false});
+            let original = request.clone();
+            let info = apply_reasoning_effort(&mut request, effort).unwrap();
+            if let Some(effort @ ("none" | "low" | "medium" | "high")) = effort {
+                assert_eq!(request["reasoning_effort"], effort);
+                assert_eq!(request["max_tokens"], 123);
+                assert_eq!(request.as_object().unwrap().len(), 4);
+                let info = info.unwrap();
+                assert_eq!(info.requested, effort);
+                assert_eq!(info.status, ReasoningStatus::Requested);
+            } else {
+                assert_eq!(request, original);
+                assert!(info.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_levels_and_deep_research_do_not_mutate_the_body() {
+        for effort in ["", "HIGH", "auto", "max", " low"] {
+            let mut request = serde_json::json!({"model":"alias"});
+            let error = apply_reasoning_effort(&mut request, Some(effort)).unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert_eq!(error.code.as_deref(), Some("invalid_reasoning_effort"));
+            assert_eq!(request, serde_json::json!({"model":"alias"}));
+        }
+        for effort in ["none", "low", "medium", "high"] {
+            let error = validate_reasoning_request(Some(effort), true).unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(error.message.contains("deep_research"));
+        }
+        assert_eq!(validate_reasoning_request(None, true).unwrap(), None);
+        assert_eq!(
+            validate_reasoning_request(Some("default"), true).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_input_and_answer_keep_optional_reasoning_fields_absent() {
+        let input: super::super::models::AskInput =
+            serde_json::from_value(serde_json::json!({"question":"q"})).unwrap();
+        assert!(input.reasoning_effort.is_none());
+        let old = serde_json::json!({"answer":"a","sources":[],"usage":null});
+        let answer: RagAnswer = serde_json::from_value(old).unwrap();
+        assert!(serde_json::to_value(answer)
+            .unwrap()
+            .get("reasoning")
+            .is_none());
+        let info = reasoning_info(Some("none"), ReasoningStatus::NotSent).unwrap();
+        assert_eq!(
+            serde_json::to_value(info).unwrap(),
+            serde_json::json!({"requested":"none","status":"not_sent"})
+        );
     }
 }
 
@@ -1462,6 +1593,7 @@ pub async fn deep_research(
                 retrieval_mode: None,
                 degradation_reason: None,
                 exam: None,
+                reasoning: None,
             })
         }
         Err((code, msg)) => Err(format!("Final synthesis failed ({}): {}", code, msg)),

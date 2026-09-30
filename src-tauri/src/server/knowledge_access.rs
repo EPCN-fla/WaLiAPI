@@ -366,6 +366,17 @@ async fn ask_inner(
                 input.diagnostics,
             )
         })?;
+    rag::validate_reasoning_request(input.reasoning_effort.as_deref(), input.deep_research)
+        .map_err(|error| {
+            rag::diagnostic_failure(
+                error,
+                "permission",
+                permission_started,
+                &stages,
+                request_id,
+                input.diagnostics,
+            )
+        })?;
     if input.deep_research {
         return Err(rag::diagnostic_failure(
             QueryError::new(
@@ -429,6 +440,7 @@ async fn ask_inner(
         input.allow_keyword_fallback,
         input.candidate_k,
         input.exam.as_ref(),
+        input.reasoning_effort.as_deref(),
     ))
     .await;
     match result {

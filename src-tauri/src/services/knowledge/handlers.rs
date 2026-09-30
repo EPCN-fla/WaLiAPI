@@ -429,6 +429,11 @@ pub async fn ask(
 }
 
 async fn ask_internal(shared: &SharedState, input: AskInput) -> Response {
+    if let Err(error) =
+        rag::validate_reasoning_request(input.reasoning_effort.as_deref(), input.deep_research)
+    {
+        return error.into_response();
+    }
     if let Err(message) = super::exam::validate_request(&input) {
         return super::model_client::QueryError::new(StatusCode::BAD_REQUEST, message)
             .at_stage("permission", "invalid_exam_request")
@@ -507,6 +512,7 @@ async fn ask_internal(shared: &SharedState, input: AskInput) -> Response {
             input.allow_keyword_fallback,
             input.candidate_k,
             input.exam.as_ref(),
+            input.reasoning_effort.as_deref(),
         )
         .await
         {

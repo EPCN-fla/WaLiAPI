@@ -579,16 +579,38 @@ fn chat_gpt5_options_map_or_drop_for_responses_backend() {
     .unwrap();
 
     assert_eq!(encoded["model"], "gpt-5.5");
-    assert!(encoded.get("reasoning").is_none());
+    assert_eq!(encoded["reasoning"], serde_json::json!({"effort": "high"}));
     assert!(encoded.get("text").is_none());
     assert!(encoded.get("max_output_tokens").is_none());
     assert!(encoded.get("stream_options").is_none());
     assert!(context.normalized.contains(&"/max_tokens".to_string()));
     assert!(context.normalized.contains(&"/stream_options".to_string()));
-    assert!(context
+    assert!(!context
         .normalized
         .contains(&"/reasoning_effort".to_string()));
     assert!(context.normalized.contains(&"/verbosity".to_string()));
+}
+
+#[test]
+fn chat_reasoning_preferences_reach_responses_without_changing_defaults() {
+    let mut request = serde_json::json!({
+        "model": "public-alias",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let (default_body, _) = encode_chat_to_responses(&request, "mapped-model").unwrap();
+    assert!(default_body.get("reasoning").is_none());
+    for effort in ["none", "low", "medium", "high"] {
+        request["reasoning_effort"] = serde_json::json!(effort);
+        let (encoded, context) = encode_chat_to_responses(&request, "mapped-model").unwrap();
+        assert_eq!(encoded["reasoning"]["effort"], effort);
+        assert_eq!(encoded["model"], "mapped-model");
+        assert!(!context.normalized.contains(&"/reasoning_effort".to_owned()));
+    }
+    request["reasoning_effort"] = serde_json::json!(false);
+    let error = encode_chat_to_responses(&request, "mapped-model").unwrap_err();
+    assert!(error
+        .json_pointers
+        .contains(&"/reasoning_effort".to_owned()));
 }
 
 #[test]

@@ -201,12 +201,13 @@ pub fn encode_chat_to_responses(
         // response.completed, so dropping this is intentional and observable.
         normalized.push("/stream_options".to_owned());
     }
-    if object.get("reasoning_effort").is_some() {
-        // Codex backend-api does not accept the public Responses `reasoning`
-        // request field on this account endpoint. Keep the Chat request
-        // compatible by dropping the preference and letting the account/model
-        // default apply.
-        normalized.push("/reasoning_effort".to_owned());
+    if let Some(effort) = object.get("reasoning_effort").and_then(Value::as_str) {
+        // 用户显式选择的强度有 Responses 等价字段；Codex 请求白名单也保留
+        // reasoning。不要吞掉偏好或按模型别名猜支持范围，交由实际上游校验。
+        response.insert(
+            "reasoning".to_owned(),
+            serde_json::json!({"effort": effort.to_ascii_lowercase()}),
+        );
     }
     if object.get("verbosity").is_some() {
         // Same story for the public Responses `text.verbosity` control: the

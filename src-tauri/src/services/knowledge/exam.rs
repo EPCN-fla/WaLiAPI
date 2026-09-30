@@ -186,7 +186,7 @@ pub fn prepare_prompt(question: &ExamQuestion, chunks: &[SearchResult], original
         .collect();
     format!(
         "原题：{original}\n结构化题目：{}\n授权参考资料（JSON数据）：{}\n\n\
-        核对规则：逐项覆盖所有输入option id，verdict只能是supported/contradicted/unknown；supported与contradicted必须引用资料中实际存在的chunk_id与完整原文quote。不要改写quote，不必计算字符位置。未知项不能当错误项。\
+        核对规则：逐项覆盖所有输入option id，verdict只能是supported/contradicted/unknown；supported与contradicted必须引用资料中实际存在的chunk_id与原文quote。每项只引用足以证明判据的最短完整片段，通常不超过100字，至多2条；不要复述全文，不要改写quote，不必计算字符位置。未知项不能当错误项。\
         polarity=positive选择supported，negative选择contradicted。单选和判断只选择一项，多选可以只有一项，不得强制至少两项。\
         判断题“正确/错误”选项判定的是完整题干：合取命题有确认反例即可为假，全部成立才为真，没有反例且部分条件缺证据则未知。\
         组合选项按三态逻辑计算，不能把“以上均正确”等当独立事实。适用规范版本冲突且题意未指定时为未知。\
@@ -295,15 +295,32 @@ pub fn validate_answer(
         .filter(|check| check.verdict == target)
         .map(|check| check.option_id.clone())
         .collect();
-    if answer
+    let unknown: Vec<_> = answer
         .option_checks
         .iter()
-        .any(|check| check.verdict == Verdict::Unknown)
-        || selected != expected
-        || selected.is_empty()
-        || (question.question_type != ExamQuestionType::Multiple && selected.len() != 1)
-    {
-        return abstain(question, "逐项结论与完整答案集合不一致或仍有未知项");
+        .filter(|check| check.verdict == Verdict::Unknown)
+        .map(|check| check.option_id.as_str())
+        .collect();
+    let mut missing = Vec::new();
+    if !unknown.is_empty() {
+        missing.push(format!("选项{}仍缺少确认依据", unknown.join("、")));
+    }
+    if selected != expected {
+        missing.push("模型给出的答案集合与逐项结论不一致".to_string());
+    }
+    if selected.is_empty() {
+        missing.push("模型未给出可确认的答案集合".to_string());
+    }
+    if question.question_type != ExamQuestionType::Multiple && selected.len() != 1 {
+        missing.push("单选或判断题的答案必须恰好一项".to_string());
+    }
+    if !missing.is_empty() {
+        // 引用和ID已通过校验，保留逐项结果以定位缺证据的选项；完整集合仍弃答。
+        // 不把无效quote/越权来源等前置合同失败与有效检查中的未知项混为一类。
+        answer.status = ExamStatus::Abstain;
+        answer.selected_option_ids.clear();
+        answer.missing_criteria = missing;
+        return answer;
     }
     answer.selected_option_ids = question
         .options
@@ -426,6 +443,37 @@ mod tests {
                 ExamStatus::Abstain
             );
         }
+    }
+    #[test]
+    fn valid_option_checks_survive_abstention_with_specific_missing_criteria() {
+        let mut response = reply();
+        response["option_checks"][1]["verdict"] = json!("unknown");
+        response["option_checks"][1]["evidence"] = json!([]);
+        let answer = validate_answer(&question(), &chunks(), &response.to_string());
+        assert_eq!(answer.status, ExamStatus::Abstain);
+        assert!(answer.selected_option_ids.is_empty());
+        assert_eq!(answer.option_checks[0].verdict, Verdict::Supported);
+        assert_eq!(answer.option_checks[0].evidence[0].start, 4);
+        assert_eq!(answer.option_checks[1].verdict, Verdict::Unknown);
+        assert_eq!(answer.missing_criteria, vec!["选项B仍缺少确认依据"]);
+
+        response = reply();
+        response["selected_option_ids"] = json!(["B"]);
+        let answer = validate_answer(&question(), &chunks(), &response.to_string());
+        assert_eq!(answer.status, ExamStatus::Abstain);
+        assert_eq!(answer.option_checks[1].verdict, Verdict::Contradicted);
+        assert_eq!(
+            answer.missing_criteria,
+            vec!["模型给出的答案集合与逐项结论不一致"]
+        );
+
+        response["option_checks"][0]["evidence"][0]["quote"] = json!("不存在的规则");
+        let answer = validate_answer(&question(), &chunks(), &response.to_string());
+        assert!(answer
+            .option_checks
+            .iter()
+            .all(|check| check.verdict == Verdict::Unknown));
+        assert_eq!(answer.missing_criteria, vec!["引用原文无法定位"]);
     }
     #[test]
     fn negative_question_selects_contradicted_item() {

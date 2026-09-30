@@ -479,6 +479,16 @@ async fn mock_model_with_delays(
     embedding_delay: std::time::Duration,
     answer_delay: std::time::Duration,
 ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    mock_model_with_capture(state, answer_text, embedding_delay, answer_delay, None).await
+}
+
+async fn mock_model_with_capture(
+    state: &AppState,
+    answer_text: &'static str,
+    embedding_delay: std::time::Duration,
+    answer_delay: std::time::Duration,
+    captured: Option<Arc<std::sync::Mutex<Vec<Value>>>>,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let embed_calls = calls.clone();
     let chat_calls = calls.clone();
@@ -488,8 +498,9 @@ async fn mock_model_with_delays(
             tokio::time::sleep(embedding_delay).await;
             Json(json!({"object":"list","data":[{"object":"embedding","index":0,"embedding":[1.0,0.0,0.0]}],"model":"embed-test","usage":{"prompt_tokens":7,"total_tokens":7}}))
         }}))
-        .route("/v1/chat/completions", post(move |Json(body): Json<Value>| { let calls = chat_calls.clone(); async move {
+        .route("/v1/chat/completions", post(move |Json(body): Json<Value>| { let calls = chat_calls.clone(); let captured = captured.clone(); async move {
             calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(captured) = captured { captured.lock().unwrap().push(body.clone()); }
             tokio::time::sleep(answer_delay).await;
             let system = body["messages"][0]["content"].as_str().unwrap_or("");
             let answer = if system.contains("改写器") { "alpha" } else if system.contains("重排器") { "[1,0]" } else { answer_text };
@@ -505,6 +516,162 @@ async fn mock_model_with_delays(
         "models":["chat-test","embed-test"], "protocol":"openai", "provider":"custom", "native_base_url":format!("http://127.0.0.1:{port}/v1"), "native_endpoints":["chat_completions","embeddings"]
     })).unwrap()).await.unwrap();
     (channel.id, calls, task)
+}
+
+#[tokio::test]
+async fn rag_reasoning_levels_reach_the_canonical_gateway_body_without_claiming_application() {
+    let (state, key, first, _, app) = setup().await;
+    let captured = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let (_, calls, task) = mock_model_with_capture(
+        &state,
+        "BCD",
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        Some(captured.clone()),
+    )
+    .await;
+    document(&state, &first.id, "alpha answer is BCD").await;
+    for (index, level) in [
+        None,
+        Some("default"),
+        Some("none"),
+        Some("low"),
+        Some("medium"),
+        Some("high"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut input = json!({"kb_id":first.id,"question":"alpha","model":"chat-test","search_mode":"keyword"});
+        if let Some(level) = level {
+            input["reasoning_effort"] = json!(level);
+        }
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/kb/ask",
+                Some(&key.key),
+                &input.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = body(response).await;
+        let sent = captured.lock().unwrap()[index].clone();
+        if let Some(level @ ("none" | "low" | "medium" | "high")) = level {
+            assert_eq!(
+                result["reasoning"],
+                json!({"requested":level,"status":"requested"})
+            );
+            assert_eq!(sent["reasoning_effort"], level);
+        } else {
+            assert!(result.get("reasoning").is_none());
+            assert!(sent.get("reasoning_effort").is_none());
+        }
+        assert_eq!(sent["model"], "chat-test");
+        for provider_field in ["thinking", "enable_thinking", "reasoning"] {
+            assert!(sent.get(provider_field).is_none());
+        }
+    }
+    // 生成已发送但考试合同无效时是 requested；不能伪称未发送或已执行。
+    let input = json!({"kb_id":first.id,"question":"alpha","model":"chat-test","search_mode":"keyword","reasoning_effort":"high", "exam":{"type":"single","stem":"alpha","polarity":"positive","options":[{"id":"A","text":"BCD"},{"id":"B","text":"EFG"}]}});
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/api/kb/ask",
+            Some(&key.key),
+            &input.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = body(response).await;
+    assert_eq!(result["exam"]["status"], "abstain");
+    assert_eq!(
+        result["reasoning"],
+        json!({"requested":"high","status":"requested"})
+    );
+    let sent = captured.lock().unwrap()[6].clone();
+    assert_eq!(sent["reasoning_effort"], "high");
+    assert_eq!(sent["max_tokens"], 1024);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        7,
+        "每个请求仅一次生成，不重试或换模型"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn rag_invalid_reasoning_and_explicit_deep_research_are_rejected_before_upstream() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, calls, task) = mock_model(&state).await;
+    for (effort, deep) in [
+        ("", false),
+        ("HIGH", false),
+        ("auto", false),
+        ("max", false),
+        ("high", true),
+        ("none", true),
+    ] {
+        let input = json!({"kb_id":first.id,"question":"alpha","model":"chat-test","reasoning_effort":effort,"deep_research":deep});
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/kb/ask",
+                Some(&key.key),
+                &input.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let result = body(response).await;
+        assert_eq!(result["error"]["code"], "invalid_reasoning_effort");
+        if deep {
+            assert!(result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("deep_research"));
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    task.abort();
+}
+
+#[tokio::test]
+async fn rag_empty_retrieval_records_reasoning_as_not_sent() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, calls, task) = mock_model(&state).await;
+    for effort in [None, Some("default"), Some("high")] {
+        let mut input = json!({"kb_id":first.id,"question":"alpha","model":"chat-test","search_mode":"keyword"});
+        if let Some(effort) = effort {
+            input["reasoning_effort"] = json!(effort);
+        }
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/kb/ask",
+                Some(&key.key),
+                &input.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = body(response).await;
+        if effort == Some("high") {
+            assert_eq!(
+                result["reasoning"],
+                json!({"requested":"high","status":"not_sent"})
+            );
+        } else {
+            assert!(result.get("reasoning").is_none());
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    task.abort();
 }
 
 #[tokio::test]
