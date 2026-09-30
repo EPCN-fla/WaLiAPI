@@ -386,11 +386,49 @@ pub async fn ask(
     Json(input): Json<AskInput>,
 ) -> Response {
     if let Some(Extension(access)) = access {
-        return match knowledge_access::ask(&shared, &access, input, false).await {
+        let request_id = access.headers.get("x-request-id").cloned();
+        let mut response = match knowledge_access::ask(&shared, &access, input, false).await {
             Ok(answer) => Json(answer).into_response(),
             Err(error) => error.into_response(),
         };
+        if let Some(request_id) = request_id {
+            response.headers_mut().insert("x-request-id", request_id);
+        }
+        return response;
     }
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let budget = input
+        .timeout_ms
+        .map(|ms| super::budget::Budget::new(ms, request_id.clone()));
+    let work = Box::pin(ask_internal(&shared, input));
+    let mut response = if let Some(budget) = &budget {
+        budget
+            .scope(async {
+                match tokio::time::timeout_at(budget.deadline(), work).await {
+                    Ok(response) => response,
+                    Err(_) => {
+                        budget.cancel();
+                        super::model_client::QueryError::new(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "RAG 总时间预算已耗尽",
+                        )
+                        .at_stage("rag", "rag_deadline_exceeded")
+                        .with_request_id(&request_id)
+                        .into_response()
+                    }
+                }
+            })
+            .await
+    } else {
+        work.await
+    };
+    response
+        .headers_mut()
+        .insert("x-request-id", request_id.parse().expect("UUID header"));
+    response
+}
+
+async fn ask_internal(shared: &SharedState, input: AskInput) -> Response {
     if input.diagnostics {
         return super::model_client::QueryError::new(
             StatusCode::BAD_REQUEST,
@@ -441,7 +479,13 @@ pub async fn ask(
         let keyword_weight = input.keyword_weight.unwrap_or(0.3);
         let search_mode = input.search_mode.as_deref().unwrap_or("hybrid");
 
-        match rag::ask_with_config(
+        let client = super::model_client::ModelClient::Internal {
+            pool: &shared.state.db.pool,
+            settings: &shared.state.settings,
+            kb_id: &kb_id,
+        };
+        match rag::ask_with_client(
+            &client,
             &shared.state.db.pool,
             &kb_id,
             &input.question,
@@ -454,10 +498,15 @@ pub async fn ask(
             vector_weight,
             keyword_weight,
             search_mode,
+            false,
+            input.allow_keyword_fallback,
         )
         .await
         {
             Ok(answer) => Json(answer).into_response(),
+            Err(error) if input.timeout_ms.is_some() || input.allow_keyword_fallback => {
+                error.into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("RAG failed: {}", e),

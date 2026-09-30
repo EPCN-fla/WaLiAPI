@@ -382,13 +382,24 @@ impl KbRepository {
     /// 升级旧数据/正文变更后补建检索投影。NULL 有部分索引，正常检索只做空检查。
     /// 分批提交可中断续跑；CAS 防止覆盖并发修改，正文、哈希和向量均不变。
     pub async fn backfill_search_text(&self) -> Result<u64, sqlx::Error> {
+        self.backfill_search_text_scope(None).await
+    }
+
+    /// 检索只等待当前知识库的遗留投影，不让其他库的积压进入请求热路径。
+    pub async fn backfill_search_text_for_kb(&self, kb_id: &str) -> Result<u64, sqlx::Error> {
+        self.backfill_search_text_scope(Some(kb_id)).await
+    }
+
+    async fn backfill_search_text_scope(&self, kb_id: Option<&str>) -> Result<u64, sqlx::Error> {
         let mut updated = 0;
         loop {
-            let rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT id, content FROM kb_chunks WHERE search_text IS NULL ORDER BY id LIMIT 128",
-            )
-            .fetch_all(&self.pool)
-            .await?;
+            let rows: Vec<(String, String)> = if let Some(kb_id) = kb_id {
+                sqlx::query_as("SELECT id, content FROM kb_chunks WHERE kb_id = ? AND search_text IS NULL ORDER BY id LIMIT 128")
+                    .bind(kb_id).fetch_all(&self.pool).await?
+            } else {
+                sqlx::query_as("SELECT id, content FROM kb_chunks WHERE search_text IS NULL ORDER BY id LIMIT 128")
+                    .fetch_all(&self.pool).await?
+            };
             if rows.is_empty() {
                 return Ok(updated);
             }
@@ -494,6 +505,80 @@ impl KbRepository {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// 仅返回完整有效切片集合及维度，不把正文、metadata 或向量 BLOB 传回应用。
+    /// 调用方在同一个读事务中校验索引并读取候选，避免两次读取看到不同版本。
+    pub async fn search_chunk_identities(
+        connection: &mut sqlx::SqliteConnection,
+        kb_id: &str,
+    ) -> Result<Vec<SearchChunkIdentity>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT c.id, c.embedding_dim, length(c.embedding) AS embedding_bytes,
+                    kb.embedding_dim AS expected_dim, kb.index_status
+             FROM kb_chunks c
+             JOIN kb_documents d ON c.doc_id = d.id AND d.kb_id = c.kb_id
+             JOIN kb_knowledge_bases kb ON c.kb_id = kb.id
+             WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'
+               AND COALESCE(json_extract(c.metadata, '$.embedding_revision'), 0) = kb.embedding_revision
+             ORDER BY c.id",
+        )
+        .bind(kb_id)
+        .fetch_all(connection)
+        .await
+    }
+
+    /// 正常 HNSW 路径只读取候选正文；分批 IN 保持 SQLite 参数数有界。
+    pub async fn search_chunks_by_ids(
+        connection: &mut sqlx::SqliteConnection,
+        kb_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<SearchChunkContent>, sqlx::Error> {
+        let mut rows = Vec::with_capacity(ids.len());
+        for batch in ids.chunks(128) {
+            let mut query = sqlx::QueryBuilder::new(
+                "SELECT c.id, c.content, c.metadata, d.filename, c.doc_id
+                 FROM kb_chunks c
+                 JOIN kb_documents d ON c.doc_id = d.id AND d.kb_id = c.kb_id
+                 JOIN kb_knowledge_bases kb ON c.kb_id = kb.id
+                 WHERE c.embedding IS NOT NULL AND d.status = 'ready'
+                   AND COALESCE(json_extract(c.metadata, '$.embedding_revision'), 0) = kb.embedding_revision
+                   AND c.kb_id = ",
+            );
+            query.push_bind(kb_id).push(" AND c.id IN (");
+            let mut separated = query.separated(", ");
+            for id in batch {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+            rows.extend(
+                query
+                    .build_query_as::<SearchChunkContent>()
+                    .fetch_all(&mut *connection)
+                    .await?,
+            );
+        }
+        Ok(rows)
+    }
+
+    /// 索引缺失或过期时的完整精确扫描输入，不使用 LIMIT 截断候选。
+    pub async fn search_vector_chunks(
+        connection: &mut sqlx::SqliteConnection,
+        kb_id: &str,
+    ) -> Result<Vec<ChunkWithEmbedding>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT c.id, c.content, c.metadata, c.embedding, c.embedding_dim, d.filename, c.doc_id
+             FROM kb_chunks c
+             JOIN kb_documents d ON c.doc_id = d.id AND d.kb_id = c.kb_id
+             JOIN kb_knowledge_bases kb ON c.kb_id = kb.id
+             WHERE c.kb_id = ? AND c.embedding IS NOT NULL AND d.status = 'ready'
+               AND COALESCE(json_extract(c.metadata, '$.embedding_revision'), 0) = kb.embedding_revision
+               AND (kb.embedding_dim = 0 OR c.embedding_dim = 0 OR c.embedding_dim = kb.embedding_dim)
+             ORDER BY c.id",
+        )
+        .bind(kb_id)
+        .fetch_all(connection)
+        .await
     }
 
     pub async fn get_chunks_by_kb(
@@ -789,6 +874,25 @@ pub struct ChunkWithEmbedding {
     pub metadata: String,
     pub embedding: Vec<u8>,
     pub embedding_dim: i64,
+    pub filename: String,
+    pub doc_id: String,
+}
+
+/// HNSW 完整集合校验使用的轻量行。
+#[derive(Debug, sqlx::FromRow)]
+pub struct SearchChunkIdentity {
+    pub id: String,
+    pub embedding_dim: i64,
+    pub embedding_bytes: i64,
+    pub expected_dim: i64,
+    pub index_status: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct SearchChunkContent {
+    pub id: String,
+    pub content: String,
+    pub metadata: String,
     pub filename: String,
     pub doc_id: String,
 }

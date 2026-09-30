@@ -343,6 +343,21 @@ async fn mock_model_with_delay(
     answer_text: &'static str,
     embedding_delay: std::time::Duration,
 ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    mock_model_with_delays(
+        state,
+        answer_text,
+        embedding_delay,
+        std::time::Duration::ZERO,
+    )
+    .await
+}
+
+async fn mock_model_with_delays(
+    state: &AppState,
+    answer_text: &'static str,
+    embedding_delay: std::time::Duration,
+    answer_delay: std::time::Duration,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let embed_calls = calls.clone();
     let chat_calls = calls.clone();
@@ -354,6 +369,7 @@ async fn mock_model_with_delay(
         }}))
         .route("/v1/chat/completions", post(move |Json(body): Json<Value>| { let calls = chat_calls.clone(); async move {
             calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(answer_delay).await;
             let system = body["messages"][0]["content"].as_str().unwrap_or("");
             let answer = if system.contains("改写器") { "alpha" } else if system.contains("重排器") { "[1,0]" } else { answer_text };
             Json(json!({"id":"test-answer","object":"chat.completion","model":"chat-test","choices":[{"index":0,"message":{"role":"assistant","content":answer},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}))
@@ -873,5 +889,218 @@ async fn rag_diagnostics_identify_real_upstream_timeout_without_changing_status(
     let logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs WHERE api_key_id = ? AND trace_id = ? AND status_code = 502")
         .bind(&key.id).bind(request_id).fetch_one(&state.db.pool).await.unwrap();
     assert_eq!(logs, 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn rag_budget_stops_slow_embedding_without_another_key_or_answer() {
+    let (state, key, first, _, app) = setup().await;
+    let (channel, calls, task) =
+        mock_model_with_delay(&state, "BCD", std::time::Duration::from_secs(2)).await;
+    Repository::new(state.db.pool.clone())
+        .replace_channel_api_keys(
+            &channel,
+            &serde_json::from_value::<Vec<crate::db::models::ChannelApiKeyInput>>(
+                json!([{"api_key":"extra-one","weight":1},{"api_key":"extra-two","weight":1}]),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    document(&state, &first.id, "alpha answer BCD").await;
+    let started = std::time::Instant::now();
+    let response = app.oneshot(json_request("POST", "/api/kb/ask", Some(&key.key),
+        &json!({"kb_id":first.id,"question":"alpha","model":"chat-test","timeout_ms":200,"diagnostics":true}).to_string())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert!(started.elapsed() < std::time::Duration::from_millis(700));
+    let request_id = response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let result = body(response).await;
+    assert_eq!(result["error"]["code"], "rag_deadline_exceeded");
+    assert_eq!(result["error"]["request_id"], request_id);
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "预算到期后不能轮换 Key 或生成回答"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn rag_explicit_keyword_fallback_uses_remaining_budget_and_reports_actual_mode() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, calls, task) =
+        mock_model_with_delay(&state, "BCD", std::time::Duration::from_secs(2)).await;
+    document(&state, &first.id, "alpha answer BCD").await;
+    let started = std::time::Instant::now();
+    let response = app.oneshot(json_request("POST", "/api/kb/ask", Some(&key.key),
+        &json!({"kb_id":first.id,"question":"alpha","model":"chat-test","timeout_ms":1000,"allow_keyword_fallback":true,"diagnostics":true}).to_string())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let result = body(response).await;
+    assert_eq!(result["answer"], "BCD");
+    assert_eq!(result["retrieval_mode"], "keyword");
+    assert_eq!(result["degradation_reason"], "rag_deadline_exceeded");
+    assert_eq!(result["diagnostics"]["stages"][1]["status"], "degraded");
+    assert!(!result["sources"].as_array().unwrap().is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    task.abort();
+}
+
+#[tokio::test]
+async fn rag_fallback_cannot_bypass_revoked_models_or_exhausted_quota() {
+    for quota in [false, true] {
+        let (state, key, first, _, app) = setup().await;
+        let (_, calls, task) = mock_model(&state).await;
+        document(&state, &first.id, "alpha answer BCD").await;
+        if quota {
+            sqlx::query("UPDATE api_keys SET quota_used = quota_limit WHERE id = ?")
+                .bind(&key.id)
+                .execute(&state.db.pool)
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("UPDATE api_keys SET denied_models = '[\"embed-test\"]' WHERE id = ?")
+                .bind(&key.id)
+                .execute(&state.db.pool)
+                .await
+                .unwrap();
+        }
+        let response = app.oneshot(json_request("POST", "/api/kb/ask", Some(&key.key),
+            &json!({"kb_id":first.id,"question":"alpha","model":"chat-test","timeout_ms":500,"allow_keyword_fallback":true}).to_string())).await.unwrap();
+        assert_eq!(
+            response.status(),
+            if quota {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::FORBIDDEN
+            }
+        );
+        let result = body(response).await;
+        assert!(result.get("answer").is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn rag_future_abort_does_not_continue_to_answer() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, calls, task) =
+        mock_model_with_delay(&state, "BCD", std::time::Duration::from_millis(350)).await;
+    document(&state, &first.id, "alpha answer BCD").await;
+    let request = json_request("POST", "/api/kb/ask", Some(&key.key),
+        &json!({"kb_id":first.id,"question":"alpha","model":"chat-test","timeout_ms":2000,"allow_keyword_fallback":true}).to_string());
+    let ask = tokio::spawn(async move { app.oneshot(request).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    ask.abort();
+    assert!(ask.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn rag_fallback_with_empty_material_is_an_error_even_without_diagnostics() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, calls, task) =
+        mock_model_with_delay(&state, "BCD", std::time::Duration::from_secs(2)).await;
+    let response = app.oneshot(json_request("POST", "/api/kb/ask", Some(&key.key),
+        &json!({"kb_id":first.id,"question":"alpha","model":"chat-test","timeout_ms":500,"allow_keyword_fallback":true}).to_string())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body(response).await["error"]["code"], "retrieval_empty");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn rag_revocation_during_answer_blocks_the_output() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, calls, task) = mock_model_with_delays(
+        &state,
+        "BCD",
+        std::time::Duration::ZERO,
+        std::time::Duration::from_millis(350),
+    )
+    .await;
+    document(&state, &first.id, "alpha answer BCD").await;
+    let request = json_request(
+        "POST",
+        "/api/kb/ask",
+        Some(&key.key),
+        &json!({"kb_id":first.id,"question":"alpha","model":"chat-test","timeout_ms":2000})
+            .to_string(),
+    );
+    let ask = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    set_grants(&state.db.pool, &key.id, &[]).await.unwrap();
+    let response = ask.await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(body(response).await.get("answer").is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    task.abort();
+}
+
+#[tokio::test]
+async fn rag_completed_answer_can_exhaust_quota_without_losing_its_response() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, calls, task) = mock_model(&state).await;
+    document(&state, &first.id, "alpha answer BCD").await;
+    sqlx::query("UPDATE api_keys SET quota_limit = 21 WHERE id = ?")
+        .bind(&key.id)
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/api/kb/ask",
+            Some(&key.key),
+            &json!({"kb_id":first.id,"question":"alpha","model":"chat-test","timeout_ms":2000})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body(response).await["answer"], "BCD");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    task.abort();
+}
+
+#[tokio::test]
+async fn rag_explicit_budget_rejects_empty_answers_without_diagnostics() {
+    let (state, key, first, _, app) = setup().await;
+    let (_, calls, task) = mock_model_with_answer(&state, "").await;
+    document(&state, &first.id, "alpha answer BCD").await;
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/api/kb/ask",
+            Some(&key.key),
+            &json!({"kb_id":first.id,"question":"alpha","model":"chat-test","timeout_ms":2000})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let result = body(response).await;
+    assert_eq!(result["error"]["code"], "answer_empty");
+    assert!(result.get("diagnostics").is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     task.abort();
 }

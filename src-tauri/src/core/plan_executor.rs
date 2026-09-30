@@ -15,6 +15,7 @@ use crate::core::attempt::{
 };
 use crate::core::route_plan::RoutePlan;
 use crate::security::gate::AuditedRequest;
+use crate::services::knowledge::budget;
 use rand::Rng;
 use serde::Serialize;
 use std::future::Future;
@@ -128,7 +129,7 @@ where
                 };
                 last_attempt_meta = Some(meta.clone());
                 last_attempt_codec_version = codec_version.clone();
-                let result = match built {
+                let mut result = match built {
                     // A construction failure (codec rejection) is already a
                     // full AttemptFailure carrying the rejected feature reason.
                     Err(failure) => failure,
@@ -163,14 +164,52 @@ where
                         }
                     }
                 };
+                // 预算请求的超时、鉴权和额度失败直接终止，避免重复请求同一
+                // 慢上游；历史聊天和入库保持原来的候选/协议组切换规则。
+                let budget_terminal = |failure: &AttemptFailure| {
+                    budget::current().is_some()
+                        && (failure.failure_class == FailureClass::ChannelAuthTerminal
+                            || matches!(failure.status_code, Some(402 | 504 | 499))
+                            || crate::endpoint_executor::driver::local_failure_code(failure)
+                                .is_some_and(|code| code != "upstream_transport_failed"))
+                };
+                if !budget_terminal(&result)
+                    && !matches!(
+                        result.failure_class,
+                        FailureClass::CallerTerminal | FailureClass::CommittedStreamError
+                    )
+                {
+                    if let Some(secs) = result.retry_after {
+                        let secs = if budget::current().is_some() {
+                            secs.min(120)
+                        } else {
+                            secs
+                        };
+                        if let Err(elapsed) = budget::run(
+                            std::time::Duration::from_secs(120),
+                            tokio::time::sleep(std::time::Duration::from_secs(secs)),
+                        )
+                        .await
+                        {
+                            result = crate::endpoint_executor::driver::budget_failure(elapsed);
+                        }
+                    }
+                }
                 flow.record_failure(&result);
                 if result.failure_class == FailureClass::CallerTerminal
                     || result.failure_class == FailureClass::CommittedStreamError
+                    || budget_terminal(&result)
                 {
                     // Honor an explicit status_code (e.g. the T06 stub's 501);
                     // fall back to the class's canonical terminal status (400
                     // for a real caller-terminal codec rejection).
-                    let status = result.status_code.unwrap_or(terminal_status_of(&result));
+                    let status = if result.failure_class == FailureClass::ChannelAuthTerminal {
+                        terminal_status_of(&result)
+                    } else {
+                        crate::endpoint_executor::driver::local_failure_status(&result)
+                            .or(result.status_code)
+                            .unwrap_or(terminal_status_of(&result))
+                    };
                     return PlanExecution {
                         status,
                         body: serde_json::json!({ "error": { "message": result.message, "failure_class": result.failure_class.as_str() } }),
@@ -190,10 +229,6 @@ where
                         duration_ms: started.elapsed().as_millis() as u64,
                         last_failure: Some(result),
                     };
-                }
-                // Honor upstream Retry-After before the next attempt.
-                if let Some(secs) = result.retry_after {
-                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
                 }
                 // Otherwise loop; `flow.next_step()` applies group transition / budget.
             }

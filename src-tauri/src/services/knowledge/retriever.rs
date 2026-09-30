@@ -1,10 +1,13 @@
 use super::index::HnswIndex;
 use super::models::SearchResult;
-use super::repository::KbRepository;
+use super::repository::{ChunkWithEmbedding, KbRepository};
 use crate::server::event_bridge::EventSink;
-use sqlx::SqlitePool;
+use sqlx::{Acquire, SqlitePool};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock, Weak,
+};
 
 /// 同一知识库的完整读改写串行；弱引用避免删除过的知识库永久占用锁表。
 fn index_write_lock(kb_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -38,200 +41,311 @@ fn index_path(kb_id: &str) -> PathBuf {
     dir.join(format!("kb_{}.hnsw", kb_id))
 }
 
-/// Try to load the HNSW index for a KB. Returns None if not built or incompatible.
-fn load_index(kb_id: &str) -> Option<HnswIndex> {
-    let path = index_path(kb_id);
-    if path.exists() {
-        match HnswIndex::load(&path) {
-            Ok(index) if index.initialized && !index.is_empty() => {
-                // Sanity check: verify that the index nodes have string IDs
-                if !index.nodes.is_empty() {
-                    // If we successfully loaded and it has nodes, it should be compatible
-                    Some(index)
-                } else {
-                    tracing::warn!("HNSW index for KB {} is empty, skipping", kb_id);
-                    None
-                }
-            }
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to load HNSW index for KB {} (likely incompatible old format): {}",
-                    kb_id,
-                    e
-                );
-                None
-            }
-        }
-    } else {
-        None
+/// 后台任务开始后不会随 Future drop 自动停止；本地 guard 和请求预算共同取消。
+struct BlockingCancellation {
+    local: Arc<AtomicBool>,
+    budget: Option<super::budget::Budget>,
+}
+
+impl BlockingCancellation {
+    fn cancelled(&self) -> bool {
+        self.local.load(Ordering::Relaxed)
+            || self
+                .budget
+                .as_ref()
+                .is_some_and(|budget| budget.check().is_err())
     }
 }
 
-/// Search knowledge base by query embedding.
-/// Uses HNSW index if available, falls back to linear scan.
+struct CancelOnDrop(Arc<AtomicBool>);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+async fn retrieval_blocking<T: Send + 'static>(
+    stage: &'static str,
+    work: impl FnOnce(&BlockingCancellation) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    // ponytail: 全进程最多 4 个检索 CPU/IO 任务，避免并发请求撑大 blocking 队列。
+    static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let started = std::time::Instant::now();
+    let local = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelOnDrop(local.clone());
+    let cancel = BlockingCancellation {
+        local,
+        budget: super::budget::current(),
+    };
+    let permit = SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| "retrieval worker unavailable")?;
+    if cancel.cancelled() {
+        return Err("retrieval cancelled".into());
+    }
+    tracing::debug!(
+        stage,
+        queue_ms = started.elapsed().as_millis() as u64,
+        "RAG blocking queue"
+    );
+    let request_id = cancel
+        .budget
+        .as_ref()
+        .map(|budget| budget.request_id())
+        .unwrap_or("");
+    let span = tracing::debug_span!("rag_retrieval_worker", request_id, stage);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _entered = span.enter();
+        if cancel.cancelled() {
+            return Err("retrieval cancelled".into());
+        }
+        let started = std::time::Instant::now();
+        let result = work(&cancel);
+        tracing::debug!(
+            stage,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            cancelled = cancel.cancelled(),
+            "RAG blocking stage"
+        );
+        result
+    })
+    .await
+    .map_err(|error| format!("retrieval worker failed: {error}"))?
+}
+
+/// 每次仍加载完整文件；未引入缺乏可靠 generation 失效机制的常驻缓存。
+fn load_index(kb_id: &str, cancel: &BlockingCancellation) -> Result<Option<HnswIndex>, String> {
+    let path = index_path(kb_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    match HnswIndex::load_cancellable(&path, &|| cancel.cancelled()) {
+        Ok(index)
+            if index.initialized && !index.is_empty() && index.entry_point < index.nodes.len() =>
+        {
+            Ok(Some(index))
+        }
+        Ok(_) => Ok(None),
+        Err(error) if cancel.cancelled() => Err(error),
+        Err(error) => {
+            tracing::warn!(kb_id, error, "Invalid HNSW index, using linear scan");
+            Ok(None)
+        }
+    }
+}
+
+/// HNSW 和候选正文使用同一 SQLite 读快照；过期时只读取一次完整向量。
 pub async fn search(
     pool: &SqlitePool,
     kb_id: &str,
     query_embedding: &[f32],
     top_k: usize,
 ) -> Result<Vec<SearchResult>, String> {
-    let repo = KbRepository::new(pool.clone());
-
-    // Try HNSW index first
-    if let Some(index) = load_index(kb_id) {
-        if index.dim == query_embedding.len() {
-            tracing::debug!("Using HNSW index for KB {} ({} nodes)", kb_id, index.len());
-            let hnsw_results = index.search(query_embedding, top_k);
-
-            if !hnsw_results.is_empty() {
-                // Load chunks and build ID map
-                let chunks = repo
-                    .get_chunks_by_kb(kb_id)
-                    .await
-                    .map_err(|e| format!("Failed to load chunks: {}", e))?;
-                tracing::debug!("Loaded {} chunks from DB", chunks.len());
-
-                // Build chunk ID -> chunk data map
-                let chunk_map: std::collections::HashMap<String, _> = chunks
-                    .into_iter()
-                    .map(|(id, content, metadata, emb, filename, doc_id)| {
-                        (id, (content, metadata, emb, filename, doc_id))
-                    })
-                    .collect();
-
-                // 切片事务先提交，后台索引随后更新；索引写入失败时差异还会持续。
-                // 只有有效节点与当前可检索切片完全一致才能采用近邻结果，
-                // 否则部分旧命中会掩盖新切片，或因删除节点而少返回结果。
-                let matches_chunks = index.len() == chunk_map.len()
-                    && index
-                        .nodes
-                        .iter()
-                        .filter(|node| !index.tombstones.contains(&node.id))
-                        .all(|node| chunk_map.contains_key(&node.id));
-                if !matches_chunks {
-                    tracing::debug!(
-                        "HNSW snapshot for KB {} is outdated, using linear scan",
-                        kb_id
-                    );
-                    return linear_search(pool, kb_id, query_embedding, top_k).await;
-                }
-
-                // Map chunk ID -> chunk data
-                let mapped: Vec<SearchResult> = hnsw_results
-                    .into_iter()
-                    .filter_map(|r| {
-                        if let Some((content, metadata, _emb, filename, doc_id)) =
-                            chunk_map.get(&r.id)
-                        {
-                            let meta: serde_json::Value =
-                                serde_json::from_str(metadata).unwrap_or(serde_json::json!({}));
-                            tracing::debug!("Mapped chunk ID {} to filename {}", r.id, filename);
-                            Some(SearchResult {
-                                chunk_id: r.id,
-                                doc_id: doc_id.clone(),
-                                filename: filename.clone(),
-                                content: content.clone(),
-                                score: r.score,
-                                metadata: meta,
-                            })
-                        } else {
-                            tracing::warn!("Failed to map chunk ID {}", r.id);
-                            None
-                        }
-                    })
-                    .collect();
-
-                if !mapped.is_empty() {
-                    return Ok(mapped);
-                }
-
-                tracing::warn!(
-                    "HNSW index returned results but mapping failed, falling back to linear scan"
-                );
-            }
-        } else {
-            tracing::warn!(
-                "HNSW index dim ({}) != query dim ({}) for KB {}, falling back to linear scan",
-                index.dim,
-                query_embedding.len(),
-                kb_id
-            );
-        }
+    if top_k == 0 {
+        return Ok(Vec::new());
     }
-
-    // Fallback: linear scan
-    linear_search(pool, kb_id, query_embedding, top_k).await
-}
-
-/// Linear scan search (original implementation).
-async fn linear_search(
-    pool: &SqlitePool,
-    kb_id: &str,
-    query_embedding: &[f32],
-    top_k: usize,
-) -> Result<Vec<SearchResult>, String> {
-    let repo = KbRepository::new(pool.clone());
-
-    let chunks = repo
-        .get_chunks_by_kb(kb_id)
+    if query_embedding.is_empty() {
+        return Ok(Vec::new());
+    }
+    if query_embedding.iter().any(|value| !value.is_finite()) {
+        return Err("invalid query embedding".into());
+    }
+    let owned_kb = kb_id.to_string();
+    let index =
+        retrieval_blocking("index_load", move |cancel| load_index(&owned_kb, cancel)).await?;
+    let pool_started = std::time::Instant::now();
+    let mut connection = pool
+        .acquire()
         .await
-        .map_err(|e| format!("Failed to load chunks: {}", e))?;
-    tracing::debug!("Linear scan: loaded {} chunks", chunks.len());
+        .map_err(|error| format!("Failed to acquire search connection: {error}"))?;
+    tracing::debug!(
+        kb_id,
+        stage = "pool_acquire",
+        elapsed_ms = pool_started.elapsed().as_millis() as u64,
+        "RAG SQL stage"
+    );
+    let mut snapshot = connection
+        .begin()
+        .await
+        .map_err(|error| format!("Failed to begin search snapshot: {error}"))?;
 
-    if chunks.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let query_dim = query_embedding.len();
-
-    let mut scored: Vec<(f32, usize, String)> = Vec::with_capacity(chunks.len());
-    let mut dim_mismatches = 0;
-
-    for (i, (id, _, _, emb, _, _)) in chunks.iter().enumerate() {
-        let vector = decode_embedding(emb);
-        if vector.len() != query_dim {
-            dim_mismatches += 1;
-            continue;
+    if let Some(index) = index.filter(|index| index.dim == query_embedding.len()) {
+        let sql_started = std::time::Instant::now();
+        let identities = KbRepository::search_chunk_identities(&mut snapshot, kb_id)
+            .await
+            .map_err(|error| format!("Failed to load chunk identities: {error}"))?;
+        tracing::debug!(
+            kb_id,
+            stage = "chunk_identities",
+            elapsed_ms = sql_started.elapsed().as_millis() as u64,
+            rows = identities.len(),
+            "RAG SQL stage"
+        );
+        let query = query_embedding.to_vec();
+        let results = retrieval_blocking("index_search", move |cancel| {
+            let mut current_ids = std::collections::HashSet::with_capacity(identities.len());
+            for identity in identities {
+                if cancel.cancelled() {
+                    return Err("retrieval cancelled".into());
+                }
+                if identity.embedding_dim != index.dim as i64
+                    || identity.embedding_bytes != 8 + index.dim as i64 * 4
+                    || (identity.expected_dim != 0 && identity.expected_dim != index.dim as i64)
+                    || identity.index_status == "stale"
+                {
+                    return Ok(None);
+                }
+                current_ids.insert(identity.id);
+            }
+            let identity_count = current_ids.len();
+            let mut live_count = 0;
+            for node in &index.nodes {
+                if cancel.cancelled() {
+                    return Err("retrieval cancelled".into());
+                }
+                if index.tombstones.contains(&node.id) {
+                    continue;
+                }
+                live_count += 1;
+                if node.vector.len() != index.dim
+                    || node.vector.iter().any(|value| !value.is_finite())
+                    || !current_ids.remove(&node.id)
+                {
+                    return Ok(None);
+                }
+            }
+            // 数量和完整 ID 集合均相等，不能只依赖 count（同数量替换也会失效）。
+            if live_count != identity_count || !current_ids.is_empty() {
+                return Ok(None);
+            }
+            index
+                .search_cancellable(&query, top_k, &|| cancel.cancelled())
+                .map(|results| {
+                    results
+                        .iter()
+                        .all(|result| result.score.is_finite())
+                        .then_some(results)
+                })
+        })
+        .await?;
+        if let Some(results) = results.filter(|results| !results.is_empty()) {
+            let ids = results
+                .iter()
+                .map(|result| result.id.clone())
+                .collect::<Vec<_>>();
+            let sql_started = std::time::Instant::now();
+            let chunks = KbRepository::search_chunks_by_ids(&mut snapshot, kb_id, &ids)
+                .await
+                .map_err(|error| format!("Failed to load candidate chunks: {error}"))?;
+            tracing::debug!(
+                kb_id,
+                stage = "candidate_chunks",
+                elapsed_ms = sql_started.elapsed().as_millis() as u64,
+                rows = chunks.len(),
+                "RAG SQL stage"
+            );
+            if chunks.len() == results.len() {
+                snapshot
+                    .rollback()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut chunks = chunks
+                    .into_iter()
+                    .map(|chunk| (chunk.id.clone(), chunk))
+                    .collect::<std::collections::HashMap<_, _>>();
+                return Ok(results
+                    .into_iter()
+                    .filter_map(|result| {
+                        chunks.remove(&result.id).map(|chunk| SearchResult {
+                            chunk_id: chunk.id,
+                            doc_id: chunk.doc_id,
+                            filename: chunk.filename,
+                            content: chunk.content,
+                            score: result.score,
+                            metadata: serde_json::from_str(&chunk.metadata)
+                                .unwrap_or_else(|_| serde_json::json!({})),
+                        })
+                    })
+                    .collect());
+            }
         }
-        let score = cosine_similarity(query_embedding, &vector);
-        scored.push((score, i, id.clone()));
-    }
-
-    if dim_mismatches > 0 {
-        tracing::warn!(
-            "Skipped {} chunks with mismatched embedding dimensions (expected {}) in KB {}",
-            dim_mismatches,
-            query_dim,
-            kb_id
+        tracing::debug!(
+            kb_id,
+            "HNSW snapshot is outdated, using complete linear scan"
         );
     }
+    let sql_started = std::time::Instant::now();
+    let chunks = KbRepository::search_vector_chunks(&mut snapshot, kb_id)
+        .await
+        .map_err(|error| format!("Failed to load vector chunks: {error}"))?;
+    tracing::debug!(
+        kb_id,
+        stage = "vector_chunks",
+        elapsed_ms = sql_started.elapsed().as_millis() as u64,
+        rows = chunks.len(),
+        "RAG SQL stage"
+    );
+    snapshot
+        .rollback()
+        .await
+        .map_err(|error| error.to_string())?;
+    // 释放池连接之后再做完整向量计算，hybrid 的 FTS 不会等待 CPU 扫描。
+    drop(connection);
+    let query = query_embedding.to_vec();
+    retrieval_blocking("linear_search", move |cancel| {
+        linear_search_chunks(chunks, &query, top_k, cancel)
+    })
+    .await
+}
 
-    if scored.is_empty() {
-        return Ok(vec![]);
+fn linear_search_chunks(
+    chunks: Vec<ChunkWithEmbedding>,
+    query: &[f32],
+    top_k: usize,
+    cancel: &BlockingCancellation,
+) -> Result<Vec<SearchResult>, String> {
+    let mut scored = Vec::with_capacity(chunks.len());
+    for (position, chunk) in chunks.iter().enumerate() {
+        if cancel.cancelled() {
+            return Err("retrieval cancelled".into());
+        }
+        let vector = decode_embedding(&chunk.embedding);
+        // 旧切片可能没有写入维度（0）；以完整解码后的实际维度验证兼容。
+        if (chunk.embedding_dim != 0 && chunk.embedding_dim != query.len() as i64)
+            || vector.len() != query.len()
+            || vector.iter().any(|value| !value.is_finite())
+        {
+            continue;
+        }
+        let score = cosine_similarity(query, &vector);
+        if score.is_finite() {
+            scored.push((score, position));
+        }
     }
-
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    if cancel.cancelled() {
+        return Err("retrieval cancelled".into());
+    }
     scored.truncate(top_k);
-
-    let results = scored
+    Ok(scored
         .into_iter()
-        .filter_map(|(score, i, _)| {
-            let (id, content, metadata, _emb, filename, doc_id) = &chunks[i];
-            let meta: serde_json::Value =
-                serde_json::from_str(metadata).unwrap_or(serde_json::json!({}));
-            Some(SearchResult {
-                chunk_id: id.clone(),
-                doc_id: doc_id.clone(),
-                filename: filename.clone(),
-                content: content.clone(),
+        .map(|(score, position)| {
+            let chunk = &chunks[position];
+            SearchResult {
+                chunk_id: chunk.id.clone(),
+                doc_id: chunk.doc_id.clone(),
+                filename: chunk.filename.clone(),
+                content: chunk.content.clone(),
                 score,
-                metadata: meta,
-            })
+                metadata: serde_json::from_str(&chunk.metadata)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            }
         })
-        .collect();
-
-    Ok(results)
+        .collect())
 }
 
 /// 管理命令与 REST 共用的文本检索入口，单库按指定模式执行。
@@ -640,12 +754,32 @@ async fn fts5_search(
     if tokens.is_empty() || top_k == 0 {
         return Ok(Vec::new());
     }
-    KbRepository::new(pool.clone())
-        .backfill_search_text()
+    let backfill_started = std::time::Instant::now();
+    let updated = KbRepository::new(pool.clone())
+        .backfill_search_text_for_kb(kb_id)
         .await
         .map_err(|e| format!("FTS5 projection backfill failed: {}", e))?;
+    tracing::debug!(
+        kb_id,
+        stage = "fts_projection",
+        elapsed_ms = backfill_started.elapsed().as_millis() as u64,
+        updated,
+        "RAG SQL stage"
+    );
     let fts_query = build_fts_query(&tokens);
 
+    let pool_started = std::time::Instant::now();
+    let mut connection = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("FTS5 connection failed: {e}"))?;
+    tracing::debug!(
+        kb_id,
+        stage = "fts_pool_acquire",
+        elapsed_ms = pool_started.elapsed().as_millis() as u64,
+        "RAG SQL stage"
+    );
+    let sql_started = std::time::Instant::now();
     let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
         "SELECT c.id, c.content, c.metadata, d.filename, c.doc_id \
          FROM kb_chunks_fts fts \
@@ -658,9 +792,16 @@ async fn fts5_search(
     .bind(kb_id)
     .bind(&fts_query)
     .bind(top_k as i64)
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await
     .map_err(|e| format!("FTS5 search failed: {}", e))?;
+    tracing::debug!(
+        kb_id,
+        stage = "fts_query",
+        elapsed_ms = sql_started.elapsed().as_millis() as u64,
+        rows = rows.len(),
+        "RAG SQL stage"
+    );
     let results = rows
         .into_iter()
         .enumerate()
@@ -1344,5 +1485,53 @@ mod rrf_tests {
             2
         );
         assert!(fuse_scored(&[], &[], 5, 0.7, 0.3, FusionMode::Rrf).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod blocking_cancellation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropping_request_stops_its_running_blocking_worker() {
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (stopped_sender, stopped_receiver) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(retrieval_blocking("cancel_test", move |cancel| {
+            let _ = started_sender.send(());
+            while !cancel.cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let _ = stopped_sender.send(());
+            Err::<(), _>("retrieval cancelled".into())
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        request.abort();
+        let _ = request.await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), stopped_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_stage_never_starts_background_computation() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let captured = entered.clone();
+        let budget = super::super::budget::Budget::new(100, "expired-fixture").stage(
+            "retrieval",
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        );
+        let result = budget
+            .scope(retrieval_blocking("expired_test", move |_| {
+                captured.store(true, Ordering::Relaxed);
+                Ok(())
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(!entered.load(Ordering::Relaxed));
     }
 }

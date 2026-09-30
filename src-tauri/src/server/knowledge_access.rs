@@ -2,6 +2,7 @@
 use super::router::SharedState;
 use crate::db::repository::Repository;
 use crate::services::knowledge::{
+    budget::Budget,
     model_client::{ModelClient, QueryError},
     models::*,
     rag,
@@ -16,6 +17,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::{collections::HashMap, time::Instant};
+use tracing::Instrument;
 
 #[derive(Clone)]
 pub struct KnowledgeAccess {
@@ -260,6 +262,89 @@ pub async fn ask(
     input: AskInput,
     mcp: bool,
 ) -> Result<RagAnswer, QueryError> {
+    let request_id = access
+        .headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let budget = input
+        .timeout_ms
+        .map(|ms| Budget::new(ms, request_id.clone()));
+    let mut trace = RagRequestTrace {
+        request_id: request_id.clone(),
+        budget: budget.clone(),
+        finished: false,
+        started: Instant::now(),
+    };
+    let diagnostics = input.diagnostics;
+    let work = Box::pin(ask_inner(shared, access, input, mcp));
+    let result = if let Some(budget) = &budget {
+        budget
+            .scope(async {
+                tokio::time::timeout_at(budget.deadline(), work)
+                    .await
+                    .unwrap_or_else(|_| {
+                        budget.cancel();
+                        Err(rag::diagnostic_failure(
+                            QueryError::new(StatusCode::GATEWAY_TIMEOUT, "RAG 总时间预算已耗尽")
+                                .at_stage("rag", "rag_deadline_exceeded"),
+                            "rag",
+                            trace.started,
+                            &[],
+                            &request_id,
+                            diagnostics,
+                        ))
+                    })
+            })
+            .instrument(tracing::info_span!("rag_request", request_id = %request_id))
+            .await
+    } else {
+        work.instrument(tracing::info_span!("rag_request", request_id = %request_id))
+            .await
+    };
+    trace.finished = true;
+    tracing::info!(
+        request_id,
+        elapsed_ms = trace.started.elapsed().as_millis() as u64,
+        status = if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+        "RAG 请求终态"
+    );
+    result.map_err(|error| error.with_request_id(&request_id))
+}
+
+struct RagRequestTrace {
+    request_id: String,
+    budget: Option<Budget>,
+    finished: bool,
+    started: Instant,
+}
+impl Drop for RagRequestTrace {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Some(budget) = &self.budget {
+                budget.cancel();
+            }
+            tracing::info!(
+                request_id = self.request_id,
+                elapsed_ms = self.started.elapsed().as_millis() as u64,
+                status = "cancelled",
+                "RAG future 已取消"
+            );
+        }
+    }
+}
+
+async fn ask_inner(
+    shared: &SharedState,
+    access: &KnowledgeAccess,
+    input: AskInput,
+    mcp: bool,
+) -> Result<RagAnswer, QueryError> {
     let permission_started = Instant::now();
     let request_id = access
         .headers
@@ -313,7 +398,7 @@ pub async fn ask(
         shared,
         headers: &access.headers,
     };
-    let result = rag::ask_with_client(
+    let result = Box::pin(rag::ask_with_client(
         &client,
         &shared.state.db.pool,
         kb_id,
@@ -330,7 +415,8 @@ pub async fn ask(
         kw,
         mode,
         input.diagnostics,
-    )
+        input.allow_keyword_fallback,
+    ))
     .await;
     match result {
         Ok(mut answer) => {

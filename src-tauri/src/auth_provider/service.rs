@@ -590,7 +590,9 @@ impl AuthService {
                 upstream_endpoint,
             )
             .await?;
-        if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+        if response.status() != reqwest::StatusCode::UNAUTHORIZED
+            || crate::services::knowledge::budget::current().is_some()
+        {
             self.mark_forbidden_if_needed(account_id, response.status())
                 .await;
             self.persist_quota_if_present(account_id, &response).await;
@@ -1554,6 +1556,131 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn rag_budget_401_does_not_force_refresh_or_replay_while_ordinary_requests_do() {
+        struct UnauthorizedOnceProvider {
+            refreshes: AtomicUsize,
+            outbound_tokens: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl Provider for UnauthorizedOnceProvider {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Codex
+            }
+            async fn login(
+                &self,
+                _: &ProviderLoginContext,
+                _: &dyn LoginRuntime,
+            ) -> Result<LoginResult, ProviderError> {
+                Err(ProviderError::LoginFailed)
+            }
+            async fn import(&self, _: &[u8]) -> Result<LoginResult, ProviderError> {
+                Err(ProviderError::ImportFailed)
+            }
+            async fn refresh(
+                &self,
+                _: &ProviderPayload,
+            ) -> Result<RefreshedPayload, ProviderError> {
+                self.refreshes.fetch_add(1, Ordering::SeqCst);
+                Ok(RefreshedPayload {
+                    payload: ProviderPayload::new(
+                        json!({"access_token":"rotated-fixture-access", "refresh_token":REFRESH, "id_token":ID, "expires_at":"2099-01-01T00:00:00Z"}),
+                    ),
+                    last_refreshed_at: Some("2026-08-08T00:00:00Z".into()),
+                    next_refresh_after: None,
+                    next_retry_after: None,
+                })
+            }
+            async fn outbound(
+                &self,
+                request: ProviderRequest<'_>,
+            ) -> Result<reqwest::Response, ProviderError> {
+                assert!(!request.is_stream);
+                assert_eq!(request.upstream_protocol, "responses");
+                assert_eq!(request.upstream_endpoint, "responses");
+                assert_eq!(request.body, &json!({"model":"gpt-test", "input":"query"}));
+                let mut tokens = self.outbound_tokens.lock().unwrap();
+                tokens.push(
+                    request.payload.as_value()["access_token"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                );
+                let status = if tokens.len() == 1 { 401 } else { 200 };
+                Ok(axum::http::Response::builder()
+                    .status(status)
+                    .body("{}")
+                    .unwrap()
+                    .into())
+            }
+            async fn list_models(
+                &self,
+                _: &AuthAccount,
+                _: &ProviderPayload,
+            ) -> Result<ProviderModels, ProviderError> {
+                Ok(vec![])
+            }
+        }
+
+        for has_budget in [false, true] {
+            let repository = repository().await;
+            let account = account(&repository).await;
+            let provider = Arc::new(UnauthorizedOnceProvider {
+                refreshes: AtomicUsize::new(0),
+                outbound_tokens: Mutex::new(Vec::new()),
+            });
+            let mut registry = ProviderRegistry::new();
+            registry.register(provider.clone());
+            // 初始凭据仍有效，排除请求前的必要刷新，单独锁定 401 后的重放分支。
+            let service = AuthService::with_clock(
+                repository.clone(),
+                registry,
+                Arc::new(FixedClock("2026-08-08T00:00:00Z".parse().unwrap())),
+            );
+            let body = json!({"model":"gpt-test", "input":"query"});
+            let headers = HeaderMap::new();
+            let request = service.outbound(
+                &account.id,
+                &body,
+                &headers,
+                false,
+                "responses",
+                "responses",
+            );
+            let response = if has_budget {
+                crate::services::knowledge::budget::Budget::new(1_000, "auth-budget-test")
+                    .scope(request)
+                    .await
+                    .unwrap()
+            } else {
+                request.await.unwrap()
+            };
+            let expected_tokens = if has_budget {
+                vec![ACCESS]
+            } else {
+                vec![ACCESS, "rotated-fixture-access"]
+            };
+            assert_eq!(
+                response.status().as_u16(),
+                if has_budget { 401 } else { 200 }
+            );
+            assert_eq!(*provider.outbound_tokens.lock().unwrap(), expected_tokens);
+            assert_eq!(
+                provider.refreshes.load(Ordering::SeqCst),
+                usize::from(!has_budget)
+            );
+            let stored = repository.get_auth_account(&account.id).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&stored.payload_json).unwrap()["access_token"],
+                if has_budget {
+                    ACCESS
+                } else {
+                    "rotated-fixture-access"
+                }
+            );
+        }
     }
 
     #[tokio::test]

@@ -119,6 +119,11 @@ pub struct RagAnswer {
     pub retrieval_details: Option<Vec<RetrievalDetail>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<RagDiagnostics>,
+    /// 仅显式启用关键词降级的请求返回实际检索模式。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
 }
 
 /// 仅显式诊断请求返回阶段结果，不包含提示词、渠道地址或凭据。
@@ -220,6 +225,12 @@ pub struct AskInput {
     /// 启用严格健康检测：必须有检索片段、有效答案和来源。
     #[serde(default)]
     pub diagnostics: bool,
+    /// 整次 RAG 共用时间预算，服务端限制为 100..=120000 毫秒；省略保持历史行为。
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// 授权通过后的可恢复向量查询失败，允许使用关键词检索。
+    #[serde(default)]
+    pub allow_keyword_fallback: bool,
 }
 
 fn default_top_k() -> usize {
