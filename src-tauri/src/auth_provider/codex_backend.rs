@@ -971,6 +971,88 @@ mod tests {
     }
 
     #[test]
+    fn chat_reasoning_controls_survive_codec_and_codex_validation() {
+        for effort in [
+            None,
+            Some("none"),
+            Some("low"),
+            Some("medium"),
+            Some("high"),
+        ] {
+            let mut chat = json!({
+                "model": "public-alias",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if let Some(effort) = effort {
+                chat["reasoning_effort"] = json!(effort);
+            }
+            let (encoded, _) = crate::protocol::codec::responses_codec::encode_chat_to_responses(
+                &chat,
+                "mapped-model",
+            )
+            .unwrap();
+            let body = validate_backend_request(&encoded).unwrap();
+            assert_eq!(body["model"], "mapped-model");
+            if let Some(effort) = effort {
+                assert_eq!(body["reasoning"]["effort"], effort);
+            } else {
+                assert!(body.get("reasoning").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_reasoning_controls_reach_mock_codex_http_backend() {
+        let (provider, state) = provider(vec![]).await;
+        let account = account();
+        let payload = payload();
+        let headers = HeaderMap::new();
+        for effort in [
+            None,
+            Some("none"),
+            Some("low"),
+            Some("medium"),
+            Some("high"),
+        ] {
+            let mut chat = json!({
+                "model": "public-alias",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if let Some(effort) = effort {
+                chat["reasoning_effort"] = json!(effort);
+            }
+            let (encoded, _) = crate::protocol::codec::responses_codec::encode_chat_to_responses(
+                &chat,
+                "mapped-model",
+            )
+            .unwrap();
+            provider
+                .outbound(ProviderRequest {
+                    account: &account,
+                    payload: &payload,
+                    body: &encoded,
+                    headers: &headers,
+                    is_stream: true,
+                    upstream_protocol: "responses",
+                    upstream_endpoint: "responses",
+                })
+                .await
+                .unwrap();
+        }
+        let requests = state.requests.lock().await;
+        assert_eq!(requests.len(), 5);
+        assert!(requests[0].1.get("reasoning").is_none());
+        for (request, effort) in requests
+            .iter()
+            .skip(1)
+            .zip(["none", "low", "medium", "high"])
+        {
+            assert_eq!(request.1["reasoning"]["effort"], effort);
+            assert_eq!(request.1["model"], "mapped-model");
+        }
+    }
+
+    #[test]
     fn backend_request_discards_null_unknown_fields() {
         let body = validate_backend_request(&json!({
             "model": "gpt-test",

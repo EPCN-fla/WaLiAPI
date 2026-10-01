@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod code_parser;
 pub mod embedder;
 pub mod handlers;

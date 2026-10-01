@@ -110,6 +110,20 @@ pub struct SearchResult {
     pub metadata: serde_json::Value,
 }
 
+/// 通用检索结果；旧请求仍只返回 data，新能力仅在显式请求时附加元数据。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResponse {
+    pub data: Vec<SearchResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<RagDiagnostics>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RagAnswer {
     pub answer: String,
@@ -119,6 +133,27 @@ pub struct RagAnswer {
     pub retrieval_details: Option<Vec<RetrievalDetail>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<RagDiagnostics>,
+    /// 仅显式启用关键词降级的请求返回实际检索模式。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
+    /// 只确认已请求思考档位，不表示上游接受或执行。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<RagReasoning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RagReasoning {
+    pub requested: String,
+    pub status: ReasoningStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningStatus {
+    Requested,
+    NotSent,
 }
 
 /// 仅显式诊断请求返回阶段结果，不包含提示词、渠道地址或凭据。
@@ -152,6 +187,19 @@ pub struct SourceInfo {
     pub filename: String,
     pub score: f32,
     pub snippet: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_no: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet_start: Option<usize>,
+    /// 显式候选请求提供最终上下文原文，供任意客户端按 Unicode 码点核对引用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +268,18 @@ pub struct AskInput {
     /// 启用严格健康检测：必须有检索片段、有效答案和来源。
     #[serde(default)]
     pub diagnostics: bool,
+    /// 整次 RAG 共用时间预算，服务端限制为 100..=120000 毫秒；省略保持历史行为。
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// 授权通过后的可恢复向量查询失败，允许使用关键词检索。
+    #[serde(default)]
+    pub allow_keyword_fallback: bool,
+    /// 最终截断前的候选池；省略时保持普通请求原有行为。
+    #[serde(default)]
+    pub candidate_k: Option<usize>,
+    /// 省略或 default 不覆盖网关 / 模型默认；其他档位使用通用协议参数。
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 fn default_top_k() -> usize {

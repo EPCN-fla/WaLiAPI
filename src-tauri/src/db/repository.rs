@@ -941,6 +941,8 @@ impl Repository {
             serde_json::to_string(&input.denied_channels.clone().unwrap_or_default())
                 .unwrap_or_else(|_| "[]".to_string());
 
+        // 创建和默认授权共用写事务，避免并发新建知识库时漏掉授权或留下半次创建。
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO api_keys (id, name, key, status, allowed_models, allowed_channels, denied_models, denied_channels, quota_limit, quota_used, created_at, updated_at)
              VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, ?)"
@@ -955,13 +957,23 @@ impl Repository {
         .bind(input.quota_limit.unwrap_or(-1))
         .bind(&now)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
-        sqlx::query_as::<_, ApiKey>("SELECT * FROM api_keys WHERE id = ?")
+        sqlx::query(
+            "INSERT INTO api_key_knowledge_access (api_key_id, kb_id)
+             SELECT ?, id FROM kb_knowledge_bases",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+
+        let api_key = sqlx::query_as::<_, ApiKey>("SELECT * FROM api_keys WHERE id = ?")
             .bind(&id)
-            .fetch_one(&self.pool)
-            .await
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(api_key)
     }
 
     pub async fn update_api_key_status(&self, id: &str, status: i64) -> Result<(), sqlx::Error> {
