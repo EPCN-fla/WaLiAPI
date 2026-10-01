@@ -4,7 +4,7 @@
 
 ### 本地 LLM API 网关 · 多协议接入 · 知识库 RAG · MCP 工具服务
 
-[![Version](https://img.shields.io/badge/version-0.3.7-blue.svg)](./src-tauri/tauri.conf.json)
+[![Version](https://img.shields.io/badge/version-0.3.8-blue.svg)](./src-tauri/tauri.conf.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)](#-使用方式)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app)
@@ -40,7 +40,7 @@
 
 | | 贡献者 | GitHub | 提交 | 代码变更 | 主要贡献 |
 |:---:|:---|:---|:---:|:---|:---|
-| 🏆 | **小傅哥** | [@fuzhengwei](https://github.com/fuzhengwei) | 283 | `+61,165 / -7,262` | 项目创建者 · 核心架构 · 多渠道网关 · 协议转换 · 安全审计 · 知识库引擎 · Wiki 知识引擎 · MCP Server · Codex 账号切换 |
+| 🏆 | **小傅哥** | [@fuzhengwei](https://github.com/fuzhengwei) | 305 | `+63,787 / -7,657` | 项目创建者 · 核心架构 · 多渠道网关 · 协议转换 · 安全审计 · 知识库引擎 · Wiki 知识引擎 · MCP Server · Codex 账号切换 · API Key 独立启停与负载均衡增强 |
 | ⚡ | **xian** | [@zsxink](https://github.com/zsxink) | 140 | `+97,192 / -24,477` | Anthropic Messages 协议兼容 · 渠道协议重构（T01-T14）· codec 加固 · SSRF 防护 · SSE 帧重组 · models 接口 · Kimi Code Auth · protocol 模块结构化重构 · Auth 多格式导入 |
 | 🛠 | **chyuan** | [@chyuan-cuihongyuan](https://github.com/chyuan-cuihongyuan) | 56 | `+11,881 / -1,729` | 统一上游重试判定决策函数与真值表测试 · 渠道健康探测与候选排序 · 语义缓存 · 流式内容持久化与断线续传 · X-Request-Id / OTLP 可观测性 · 知识库增量索引、查询改写与混合检索 · 配额强化 · 401/403 下游脱敏 · StepFun 渠道预设接入（PR #127） |
 | 🚀 | **GululuCopa** | [@GululuCopa](https://github.com/GululuCopa) | 24 | `+13,087 / -475` | Grok OAuth 登录（PR #122）· Antigravity OAuth Gemini 登录（PR #121）与 v0.3.6 修复（PR #128）· Grok 与 Antigravity namespace 工具兼容修复 · 网关客户端适配（流式出站无总超时、Grok 工具白名单与加密推理约束对齐、采样字段兼容、OpenCode/OpenClaw/Hermes 配置生成修正，PR #135）· codec 响应格式与防护修复（response_format 映射、safeguards fail-open、Gemini JSON Schema / Gemini 3 工具签名兼容、function_call fc_ 前缀修复，PR #136） |
@@ -55,7 +55,7 @@
 | 🐛 | **lianggq** | [@GQingL](https://github.com/GQingL) | 1 | `+91 / -9` | 日志日期筛选修复 · macOS 渠道删除按钮修复 |
 | 🐛 | **zjx** | [@Sadsunset3](https://github.com/Sadsunset3) | 8 | `+1,058 / -134` | Anthropic 容量错误提交前识别与跨协议故障切换 · sub2api 导入兼容与账号数刷新 · Claude Code 网关鉴权初始化 · Codex Auth 写入跨平台修复 · 账号操作后滚动位置保持 |
 | 🐛 | **breezewonders** | [@breezewonders-dev](https://github.com/breezewonders-dev) | 1 | `+14 / -0` | Chat-to-Responses 转换 store 字段归一化修复 |
-| 🧩 | **黄科铭** | [@huangkemingyyds](https://github.com/huangkemingyyds) | 2 | `+463 / -82` | Antigravity 模型额度展示与工具调用 ID 保留 · Codex 旧会话回放与 GPT-6 模型同步修复（PR #137 #138） |
+| 🧩 | **黄科铭** | [@huangkemingyyds](https://github.com/huangkemingyyds) | 3 | `+1,986 / -240` | Antigravity 模型额度展示与工具调用 ID 保留 · Codex 旧会话回放与 GPT-6 模型同步修复（PR #137 #138）· 模型映射规范化与 Antigravity Responses 工具路由修复（PR #141） |
 
 </div>
 
@@ -681,7 +681,37 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 
 ## 📌 版本历史
 
-### v0.3.7 (2026-09-28)
+### v0.3.8 (2026-10-01)
+
+#### 渠道与负载均衡
+
+- ✨ **API Key 独立启停开关**（迁移 044）：主 Key 与从 Key 均可单独停用/启用，停用后不参与负载均衡；渠道全部 Key 停用时该渠道整体跳过，请求自动切换其他可用渠道，不会误用已停用的 Key
+- ✨ **渠道预览快捷启停与加密展示**：渠道卡片展开即可点击切换任意 Key 的启用状态（乐观更新，失败自动回滚）；Key 默认掩码展示（仅前 4 位与后 4 位可见），按需查看明文；主 Key 停用时整行变淡并显示「已停用」徽标
+- 🐛 **连通性测试对齐调度语义**：保存触发的草稿测试、渠道列表测试按钮与保存侧指纹，在主 Key 停用时自动改测第一个启用的从 Key，与负载均衡实际行为一致；「同步上游模型」同样适用
+- 🐛 **修复编辑渠道时从 Key 被掩码值覆盖**：编辑保存对从 Key 为全量替换写入，未重新编辑过的从 Key 会以掩码值落库导致凭证损坏；现前端保存时回传 Key id，后端识别掩码值并回填库中真实 Key
+- 🐛 **修复流式路径停用 Key 回退**：凭据槽为空时不再回退到已停用的主 Key，正确切换下一候选渠道
+- 🎨 **主/从 Key 行 UI 对齐**：表单内主 Key 与从 Key 行的按钮顺序（复制 → 权重 → 启停 → 编辑 → 删除）、输入框宽度与启停胶囊样式统一；预览页主/从 Key 启停胶囊共用同一组件
+- 🔧 **导入导出兼容**：`api_key_enabled` 随渠道导出/导入透传，旧版本导出文件缺省视为启用
+
+#### 知识库与 RAG（PR #142，@Zhengmingming1）
+
+- ✨ **RAG 时间预算与受控降级**：为检索与读取链路引入时间预算，超时按受控降级返回可用结果，避免长尾检索拖垮问答体验
+- ✨ **考试逐项合同与证据覆盖检索**：新增考试场景逐项判定与证据覆盖检索能力（迁移 043 检索投影版本）
+- ✨ **通用思考强度与弃答诊断细化**：支持通用思考强度配置，考试弃答诊断按阶段细化归因
+- ✨ **新建密钥与知识库默认双向授权查询权限**：新建 API Key 与知识库时默认建立双向授权的查询权限，减少漏配
+- 🔄 **分离通用检索与调用方业务规则**：检索器与调用方业务规则解耦，便于复用与回归验证
+
+#### 模型映射与协议（PR #141，@huangkemingyyds）
+
+- 🐛 **修复模型映射与 Antigravity Responses 工具路由**：规范化渠道和 Auth 账号模型映射，统一禁用映射与知识库调用行为；支持 Codex Responses additional_tools 经 Gemini 转换，恢复自定义工具调用及流事件，并兼容旧会话回放
+
+#### 其他
+
+- 📝 **README 贡献者数据同步**：更新小傅哥（305 commits）、Nelson（27 commits，PR #142）、黄科铭（3 commits，PR #141）提交数与代码变更统计，历史版本折叠展示
+- 🔧 **版本号统一升级至 0.3.8**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
+
+<details>
+<summary><b>v0.3.7 (2026-09-28)</b></summary>
 
 #### 知识库与 RAG
 
@@ -701,7 +731,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 📝 **README 贡献者数据同步**：更新 Nelson（@Zhengmingming1，PR #140）提交数与代码变更统计
 - 🔧 **版本号统一升级至 0.3.7**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
-### v0.3.6 (2026-09-23)
+</details>
+
+<details>
+<summary><b>v0.3.6 (2026-09-23)</b></summary>
+
 
 #### 协议转换（codec）
 
@@ -735,7 +769,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 📝 **README 贡献者数据同步**：新增贡献者 黄科铭（@huangkemingyyds，PR #137 #138），按当前仓库提交记录更新全体贡献者提交数与代码变更统计
 - 🔧 **版本号统一升级至 0.3.6**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
-### v0.3.5 (2026-09-21)
+</details>
+
+<details>
+<summary><b>v0.3.5 (2026-09-21)</b></summary>
+
 
 #### 新增渠道
 
@@ -746,7 +784,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 📝 **README 贡献者数据同步**：按当前仓库提交记录更新贡献者提交数与代码变更统计
 - 🔧 **版本号统一升级至 0.3.5**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
-### v0.3.4 (2026-09-20)
+</details>
+
+<details>
+<summary><b>v0.3.4 (2026-09-20)</b></summary>
+
 
 #### Auth 账号
 
@@ -765,7 +807,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 📝 **README 贡献者数据同步**：新增贡献者 GululuCopa（PR #121 #122），并按当前仓库提交记录更新全体贡献者提交数与代码变更统计
 - 🔧 **版本号统一升级至 0.3.4**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
-### v0.3.3 (2026-09-16)
+</details>
+
+<details>
+<summary><b>v0.3.3 (2026-09-16)</b></summary>
+
 
 #### 日志
 
@@ -788,10 +834,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 📝 **README 贡献者数据同步**：按当前仓库提交记录更新贡献者提交数与代码变更统计，README 历史版本改为折叠展示
 - 🔧 **版本号统一升级至 0.3.3**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
-<details>
-<summary>📜 查看历史版本（v0.3.2 及更早）</summary>
+</details>
 
-### v0.3.2 (2026-09-13)
+<details>
+<summary><b>v0.3.2 (2026-09-13)</b></summary>
+
 
 #### 知识库检索与数据安全
 
@@ -812,7 +859,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 📝 **README 贡献者数据同步**：按当前仓库提交记录更新贡献者提交数与代码变更统计
 - 🔧 **版本号统一升级至 0.3.2**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
-### v0.3.1 (2026-09-10)
+</details>
+
+<details>
+<summary><b>v0.3.1 (2026-09-10)</b></summary>
+
 
 #### 渠道与配额
 
@@ -846,7 +897,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 
 - 🐛 **Anthropic 容量错误提交前识别**：容量/过载类错误在响应提交前检测并触发跨协议故障切换，避免错误透传给下游（PR #101）
 
-### v0.3.0 (2026-09-09)
+</details>
+
+<details>
+<summary><b>v0.3.0 (2026-09-09)</b></summary>
+
 
 #### 审计日志策略优化
 
@@ -863,7 +918,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 📝 **README 贡献者数据同步**：按最新提交记录更新全体贡献者提交数与代码变更统计，zjx 关联 GitHub 账号 @Sadsunset3
 - 🔧 **版本号统一升级至 0.3.0**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
-### v0.2.9 (2026-09-07)
+</details>
+
+<details>
+<summary><b>v0.2.9 (2026-09-07)</b></summary>
+
 
 #### Codex 账号与额度
 
@@ -883,7 +942,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 📝 **README 贡献者数据同步**：新增 2 位贡献者 yuanqixun 和 zjx，并按最新提交记录更新全体贡献者提交数与代码变更统计
 - 🔧 **版本号统一升级至 0.2.9**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
-### v0.2.8 (2026-09-03)
+</details>
+
+<details>
+<summary><b>v0.2.8 (2026-09-03)</b></summary>
+
 
 #### Codex 账号切换
 
@@ -903,7 +966,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 📝 **README 贡献者数据同步**：新增 2 位贡献者 Jason（@freakojc，PR #62 #63）和 cham（@Cham1229，PR #64），按最新提交记录更新全体贡献者提交数与代码变更统计
 - 🔧 **版本号统一升级至 0.2.8**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
-### v0.2.7 (2026-09-02)
+</details>
+
+<details>
+<summary><b>v0.2.7 (2026-09-02)</b></summary>
+
 
 #### 仪表盘
 
@@ -919,7 +986,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 📝 **README 贡献者数据同步**：按最新提交记录更新贡献者提交数与代码变更统计
 - 🔧 **版本号统一升级至 0.2.7**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
-### v0.2.6 (2026-09-02)
+</details>
+
+<details>
+<summary><b>v0.2.6 (2026-09-02)</b></summary>
+
 
 #### 缓存命中 Token 统计
 
@@ -945,7 +1016,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 🔧 **默认窗口尺寸调整**：1280×860 → 1440×900，适配仪表盘新增指标
 - 🔧 **版本号统一升级至 0.2.6**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
-### v0.2.5 (2026-09-01)
+</details>
+
+<details>
+<summary><b>v0.2.5 (2026-09-01)</b></summary>
+
 
 #### Docker Web 部署
 
@@ -977,7 +1052,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 
 - 🔧 **版本号统一升级至 0.2.5**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
-### v0.2.4 (2026-08-28)
+</details>
+
+<details>
+<summary><b>v0.2.4 (2026-08-28)</b></summary>
+
 
 #### Auth 账号导入增强
 
@@ -1000,7 +1079,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 📝 **README 文档完善**：更新代码贡献者信息表（补齐 v0.2.2 Docker / Web 管理面板贡献者 Fla1337，同步各贡献者最新提交量与代码变更统计）
 - 🔧 **版本号统一升级至 0.2.3**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
-### v0.2.2 (2026-08-26)
+</details>
+
+<details>
+<summary><b>v0.2.2 (2026-08-26)</b></summary>
+
 
 #### Web 管理面板（Docker / headless 部署）
 
@@ -1043,7 +1126,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 
 - 版本号统一升级至 0.2.2（package.json / Cargo.toml / tauri.conf.json）
 
-### v0.2.1 (2026-08-18)
+</details>
+
+<details>
+<summary><b>v0.2.1 (2026-08-18)</b></summary>
+
 
 #### 协议转换层结构化重构
 
@@ -1078,14 +1165,22 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 121 个文件变更，+22,616 / -14,462 行代码
 - 版本号统一升级至 0.2.1（package.json / Cargo.toml / tauri.conf.json）
 
-### v0.2.0 (2026-08-14)
+</details>
+
+<details>
+<summary><b>v0.2.0 (2026-08-14)</b></summary>
+
 
 #### 端点验证与稳定性
 
 - 🐛 **端点验证 bug 修复**：修复渠道端点校验逻辑缺陷
 - 🔧 **版本号统一升级至 0.2.0**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
 
-### v0.1.9 (2026-08-13)
+</details>
+
+<details>
+<summary><b>v0.1.9 (2026-08-13)</b></summary>
+
 
 #### 渠道多 Key 负载均衡
 
@@ -1106,7 +1201,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 
 - ✨ **Release Notes 动态化**：自动更新弹窗中的版本说明从 CHANGELOG.md 自动提取，不再显示固定文案。四个 CI workflow（macOS ARM64/Intel、Windows、Linux）均已接入
 
-### v0.1.8 (2026-08-12)
+</details>
+
+<details>
+<summary><b>v0.1.8 (2026-08-12)</b></summary>
+
 
 #### API 密钥管理增强
 
@@ -1127,7 +1226,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - ✨ **Auth 账号豁免渠道限制**：Auth 账号无 channel id，豁免渠道级白/黑名单，模型级限制仍生效
 - ✨ **priority/weight 中文化**：AccountCard 与 EditModal 标签改为「优先级」「权重」
 
-### v0.1.7 (2026-08-09)
+</details>
+
+<details>
+<summary><b>v0.1.7 (2026-08-09)</b></summary>
+
 
 #### Wiki 知识引擎（大功能）
 
@@ -1154,7 +1257,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - **tool_choice 透传修复**：仅在转换出函数工具时透传并规范化到 Chat 格式
 - **Anthropic Messages 转换修复**：system 提取 + tool_choice 映射 + stream_options
 
-### v0.1.6 (2026-08-08)
+</details>
+
+<details>
+<summary><b>v0.1.6 (2026-08-08)</b></summary>
+
 
 #### 渠道协议大重构（T01–T14）
 
@@ -1192,7 +1299,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 品牌 SVG 图标（Claude、Moonshot、Doubao 等）
 - 渠道预设更新（名称、图标、端点、描述）
 
-### v0.1.5 (2026-08-03)
+</details>
+
+<details>
+<summary><b>v0.1.5 (2026-08-03)</b></summary>
+
 
 - ✨ 模型映射一对多：`model_mapping` 支持单目标→多目标数组映射，同优先级渠道间随机负载均衡
 - 🐛 输入法 composing 回车误触发修复：`isComposing` + `keyCode 229` 双重防护，覆盖 ChannelForm / ApiKeysPage / KnowledgeBasePage
@@ -1204,7 +1315,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - ✨ LLM 使用页空配置提示：无密钥/无渠道时显示红色提示 + 快捷跳转链接
 - ✨ 渠道卡片空白区域点击展开/收起
 
-### v0.1.4 (2026-07-30)
+</details>
+
+<details>
+<summary><b>v0.1.4 (2026-07-30)</b></summary>
+
 
 - ✨ 知识库引擎：文档解析 → tree-sitter 代码符号感知 → 智能分块 → 向量化 → HNSW 索引
 - ✨ 混合检索：HNSW 向量检索 + SQLite FTS5 全文检索加权融合，三种模式（向量/关键词/混合）
@@ -1215,7 +1330,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - ✨ 导入导出：渠道配置 JSON 备份 + WaLiCode 备份文件导入
 - ✨ 内置应用更新检查（Tauri Updater）
 
-### v0.1.3 (2026-07-26)
+</details>
+
+<details>
+<summary><b>v0.1.3 (2026-07-26)</b></summary>
+
 
 #### 知识库 RAG 增强
 
@@ -1229,7 +1348,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 
 - 🔧 **自动更新处理优化**：完善自动更新流程的异常处理
 
-### v0.1.2 (2026-07-22)
+</details>
+
+<details>
+<summary><b>v0.1.2 (2026-07-22)</b></summary>
+
 
 #### 自动更新
 
@@ -1240,7 +1363,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - 🔧 **release-mirror 改用 `workflow_run` 触发**，GitCode 镜像同步优化
 - 🐛 **Updater 配置修复**：添加 `createUpdaterArtifacts: true`
 
-### v0.1.1 (2026-07-21)
+</details>
+
+<details>
+<summary><b>v0.1.1 (2026-07-21)</b></summary>
+
 
 - ✨ 多协议网关：支持 OpenAI Chat Completions + Responses API + Anthropic Messages 三协议入口
 - ✨ 仪表盘优化：统一 6 卡片指标网格 + 健康度徽章 + 动态运维建议
@@ -1248,7 +1375,11 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 - ✨ 密钥统计：每个密钥的调用指标展示
 - ✨ 接入示例页：三协议切换 + 15 套代码示例 + 连接测试
 
-### v0.1.0 (2026-07-18)
+</details>
+
+<details>
+<summary><b>v0.1.0 (2026-07-18)</b></summary>
+
 
 - 🎉 首个发布版本
 - 多渠道管理（10 种渠道类型）+ 优先级/权重负载均衡
