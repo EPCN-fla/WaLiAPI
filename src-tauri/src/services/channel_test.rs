@@ -451,6 +451,34 @@ fn is_blocked_ip(ip: IpAddr, allow_loopback: bool, allow_private: bool) -> bool 
 ///   path, never the empty key);
 /// * a create (no id) with a blank key yields the empty key — the Ollama
 ///   explicit-empty case remains legal, and other protocols simply have no key.
+/// 解析「生效 Key」：主 Key 启用（或 api_key_enabled 缺省）时返回主 Key 本身；
+/// 主 Key 已停用（api_key_enabled == 0）时返回第一个启用的从 Key 的真实值；
+/// 没有启用的从 Key 时仍返回主 Key（向后兼容：测试仍可验证主 Key 凭证本身）。
+///
+/// 草稿测试与保存侧指纹（`update_channel_impl` 的 eff_key 回退分支）必须使用
+/// 同一规则，否则测试与保存的 `draft_fingerprint`（含 SHA-256(key)）不一致，
+/// T07 保存门禁会误判「草稿已变更」。
+pub async fn effective_probe_key(repo: &Repository, channel_id: &str, main_key: &str) -> String {
+    if main_key.is_empty() {
+        return String::new();
+    }
+    let ch = match repo.get_channel(channel_id).await {
+        Ok(ch) => ch,
+        Err(_) => return main_key.to_string(),
+    };
+    if ch.api_key_enabled != Some(0) {
+        return main_key.to_string();
+    }
+    let keys = match repo.get_channel_api_keys(channel_id).await {
+        Ok(keys) => keys,
+        Err(_) => return main_key.to_string(),
+    };
+    keys.into_iter()
+        .find(|k| k.status == 1)
+        .map(|k| k.api_key)
+        .unwrap_or_else(|| main_key.to_string())
+}
+
 pub async fn resolve_draft_api_key(
     input: &DraftChannelTestInput,
     repo: &Repository,
@@ -467,7 +495,8 @@ pub async fn resolve_draft_api_key(
                 .get_channel(id)
                 .await
                 .map_err(|e| format!("读取渠道失败：{e}"))?;
-            return Ok(ch.api_key);
+            // 主 Key 停用时走第一个启用的从 Key（与真实调度语义一致）。
+            return Ok(effective_probe_key(repo, id, &ch.api_key).await);
         }
     }
     Ok(String::new())
@@ -599,6 +628,7 @@ fn draft_channel(input: &DraftChannelTestInput, api_key: &str, timeout_secs: i64
         last_probe_at: None,
         last_probe_ok: None,
         probe_latency_ms: None,
+        api_key_enabled: Some(1),
     }
 }
 
@@ -2177,6 +2207,7 @@ data: {"type":"message_stop"}
             last_probe_at: None,
             last_probe_ok: None,
             probe_latency_ms: None,
+            api_key_enabled: Some(1),
         }
     }
 
@@ -2307,6 +2338,7 @@ data: {"type":"message_stop"}
             last_probe_at: None,
             last_probe_ok: None,
             probe_latency_ms: None,
+            api_key_enabled: Some(1),
         };
         insert_channel(&pool, &channel).await;
         let repo = Repository::new(pool);

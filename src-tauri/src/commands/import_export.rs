@@ -71,6 +71,9 @@ pub struct ExportedChannel {
     pub last_test_at: Option<String>,
     #[serde(default)]
     pub last_test_ok: Option<i64>,
+    /// 主 Key 是否参与负载均衡（迁移 044；v1 文件缺省 = 启用）。
+    #[serde(default)]
+    pub api_key_enabled: Option<i64>,
     // --- New protocol identity (v2; absent in v1) ---
     #[serde(default)]
     pub protocol: Option<String>,
@@ -110,6 +113,7 @@ impl From<Channel> for ExportedChannel {
             timeout_secs: Some(c.timeout_secs),
             last_test_at: c.last_test_at,
             last_test_ok: c.last_test_ok,
+            api_key_enabled: Some(c.api_key_enabled.unwrap_or(1)),
             protocol: Some(identity.protocol),
             provider: Some(identity.provider),
             native_base_url: Some(identity.native_base_url),
@@ -506,6 +510,7 @@ pub fn exported_channel_to_import(ch: &ExportedChannel) -> ImportChannelInput {
         legacy_executor_override: legacy_override,
         last_test_at: ch.last_test_at.clone(),
         last_test_ok: ch.last_test_ok,
+        api_key_enabled: Some(ch.api_key_enabled.unwrap_or(1)),
     }
 }
 
@@ -1037,6 +1042,7 @@ mod tests {
             last_probe_at: None,
             last_probe_ok: None,
             probe_latency_ms: None,
+            api_key_enabled: Some(1),
         }
     }
 
@@ -1072,6 +1078,7 @@ mod tests {
             last_probe_at: None,
             last_probe_ok: None,
             probe_latency_ms: None,
+            api_key_enabled: Some(1),
         }
     }
 
@@ -1106,6 +1113,7 @@ mod tests {
             last_probe_at: None,
             last_probe_ok: None,
             probe_latency_ms: None,
+            api_key_enabled: Some(1),
         }
     }
 

@@ -12,6 +12,8 @@ export interface ChannelKey {
 
 /** Input for creating/updating a channel API key. */
 export interface ChannelKeyInput {
+  /** 已存在 Key 的数据库 ID：后端据此把掩码值识别为「未修改」并保全真实值。 */
+  id?: string;
   api_key: string;
   weight?: number;
   status?: number;
@@ -63,6 +65,8 @@ export interface Channel {
   last_probe_at: string | null;
   last_probe_ok: number | null;
   probe_latency_ms: number | null;
+  /** 主 Key 是否参与负载均衡（迁移 044）。1 = 启用，0 = 停用。 */
+  api_key_enabled?: number;
   /** Multi-key: extra API keys (masked in DTO, use getChannelExtraKeys for full). */
   extra_keys: ChannelKey[];
   /** 渠道级自定义上游请求头。 */

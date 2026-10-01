@@ -67,6 +67,8 @@ export const channelApi = {
   getExtraKeyValue: (keyId: string) => invoke<string>("get_channel_extra_key_value", { keyId }),
   /** 启用/禁用一个额外 Key。 */
   toggleExtraKey: (keyId: string, status: number) => invoke<void>("toggle_channel_extra_key", { keyId, status }),
+  /** 启用/停用渠道主 Key（#1）。停用后不参与负载均衡。 */
+  togglePrimaryKey: (id: string, enabled: boolean) => invoke<void>("toggle_channel_primary_key", { id, enabled }),
   /** 删除一个额外 Key。 */
   deleteExtraKey: (keyId: string) => invoke<void>("delete_channel_extra_key", { keyId }),
 };

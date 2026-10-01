@@ -12,35 +12,39 @@ use std::time::Instant;
 
 /// Multi-key load balancing for the legacy proxy path.  Selects a random
 /// enabled key from the channel's extra keys, weighted by `weight`.  The
-/// primary `api_key` participates with the channel-level `weight`.
-async fn select_key_for_channel(channel: &Channel, repo: &Arc<Repository>) -> Channel {
+/// primary `api_key` participates with the channel-level `weight` unless it
+/// has been disabled (config `api_key_enabled = 0`).
+/// Returns `None` when the channel has no enabled credential at all (primary
+/// disabled/empty and no enabled extra keys) — the caller skips the channel.
+async fn select_key_for_channel(channel: &Channel, repo: &Arc<Repository>) -> Option<Channel> {
     let extra_keys = match repo.get_channel_api_keys(&channel.id).await {
         Ok(keys) => keys
             .into_iter()
             .filter(|k| k.status == 1)
             .collect::<Vec<_>>(),
-        Err(_) => return channel.clone(),
+        // DB 读取失败：保守降级为「无额外 Key」，主 Key 开关仍然生效。
+        Err(_) => Vec::new(),
     };
-    if extra_keys.is_empty() {
-        return channel.clone();
+    let primary_ok = !channel.api_key.is_empty() && channel.primary_key_enabled();
+    if extra_keys.is_empty() && !primary_ok {
+        return None;
     }
     let mut pool: Vec<(String, i64)> = Vec::new();
-    if !channel.api_key.is_empty() {
+    if primary_ok {
         pool.push((channel.api_key.clone(), channel.weight.max(1)));
     }
     for k in &extra_keys {
         pool.push((k.api_key.clone(), k.weight.max(1)));
     }
     if pool.is_empty() {
-        return channel.clone();
+        return None;
     }
     // FIX-10：加权选择收敛为 core::weighted_key 单一实现（等权多 Key 均匀
     // 分布；旧内联实现 `pick <= 0` 边界错误使第二个 Key 永远轮空，#34 根因）。
-    let chosen = crate::core::weighted_key::pick_weighted_key(&pool)
-        .unwrap_or_else(|| channel.api_key.clone());
+    let chosen = crate::core::weighted_key::pick_weighted_key(&pool)?;
     let mut ch = channel.clone();
     ch.api_key = chosen;
-    ch
+    Some(ch)
 }
 
 #[allow(dead_code)]
@@ -177,7 +181,11 @@ pub async fn handle_request(
 
     for (attempt, channel) in selected_channels.into_iter().take(max_attempts).enumerate() {
         // Multi-key load balancing: select a key from extra keys if available.
-        let channel = select_key_for_channel(&channel, &repo).await;
+        // None = 主 Key 与全部额外 Key 均被停用：跳过该渠道，尝试下一个候选。
+        let channel = match select_key_for_channel(&channel, &repo).await {
+            Some(c) => c,
+            None => continue,
+        };
         let config = Dispatcher::channel_to_config(&channel);
         let adaptor = get_adaptor(&channel.channel_type);
         let attempt_start = Instant::now();

@@ -52,6 +52,8 @@ pub struct ChannelDto {
     pub last_probe_at: Option<String>,
     pub last_probe_ok: Option<i64>,
     pub probe_latency_ms: Option<i64>,
+    /// 主 Key 是否参与负载均衡（迁移 044）。1 = 启用，0 = 停用。
+    pub api_key_enabled: i64,
     // --- Multi-key: extra API keys for load balancing (migration 023) ---
     pub extra_keys: Vec<ChannelKeyDto>,
     /// 渠道级自定义上游请求头（敏感值原样返回给已进入管理面的前端）。
@@ -117,6 +119,7 @@ impl From<Channel> for ChannelDto {
             last_probe_at: c.last_probe_at,
             last_probe_ok: c.last_probe_ok,
             probe_latency_ms: c.probe_latency_ms,
+            api_key_enabled: c.api_key_enabled.unwrap_or(1),
             extra_keys: Vec::new(), // populated by to_dto_with_keys
             request_headers: serde_json::from_str::<serde_json::Value>(&c.config)
                 .ok()
@@ -282,7 +285,9 @@ pub async fn update_channel_impl(
         } else if input.clear_api_key == Some(true) {
             String::new()
         } else {
-            existing.api_key.clone()
+            // 与测试侧 resolve_draft_api_key 同规则：主 Key 停用时指纹绑定
+            // 第一个启用的从 Key，保证测试与保存指纹一致（T07 门禁不误判）。
+            channel_test::effective_probe_key(&repo, &input.id, &existing.api_key).await
         };
         let eff_override = input
             .legacy_executor_override
@@ -513,7 +518,10 @@ pub async fn test_channel_impl(
     state: &std::sync::Arc<AppState>,
 ) -> Result<TestChannelResult, String> {
     let repo = Repository::new(state.db.pool.clone());
-    let channel = repo.get_channel(id).await.map_err(|e| e.to_string())?;
+    let mut channel = repo.get_channel(id).await.map_err(|e| e.to_string())?;
+    // 主 Key 停用时走第一个启用的从 Key（与真实调度语义一致）。
+    channel.api_key =
+        channel_test::effective_probe_key(&repo, id, &channel.api_key).await;
 
     let config = ChannelConfig {
         base_url: channel.base_url.clone(),
@@ -607,6 +615,28 @@ pub async fn toggle_channel_extra_key(
         .map_err(|e| e.to_string())
 }
 
+/// 启用/停用渠道主 Key（#1，channels.api_key）。停用后不参与负载均衡；
+/// 主 Key 与全部额外 Key 均停用时该渠道整体跳过。
+#[tauri::command]
+pub async fn toggle_channel_primary_key(
+    id: String,
+    enabled: bool,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<(), String> {
+    toggle_channel_primary_key_impl(&id, enabled, &*state).await
+}
+
+pub async fn toggle_channel_primary_key_impl(
+    id: &str,
+    enabled: bool,
+    state: &std::sync::Arc<AppState>,
+) -> Result<(), String> {
+    let repo = Repository::new(state.db.pool.clone());
+    repo.toggle_channel_primary_key(id, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Delete a channel API key.
 #[tauri::command]
 pub async fn delete_channel_extra_key(
@@ -653,6 +683,7 @@ mod tests {
             last_probe_at: None,
             last_probe_ok: None,
             probe_latency_ms: None,
+            api_key_enabled: Some(1),
         }
     }
 

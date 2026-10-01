@@ -78,27 +78,34 @@ fn extract_reasoning_effort(audited: &AuditedRequest) -> Option<String> {
 /// weighted sampling without replacement.  The returned `Channel` copies are
 /// intentionally request-local: credential values never enter PreparedAttempt,
 /// request logs, or tracing fields.
+/// The primary key participates only when enabled (config `api_key_enabled`,
+/// absent = enabled).  Returns an EMPTY vec when the channel has no enabled
+/// credential at all — the caller must skip / fail over the candidate.
 async fn channel_key_slots(channel: &Channel, repo: &Repository) -> Vec<Channel> {
     let extra_keys = match repo.get_channel_api_keys(&channel.id).await {
         Ok(keys) => keys
             .into_iter()
             .filter(|k| k.status == 1)
             .collect::<Vec<_>>(),
-        Err(_) => return vec![channel.clone()],
+        // DB 读取失败：保守降级为「无额外 Key」，主 Key 开关仍然生效。
+        Err(_) => Vec::new(),
     };
+    let primary_ok = !channel.api_key.is_empty() && channel.primary_key_enabled();
     if extra_keys.is_empty() {
-        return vec![channel.clone()];
+        return if primary_ok { vec![channel.clone()] } else { Vec::new() };
     }
     // Build weighted pool: primary key (weight = channel.weight) + extras.
     let mut pool: Vec<(String, i64)> = Vec::new();
-    if !channel.api_key.is_empty() {
+    if primary_ok {
         pool.push((channel.api_key.clone(), channel.weight.max(1)));
     }
     for k in &extra_keys {
         pool.push((k.api_key.clone(), k.weight.max(1)));
     }
     if pool.is_empty() {
-        return vec![channel.clone()];
+        // 主 Key 与全部额外 Key 均被停用（或 Key 全为空且主 Key 停用）：
+        // 渠道无可用凭证，返回空让调用方换下一个候选。
+        return Vec::new();
     }
     // Duplicate values are one credential slot, not two chances to send the
     // same secret. Preserve the first configured weight for deterministic
@@ -1502,20 +1509,29 @@ pub(crate) async fn route_stream_plan_with_auth_service(
 
                 let dispatched = match candidate {
                     Some(RouteCandidate::Channel { channel, identity }) => {
-                        let channel = channel_key_slots(&channel, repo)
-                            .await
-                            .into_iter()
-                            .next()
-                            .unwrap_or(channel);
-                        dispatch_stream_executor(
-                            endpoint,
-                            &attempt,
-                            &channel,
-                            &identity,
-                            safe_headers,
-                            query.as_deref(),
-                        )
-                        .await
+                        match channel_key_slots(&channel, repo).await.into_iter().next() {
+                            Some(slot) => {
+                                dispatch_stream_executor(
+                                    endpoint,
+                                    &attempt,
+                                    &slot,
+                                    &identity,
+                                    safe_headers,
+                                    query.as_deref(),
+                                )
+                                .await
+                            }
+                            None => {
+                                // 主 Key 与全部额外 Key 均被停用：该候选无可用
+                                // 凭证，按可重试失败换下一个候选渠道。
+                                StreamAttemptResult::Failure(AttemptFailure {
+                                    failure_class: FailureClass::Retryable,
+                                    message: "no enabled channel credential slot".to_string(),
+                                    status_code: Some(502),
+                                    retry_after: None,
+                                })
+                            }
+                        }
                     }
                     Some(RouteCandidate::AuthAccount(_)) => {
                         dispatch_auth_account_stream_executor(&attempt, &auth_service, safe_headers)
@@ -2861,6 +2877,7 @@ mod tests {
             last_probe_at: None,
             last_probe_ok: None,
             probe_latency_ms: None,
+            api_key_enabled: Some(1),
         }
     }
 

@@ -17,6 +17,11 @@ pub struct ChannelApiKey {
 /// Input for creating/updating a channel API key entry.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChannelApiKeyInput {
+    /// 已存在从 Key 的数据库 ID（编辑保存时由前端回传）。列表 DTO 的 api_key
+    /// 是掩码值，更新路径据此把「值仍为该 ID 存量掩码」的提交识别为未修改，
+    /// 用库中真实值替换，避免掩码串覆盖真实 Key（仅更新路径消费此字段）。
+    #[serde(default)]
+    pub id: Option<String>,
     pub api_key: String,
     #[serde(default)]
     pub weight: Option<i64>,
@@ -73,9 +78,19 @@ pub struct Channel {
     pub last_probe_ok: Option<i64>,
     #[sqlx(default)]
     pub probe_latency_ms: Option<i64>,
+    /// 主 Key 是否参与负载均衡调度（迁移 044）。Some(0) = 停用；
+    /// None/Some(1) = 启用。None 兼容只迁移到早期版本的集成测试行。
+    #[sqlx(default)]
+    pub api_key_enabled: Option<i64>,
 }
 
 impl Channel {
+    /// 主 Key（channels.api_key）是否参与调度（迁移 044 列 api_key_enabled）。
+    /// None（早期迁移的测试行/历史数据）视为启用，保持向后兼容。
+    pub fn primary_key_enabled(&self) -> bool {
+        self.api_key_enabled.unwrap_or(1) != 0
+    }
+
     /// 返回规范化但尚未应用禁用列表的原始模型映射，供管理面与导出使用。
     pub fn normalized_model_mapping(&self) -> serde_json::Value {
         let mut mapping: serde_json::Value =
@@ -406,6 +421,9 @@ pub struct ImportChannelInput {
     pub last_test_at: Option<String>,
     #[serde(default)]
     pub last_test_ok: Option<i64>,
+    /// 主 Key 是否参与负载均衡（迁移 044；v1 文件缺省 = 启用）。
+    #[serde(default)]
+    pub api_key_enabled: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -1008,6 +1026,7 @@ mod mapping_disabled_tests {
             last_probe_at: None,
             last_probe_ok: None,
             probe_latency_ms: None,
+            api_key_enabled: Some(1),
         };
         assert_eq!(ch.active_model_mapping()["auto"], "m-b");
 
