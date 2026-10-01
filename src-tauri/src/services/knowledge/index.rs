@@ -208,22 +208,37 @@ impl HnswIndex {
 
     /// Search the index for the k nearest neighbours.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
+        self.search_cancellable(query, k, &|| false)
+            .unwrap_or_default()
+    }
+
+    /// 请求取消后停止后台向量计算；旧同步调用继续使用无取消入口。
+    pub fn search_cancellable(
+        &self,
+        query: &[f32],
+        k: usize,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Vec<SearchResult>, String> {
+        if cancelled() {
+            return Err("retrieval cancelled".into());
+        }
         if !self.initialized || self.nodes.is_empty() || k == 0 || query.len() != self.dim {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // ponytail: 千级以内的小库直接精确搜索；大库保留图搜索，避免线性开销。
         // 同时兼容旧图的连通性缺陷，不需要为查询重新调用 embedding。
         let candidates = if self.nodes.len() <= 1024 {
-            let mut all: Vec<SearchItem> = self
-                .nodes
-                .iter()
-                .enumerate()
-                .map(|(id, node)| SearchItem {
+            let mut all = Vec::with_capacity(self.nodes.len());
+            for (id, node) in self.nodes.iter().enumerate() {
+                if cancelled() {
+                    return Err("retrieval cancelled".into());
+                }
+                all.push(SearchItem {
                     id,
                     distance: cosine_distance(query, &node.vector),
-                })
-                .collect();
+                });
+            }
             all.sort_by(|a, b| a.distance.total_cmp(&b.distance).then(a.id.cmp(&b.id)));
             all
         } else {
@@ -232,12 +247,15 @@ impl HnswIndex {
                 .max(k)
                 .saturating_add(self.tombstones.len())
                 .min(self.nodes.len());
-            self.search_internal(query, ef, usize::MAX)
+            self.search_internal_cancellable(query, ef, usize::MAX, cancelled)?
         };
+        if cancelled() {
+            return Err("retrieval cancelled".into());
+        }
 
         // Convert internal indices to external IDs and compute scores.
         // 墓碑节点（已摘除）在结果组装前过滤，保证 take(k) 全部是存活节点。
-        candidates
+        Ok(candidates
             .into_iter()
             .filter(|r| !self.tombstones.contains(&self.nodes[r.id].id))
             .take(k)
@@ -245,7 +263,7 @@ impl HnswIndex {
                 id: self.nodes[r.id].id.clone(),
                 score: 1.0 - r.distance, // Convert distance to similarity score
             })
-            .collect()
+            .collect())
     }
 
     /// 单点插入（增量索引用）：贪心下沉找最近邻、双向连边，不重排既有节点。
@@ -382,8 +400,19 @@ impl HnswIndex {
     /// Returns internal node indices sorted by distance (closest first).
     /// `exclude` is the node index to exclude (used during construction).
     fn search_internal(&self, query: &[f32], ef: usize, exclude: usize) -> Vec<SearchItem> {
+        self.search_internal_cancellable(query, ef, exclude, &|| false)
+            .unwrap_or_default()
+    }
+
+    fn search_internal_cancellable(
+        &self,
+        query: &[f32],
+        ef: usize,
+        exclude: usize,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Vec<SearchItem>, String> {
         if self.nodes.is_empty() || ef == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let n = self.nodes.len();
@@ -417,6 +446,9 @@ impl HnswIndex {
             id: curr,
         }) = candidates.pop()
         {
+            if cancelled() {
+                return Err("retrieval cancelled".into());
+            }
             // Check if we should stop
             let furthest_in_results = results.peek().map(|r| r.0.distance).unwrap_or(f32::MAX);
 
@@ -460,7 +492,7 @@ impl HnswIndex {
                 .partial_cmp(&b.distance)
                 .unwrap_or(Ordering::Equal)
         });
-        sorted
+        Ok(sorted)
     }
 
     /// Serialize the index to bytes.
@@ -506,6 +538,74 @@ impl HnswIndex {
         Self::from_bytes(&data)
     }
 
+    /// 分块读取、解码和骨架修复均检查取消，防止丢弃请求后继续完整扫描。
+    pub fn load_cancellable(path: &Path, cancelled: &impl Fn() -> bool) -> Result<Self, String> {
+        use std::io::Read;
+        struct CheckedReader<'a, R, F> {
+            reader: R,
+            cancelled: &'a F,
+            bytes_since_check: usize,
+        }
+        impl<R: Read, F: Fn() -> bool> Read for CheckedReader<'_, R, F> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.bytes_since_check >= 64 * 1024 {
+                    if (self.cancelled)() {
+                        return Err(std::io::Error::other("retrieval cancelled"));
+                    }
+                    self.bytes_since_check = 0;
+                }
+                let count = self.reader.read(buffer)?;
+                self.bytes_since_check += count;
+                Ok(count)
+            }
+        }
+        let file =
+            std::fs::File::open(path).map_err(|e| format!("Failed to read index file: {e}"))?;
+        let read_started = std::time::Instant::now();
+        let mut data = Vec::new();
+        // read_to_end 会重试 Interrupted；每块显式检查并立即返回取消。
+        let mut reader = std::io::BufReader::new(file);
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            if cancelled() {
+                return Err("retrieval cancelled".into());
+            }
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|e| format!("Failed to read index file: {e}"))?;
+            if count == 0 {
+                break;
+            }
+            data.extend_from_slice(&buffer[..count]);
+        }
+        tracing::debug!(
+            stage = "index_read",
+            elapsed_ms = read_started.elapsed().as_millis() as u64,
+            bytes = data.len(),
+            "RAG index stage"
+        );
+        let decode_started = std::time::Instant::now();
+        let mut index: Self = bincode::deserialize_from(CheckedReader {
+            reader: std::io::Cursor::new(data),
+            cancelled,
+            bytes_since_check: 64 * 1024,
+        })
+        .map_err(|e| format!("Failed to deserialize HNSW index: {e}"))?;
+        for i in 1..index.nodes.len() {
+            if cancelled() {
+                return Err("retrieval cancelled".into());
+            }
+            index.connect_pair(i - 1, i);
+        }
+        tracing::debug!(
+            stage = "index_decode",
+            elapsed_ms = decode_started.elapsed().as_millis() as u64,
+            nodes = index.nodes.len(),
+            "RAG index stage"
+        );
+        Ok(index)
+    }
+
     /// Get number of live nodes (physical nodes minus tombstones).
     pub fn len(&self) -> usize {
         self.nodes.len() - self.tombstones.len()
@@ -548,6 +648,32 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellable_load_preserves_format_and_stops_during_decode() {
+        let path = std::env::temp_dir().join(format!("rag-index-{}.hnsw", uuid::Uuid::new_v4()));
+        let mut index = HnswIndex::new(1536, 2, 10, 5);
+        index.nodes = (0..65)
+            .map(|id| IndexNode {
+                id: id.to_string(),
+                doc_id: "doc".into(),
+                vector: vec![0.25; 1536],
+                neighbours: Vec::new(),
+            })
+            .collect();
+        index.initialized = true;
+        index.save(&path).unwrap();
+        let loaded = HnswIndex::load_cancellable(&path, &|| false).unwrap();
+        assert_eq!(loaded.search(&vec![0.25; 1536], 5).len(), 5);
+        let read_checks = std::fs::metadata(&path).unwrap().len().div_ceil(64 * 1024) as usize + 1;
+        let checks = std::cell::Cell::new(0);
+        let result = HnswIndex::load_cancellable(&path, &|| {
+            checks.set(checks.get() + 1);
+            checks.get() > read_checks + 1
+        });
+        std::fs::remove_file(path).unwrap();
+        assert!(result.unwrap_err().contains("retrieval cancelled"));
+    }
 
     #[test]
     fn result_heap_retains_nearest_when_capacity_is_exceeded() {

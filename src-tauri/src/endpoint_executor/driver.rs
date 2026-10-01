@@ -29,6 +29,7 @@ use crate::endpoint_executor::{
 };
 use crate::security;
 use crate::security::gate::AuditedRequest;
+use crate::services::knowledge::budget::{self, BudgetElapsed};
 use crate::utils;
 use axum::body::Body;
 use axum::http::{header, StatusCode};
@@ -136,19 +137,63 @@ pub(crate) async fn dispatch_channel_with_key_failover(
     query: Option<&str>,
     repo: &Repository,
 ) -> crate::core::attempt::AttemptResult {
-    let slots = channel_key_slots(channel, repo).await;
+    let mut slots = channel_key_slots(channel, repo).await;
+    slots.truncate(3);
+    let slot_count = slots.len();
     let mut last = None;
     // Keep credential expansion bounded by the same conservative default as
     // RoutePlan's per-group budget. The planner still owns cross-candidate and
     // total-attempt limits; this cap prevents a channel with dozens of keys
     // from bypassing those limits in one closure invocation.
-    for slot in slots.into_iter().take(3) {
-        let result =
-            dispatch_executor(endpoint, attempt, &slot, identity, safe_headers, query).await;
+    for (slot_no, slot) in slots.into_iter().enumerate() {
+        if let Some(active) = budget::current() {
+            if let Err(elapsed) = active.check() {
+                return crate::core::attempt::AttemptResult::Failure(budget_failure(elapsed));
+            }
+        }
+        let mut trace =
+            PhysicalAttemptTrace::new(attempt, slot_no + 1, Some(identity.identity_revision));
+        let result = match budget::run(
+            Duration::from_secs(slot.timeout_secs.max(0) as u64),
+            Box::pin(dispatch_executor(
+                endpoint,
+                attempt,
+                &slot,
+                identity,
+                safe_headers,
+                query,
+            )),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(elapsed) => crate::core::attempt::AttemptResult::Failure(budget_failure(elapsed)),
+        };
+        trace.finish(&result);
         match result {
             crate::core::attempt::AttemptResult::Failure(ref failure)
-                if failure.failure_class == FailureClass::Retryable =>
+                if failure.failure_class == FailureClass::Retryable
+                    && !(budget::current().is_some()
+                        && (matches!(failure.status_code, Some(402 | 504 | 499))
+                            || local_failure_code(failure)
+                                .is_some_and(|code| code != "upstream_transport_failed"))) =>
             {
+                // 可选 RAG 预算内的 Key 轮换也遵守 Retry-After；最后一个 Key
+                // 的等待由计划层负责，避免同一次失败等待两遍。
+                if budget::current().is_some() && slot_no + 1 < slot_count {
+                    if let Some(secs) = failure.retry_after {
+                        if let Err(elapsed) = budget::run(
+                            Duration::from_secs(120),
+                            tokio::time::sleep(Duration::from_secs(secs.min(120))),
+                        )
+                        .await
+                        {
+                            return crate::core::attempt::AttemptResult::Failure(budget_failure(
+                                elapsed,
+                            ));
+                        }
+                    }
+                }
                 last = Some(result)
             }
             _ => return result,
@@ -162,6 +207,145 @@ pub(crate) async fn dispatch_channel_with_key_failover(
             retry_after: None,
         })
     })
+}
+
+pub(crate) fn budget_failure(elapsed: BudgetElapsed) -> AttemptFailure {
+    AttemptFailure {
+        failure_class: FailureClass::Retryable,
+        message: match elapsed {
+            BudgetElapsed::Deadline => "RAG absolute deadline exceeded",
+            BudgetElapsed::ChannelTimeout => "upstream channel timeout exceeded",
+            BudgetElapsed::Cancelled => "client cancelled RAG request",
+        }
+        .to_string(),
+        status_code: None,
+        retry_after: None,
+    }
+}
+
+/// None 表示尚未收到 HTTP 响应。只有本地构造函数可设置这些固定原因，
+/// 实际上游错误总携带 Some(status)，其自由正文不能冒充预算或传输失败。
+pub(crate) fn local_failure_code(failure: &AttemptFailure) -> Option<&'static str> {
+    if failure.status_code.is_some() {
+        return None;
+    }
+    match failure.message.as_str() {
+        "RAG absolute deadline exceeded" => Some("rag_deadline_exceeded"),
+        "upstream channel timeout exceeded" | "upstream transport timed out" => {
+            Some("model_timeout")
+        }
+        "client cancelled RAG request" => Some("client_cancelled"),
+        "upstream transport failed" => Some("upstream_transport_failed"),
+        _ => None,
+    }
+}
+
+fn failure_kind(failure: &AttemptFailure) -> &'static str {
+    if let Some(code) = local_failure_code(failure) {
+        return code;
+    }
+    match failure {
+        _ if failure.failure_class == FailureClass::ChannelAuthTerminal => "authentication_failed",
+        _ if failure.failure_class == FailureClass::UpstreamProtocolError => "protocol_failed",
+        _ if failure.status_code == Some(402)
+            || (failure.status_code == Some(429)
+                && failure.failure_class == FailureClass::CallerTerminal) =>
+        {
+            "quota_exceeded"
+        }
+        _ if failure.status_code == Some(429) => "rate_limited",
+        _ if failure.status_code == Some(504) => "upstream_timeout",
+        _ if failure.status_code.is_some_and(|status| status >= 500) => "upstream_http_5xx",
+        _ => "request_rejected",
+    }
+}
+
+pub(crate) fn local_failure_status(failure: &AttemptFailure) -> Option<u16> {
+    match local_failure_code(failure) {
+        Some("rag_deadline_exceeded" | "model_timeout") => Some(504),
+        Some("client_cancelled") => Some(499),
+        Some("upstream_transport_failed") => Some(502),
+        _ => None,
+    }
+}
+
+/// 一行对应一次真实出站尝试，只记录路由身份和 Key 序号，不记录凭据或正文。
+struct PhysicalAttemptTrace {
+    started: Instant,
+    channel_id: String,
+    upstream_model: String,
+    upstream_protocol: String,
+    identity_revision: Option<i64>,
+    attempt_no: usize,
+    key_slot: usize,
+    active: Option<budget::Budget>,
+    finished: bool,
+}
+
+impl PhysicalAttemptTrace {
+    fn new(
+        attempt: &crate::core::attempt::PreparedAttempt,
+        key_slot: usize,
+        identity_revision: Option<i64>,
+    ) -> Self {
+        let trace = Self {
+            started: Instant::now(),
+            channel_id: attempt.channel_id.clone(),
+            upstream_model: attempt.upstream_model.clone(),
+            upstream_protocol: attempt.upstream_protocol.clone(),
+            identity_revision,
+            attempt_no: attempt.attempt_no,
+            key_slot,
+            active: budget::current(),
+            finished: false,
+        };
+        tracing::info!(channel_id = %trace.channel_id, attempt_no = trace.attempt_no,
+            upstream_model = %trace.upstream_model, upstream_protocol = %trace.upstream_protocol, identity_revision = trace.identity_revision,
+            key_slot = trace.key_slot, request_id = trace.active.as_ref().map(|b| b.request_id()),
+            stage = trace.active.as_ref().map(|b| b.stage_name()), "上游物理尝试开始");
+        trace
+    }
+
+    fn finish(&mut self, result: &crate::core::attempt::AttemptResult) {
+        let (status, outcome) = match result {
+            crate::core::attempt::AttemptResult::Success(success) => (success.status, "success"),
+            crate::core::attempt::AttemptResult::Failure(failure) => (
+                local_failure_status(failure)
+                    .or(failure.status_code)
+                    .unwrap_or(502),
+                failure_kind(failure),
+            ),
+        };
+        self.record(status, outcome);
+        self.finished = true;
+    }
+
+    fn record(&self, status: u16, outcome: &str) {
+        tracing::info!(channel_id = %self.channel_id, attempt_no = self.attempt_no,
+            upstream_model = %self.upstream_model, upstream_protocol = %self.upstream_protocol, identity_revision = self.identity_revision,
+            key_slot = self.key_slot, request_id = self.active.as_ref().map(|b| b.request_id()),
+            stage = self.active.as_ref().map(|b| b.stage_name()), duration_ms = self.started.elapsed().as_millis() as u64,
+            status, outcome, "上游物理尝试终态");
+    }
+}
+
+impl Drop for PhysicalAttemptTrace {
+    fn drop(&mut self) {
+        if !self.finished {
+            let expired = self
+                .active
+                .as_ref()
+                .is_some_and(|b| b.remaining().is_zero());
+            self.record(
+                if expired { 504 } else { 499 },
+                if expired {
+                    "deadline_exceeded"
+                } else {
+                    "client_cancelled"
+                },
+            );
+        }
+    }
 }
 
 fn candidate_lookup(plan: &RoutePlan) -> HashMap<String, RouteCandidate> {
@@ -374,8 +558,25 @@ pub(crate) async fn route_plan_response_with_auth_service(
                         result
                     }
                     Some(RouteCandidate::AuthAccount(_)) => {
-                        dispatch_auth_account_executor(endpoint, &attempt, &auth_service, &safe)
-                            .await
+                        let mut trace = PhysicalAttemptTrace::new(&attempt, 1, None);
+                        let result = match budget::run(
+                            Duration::from_secs(120),
+                            dispatch_auth_account_executor(
+                                endpoint,
+                                &attempt,
+                                &auth_service,
+                                &safe,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(elapsed) => crate::core::attempt::AttemptResult::Failure(
+                                budget_failure(elapsed),
+                            ),
+                        };
+                        trace.finish(&result);
+                        result
                     }
                     None => crate::core::attempt::AttemptResult::Failure(
                         missing_candidate_failure(&attempt.channel_id),
@@ -412,12 +613,37 @@ pub(crate) async fn route_plan_response_with_auth_service(
         .header(header::CONTENT_TYPE, "application/json");
     // 只使用执行器的类型化失败原因，不从上游正文/自定义错误码猜测超时。
     // 耗尽预算后的 HTTP 仍由 AttemptFlow 决定（Retryable => 502）。
-    if execution.last_failure.as_ref().is_some_and(|failure| {
-        failure.failure_class == FailureClass::Retryable && failure.status_code == Some(504)
-    }) {
-        builder = builder.extension(
-            crate::services::knowledge::model_client::GatewayFailureCode("model_timeout"),
-        );
+    if let Some(failure) = &execution.last_failure {
+        let local_code = match failure {
+            _ if local_failure_code(failure).is_some() => local_failure_code(failure),
+            _ if failure.failure_class == FailureClass::ChannelAuthTerminal => {
+                Some("upstream_authentication_failed")
+            }
+            _ if failure.failure_class == FailureClass::Retryable
+                && failure.status_code == Some(504) =>
+            {
+                Some("model_timeout")
+            }
+            _ if budget::current().is_some() => match failure.status_code {
+                Some(429) if failure.failure_class == FailureClass::CallerTerminal => {
+                    Some("upstream_quota_exceeded")
+                }
+                Some(429) => Some("upstream_rate_limited"),
+                Some(402) => Some("upstream_quota_exceeded"),
+                _ if failure.failure_class == FailureClass::UpstreamProtocolError => {
+                    Some("upstream_protocol_error")
+                }
+                _ if failure.failure_class == FailureClass::Retryable => {
+                    Some("upstream_unavailable")
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(code) = local_code {
+            builder = builder
+                .extension(crate::services::knowledge::model_client::GatewayFailureCode(code));
+        }
     }
     for (name, value) in &execution.response_headers {
         if name.eq_ignore_ascii_case("content-type")
@@ -440,6 +666,420 @@ pub(crate) async fn route_plan_response_with_auth_service(
             )
                 .into_response()
         })
+}
+
+#[cfg(test)]
+mod rag_budget_tests {
+    use super::*;
+    use crate::core::{feature_flags::FeatureFlags, route_plan::authorize_and_plan};
+    use crate::db::models::{ChannelApiKeyInput, CreateApiKeyInput, CreateChannelInput};
+    use crate::security::gate::{DownstreamProtocol, RequestEnvelope, RequestFeatures};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct SlowUpstream {
+        base: String,
+        calls: Arc<AtomicUsize>,
+        closed: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for SlowUpstream {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl SlowUpstream {
+        async fn start(
+            status: u16,
+            delay_headers: bool,
+            delay: Duration,
+            extra_headers: &str,
+            body: &str,
+        ) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}/v1", listener.local_addr().unwrap());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let closed = Arc::new(AtomicUsize::new(0));
+            let (received, disconnected) = (calls.clone(), closed.clone());
+            let (extra_headers, body) = (extra_headers.to_string(), body.to_string());
+            let task = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let (received, disconnected) = (received.clone(), disconnected.clone());
+                    let (extra_headers, body) = (extra_headers.clone(), body.clone());
+                    tokio::spawn(async move {
+                        let mut buffer = Vec::new();
+                        let mut bytes = [0u8; 4096];
+                        loop {
+                            let count = socket.read(&mut bytes).await.unwrap_or(0);
+                            if count == 0 {
+                                return;
+                            }
+                            buffer.extend_from_slice(&bytes[..count]);
+                            let Some(end) = buffer.windows(4).position(|part| part == b"\r\n\r\n")
+                            else {
+                                continue;
+                            };
+                            let headers = String::from_utf8_lossy(&buffer[..end]);
+                            let content_length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if buffer.len() >= end + 4 + content_length {
+                                break;
+                            }
+                        }
+                        received.fetch_add(1, Ordering::SeqCst);
+                        let response_headers = format!("HTTP/1.1 {status} mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n", body.len());
+                        if !delay_headers
+                            && socket.write_all(response_headers.as_bytes()).await.is_err()
+                        {
+                            return;
+                        }
+                        if !delay.is_zero() {
+                            tokio::select! {
+                                _ = tokio::time::sleep(delay) => {},
+                                _ = socket.read(&mut bytes) => {
+                                    disconnected.fetch_add(1, Ordering::SeqCst);
+                                    return;
+                                },
+                            }
+                        }
+                        if delay_headers
+                            && socket.write_all(response_headers.as_bytes()).await.is_err()
+                        {
+                            return;
+                        }
+                        let _ = socket.write_all(body.as_bytes()).await;
+                    });
+                }
+            });
+            Self {
+                base,
+                calls,
+                closed,
+                task,
+            }
+        }
+    }
+
+    async fn setup(base: &str) -> (Arc<Repository>, ApiKey, RoutePlan, AuditedRequest) {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let repo = Arc::new(Repository::new(pool));
+        let key = repo
+            .create_api_key(&CreateApiKeyInput {
+                name: "budget-test".into(),
+                key: None,
+                allowed_models: None,
+                allowed_channels: None,
+                denied_models: None,
+                denied_channels: None,
+                quota_limit: None,
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+        let mut channels = Vec::new();
+        for priority in [10, 5] {
+            channels.push(
+                repo.create_channel(&CreateChannelInput {
+                    name: format!("upstream-{priority}"),
+                    channel_type: "openai".into(),
+                    base_url: base.into(),
+                    api_key: "test-primary".into(),
+                    models: vec!["embedding-test".into()],
+                    priority: Some(priority),
+                    protocol: Some("openai".into()),
+                    provider: Some("custom".into()),
+                    native_base_url: Some(base.into()),
+                    native_endpoints: Some(vec!["embeddings".into()]),
+                    timeout_secs: Some(30),
+                    extra_keys: Some(vec![ChannelApiKeyInput {
+                        api_key: "test-secondary".into(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        let body = json!({"model":"embedding-test", "input":["query"], "encoding_format":"float"});
+        let plan = authorize_and_plan(
+            &key,
+            "embedding-test",
+            EndpointKind::Embeddings,
+            &channels,
+            &FeatureFlags::all_on(),
+            &body,
+            &mut rand::rngs::StdRng::seed_from_u64(7),
+        )
+        .unwrap();
+        let audit = AuditedRequest {
+            envelope: RequestEnvelope {
+                downstream_protocol: DownstreamProtocol::Embeddings,
+                endpoint: "/v1/embeddings".into(),
+                original_json: body.clone(),
+                safe_forward_headers: vec![],
+                query: None,
+                model: "embedding-test".into(),
+                stream: false,
+                trace_id: Some("budget-test".into()),
+            },
+            forward_json: body.clone(),
+            sanitized_log_json: body,
+            body_hash: "h".into(),
+            body_len: 0,
+            audit_result: security::SecurityScanResult::default(),
+            request_features: RequestFeatures::default(),
+            security_settings: security::SecuritySettings::default(),
+        };
+        (repo, key, plan, audit)
+    }
+
+    #[derive(Clone, Copy)]
+    struct RequestElapsed(Duration);
+
+    async fn request(mock: &SlowUpstream, timeout_ms: Option<u64>) -> Response {
+        let (repo, key, plan, audit) = setup(&mock.base).await;
+        let future = route_plan_response(
+            plan,
+            &audit,
+            &key,
+            &[],
+            "embedding",
+            &repo,
+            "{}",
+            Some("budget-test".into()),
+        );
+        // 仅测量预算建立后的请求；真实数据库迁移不属于请求预算。
+        let started = Instant::now();
+        let mut response = match timeout_ms {
+            Some(timeout) => {
+                budget::Budget::new(timeout, "budget-test")
+                    .scope(future)
+                    .await
+            }
+            None => future.await,
+        };
+        response
+            .extensions_mut()
+            .insert(RequestElapsed(started.elapsed()));
+        response
+    }
+
+    const VECTOR: &str = r#"{"data":[{"index":0,"embedding":[1.0,0.0]}],"usage":{"prompt_tokens":1,"total_tokens":1}}"#;
+
+    async fn warm_request_path() {
+        // 独立快速上游预热真实客户端；目标请求的 150ms 只测试已经可达的网络路径。
+        let warmup = SlowUpstream::start(200, false, Duration::ZERO, "", VECTOR).await;
+        assert_eq!(request(&warmup, None).await.status(), StatusCode::OK);
+        assert_eq!(warmup.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rag_deadline_covers_headers_and_body_without_key_or_channel_replay() {
+        warm_request_path().await;
+        for delay_headers in [true, false] {
+            let mock =
+                SlowUpstream::start(200, delay_headers, Duration::from_secs(2), "", VECTOR).await;
+            let response = request(&mock, Some(150)).await;
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            let elapsed = response.extensions().get::<RequestElapsed>().unwrap().0;
+            assert!(elapsed < Duration::from_secs(1), "请求耗时：{elapsed:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                mock.closed.load(Ordering::SeqCst),
+                1,
+                "deadline must drop the upstream TCP response"
+            );
+            assert_eq!(
+                response
+                    .extensions()
+                    .get::<crate::services::knowledge::model_client::GatewayFailureCode>()
+                    .unwrap()
+                    .0,
+                "rag_deadline_exceeded"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rag_retry_after_shares_the_same_deadline_for_rate_limits_and_server_errors() {
+        warm_request_path().await;
+        for status in [429, 503] {
+            let mock = SlowUpstream::start(
+                status,
+                false,
+                Duration::ZERO,
+                "Retry-After: 10\r\n",
+                r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+            )
+            .await;
+            let response = request(&mock, Some(150)).await;
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            let elapsed = response.extensions().get::<RequestElapsed>().unwrap().0;
+            assert!(elapsed < Duration::from_secs(1), "请求耗时：{elapsed:?}");
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn rag_auth_and_structured_quota_rejections_are_terminal() {
+        for (status, body, expected_code) in [
+            (
+                200,
+                r#"{"error":{"code":"insufficient_quota"}}"#,
+                "upstream_quota_exceeded",
+            ),
+            (
+                401,
+                r#"{"error":{"message":"untrusted secret"}}"#,
+                "upstream_authentication_failed",
+            ),
+            (403, "{}", "upstream_authentication_failed"),
+            (402, "{}", "upstream_quota_exceeded"),
+            (
+                429,
+                r#"{"error":{"code":"insufficient_quota"}}"#,
+                "upstream_quota_exceeded",
+            ),
+        ] {
+            let mock = SlowUpstream::start(status, false, Duration::ZERO, "", body).await;
+            let response = request(&mock, Some(1_000)).await;
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                response
+                    .extensions()
+                    .get::<crate::services::knowledge::model_client::GatewayFailureCode>()
+                    .unwrap()
+                    .0,
+                expected_code
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_rag_future_closes_the_upstream_and_never_replays() {
+        let mock = SlowUpstream::start(200, false, Duration::from_secs(2), "", VECTOR).await;
+        let (repo, key, plan, audit) = setup(&mock.base).await;
+        let task = tokio::spawn(async move {
+            budget::Budget::new(1_000, "budget-test")
+                .scope(route_plan_response(
+                    plan,
+                    &audit,
+                    &key,
+                    &[],
+                    "embedding",
+                    &repo,
+                    "{}",
+                    Some("budget-test".into()),
+                ))
+                .await
+        });
+        for _ in 0..100 {
+            if mock.calls.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn channel_cap_is_distinct_from_the_longer_rag_deadline() {
+        let mock = SlowUpstream::start(200, false, Duration::from_secs(3), "", VECTOR).await;
+        let (repo, key, mut plan, audit) = setup(&mock.base).await;
+        for group in &mut plan.groups {
+            for candidate in &mut group.candidates {
+                if let RouteCandidate::Channel { channel, .. } = &mut candidate.candidate {
+                    channel.timeout_secs = 1;
+                }
+            }
+        }
+        let response = budget::Budget::new(2_000, "budget-test")
+            .scope(route_plan_response(
+                plan,
+                &audit,
+                &key,
+                &[],
+                "embedding",
+                &repo,
+                "{}",
+                Some("budget-test".into()),
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<crate::services::knowledge::model_client::GatewayFailureCode>()
+                .unwrap()
+                .0,
+            "model_timeout"
+        );
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn upstream_messages_cannot_spoof_local_failure_or_quota_classification() {
+        budget::Budget::new(1_000, "test")
+            .scope(async {
+                for message in [
+                    "RAG absolute deadline exceeded",
+                    "upstream transport timed out",
+                    "upstream transport failed",
+                ] {
+                    let body = json!({"error":{"message":message}}).to_string();
+                    let failure = crate::endpoint_executor::failure_from_upstream(502, &body, None);
+                    assert_eq!(local_failure_code(&failure), None);
+                }
+                let failure = crate::endpoint_executor::failure_from_upstream(
+                    429,
+                    r#"{"error":{"message":"insufficient_quota"}}"#,
+                    None,
+                );
+                assert_eq!(failure.failure_class, FailureClass::Retryable);
+                assert_eq!(
+                    local_failure_code(&budget_failure(BudgetElapsed::Deadline)),
+                    Some("rag_deadline_exceeded")
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn historical_requests_keep_success_and_existing_key_failover() {
+        let mock = SlowUpstream::start(200, false, Duration::from_millis(40), "", VECTOR).await;
+        assert_eq!(request(&mock, None).await.status(), StatusCode::OK);
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+        let rate_limited = SlowUpstream::start(429, false, Duration::ZERO, "", "{}").await;
+        assert_eq!(
+            request(&rate_limited, None).await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            rate_limited.calls.load(Ordering::SeqCst),
+            4,
+            "two Keys on two channels retain legacy failover"
+        );
+    }
 }
 
 /// Write the RequestLog + quota for a non-stream facade execution.
