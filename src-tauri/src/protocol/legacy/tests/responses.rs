@@ -168,6 +168,29 @@ fn responses_to_openai_rejects_item_without_role_instead_of_dropping_it() {
 }
 
 #[test]
+fn responses_to_openai_rejects_additional_tools_input_item() {
+    let body = serde_json::json!({
+        "model": "m",
+        "input": [{"type": "additional_tools", "tools": [{"type": "custom", "name": "exec"}]}]
+    });
+    let error = responses_to_openai(&body).unwrap_err();
+    assert!(error.json_pointers.contains(&"/input/0/type".to_string()));
+}
+
+#[test]
+fn responses_to_openai_drops_empty_additional_tools_input_item() {
+    let body = serde_json::json!({
+        "model": "m",
+        "input": [
+            {"type": "additional_tools", "tools": []},
+            {"type": "message", "role": "user", "content": "hello"}
+        ]
+    });
+    let converted = responses_to_openai(&body).unwrap();
+    assert_eq!(converted["messages"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn responses_to_openai_maps_string_input_to_a_user_message() {
     let body = serde_json::json!({"model": "m", "input": "hello"});
     let converted = responses_to_openai(&body).unwrap();

@@ -281,8 +281,6 @@ fn validate_responses_input_items(
         "code_interpreter_call",
         "local_shell_call",
         "local_shell_call_output",
-        "custom_tool_call",
-        "custom_tool_call_output",
         "image_generation_call",
         "item_reference",
     ];
@@ -321,8 +319,17 @@ fn validate_responses_input_items(
         };
         let known = matches!(
             item_type,
-            "message" | "function_call" | "function_call_output"
+            "message"
+                | "function_call"
+                | "function_call_output"
+                | "custom_tool_call"
+                | "custom_tool_call_output"
         ) || (item_type == "item" && object.get("role").is_some())
+            || (item_type == "additional_tools"
+                && object
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty))
             || KNOWN_DROPPED.contains(&item_type);
         if !known {
             crate::protocol::codec::request::reject(
@@ -364,7 +371,10 @@ pub(super) fn convert_responses_input_to_messages(input: &Value) -> Value {
             let mut seen = false;
             for (i, item) in arr.iter().enumerate().rev() {
                 v[i] = seen;
-                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                if matches!(
+                    item.get("type").and_then(|t| t.as_str()),
+                    Some("function_call" | "custom_tool_call")
+                ) {
                     seen = true;
                 }
             }
@@ -374,7 +384,7 @@ pub(super) fn convert_responses_input_to_messages(input: &Value) -> Value {
         for item in arr {
             let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match item_type {
-                "function_call" => {
+                "function_call" | "custom_tool_call" => {
                     let cid = item
                         .get("call_id")
                         .and_then(|c| c.as_str())
@@ -389,7 +399,7 @@ pub(super) fn convert_responses_input_to_messages(input: &Value) -> Value {
                         call_ids.insert(cid);
                     }
                 }
-                "function_call_output" => {
+                "function_call_output" | "custom_tool_call_output" => {
                     let cid = item
                         .get("call_id")
                         .and_then(|c| c.as_str())
@@ -509,9 +519,19 @@ pub(super) fn convert_responses_input_to_messages(input: &Value) -> Value {
                 }
 
                 // function_call: assistant's tool call → buffer for the next merged assistant message
-                "function_call" => {
+                "function_call" | "custom_tool_call" => {
                     let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let arguments = item.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
+                    let arguments = if item_type == "custom_tool_call" {
+                        serde_json::to_string(&serde_json::json!({
+                            "input": item.get("input").and_then(Value::as_str).unwrap_or("")
+                        }))
+                        .unwrap_or_else(|_| "{\"input\":\"\"}".to_owned())
+                    } else {
+                        item.get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned()
+                    };
                     let original_call_id = item
                         .get("call_id")
                         .and_then(|c| c.as_str())
@@ -522,12 +542,12 @@ pub(super) fn convert_responses_input_to_messages(input: &Value) -> Value {
                         .get(&original_call_id)
                         .cloned()
                         .unwrap_or(original_call_id);
-                    pending_tool_calls.push((call_id, name.to_string(), arguments.to_string()));
+                    pending_tool_calls.push((call_id, name.to_string(), arguments));
                 }
 
                 // function_call_output: tool result → OpenAI tool message, then
                 // release any deferred messages once every awaited output has landed
-                "function_call_output" => {
+                "function_call_output" | "custom_tool_call_output" => {
                     flush_tool_calls(
                         &mut msgs,
                         &mut pending_tool_calls,
@@ -545,7 +565,21 @@ pub(super) fn convert_responses_input_to_messages(input: &Value) -> Value {
                         .get(&original_call_id)
                         .cloned()
                         .unwrap_or(original_call_id);
-                    let output = item.get("output").and_then(|o| o.as_str()).unwrap_or("");
+                    let output = match item.get("output") {
+                        Some(Value::String(output)) => output.clone(),
+                        Some(Value::Array(blocks)) => blocks
+                            .iter()
+                            .filter_map(|block| {
+                                block.get("text").and_then(Value::as_str).filter(|_| {
+                                    matches!(
+                                        block.get("type").and_then(Value::as_str),
+                                        Some("input_text" | "output_text" | "text")
+                                    )
+                                })
+                            })
+                            .collect::<String>(),
+                        _ => String::new(),
+                    };
                     awaiting.remove(&call_id);
                     msgs.push(serde_json::json!({
                         "role": "tool",

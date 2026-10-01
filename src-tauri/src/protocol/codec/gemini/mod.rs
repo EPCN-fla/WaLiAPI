@@ -215,9 +215,11 @@ fn looks_like_thought_signature(value: &str) -> bool {
 /// 没有等价物，保留会让上游 400（`Gemini only supports Responses function
 /// tools`）。这里统一移除、只留 `function`，不把内置工具伪装成 function；
 /// 指向被移除工具的 `tool_choice` 一并移除，避免悬空引用。
-fn normalize_responses_for_gemini(body: &Value) -> (Value, Vec<String>) {
+fn normalize_responses_for_gemini(
+    body: &Value,
+) -> Result<(Value, Vec<String>, Vec<String>), UnsupportedFeatures> {
     let tools = body.get("tools").and_then(Value::as_array);
-    let filtered_tools: Vec<Value> = tools
+    let mut filtered_tools: Vec<Value> = tools
         .map(|items| {
             items
                 .iter()
@@ -230,10 +232,119 @@ fn normalize_responses_for_gemini(body: &Value) -> (Value, Vec<String>) {
         .map(|items| items.len().saturating_sub(filtered_tools.len()))
         .unwrap_or_default();
 
-    let kept_names: std::collections::HashSet<&str> = filtered_tools
-        .iter()
-        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-        .collect();
+    let mut kept_names = std::collections::HashSet::<String>::new();
+    for (index, tool) in filtered_tools.iter().enumerate() {
+        if let Some(name) = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        {
+            if !kept_names.insert(name.to_owned()) {
+                return Err(UnsupportedFeatures::single(
+                    FeatureKind::InvalidToolArguments,
+                    format!("/tools/{index}/name"),
+                    format!("duplicate Responses tool name {name:?}"),
+                ));
+            }
+        }
+    }
+
+    let mut custom_tool_names = Vec::new();
+    let mut retained_input = Vec::new();
+    let mut additional_tool_pointers = Vec::new();
+    if let Some(input) = body.get("input").and_then(Value::as_array) {
+        for (input_index, item) in input.iter().enumerate() {
+            if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+                retained_input.push(item.clone());
+                continue;
+            }
+            additional_tool_pointers.push(format!("/input/{input_index}"));
+            let registry = item.get("tools").and_then(Value::as_array).ok_or_else(|| {
+                UnsupportedFeatures::single(
+                    FeatureKind::InvalidToolArguments,
+                    format!("/input/{input_index}/tools"),
+                    "additional_tools requires a tools array",
+                )
+            })?;
+            for (registry_index, registered) in registry.iter().enumerate() {
+                let registry_pointer = format!("/input/{input_index}/tools/{registry_index}");
+                let entries: Vec<(&Value, String)> =
+                    if registered.get("type").and_then(Value::as_str) == Some("namespace") {
+                        registered
+                            .get("tools")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| {
+                                UnsupportedFeatures::single(
+                                    FeatureKind::InvalidToolArguments,
+                                    format!("{registry_pointer}/tools"),
+                                    "additional_tools namespace requires a tools array",
+                                )
+                            })?
+                            .iter()
+                            .enumerate()
+                            .map(|(index, tool)| {
+                                (tool, format!("{registry_pointer}/tools/{index}"))
+                            })
+                            .collect()
+                    } else {
+                        vec![(registered, registry_pointer)]
+                    };
+
+                for (registered, pointer) in entries {
+                    let tool_type = registered.get("type").and_then(Value::as_str);
+                    if !matches!(tool_type, Some("function" | "custom")) {
+                        return Err(UnsupportedFeatures::single(
+                            FeatureKind::BuiltinTool,
+                            format!("{pointer}/type"),
+                            format!("unsupported additional tool type {tool_type:?}"),
+                        ));
+                    }
+                    let name = registered
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| {
+                            UnsupportedFeatures::single(
+                                FeatureKind::MissingToolField,
+                                format!("{pointer}/name"),
+                                "additional tool requires a non-empty name",
+                            )
+                        })?;
+                    if !kept_names.insert(name.to_owned()) {
+                        return Err(UnsupportedFeatures::single(
+                            FeatureKind::InvalidToolArguments,
+                            format!("{pointer}/name"),
+                            format!("duplicate Responses tool name {name:?}"),
+                        ));
+                    }
+
+                    let mut flattened = if tool_type == Some("custom") {
+                        custom_tool_names.push(name.to_owned());
+                        serde_json::json!({
+                            "type": "function",
+                            "name": name,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "input": {"type": "string"}
+                                },
+                                "required": ["input"]
+                            }
+                        })
+                    } else {
+                        registered.clone()
+                    };
+                    if let Some(description) = registered.get("description") {
+                        flattened["description"] = description.clone();
+                    }
+                    filtered_tools.push(flattened);
+                }
+            }
+        }
+    }
+
+    let kept_names: std::collections::HashSet<&str> =
+        kept_names.iter().map(String::as_str).collect();
     let droppable_tool_choice = body
         .get("tool_choice")
         .and_then(Value::as_object)
@@ -266,13 +377,22 @@ fn normalize_responses_for_gemini(body: &Value) -> (Value, Vec<String>) {
     if droppable_tool_choice {
         normalized_fields.push("/tool_choice".to_owned());
     }
-    if removed_count == 0 && !droppable_tool_choice {
-        return (body.clone(), normalized_fields);
+    let service_tier_changed = body.get("service_tier").is_some();
+    if service_tier_changed {
+        normalized_fields.push("/service_tier".to_owned());
+    }
+    normalized_fields.extend(additional_tool_pointers);
+    let input_changed = body
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|input| retained_input.len() != input.len());
+    if removed_count == 0 && !droppable_tool_choice && !input_changed && !service_tier_changed {
+        return Ok((body.clone(), normalized_fields, custom_tool_names));
     }
 
     let mut normalized = body.clone();
     let Some(normalized_object) = normalized.as_object_mut() else {
-        return (body.clone(), normalized_fields);
+        return Ok((body.clone(), normalized_fields, custom_tool_names));
     };
 
     if filtered_tools.is_empty() {
@@ -283,13 +403,17 @@ fn normalize_responses_for_gemini(body: &Value) -> (Value, Vec<String>) {
     if droppable_tool_choice {
         normalized_object.remove("tool_choice");
     }
+    normalized_object.remove("service_tier");
+    if body.get("input").and_then(Value::as_array).is_some() {
+        normalized_object.insert("input".to_owned(), Value::Array(retained_input));
+    }
 
     tracing::debug!(
         removed_tools = removed_count,
         dropped_tool_choice = droppable_tool_choice,
         "normalized unsupported Responses tools for Antigravity Gemini conversion"
     );
-    (normalized, normalized_fields)
+    Ok((normalized, normalized_fields, custom_tool_names))
 }
 
 fn merge_conversion_context(target: &mut ConversionContext, first: &ConversionContext) {
@@ -298,6 +422,7 @@ fn merge_conversion_context(target: &mut ConversionContext, first: &ConversionCo
     let mut normalized = first.normalized.clone();
     normalized.append(&mut target.normalized);
     target.normalized = normalized;
+    target.custom_tool_names = first.custom_tool_names.clone();
 }
 
 fn responses_context(request: &Value, model: &str) -> ConversionContext {
@@ -451,6 +576,49 @@ fn validate_responses_for_gemini(body: &Value) -> Result<(), UnsupportedFeatures
                     });
                 }
             }
+            Some("custom_tool_call") => {
+                for field in ["call_id", "name", "input"] {
+                    if item
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .is_none()
+                    {
+                        rejected.push(super::error::RejectedField {
+                            code: FeatureKind::MissingToolField.code().to_owned(),
+                            pointer: format!("{pointer}/{field}"),
+                            message: format!("custom_tool_call requires non-empty {field}"),
+                        });
+                    }
+                }
+            }
+            Some("custom_tool_call_output") => {
+                if item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    rejected.push(super::error::RejectedField {
+                        code: FeatureKind::MissingToolField.code().to_owned(),
+                        pointer: format!("{pointer}/call_id"),
+                        message: "custom_tool_call_output requires non-empty call_id".to_owned(),
+                    });
+                }
+                if !matches!(item.get("output"), Some(Value::String(_) | Value::Array(_))) {
+                    rejected.push(super::error::RejectedField {
+                        code: FeatureKind::InvalidToolArguments.code().to_owned(),
+                        pointer: format!("{pointer}/output"),
+                        message: "custom_tool_call_output requires string or content-array output"
+                            .to_owned(),
+                    });
+                }
+            }
+            Some("additional_tools")
+                if item
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty) => {}
             // 这些是 Responses 的已知内置调用/思考记录；Gemini 没有等价物，
             // 可以按既有 fail-open 策略丢弃。未知类型必须拒绝，避免转换器
             // 在 responses_decode.rs 的兜底分支里静默丢掉新协议对象。
@@ -467,8 +635,6 @@ fn validate_responses_for_gemini(body: &Value) -> Result<(), UnsupportedFeatures
                 | "code_interpreter_call"
                 | "local_shell_call"
                 | "local_shell_call_output"
-                | "custom_tool_call"
-                | "custom_tool_call_output"
                 | "image_generation_call"
                 | "item_reference",
             ) => {}
@@ -504,7 +670,8 @@ impl CodecDirection for ResponsesToGemini {
         request: &Value,
         model: &str,
     ) -> Result<(Value, ConversionContext), PrepareError> {
-        let (normalized, first_normalized) = normalize_responses_for_gemini(request);
+        let (normalized, first_normalized, custom_tool_names) =
+            normalize_responses_for_gemini(request)?;
         validate_responses_for_gemini(&normalized)?;
         let mut chat = crate::protocol::responses_to_openai(&normalized)?;
         chat.as_object_mut()
@@ -520,6 +687,7 @@ impl CodecDirection for ResponsesToGemini {
         let mut context = responses_context(request, model);
         context.normalized.extend(first_normalized);
         context.normalized.extend(chat_context.normalized);
+        context.custom_tool_names = custom_tool_names;
         Ok((encoded, context))
     }
     fn new_response_decoder(
@@ -547,6 +715,65 @@ struct GeminiThenChatToResponses {
     inner: ConversionContext,
 }
 
+fn restore_non_stream_custom_tool_calls(
+    response: &mut Value,
+    context: &ConversionContext,
+) -> Result<(), DecodeError> {
+    let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for (index, item) in output.iter_mut().enumerate() {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            continue;
+        }
+        let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+        if !context
+            .custom_tool_names
+            .iter()
+            .any(|custom| custom == name)
+        {
+            continue;
+        }
+        let arguments = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                DecodeError::new(
+                    format!("/output/{index}/arguments"),
+                    "Gemini custom tool call is missing arguments",
+                )
+            })?;
+        let input = serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| {
+                DecodeError::new(
+                    format!("/output/{index}/arguments/input"),
+                    "Gemini custom tool call arguments require a string input",
+                )
+            })?;
+        let object = item
+            .as_object_mut()
+            .expect("Responses output item is an object");
+        object.insert(
+            "id".to_owned(),
+            Value::String(format!("ctc_{}", uuid::Uuid::new_v4().simple())),
+        );
+        object.insert(
+            "type".to_owned(),
+            Value::String("custom_tool_call".to_owned()),
+        );
+        object.remove("arguments");
+        object.insert("input".to_owned(), Value::String(input));
+    }
+    Ok(())
+}
+
 impl NonStreamDecoder for GeminiThenChatToResponses {
     fn decode(&self, body: &Value) -> Result<DecodedResponse, DecodeError> {
         let (chat, usage) =
@@ -557,8 +784,10 @@ impl NonStreamDecoder for GeminiThenChatToResponses {
                 "Chat response missing choices[0].message",
             ));
         }
+        let mut response = crate::protocol::openai_to_responses(&chat, &self.inner.upstream_model);
+        restore_non_stream_custom_tool_calls(&mut response, &self.inner)?;
         Ok(DecodedResponse {
-            body: crate::protocol::openai_to_responses(&chat, &self.inner.upstream_model),
+            body: response,
             usage,
         })
     }
@@ -1010,6 +1239,177 @@ mod tests {
             .features
             .contains(&"unsupported_feature.unknown_block".to_string()));
         assert!(error.json_pointers.contains(&"/input/0/type".to_string()));
+    }
+
+    #[test]
+    fn responses_to_gemini_expands_additional_tools_losslessly() {
+        let req = json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "additional_tools", "tools": [{
+                    "type": "namespace",
+                    "name": "functions",
+                    "tools": [
+                        {"type": "custom", "name": "exec", "description": "run command", "format": {"type": "grammar"}},
+                        {"type": "function", "name": "wait", "parameters": {"type": "object", "properties": {}}}
+                    ]
+                }]}
+            ]
+        });
+        let (encoded, context) = RESPONSES_TO_GEMINI.encode_request(&req, "m").unwrap();
+        assert_eq!(encoded["contents"].as_array().unwrap().len(), 1);
+        let declarations = encoded["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap();
+        assert_eq!(declarations.len(), 2);
+        assert_eq!(declarations[0]["name"], "exec");
+        assert_eq!(
+            declarations[0]["parameters"]["properties"]["input"]["type"],
+            "string"
+        );
+        assert_eq!(declarations[0]["parameters"]["required"], json!(["input"]));
+        assert_eq!(declarations[1]["name"], "wait");
+        assert_eq!(context.custom_tool_names, vec!["exec"]);
+    }
+
+    #[test]
+    fn responses_to_gemini_accepts_priority_service_tier_from_codex() {
+        let request = json!({
+            "model": "gpt-6-sol",
+            "service_tier": "priority",
+            "stream": true,
+            "input": [
+                {"type": "additional_tools", "tools": [{
+                    "type": "namespace",
+                    "name": "functions",
+                    "tools": [{"type": "custom", "name": "exec"}]
+                }]},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "run a command"}
+                ]}
+            ]
+        });
+
+        let (encoded, context) = RESPONSES_TO_GEMINI
+            .encode_request(&request, "claude-opus-4-6-thinking")
+            .expect("Codex service tier is not a Gemini request field");
+
+        assert_eq!(encoded["model"], "claude-opus-4-6-thinking");
+        assert_eq!(
+            encoded["tools"][0]["functionDeclarations"][0]["name"],
+            "exec"
+        );
+        assert!(context
+            .normalized
+            .iter()
+            .any(|pointer| pointer == "/service_tier"));
+    }
+
+    #[test]
+    fn responses_to_gemini_rejects_duplicate_expanded_tool_names() {
+        let req = json!({
+            "input": [{
+                "type": "additional_tools",
+                "tools": [{"type": "namespace", "name": "one", "tools": [
+                    {"type": "custom", "name": "exec"},
+                    {"type": "function", "name": "exec", "parameters": {"type": "object"}}
+                ]}]
+            }]
+        });
+        assert!(RESPONSES_TO_GEMINI.encode_request(&req, "m").is_err());
+    }
+
+    #[test]
+    fn responses_to_gemini_replays_custom_tool_history() {
+        let req = json!({
+            "input": [
+                {"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_1", "name": "exec", "input": "pwd"},
+                {"type": "custom_tool_call_output", "call_id": "call_1", "output": [{"type": "input_text", "text": "E:/repo"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+                {"type": "additional_tools", "tools": [{"type": "custom", "name": "exec"}]}
+            ]
+        });
+        let (encoded, _) = RESPONSES_TO_GEMINI.encode_request(&req, "m").unwrap();
+        assert_eq!(encoded["contents"][0]["role"], "model");
+        assert_eq!(
+            encoded["contents"][0]["parts"][0]["functionCall"]["name"],
+            "exec"
+        );
+        assert_eq!(
+            encoded["contents"][0]["parts"][0]["functionCall"]["args"]["input"],
+            "pwd"
+        );
+        assert_eq!(encoded["contents"][1]["role"], "user");
+        assert_eq!(
+            encoded["contents"][1]["parts"][0]["functionResponse"]["name"],
+            "exec"
+        );
+    }
+
+    #[test]
+    fn responses_to_gemini_restores_non_stream_custom_tool_call() {
+        let req = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run it"}]},
+                {"type": "additional_tools", "tools": [{"type": "custom", "name": "exec"}]}
+            ]
+        });
+        let (_, context) = RESPONSES_TO_GEMINI.encode_request(&req, "m").unwrap();
+        let decoder = RESPONSES_TO_GEMINI.new_response_decoder(&context);
+        let decoded = decoder.decode(&json!({
+            "candidates": [{
+                "content": {"parts": [{"functionCall": {"id": "call_1", "name": "exec", "args": {"input": "pwd"}}}]},
+                "finishReason": "STOP"
+            }]
+        })).unwrap();
+        let item = &decoded.body["output"][0];
+        assert_eq!(item["type"], "custom_tool_call");
+        assert!(item["id"].as_str().unwrap().starts_with("ctc_"));
+        assert_eq!(item["call_id"], "call_1");
+        assert_eq!(item["name"], "exec");
+        assert_eq!(item["input"], "pwd");
+        assert!(item.get("arguments").is_none());
+    }
+
+    #[test]
+    fn responses_to_gemini_restores_stream_custom_tool_call_events() {
+        let req = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run it"}]},
+                {"type": "additional_tools", "tools": [{"type": "custom", "name": "exec"}]}
+            ],
+            "stream": true
+        });
+        let (_, context) = RESPONSES_TO_GEMINI.encode_request(&req, "m").unwrap();
+        let mut decoder = RESPONSES_TO_GEMINI.new_stream_response_decoder(&context);
+        let frame = concat!(
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[",
+            "{\"functionCall\":{\"id\":\"call_1\",\"name\":\"exec\",\"args\":{\"input\":\"pwd\"}}}",
+            "]},\"finishReason\":\"STOP\"}]}}\n\n"
+        );
+        let mut events = decoder.feed(frame.as_bytes()).unwrap();
+        events.extend(decoder.finish().unwrap());
+        let joined = events.join("");
+        assert!(joined.contains("\"type\":\"custom_tool_call\""));
+        assert!(joined.contains("\"id\":\"ctc_"));
+        assert!(joined.contains("response.custom_tool_call_input.delta"));
+        assert!(joined.contains("response.custom_tool_call_input.done"));
+        assert!(!joined.contains("response.function_call_arguments."));
+    }
+
+    #[test]
+    fn responses_to_gemini_drops_empty_additional_tools_registry() {
+        let req = json!({
+            "model": "m",
+            "input": [
+                {"type": "additional_tools", "tools": []},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+            ]
+        });
+        let (encoded, context) = RESPONSES_TO_GEMINI.encode_request(&req, "m").unwrap();
+        assert_eq!(encoded["contents"].as_array().unwrap().len(), 1);
+        assert!(context.normalized.iter().any(|p| p == "/input/0"));
     }
 
     #[test]

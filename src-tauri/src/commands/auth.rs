@@ -1134,7 +1134,11 @@ pub async fn auth_update(
     let model_mapping_json = input
         .model_mapping
         .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
+        .map(|v| {
+            let mut normalized = v.clone();
+            crate::db::models::normalize_model_mapping(&mut normalized);
+            serde_json::to_string(&normalized).unwrap_or_else(|_| "{}".to_string())
+        })
         .unwrap_or_else(|| "{}".to_string());
     let repository = Repository::new(state.db.pool.clone());
     // None = 不修改（沿用库中现值）；Some = 整体替换。
@@ -1147,7 +1151,11 @@ pub async fn auth_update(
     let model_mapping_disabled_json = input
         .model_mapping_disabled
         .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()))
+        .map(|v| {
+            let mut normalized = v.clone();
+            crate::db::models::normalize_model_mapping_disabled(&mut normalized);
+            serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".to_string())
+        })
         .unwrap_or(current_disabled);
     repository
         .update_auth_account(
@@ -1301,6 +1309,18 @@ mod tests {
         assert!(!encoded.contains("access_token") && !encoded.contains("refresh_token"));
     }
 
+    #[test]
+    fn account_dto_normalizes_historical_model_mapping_names() {
+        let mut account = account_fixture();
+        account.model_mapping_json = json!({" alias ": " upstream "}).to_string();
+        account.model_mapping_disabled = json!([[" alias ", " upstream "]]).to_string();
+
+        let dto = dto_from_account(account).unwrap();
+
+        assert_eq!(dto.model_mapping, json!({"alias": "upstream"}));
+        assert_eq!(dto.model_mapping_disabled, json!([["alias", "upstream"]]));
+    }
+
     async fn test_repository() -> Repository {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1309,6 +1329,38 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         Repository::new(pool)
+    }
+
+    #[tokio::test]
+    async fn mapping_disabled_shortcut_normalizes_names_before_storage() {
+        let repository = test_repository().await;
+        let account = repository
+            .upsert_by_provider_account_id(&AuthAccountUpsert {
+                provider: "codex".into(),
+                label: "Codex".into(),
+                account_id: "provider-normalize".into(),
+                attributes: json!({}),
+                payload: json!({"version": 1}),
+                last_refreshed_at: None,
+                next_refresh_after: None,
+                next_retry_after: None,
+            })
+            .await
+            .unwrap();
+
+        repository
+            .update_auth_account_mapping_disabled(
+                &account.id,
+                &json!([[" alias ", " upstream "], [" ", "upstream"]]).to_string(),
+            )
+            .await
+            .unwrap();
+
+        let stored = repository.get_auth_account(&account.id).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&stored.model_mapping_disabled).unwrap(),
+            json!([["alias", "upstream"]])
+        );
     }
 
     #[tokio::test]

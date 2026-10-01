@@ -27,11 +27,62 @@ impl IdentityDirection {
 ///   从未持久化的 reasoning 条目。
 ///
 /// 这些条目已经写入客户端旧会话，因此需要在 identity 回放路径兼容处理。
-fn normalize_responses_input_items(request: &mut Value) {
+fn normalize_responses_input_items(request: &mut Value) -> Vec<String> {
     let store_is_disabled = request.get("store").and_then(Value::as_bool) == Some(false);
     let Some(items) = request.get_mut("input").and_then(Value::as_array_mut) else {
-        return;
+        return Vec::new();
     };
+
+    // 旧转换链可能在上游只返回参数、没有返回工具名时生成空名 function_call。
+    // 原生 Responses 会拒绝整个历史；工具名无法可靠反推，因此删除坏调用及其
+    // 配对输出。若同一 call_id 仍有合法调用，则保守保留其输出。
+    let valid_call_ids = items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .filter(|item| {
+            item.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.trim().is_empty())
+        })
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .filter(|call_id| !call_id.is_empty())
+        .map(str::to_owned)
+        .collect::<std::collections::HashSet<_>>();
+    let invalid_call_ids = items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .filter(|item| {
+            !item
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.trim().is_empty())
+        })
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .filter(|call_id| !call_id.is_empty() && !valid_call_ids.contains(*call_id))
+        .map(str::to_owned)
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut normalized = Vec::new();
+    let original_items = std::mem::take(items);
+    for (index, item) in original_items.into_iter().enumerate() {
+        let item_type = item.get("type").and_then(Value::as_str);
+        let blank_function_call = item_type == Some("function_call")
+            && !item
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.trim().is_empty());
+        let paired_output = item_type == Some("function_call_output")
+            && item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .is_some_and(|call_id| invalid_call_ids.contains(call_id));
+        if blank_function_call || paired_output {
+            normalized.push(format!("/input/{index}"));
+        } else {
+            items.push(item);
+        }
+    }
+
     for item in items.iter_mut() {
         match item.get("type").and_then(Value::as_str) {
             Some("function_call") => {
@@ -102,6 +153,43 @@ fn normalize_responses_input_items(request: &mut Value) {
             _ => {}
         }
     }
+    normalized
+}
+
+/// Codex Responses Lite 把本轮工具注册表放在首个 `additional_tools`
+/// 输入项中，部分 Responses 兼容上游只读取顶层 `tools`。在原生
+/// Responses 转发时保留原输入项，同时在顶层缺失工具时复制一份，避免
+/// 上游把工具调用降级成普通文本。
+fn promote_additional_tools(request: &mut Value) -> bool {
+    let top_level_tools_missing = match request.get("tools") {
+        None => true,
+        Some(Value::Array(tools)) => tools.is_empty(),
+        Some(_) => false,
+    };
+    if !top_level_tools_missing {
+        return false;
+    }
+
+    let tools = request
+        .get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        })
+        .and_then(|item| item.get("tools"))
+        .and_then(Value::as_array)
+        .filter(|tools| !tools.is_empty())
+        .cloned();
+    let Some(tools) = tools else {
+        return false;
+    };
+    let Some(object) = request.as_object_mut() else {
+        return false;
+    };
+    object.insert("tools".to_owned(), Value::Array(tools));
+    true
 }
 
 impl CodecDirection for IdentityDirection {
@@ -141,9 +229,13 @@ impl CodecDirection for IdentityDirection {
         if !object.contains_key("stream") {
             object.insert("stream".to_owned(), Value::Bool(false));
         }
-        if self.protocol == Protocol::Responses {
-            normalize_responses_input_items(&mut encoded);
-        }
+        let promoted_additional_tools =
+            self.protocol == Protocol::Responses && promote_additional_tools(&mut encoded);
+        let normalized_input_items = if self.protocol == Protocol::Responses {
+            normalize_responses_input_items(&mut encoded)
+        } else {
+            Vec::new()
+        };
         let request_id = request
             .get("id")
             .and_then(Value::as_str)
@@ -153,10 +245,12 @@ impl CodecDirection for IdentityDirection {
             .get("stream")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        Ok((
-            encoded,
-            ConversionContext::new(request_id, mapped_model, stream),
-        ))
+        let mut context = ConversionContext::new(request_id, mapped_model, stream);
+        context.normalized.extend(normalized_input_items);
+        if promoted_additional_tools {
+            context.normalized.push("/tools".to_owned());
+        }
+        Ok((encoded, context))
     }
 
     fn new_response_decoder(

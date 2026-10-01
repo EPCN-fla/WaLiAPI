@@ -110,6 +110,58 @@ fn native_explicit_stream_true_is_preserved() {
     assert_eq!(encoded["stream"], true);
 }
 
+#[test]
+fn responses_identity_promotes_additional_tools_to_top_level_tools() {
+    let request = serde_json::json!({
+        "model": "gpt-5.6-sol",
+        "stream": true,
+        "tool_choice": "auto",
+        "input": [{
+            "type": "additional_tools",
+            "id": "at_test",
+            "role": "developer",
+            "tools": [{
+                "type": "namespace",
+                "name": "functions",
+                "tools": [{
+                    "type": "custom",
+                    "name": "exec",
+                    "description": "Run JavaScript",
+                    "format": {"type": "text"}
+                }]
+            }]
+        }]
+    });
+
+    let (encoded, context) = RESPONSES_IDENTITY
+        .encode_request(&request, "glm-5.2")
+        .expect("native Responses request must be encodable");
+
+    assert_eq!(encoded["model"], "glm-5.2");
+    assert_eq!(encoded["tools"], request["input"][0]["tools"]);
+    assert_eq!(encoded["input"][0], request["input"][0]);
+    assert!(context.normalized.iter().any(|pointer| pointer == "/tools"));
+}
+
+#[test]
+fn responses_identity_preserves_explicit_top_level_tools() {
+    let request = serde_json::json!({
+        "model": "gpt-5.6-sol",
+        "tools": [{"type": "function", "name": "existing", "parameters": {"type": "object"}}],
+        "input": [{
+            "type": "additional_tools",
+            "tools": [{"type": "function", "name": "fallback", "parameters": {"type": "object"}}]
+        }]
+    });
+
+    let (encoded, context) = RESPONSES_IDENTITY
+        .encode_request(&request, "glm-5.2")
+        .expect("native Responses request must be encodable");
+
+    assert_eq!(encoded["tools"], request["tools"]);
+    assert!(!context.normalized.iter().any(|pointer| pointer == "/tools"));
+}
+
 /// issue #129：旧会话里 `function_call` 条目的 `id` 曾被打上游 Chat 的
 /// tool_call id（`call_xxx`），官方 Responses 上游回放历史时会 400。
 /// identity 转发前必须把它规范成 `fc_` 前缀，且不动 `call_id`。
@@ -167,6 +219,58 @@ fn responses_identity_rewrites_legacy_function_call_item_ids() {
     assert_eq!(items[3]["id"], serde_json::json!("fc_already_ok"));
     // 非 function_call 条目不受影响。
     assert!(items[0].get("id").is_none());
+}
+
+/// 历史跨协议流若生成了没有工具名的调用，Responses 原生上游会拒绝整段会话。
+/// 工具名无法可靠反推，因此应成对移除坏调用及其输出，保留其余合法历史。
+#[test]
+fn responses_identity_drops_blank_function_call_and_paired_output() {
+    let request = serde_json::json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "function_call",
+                "id": "fc_bad",
+                "call_id": "call_bad",
+                "name": "   ",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_bad",
+                "output": "legacy output"
+            },
+            {
+                "type": "function_call",
+                "id": "fc_good",
+                "call_id": "call_good",
+                "name": "exec_command",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_good",
+                "output": "ok"
+            }
+        ]
+    });
+
+    let (encoded, context) = RESPONSES_IDENTITY
+        .encode_request(&request, "gpt-5.6-sol")
+        .expect("legacy Responses history must remain encodable");
+    let items = encoded["input"].as_array().unwrap();
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["call_id"], "call_good");
+    assert_eq!(items[1]["call_id"], "call_good");
+    assert!(context
+        .normalized
+        .iter()
+        .any(|pointer| pointer == "/input/0"));
+    assert!(context
+        .normalized
+        .iter()
+        .any(|pointer| pointer == "/input/1"));
 }
 
 /// 旧版 Chat→Responses 会把明文推理放进 `reasoning.content`；官方 Responses

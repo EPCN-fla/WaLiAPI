@@ -98,7 +98,7 @@ async fn try_ocr_with_channel(
     let image_data = base64::engine::general_purpose::STANDARD.encode(jpeg);
 
     // 应用模型映射（与 embedder.rs 同一语义）
-    let actual_model = apply_model_mapping(model, &channel.model_mapping);
+    let actual_model = super::super::resolve_channel_model(channel, model);
 
     // 按渠道协议构造请求：claude 渠道走 Anthropic Messages 视觉格式（/messages + x-api-key），
     // 其余渠道走 OpenAI Chat Completions 视觉格式（/chat/completions + Bearer）
@@ -228,15 +228,4 @@ async fn try_ocr_with_channel(
         markdown: content,
         total_tokens,
     })
-}
-
-fn apply_model_mapping(model: &str, mapping_json: &str) -> String {
-    if mapping_json.is_empty() || mapping_json == "{}" {
-        return model.to_string();
-    }
-    let mapping: serde_json::Value = serde_json::from_str(mapping_json).unwrap_or_default();
-    if let Some(mapped) = mapping.get(model).and_then(|m| m.as_str()) {
-        return mapped.to_string();
-    }
-    model.to_string()
 }
