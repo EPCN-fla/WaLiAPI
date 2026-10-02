@@ -25,6 +25,7 @@ type AccountActions = {
   onRelogin: () => void;
   /** 映射对快捷开启/关闭（迁移 042） */
   onToggleMapping: (from: string, to: string, currentlyOff: boolean) => void;
+  onReset: () => void;
 };
 
 type ActionButtonProps = {
@@ -134,7 +135,8 @@ function RowActions({ account, actions }: { account: AuthAccount; actions: Accou
           {(account.provider === "codex" || account.provider === "gemini") && <ActionButton label="刷新额度" onClick={actions.onRefreshQuota} disabled={actions.pending} className="rounded-lg p-1.5 text-muted-foreground hover:bg-primary/10 hover:text-primary disabled:opacity-50">{actions.quotaPending ? <Loader2 size={15} className="animate-spin" /> : <Gauge size={15} />}</ActionButton>}
           <ActionButton label="刷新令牌" onClick={actions.onRefresh} disabled={actions.pending} className="rounded-lg p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50">{actions.pending && !actions.quotaPending ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}</ActionButton>
           <ActionButton label="同步模型" onClick={actions.onSync} disabled={actions.pending} className="rounded-lg p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"><RotateCw size={15} /></ActionButton>
-          {account.provider === "codex" && <ActionButton label="导出 JSON" onClick={actions.onExport} disabled={actions.pending} className="rounded-lg p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"><Download size={15} /></ActionButton>}
+      {account.provider === "codex" && !account.disabled && account.status !== "invalid" && <ActionButton label="使用重置卡" onClick={actions.onReset} disabled={actions.pending} className="rounded-lg border border-emerald-200 bg-emerald-50 p-1.5 text-emerald-600 hover:bg-emerald-100 disabled:opacity-50"><span className="text-xs font-bold">R</span></ActionButton>}
+      {account.provider === "codex" && <ActionButton label="导出 JSON" onClick={actions.onExport} disabled={actions.pending} className="rounded-lg p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"><Download size={15} /></ActionButton>}
         </>
       )}
       <ActionButton label="编辑账号" onClick={actions.onEdit} disabled={actions.pending} className="rounded-lg p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"><Edit3 size={15} /></ActionButton>
