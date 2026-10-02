@@ -90,15 +90,6 @@ pub fn blocking_client(timeout_secs: u64, proxy_url: Option<&str>) -> reqwest::C
     }
 }
 
-/// 构建使用全局代理设置的非流式客户端。
-///
-/// 模型同步在渠道代理缺省或 `global` 时通过 `ProxySetting::resolve` 读取
-/// `global_proxy_url`；Auth 账号没有渠道级 config，因此直接复用同一全局语义。
-/// 代理 URL 不写死端口，设置页保存的任意可用本地代理都会生效。
-pub fn global_blocking_client(timeout_secs: u64) -> reqwest::Client {
-    blocking_client(timeout_secs, global_proxy_url().as_deref())
-}
-
 /// Build a reqwest client for **streaming** (SSE) requests: only the TCP
 /// connection establishment is capped at [`CONNECT_TIMEOUT_SECS`]; the
 /// response body is allowed to stream indefinitely so long LLM generations

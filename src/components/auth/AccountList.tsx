@@ -5,6 +5,7 @@ import type { AuthAccount, AuthQuotaState, AuthQuotaWindow, AuthModelState } fro
 import { quotaDisplayState } from "./quotaDisplay";
 import { QuotaBlock } from "./QuotaBlock";
 import { MappingChips } from "../MappingChips";
+import { ResetCreditIcon } from "./ResetCreditIcon";
 
 const WINDOW_MINUTES = {
   fiveHours: 5 * 60,
@@ -135,7 +136,7 @@ function RowActions({ account, actions }: { account: AuthAccount; actions: Accou
           {(account.provider === "codex" || account.provider === "gemini") && <ActionButton label="刷新额度" onClick={actions.onRefreshQuota} disabled={actions.pending} className="rounded-lg p-1.5 text-muted-foreground hover:bg-primary/10 hover:text-primary disabled:opacity-50">{actions.quotaPending ? <Loader2 size={15} className="animate-spin" /> : <Gauge size={15} />}</ActionButton>}
           <ActionButton label="刷新令牌" onClick={actions.onRefresh} disabled={actions.pending} className="rounded-lg p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50">{actions.pending && !actions.quotaPending ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}</ActionButton>
           <ActionButton label="同步模型" onClick={actions.onSync} disabled={actions.pending} className="rounded-lg p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"><RotateCw size={15} /></ActionButton>
-      {account.provider === "codex" && !account.disabled && account.status !== "invalid" && <ActionButton label="使用重置卡" onClick={actions.onReset} disabled={actions.pending} className="rounded-lg border border-emerald-200 bg-emerald-50 p-1.5 text-emerald-600 hover:bg-emerald-100 disabled:opacity-50"><span className="text-xs font-bold">R</span></ActionButton>}
+      {account.provider === "codex" && !account.disabled && account.status !== "invalid" && <ActionButton label="重置额度" onClick={actions.onReset} disabled={actions.pending} className="group/reset relative rounded-lg border border-border bg-white p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-blue-500 disabled:opacity-50"><span className="pointer-events-none absolute -top-9 left-1/2 hidden -translate-x-1/2 whitespace-nowrap rounded-lg bg-slate-800 px-2 py-1 text-[11px] font-medium text-white group-hover/reset:block">重置额度</span><ResetCreditIcon size={17} /></ActionButton>}
       {account.provider === "codex" && <ActionButton label="导出 JSON" onClick={actions.onExport} disabled={actions.pending} className="rounded-lg p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"><Download size={15} /></ActionButton>}
         </>
       )}

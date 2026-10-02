@@ -40,6 +40,7 @@ fn codex_user_agent() -> String {
 /// test-only so production calls cannot be redirected by frontend/downstream data.
 #[derive(Clone)]
 pub struct CodexProvider {
+    #[cfg(test)]
     client: reqwest::Client,
     backend_base: String,
     login: CodexLogin,
@@ -54,6 +55,7 @@ impl Default for CodexProvider {
 impl CodexProvider {
     pub fn new() -> Self {
         Self {
+            #[cfg(test)]
             client: backend_client(),
             backend_base: CODEX_BACKEND_BASE.to_owned(),
             login: CodexLogin::new(),
@@ -63,6 +65,7 @@ impl CodexProvider {
     #[cfg(test)]
     fn with_endpoints(backend_base: String, login: CodexLogin) -> Self {
         Self {
+            #[cfg(test)]
             client: backend_client(),
             backend_base: backend_base.trim_end_matches('/').to_owned(),
             login,
@@ -105,7 +108,8 @@ impl CodexProvider {
             header::ACCEPT,
             header::HeaderValue::from_static("application/json"),
         );
-        let response = reset_client()
+        let response = self
+            .blocking_client()
             .get(self.usage_endpoint())
             .headers(headers)
             .send()
@@ -137,7 +141,8 @@ impl CodexProvider {
         );
         let endpoint = self.backend_root_endpoint(RESET_CREDITS_PATH);
         let response = loop {
-            match reset_client()
+            match self
+                .blocking_client()
                 .get(&endpoint)
                 .headers(headers.clone())
                 .send()
@@ -153,7 +158,13 @@ impl CodexProvider {
                     // 读取卡列表是幂等 GET。代理偶发断开时只允许一次
                     // 只读重试；消费 POST 的未知结果绝不走这条路径。
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    match reset_client().get(&endpoint).headers(headers).send().await {
+                    match self
+                        .blocking_client()
+                        .get(&endpoint)
+                        .headers(headers)
+                        .send()
+                        .await
+                    {
                         Ok(response) => break response,
                         Err(error) => {
                             tracing::warn!(
@@ -197,7 +208,8 @@ impl CodexProvider {
             "redeem_request_id": redeem_request_id,
             "credit_id": credit_id,
         });
-        let response = reset_client()
+        let response = self
+            .blocking_client()
             .post(self.backend_root_endpoint(RESET_CONSUME_PATH))
             .headers(headers)
             .json(&body)
@@ -272,6 +284,31 @@ impl CodexProvider {
         }
         Ok(headers)
     }
+
+    /// 账号请求复用项目已有的代理感知客户端：流式响应走
+    /// `streaming_client`，额度、模型和重置卡等短请求走
+    /// `blocking_client`。代理地址始终从设置页同步的全局状态读取。
+    fn streaming_client(&self) -> reqwest::Client {
+        #[cfg(test)]
+        {
+            return self.client.clone();
+        }
+        #[cfg(not(test))]
+        {
+            crate::adaptor::streaming_client(crate::adaptor::global_proxy_url().as_deref())
+        }
+    }
+
+    fn blocking_client(&self) -> reqwest::Client {
+        #[cfg(test)]
+        {
+            return self.client.clone();
+        }
+        #[cfg(not(test))]
+        {
+            crate::adaptor::blocking_client(30, crate::adaptor::global_proxy_url().as_deref())
+        }
+    }
 }
 
 #[async_trait]
@@ -338,7 +375,7 @@ impl Provider for CodexProvider {
     ) -> Result<reqwest::Response, ProviderError> {
         let body = validate_backend_request(request.body)?;
         let headers = self.auth_headers(request.payload, request.account, request.headers)?;
-        self.client
+        self.streaming_client()
             .post(self.endpoint(RESPONSES_PATH))
             .headers(headers)
             .json(&body)
@@ -364,7 +401,7 @@ impl Provider for CodexProvider {
                 .map_err(|_| ProviderError::InvalidPayload)?,
         );
         let response = self
-            .client
+            .blocking_client()
             .get(self.endpoint(MODELS_PATH))
             // This is part of Codex's native `/models` request contract.  The
             // backend uses it to select models compatible with the client.
@@ -440,6 +477,7 @@ impl Provider for CodexProvider {
     }
 }
 
+#[cfg(test)]
 fn backend_client() -> reqwest::Client {
     // Disabling all optional content encodings keeps this adapter from adding a
     // request content coding implicitly.
@@ -449,13 +487,6 @@ fn backend_client() -> reqwest::Client {
         .no_deflate()
         .build()
         .expect("reqwest client construction must not fail")
-}
-
-fn reset_client() -> reqwest::Client {
-    // 重置卡和额度回读都必须复用项目的代理感知连接池。官方 Codex
-    // 客户端同样不会为每次 GET/POST 新建连接池；新建裸客户端会丢失
-    // 代理路由和已建立的 TLS 连接，桌面端代理偶发断开时容易出现 EOF。
-    crate::adaptor::global_blocking_client(30)
 }
 
 fn reset_http_error(status: StatusCode) -> ProviderError {
