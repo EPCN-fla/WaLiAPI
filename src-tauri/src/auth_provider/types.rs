@@ -127,15 +127,9 @@ impl AuthAccountSummary {
         let attributes = serde_json::from_str(&account.attributes_json)
             .map_err(|_| ProviderError::InvalidPayload)?;
         let model_mapping = account
-            .model_mapping()
+            .normalized_model_mapping()
             .map_err(|_| ProviderError::InvalidPayload)?;
-        let model_mapping_disabled: serde_json::Value =
-            serde_json::from_str(if account.model_mapping_disabled.is_empty() {
-                "[]"
-            } else {
-                &account.model_mapping_disabled
-            })
-            .unwrap_or(serde_json::Value::Array(Default::default()));
+        let model_mapping_disabled = account.normalized_model_mapping_disabled();
         Ok(Self {
             id: account.id.clone(),
             provider: account.provider.clone(),

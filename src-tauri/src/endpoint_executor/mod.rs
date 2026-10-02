@@ -457,11 +457,17 @@ fn header_map(headers: &[(String, String)]) -> reqwest::header::HeaderMap {
 /// of the channel-style 502 mask: the caller needs to know re-login fixes it.
 fn provider_failure(error: crate::auth_provider::ProviderError) -> AttemptFailure {
     let failure_class = error.failure_class();
+    let budget_payment =
+        crate::services::knowledge::budget::current().is_some() && error.is_payment_required();
     AttemptFailure {
-        status_code: Some(match failure_class {
-            FailureClass::CallerTerminal => 400,
-            FailureClass::ChannelAuthTerminal => 401,
-            _ => 502,
+        status_code: Some(if budget_payment {
+            402
+        } else {
+            match failure_class {
+                FailureClass::CallerTerminal => 400,
+                FailureClass::ChannelAuthTerminal => 401,
+                _ => 502,
+            }
         }),
         failure_class,
         message: error.to_string(),
@@ -632,6 +638,14 @@ pub fn semantic_failure(protocol: &str, body: &Value) -> Option<AttemptFailure> 
     if !(responses_failed || anthropic_error || openai_error) {
         return None;
     }
+    if crate::services::knowledge::budget::current().is_some() && structured_quota_error(body) {
+        return Some(AttemptFailure {
+            failure_class: FailureClass::CallerTerminal,
+            message: "upstream quota rejected".to_string(),
+            status_code: Some(429),
+            retry_after: None,
+        });
+    }
     let error = body.get("error").filter(|v| !v.is_null()).unwrap_or(body);
     let kind = error
         .get("type")
@@ -792,7 +806,16 @@ pub fn failure_from_upstream(
     body: &str,
     retry_after_secs: Option<u64>,
 ) -> AttemptFailure {
-    let class = classify_upstream_status(status, body).unwrap_or(FailureClass::Retryable);
+    let mut class = classify_upstream_status(status, body).unwrap_or(FailureClass::Retryable);
+    // 仅预算请求收紧明确的额度拒绝；不能通过换 Key 或关键词降级绕过。
+    // 只识别结构化机器码，不按上游自由消息文本猜测额度。
+    if crate::services::knowledge::budget::current().is_some() && status == 429 {
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            if structured_quota_error(&value) {
+                class = FailureClass::CallerTerminal;
+            }
+        }
+    }
     let message = error_message_from_body(body).unwrap_or_else(|| {
         let cls = class.as_str();
         format!("upstream HTTP {status} ({cls})")
@@ -810,6 +833,17 @@ pub fn failure_from_upstream(
         status_code,
         retry_after: retry_after_secs,
     }
+}
+
+fn structured_quota_error(value: &Value) -> bool {
+    ["/error/code", "/error/type", "/code", "/type"]
+        .iter()
+        .any(|pointer| {
+            matches!(
+                value.pointer(pointer).and_then(Value::as_str),
+                Some("insufficient_quota" | "quota_exceeded" | "billing_hard_limit_reached")
+            )
+        })
 }
 
 /// Auth Account variant of [`failure_from_upstream`]: the account belongs to
@@ -840,6 +874,20 @@ fn error_message_from_body(body: &str) -> Option<String> {
 }
 
 fn transport_failure(e: reqwest::Error) -> AttemptFailure {
+    if crate::services::knowledge::budget::current().is_some() {
+        return AttemptFailure {
+            failure_class: FailureClass::Retryable,
+            message: if e.is_timeout() {
+                "upstream transport timed out"
+            } else {
+                "upstream transport failed"
+            }
+            .to_string(),
+            // 没有收到 HTTP 响应；与真实上游状态区分，防止上游正文伪造本地失败。
+            status_code: None,
+            retry_after: None,
+        };
+    }
     AttemptFailure {
         failure_class: FailureClass::Retryable,
         message: format!("upstream connection failed: {e}"),
@@ -1172,20 +1220,25 @@ pub async fn dispatch_executor(
             // text) or an undecoded compressed body (gzip etc.) — the distinction
             // only shows up in the bytes and headers, so log them before failing.
             let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).to_string();
-            tracing::warn!(
-                url = %final_url(
-                    &attempt.native_base_url,
-                    &endpoint_path(&attempt.upstream_protocol, &attempt.upstream_endpoint),
-                    query
-                ),
-                status = status,
-                content_encoding = ?content_encoding,
-                content_type = ?content_type,
-                body_len = bytes.len(),
-                body_preview = %preview,
-                err = %e,
-                "2xx upstream body failed JSON decode"
-            );
+            if crate::services::knowledge::budget::current().is_some() {
+                tracing::warn!(status, content_encoding = ?content_encoding, content_type = ?content_type,
+                    body_len = bytes.len(), "RAG 上游响应不是有效 JSON");
+            } else {
+                tracing::warn!(
+                    url = %final_url(
+                        &attempt.native_base_url,
+                        &endpoint_path(&attempt.upstream_protocol, &attempt.upstream_endpoint),
+                        query
+                    ),
+                    status = status,
+                    content_encoding = ?content_encoding,
+                    content_type = ?content_type,
+                    body_len = bytes.len(),
+                    body_preview = %preview,
+                    err = %e,
+                    "2xx upstream body failed JSON decode"
+                );
+            }
             // Draft-test probes only: a gateway that ignores `stream:false` and
             // ALWAYS returns SSE is still speaking the endpoint's protocol, so a
             // probe must not fail it just because the body is SSE-framed rather

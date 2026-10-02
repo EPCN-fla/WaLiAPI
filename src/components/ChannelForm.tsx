@@ -132,6 +132,8 @@ interface FormState {
   // 出站代理：跟随全局 / 强制直连 / 自定义代理
   proxy_mode: "global" | "direct" | "custom";
   proxy_url: string;
+  /** 主 Key 是否参与负载均衡（config.api_key_enabled，缺省 = 启用）。 */
+  mainKeyEnabled: boolean;
 }
 
 interface RequestHeaderItem {
@@ -194,6 +196,8 @@ function initForm(editing: Channel | null, duplicate = false): FormState {
       })),
       proxy_mode: parseProxyMode(editing.config),
       proxy_url: parseProxyUrl(editing.config),
+      // 复制模式不继承主 Key 停用状态（副本从全新 Key 开始）。
+      mainKeyEnabled: duplicate ? true : (editing.api_key_enabled ?? 1) !== 0,
     };
   }
   return {
@@ -215,6 +219,7 @@ function initForm(editing: Channel | null, duplicate = false): FormState {
     request_headers: [],
     proxy_mode: "global",
     proxy_url: "",
+    mainKeyEnabled: true,
   };
 }
 
@@ -269,6 +274,8 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
   const [saving, setSaving] = useState(false);
   const [clearKeyRequested, setClearKeyRequested] = useState(false);
   const [mainKeyEditing, setMainKeyEditing] = useState(false);
+  const [mainKeyStatusLoading, setMainKeyStatusLoading] = useState(false);
+  const [extraKeyCopying, setExtraKeyCopying] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   // ── T14 同步上游模型 ─────────────────────────────────────────────────────
@@ -536,6 +543,22 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
     }
   }
 
+  /** 主 Key 启用/停用（立即持久化到 api_key_enabled 列，与额外 Key 开关同语义）。 */
+  async function toggleMainKeyStatus() {
+    if (!editing || duplicate) return;
+    const next = !form.mainKeyEnabled;
+    setMainKeyStatusLoading(true);
+    setForm(prev => ({ ...prev, mainKeyEnabled: next }));
+    try {
+      await channelApi.togglePrimaryKey(editing.id, next);
+      invalidateReceipt();
+    } catch {
+      setForm(prev => ({ ...prev, mainKeyEnabled: !next }));
+    } finally {
+      setMainKeyStatusLoading(false);
+    }
+  }
+
   // ── 模型列表 ────────────────────────────────────────────────────────────
   function addModel() {
     const m = modelInput.trim();
@@ -750,10 +773,12 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
       // 编辑留空 = 不修改；掩码值未改 = 不修改；显式清除走 clear_api_key 标记。
       ...((form.api_key.trim() !== "" && form.api_key !== mainKeyOriginalMasked) ? { api_key: form.api_key } : {}),
       ...(clearKeyRequested ? { clear_api_key: true } : {}),
-      // Multi-key: full-replace semantics — send all extra keys
+      // Multi-key: full-replace semantics — send all extra keys（存量 Key 回传
+      // id，后端据此把掩码值识别为未修改，用库中真实值落库）。
       extra_keys: form.extra_keys
         .filter(k => k.api_key.trim() !== "")
         .map(k => ({
+          id: k.isExisting ? k.id : undefined,
           api_key: k.api_key,
           weight: k.weight,
           status: k.enabled ? 1 : 0,
@@ -1051,8 +1076,8 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
                 </button>
               </div>
               <div className="space-y-2.5">
-                {/* 主 Key 行：#1，权重联动渠道权重；无删除/启停（后端无主 Key 独立启停概念） */}
-                <div className="rounded-xl border border-border bg-background/50 px-3.5 py-3">
+                {/* 主 Key 行：#1，权重联动渠道权重；无删除（可启用/停用） */}
+                <div className={`rounded-xl border border-border px-3.5 py-3 transition-all ${form.mainKeyEnabled ? "bg-background/50" : "bg-muted/30 opacity-60"}`}>
                   <div className="flex items-center gap-2">
                     <span className="shrink-0 text-xs font-mono text-muted-foreground w-6">#1</span>
                     <span className="shrink-0 rounded-md bg-primary/12 px-1.5 py-0.5 text-[11px] font-semibold text-primary">主</span>
@@ -1104,6 +1129,19 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
                       className="w-16 shrink-0 rounded-lg border border-border bg-background/70 px-2 py-2 text-center text-sm"
                       title="主 Key 权重（联动渠道权重）"
                     />
+
+                    {/* 主 Key 启用/停用（编辑态；立即持久化，停用后不参与负载均衡） */}
+                    {editing && !duplicate && (
+                      <button
+                        type="button"
+                        onClick={toggleMainKeyStatus}
+                        disabled={mainKeyStatusLoading}
+                        className={`shrink-0 p-1.5 transition-colors disabled:opacity-50 ${form.mainKeyEnabled ? "text-green-500 hover:text-green-600" : "text-muted-foreground hover:text-foreground"}`}
+                        title={form.mainKeyEnabled ? "停用主 Key（不参与负载均衡）" : "启用主 Key"}
+                      >
+                        {mainKeyStatusLoading ? <Loader2 size={14} className="animate-spin" /> : <Power size={14} />}
+                      </button>
+                    )}
 
                     {/* 钥匙编辑 / 确认编辑 */}
                     {editing && !clearKeyRequested && !mainKeyEditing && (
@@ -1177,21 +1215,24 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
                           </code>
                         )}
 
-                        {/* 复制 */}
-                        {k.isExisting && !k.isEditing && (
+                        {/* 复制：已存在 Key 从后端取全量明文，新 Key 直接用本地原始值 */}
+                        {!k.isEditing && (
                           <button
                             type="button"
                             onClick={async () => {
+                              setExtraKeyCopying(k.id);
                               try {
-                                const v = await channelApi.getExtraKeyValue(k.id);
+                                const v = k.isExisting ? await channelApi.getExtraKeyValue(k.id) : k.api_key;
                                 await copyToClipboard(v);
                                 showToast(`已复制从 Key #${idx + 2}`);
-                              } catch { /* ignore */ }
+                              } catch { /* ignore */ } finally {
+                                setExtraKeyCopying(null);
+                              }
                             }}
                             className="action-secondary shrink-0 p-1.5"
                             title="复制"
                           >
-                            <Copy size={14} />
+                            {extraKeyCopying === k.id ? <Loader2 size={14} className="animate-spin" /> : <Copy size={14} />}
                           </button>
                         )}
 
@@ -1206,7 +1247,21 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
                           title="权重"
                         />
 
-                        {/* 操作按钮 */}
+                        {/* 启用/禁用：已存在 Key 立即持久化；新 Key 仅本地切换，随表单保存生效。位置与主 Key 行对齐（复制 → 权重 → ⏻ → 🔑 → 删除） */}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            k.isExisting
+                              ? toggleExtraKeyStatus(k.id)
+                              : updateExtraKeyField(k.id, "enabled", !k.enabled)
+                          }
+                          className={`shrink-0 p-1.5 transition-colors ${k.enabled ? "text-green-500 hover:text-green-600" : "text-muted-foreground hover:text-foreground"}`}
+                          title={k.enabled ? "禁用" : "启用"}
+                        >
+                          <Power size={14} />
+                        </button>
+
+                        {/* 编辑 / 确认 */}
                         {k.isEditing ? (
                           <button
                             type="button"
@@ -1227,23 +1282,11 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
                           </button>
                         )}
 
-                        {/* 启用/禁用（仅已存在的 key）*/}
-                        {k.isExisting && (
-                          <button
-                            type="button"
-                            onClick={() => toggleExtraKeyStatus(k.id)}
-                            className={`shrink-0 p-1.5 transition-colors ${k.enabled ? "text-green-500 hover:text-green-600" : "text-muted-foreground hover:text-foreground"}`}
-                            title={k.enabled ? "禁用" : "启用"}
-                          >
-                            <Power size={14} />
-                          </button>
-                        )}
-
-                        {/* 删除 */}
+                        {/* 删除（样式与主行删除/清除按钮一致，保证各列对齐） */}
                         <button
                           type="button"
                           onClick={() => removeExtraKey(k.id)}
-                          className="shrink-0 p-1.5 text-muted-foreground transition-colors hover:text-red-500"
+                          className="action-secondary shrink-0 p-1.5 hover:text-red-500"
                           title="删除"
                         >
                           <Trash2 size={14} />
@@ -1252,7 +1295,7 @@ export function ChannelForm({ editing, duplicate = false, onClose, onSaved }: {
                     </div>
                   ))}
                 <p className="text-xs text-muted-foreground">
-                  💡 主 Key（#1）+ 额外 Keys 共同参与负载均衡，按权重随机选择。失效 Key 自动降级，请求转发至其他可用 Key。
+                  💡 主 Key（#1）+ 额外 Keys 共同参与负载均衡，按权重随机选择。可点击 ⏻ 停用任一 Key，停用后不参与调度；失效 Key 自动降级，请求转发至其他可用 Key。
                 </p>
               </div>
             </div>

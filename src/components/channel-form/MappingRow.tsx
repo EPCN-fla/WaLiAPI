@@ -43,6 +43,9 @@ export function MappingRow({
         <input
           value={from}
           onChange={e => onChange("from", e.target.value)}
+          onBlur={() => {
+            if (from !== from.trim()) onChange("from", from.trim());
+          }}
           onFocus={() => setShowFromPicker(true)}
           placeholder="映射模型名"
           className="w-full rounded-xl border border-border bg-white px-3 py-2.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"

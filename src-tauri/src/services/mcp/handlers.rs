@@ -595,6 +595,12 @@ async fn dispatch_scoped(
                             required.push(serde_json::json!("model"));
                             tool["inputSchema"]["properties"]["model"]["description"] =
                                 serde_json::json!("已授权的生成模型，必填。");
+                            tool["inputSchema"]["properties"]["timeout_ms"] = serde_json::json!({
+                                "type": "integer", "description": "可选整次 RAG 时间预算，服务端限幅为 100 至 120000 毫秒。"
+                            });
+                            tool["inputSchema"]["properties"]["allow_keyword_fallback"] = serde_json::json!({
+                                "type": "boolean", "default": false, "description": "hybrid 模式下允许已授权的可恢复 Embedding 失败降级到关键词检索。"
+                            });
                         }
                     }
                     tool

@@ -56,7 +56,7 @@ export function KnowledgeConnectionPanel({ kbId }: { kbId: string }) {
   return (
     <div className="space-y-3 rounded-xl border border-slate-200 bg-white p-4 text-sm">
       <p className="font-semibold">API Key 授权</p>
-      <p className="text-xs text-slate-500">在<Link to="/api-keys" className="text-blue-600 underline">密钥 → 知识库查询权限</Link>中勾选此 RAG，再使用同一个 API Key 连接 REST 或 MCP，无需设置环境变量 Token。</p>
+      <p className="text-xs text-slate-500">新建密钥默认授权全部现有 RAG，新建 RAG 默认授权全部已有密钥。可在<Link to="/api-keys" className="text-blue-600 underline">密钥 → 知识库查询权限</Link>中调整，再使用已授权的 API Key 连接 REST 或 MCP，无需设置环境变量 Token。</p>
       <div className="flex flex-wrap gap-2">
         <select aria-label="已授权的 API Key" value={keyId} disabled={loading || testing} onChange={e => { setKeyId(e.target.value); setMessage(""); setError(""); setHealth(null); }} className="min-w-0 flex-1 rounded-lg border border-slate-200 px-3 py-2">
           {!keys.length && <option value="">{loading ? "正在加载…" : "尚无已授权的 API Key"}</option>}

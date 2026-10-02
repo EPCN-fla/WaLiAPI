@@ -50,6 +50,8 @@ pub struct StreamState {
     pub accumulated_reasoning: String,
     /// Map from tool_call index → (output_index, call_id, name, accumulated_arguments, item_added_sent, arguments_done_sent)
     pub tool_calls: HashMap<u64, ToolCallState>,
+    /// Responses custom tools represented temporarily as Gemini functions.
+    pub custom_tool_names: std::collections::HashSet<String>,
     /// Whether any tool calls were seen in this stream.
     pub has_tool_calls: bool,
     /// Monotonic sequence number counter for all events.
@@ -67,6 +69,16 @@ pub struct ToolCallState {
     pub item_added_sent: bool,
     pub arguments_done_sent: bool,
     pub output_item_done_sent: bool,
+    pub is_custom: bool,
+}
+
+impl StreamState {
+    pub fn with_custom_tool_names(names: &[String]) -> Self {
+        Self {
+            custom_tool_names: names.iter().cloned().collect(),
+            ..Self::default()
+        }
+    }
 }
 
 pub(super) fn now_ts() -> u64 {

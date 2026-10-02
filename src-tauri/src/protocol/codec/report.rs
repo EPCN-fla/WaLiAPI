@@ -65,6 +65,10 @@ pub struct ConversionContext {
     /// transformed in a fail-open way during request encoding.  Populated by
     /// the encoder and surfaced through the [`ConversionReport`].
     pub normalized: Vec<String>,
+    /// Responses custom tools represented as Gemini function declarations.
+    /// Response decoders use this registry to restore custom-tool wire items
+    /// instead of exposing them as ordinary function calls.
+    pub custom_tool_names: Vec<String>,
 }
 
 impl ConversionContext {
@@ -78,6 +82,7 @@ impl ConversionContext {
             upstream_model: upstream_model.into(),
             stream,
             normalized: Vec::new(),
+            custom_tool_names: Vec::new(),
         }
     }
 }

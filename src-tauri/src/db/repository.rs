@@ -405,12 +405,20 @@ impl Repository {
         let model_mapping = input
             .model_mapping
             .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
+            .map(|v| {
+                let mut normalized = v.clone();
+                crate::db::models::normalize_model_mapping(&mut normalized);
+                serde_json::to_string(&normalized).unwrap_or_else(|_| "{}".to_string())
+            })
             .unwrap_or_else(|| "{}".to_string());
         let model_mapping_disabled = input
             .model_mapping_disabled
             .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()))
+            .map(|v| {
+                let mut normalized = v.clone();
+                crate::db::models::normalize_model_mapping_disabled(&mut normalized);
+                serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".to_string())
+            })
             .unwrap_or_else(|| "[]".to_string());
 
         let (identity, legacy_type, legacy_base, endpoints_json) = Self::plan_channel_identity(
@@ -480,12 +488,19 @@ impl Repository {
         let now = now_iso();
         let models = serde_json::to_string(&input.models).unwrap_or_else(|_| "[]".to_string());
         let config = serde_json::to_string(&input.config).unwrap_or_else(|_| "{}".to_string());
-        let model_mapping =
-            serde_json::to_string(&input.model_mapping).unwrap_or_else(|_| "{}".to_string());
+        let model_mapping = {
+            let mut normalized = input.model_mapping.clone();
+            crate::db::models::normalize_model_mapping(&mut normalized);
+            serde_json::to_string(&normalized).unwrap_or_else(|_| "{}".to_string())
+        };
         let model_mapping_disabled = input
             .model_mapping_disabled
             .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()))
+            .map(|v| {
+                let mut normalized = v.clone();
+                crate::db::models::normalize_model_mapping_disabled(&mut normalized);
+                serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".to_string())
+            })
             .unwrap_or_else(|| "[]".to_string());
         let endpoints_json = input
             .native_endpoints
@@ -499,8 +514,8 @@ impl Repository {
                 config, model_mapping, model_mapping_disabled, timeout_secs,
                 protocol, provider, native_base_url, native_endpoints,
                 preset_revision, identity_revision, legacy_executor_override,
-                created_at, updated_at, last_test_at, last_test_ok)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                created_at, updated_at, last_test_at, last_test_ok, api_key_enabled)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&input.name)
@@ -526,6 +541,7 @@ impl Repository {
         .bind(&now)
         .bind(&input.last_test_at)
         .bind(input.last_test_ok)
+        .bind(input.api_key_enabled.unwrap_or(1))
         .execute(&self.pool)
         .await?;
 
@@ -597,11 +613,15 @@ impl Repository {
             q.push(", config = ").push_bind(c);
         }
         if let Some(mapping) = &input.model_mapping {
-            let m = serde_json::to_string(mapping).unwrap_or_else(|_| "{}".to_string());
+            let mut normalized = mapping.clone();
+            crate::db::models::normalize_model_mapping(&mut normalized);
+            let m = serde_json::to_string(&normalized).unwrap_or_else(|_| "{}".to_string());
             q.push(", model_mapping = ").push_bind(m);
         }
         if let Some(disabled) = &input.model_mapping_disabled {
-            let d = serde_json::to_string(disabled).unwrap_or_else(|_| "[]".to_string());
+            let mut normalized = disabled.clone();
+            crate::db::models::normalize_model_mapping_disabled(&mut normalized);
+            let d = serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".to_string());
             q.push(", model_mapping_disabled = ").push_bind(d);
         }
         if let Some(timeout_secs) = input.timeout_secs {
@@ -695,6 +715,21 @@ impl Repository {
 
         // Multi-key: replace extra keys if provided (full-replace semantics).
         if let Some(extra) = &input.extra_keys {
+            // 掩码写回防护：列表 DTO 的 api_key 是掩码值，编辑表单里未进入
+            // 编辑态的存量 Key 提交的仍是掩码串。按前端回传的 id 找到库中
+            // 真实值，凡提交值 == 该 Key 的掩码形式即视为「未修改」，用真实
+            // 值落库，避免掩码串覆盖真实凭证。
+            let existing_values: std::collections::HashMap<String, String> =
+                match sqlx::query_as::<_, (String, String)>(
+                    "SELECT id, api_key FROM channel_api_keys WHERE channel_id = ?",
+                )
+                .bind(&input.id)
+                .fetch_all(&mut *tx)
+                .await
+                {
+                    Ok(rows) => rows.into_iter().collect(),
+                    Err(_) => Default::default(),
+                };
             // Delete + re-insert within the same transaction.
             sqlx::query("DELETE FROM channel_api_keys WHERE channel_id = ?")
                 .bind(&input.id)
@@ -702,6 +737,12 @@ impl Repository {
                 .await?;
             let now_k = &now;
             for k in extra {
+                let real_value = match k.id.as_deref().and_then(|id| existing_values.get(id)) {
+                    Some(stored) if k.api_key == crate::utils::secret::mask_secret(stored) => {
+                        stored.clone()
+                    }
+                    _ => k.api_key.clone(),
+                };
                 let kid = uuid::Uuid::new_v4().to_string();
                 sqlx::query(
                     "INSERT INTO channel_api_keys (id, channel_id, api_key, weight, status, created_at, updated_at)
@@ -709,7 +750,7 @@ impl Repository {
                 )
                 .bind(&kid)
                 .bind(&input.id)
-                .bind(&k.api_key)
+                .bind(&real_value)
                 .bind(k.weight.unwrap_or(1))
                 .bind(k.status.unwrap_or(1))
                 .bind(now_k)
@@ -806,6 +847,24 @@ impl Repository {
             .bind(status)
             .bind(&now)
             .bind(key_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 启用/停用渠道主 Key（迁移 044 窄列更新）。
+    /// 刻意不触碰 config 列——015 的身份失效触发器由 UPDATE OF config 触发，
+    /// 窄列更新可完全绕开身份重建。
+    pub async fn toggle_channel_primary_key(
+        &self,
+        channel_id: &str,
+        enabled: bool,
+    ) -> Result<(), sqlx::Error> {
+        let now = now_iso();
+        sqlx::query("UPDATE channels SET api_key_enabled = ?, updated_at = ? WHERE id = ?")
+            .bind(if enabled { 1_i64 } else { 0_i64 })
+            .bind(&now)
+            .bind(channel_id)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -922,6 +981,8 @@ impl Repository {
             serde_json::to_string(&input.denied_channels.clone().unwrap_or_default())
                 .unwrap_or_else(|_| "[]".to_string());
 
+        // 创建和默认授权共用写事务，避免并发新建知识库时漏掉授权或留下半次创建。
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO api_keys (id, name, key, status, allowed_models, allowed_channels, denied_models, denied_channels, quota_limit, quota_used, created_at, updated_at)
              VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, ?)"
@@ -936,13 +997,23 @@ impl Repository {
         .bind(input.quota_limit.unwrap_or(-1))
         .bind(&now)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
-        sqlx::query_as::<_, ApiKey>("SELECT * FROM api_keys WHERE id = ?")
+        sqlx::query(
+            "INSERT INTO api_key_knowledge_access (api_key_id, kb_id)
+             SELECT ?, id FROM kb_knowledge_bases",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+
+        let api_key = sqlx::query_as::<_, ApiKey>("SELECT * FROM api_keys WHERE id = ?")
             .bind(&id)
-            .fetch_one(&self.pool)
-            .await
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(api_key)
     }
 
     pub async fn update_api_key_status(&self, id: &str, status: i64) -> Result<(), sqlx::Error> {
@@ -1184,14 +1255,24 @@ impl Repository {
                 "label must be non-empty, priority >= 0, and weight >= 1".into(),
             ));
         }
+        let mut model_mapping = serde_json::from_str(model_mapping_json)
+            .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+        crate::db::models::normalize_model_mapping(&mut model_mapping);
+        let model_mapping_json =
+            serde_json::to_string(&model_mapping).unwrap_or_else(|_| "{}".to_owned());
+        let mut model_mapping_disabled = serde_json::from_str(model_mapping_disabled_json)
+            .unwrap_or_else(|_| serde_json::Value::Array(Default::default()));
+        crate::db::models::normalize_model_mapping_disabled(&mut model_mapping_disabled);
+        let model_mapping_disabled_json =
+            serde_json::to_string(&model_mapping_disabled).unwrap_or_else(|_| "[]".to_owned());
         sqlx::query(
             "UPDATE auth_accounts SET label = ?, priority = ?, weight = ?, model_mapping_json = ?, model_mapping_disabled = ?, updated_at = ? WHERE id = ?",
         )
         .bind(label)
         .bind(priority)
         .bind(weight)
-        .bind(model_mapping_json)
-        .bind(model_mapping_disabled_json)
+        .bind(&model_mapping_json)
+        .bind(&model_mapping_disabled_json)
         .bind(now_iso())
         .bind(id)
         .execute(&self.pool)
@@ -1206,10 +1287,14 @@ impl Repository {
         id: &str,
         model_mapping_disabled_json: &str,
     ) -> Result<(), sqlx::Error> {
+        let mut disabled = serde_json::from_str(model_mapping_disabled_json)
+            .unwrap_or_else(|_| serde_json::Value::Array(Default::default()));
+        crate::db::models::normalize_model_mapping_disabled(&mut disabled);
+        let normalized_json = serde_json::to_string(&disabled).unwrap_or_else(|_| "[]".to_owned());
         sqlx::query(
             "UPDATE auth_accounts SET model_mapping_disabled = ?, updated_at = ? WHERE id = ?",
         )
-        .bind(model_mapping_disabled_json)
+        .bind(normalized_json)
         .bind(now_iso())
         .bind(id)
         .execute(&self.pool)

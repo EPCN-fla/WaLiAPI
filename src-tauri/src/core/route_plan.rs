@@ -1096,6 +1096,24 @@ fn classify_auth_account(
     ))
 }
 
+/// Codex Responses Lite may register the current turn's tools through an
+/// `additional_tools` input item. Only the Responses→Gemini codec can preserve
+/// a non-empty registry; Chat/Messages conversion candidates must be filtered.
+/// Codex can send an empty registry (e.g. a turn where the client has not
+/// enabled tools); that carries no tool payload and must not block otherwise
+/// valid conversion routes.
+fn responses_request_uses_additional_tools(body: &Value) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+                .filter_map(|item| item.get("tools").and_then(Value::as_array))
+                .any(|tools| !tools.is_empty())
+        })
+}
+
 /// Build the ordered group plan from the surviving model candidates.
 fn build_route_plan<R: Rng + ?Sized>(
     endpoint: EndpointKind,
@@ -1122,6 +1140,17 @@ fn build_route_plan<R: Rng + ?Sized>(
                 if let Some((tier, proto, ep)) =
                     classify_channel(endpoint, &identity, &channel, flags)
                 {
+                    if endpoint == EndpointKind::Responses
+                        && tier == GroupTier::Conversion
+                        && proto != UpstreamProtocol::Gemini
+                        && responses_request_uses_additional_tools(body)
+                    {
+                        config_errors.push(format!(
+                            "channel '{}' ({}): Responses additional_tools requires a native Responses upstream",
+                            channel.name, channel.id
+                        ));
+                        continue;
+                    }
                     routed.push(RouteGroupCandidate {
                         candidate: RouteCandidate::Channel { channel, identity },
                         tier,
@@ -1145,6 +1174,19 @@ fn build_route_plan<R: Rng + ?Sized>(
                     continue;
                 };
                 if let Some((tier, proto, ep)) = classify_auth_account(endpoint, &profile) {
+                    if endpoint == EndpointKind::Responses
+                        && !matches!(
+                            profile.upstream_protocol,
+                            UpstreamProtocol::Responses | UpstreamProtocol::Gemini
+                        )
+                        && responses_request_uses_additional_tools(body)
+                    {
+                        config_errors.push(format!(
+                            "auth account '{}' ({}): Responses additional_tools requires a native Responses upstream",
+                            account.label, account.id
+                        ));
+                        continue;
+                    }
                     routed.push(RouteGroupCandidate {
                         candidate: RouteCandidate::AuthAccount(account),
                         tier,
@@ -1400,6 +1442,7 @@ mod tests {
             last_probe_at: None,
             last_probe_ok: None,
             probe_latency_ms: None,
+            api_key_enabled: Some(1),
         }
     }
 
@@ -1449,6 +1492,7 @@ mod tests {
             last_probe_at: None,
             last_probe_ok: None,
             probe_latency_ms: None,
+            api_key_enabled: Some(1),
         }
     }
 
@@ -2570,7 +2614,7 @@ mod tests {
             "m",
             EndpointKind::Responses,
             &[],
-            &[account.clone()],
+            std::slice::from_ref(&account),
             &flags_off,
             &json!({}),
             &mut seeded(),
@@ -2586,7 +2630,7 @@ mod tests {
             "m",
             EndpointKind::ChatCompletions,
             &[],
-            &[account.clone()],
+            std::slice::from_ref(&account),
             &flags_off,
             &json!({}),
             &mut seeded(),
@@ -2598,7 +2642,7 @@ mod tests {
             "m",
             EndpointKind::Messages,
             &[],
-            &[account.clone()],
+            std::slice::from_ref(&account),
             &flags_off,
             &json!({}),
             &mut seeded(),
@@ -2611,7 +2655,7 @@ mod tests {
                 "m",
                 EndpointKind::CountTokens,
                 &[],
-                &[account],
+                std::slice::from_ref(&account),
                 &flags_off,
                 &json!({}),
                 &mut seeded(),
@@ -2865,6 +2909,162 @@ mod tests {
                 "https://cloudcode-pa.googleapis.com"
             );
         }
+    }
+
+    #[test]
+    fn responses_additional_tools_keeps_gemini_auth_conversion() {
+        let key = api_key(&[], &[]);
+        let channel = new_channel(
+            "native-responses",
+            "openai",
+            "custom",
+            "https://example.test/v1",
+            &["responses"],
+            5,
+            1,
+        );
+        let body = json!({
+            "model": "m",
+            "input": [{
+                "type": "additional_tools",
+                "tools": [{
+                    "type": "custom",
+                    "name": "exec_command"
+                }]
+            }]
+        });
+        let plan = authorize_and_plan_with_accounts(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &[channel],
+            &[gemini_account("gemini", "m")],
+            &flags(true),
+            &body,
+            &mut seeded(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.groups.len(), 2);
+        assert_eq!(plan.groups[0].tier, GroupTier::Native);
+        assert_eq!(
+            plan.groups[0].candidates[0].candidate.id(),
+            "native-responses"
+        );
+        assert_eq!(plan.groups[1].tier, GroupTier::Conversion);
+        assert_eq!(plan.groups[1].upstream_protocol, UpstreamProtocol::Gemini);
+        assert_eq!(plan.groups[1].candidates[0].candidate.id(), "gemini");
+        assert!(!plan
+            .config_errors
+            .iter()
+            .any(|error| error.contains("gemini") && error.contains("Responses additional_tools")));
+    }
+
+    #[test]
+    fn responses_additional_tools_skips_chat_conversion_channel() {
+        let key = api_key(&[], &[]);
+        let conversion = new_channel(
+            "chat-conversion",
+            "openai",
+            "custom",
+            "https://chat.example.test/v1",
+            &["chat_completions"],
+            10,
+            1,
+        );
+        let native = new_channel(
+            "native-responses",
+            "openai",
+            "custom",
+            "https://responses.example.test/v1",
+            &["responses"],
+            1,
+            1,
+        );
+        let body = json!({
+            "model": "m",
+            "input": [{
+                "type": "additional_tools",
+                "tools": [{
+                    "type": "custom",
+                    "name": "exec_command"
+                }]
+            }]
+        });
+
+        let plan = authorize_and_plan(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &[conversion, native],
+            &flags(true),
+            &body,
+            &mut seeded(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].tier, GroupTier::Native);
+        assert_eq!(plan.groups[0].candidates.len(), 1);
+        assert_eq!(
+            plan.groups[0].candidates[0].candidate.id(),
+            "native-responses"
+        );
+        assert!(plan
+            .config_errors
+            .iter()
+            .any(|error| error.contains("chat-conversion")
+                && error.contains("Responses additional_tools")));
+    }
+
+    #[test]
+    fn responses_empty_additional_tools_does_not_block_conversion() {
+        let key = api_key(&[], &[]);
+        let body = json!({
+            "model": "m",
+            "input": [{
+                "type": "additional_tools",
+                "tools": []
+            }]
+        });
+        let plan = authorize_and_plan_with_accounts(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &[],
+            &[gemini_account("gemini", "m")],
+            &flags(false),
+            &body,
+            &mut seeded(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].candidates[0].candidate.id(), "gemini");
+    }
+
+    #[test]
+    fn responses_without_additional_tools_keeps_gemini_auth_conversion() {
+        let key = api_key(&[], &[]);
+        let body = json!({
+            "model": "m",
+            "input": "hello"
+        });
+        let plan = authorize_and_plan_with_accounts(
+            &key,
+            "m",
+            EndpointKind::Responses,
+            &[],
+            &[gemini_account("gemini", "m")],
+            &flags(false),
+            &body,
+            &mut seeded(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].tier, GroupTier::Conversion);
+        assert_eq!(plan.groups[0].upstream_protocol, UpstreamProtocol::Gemini);
     }
 
     fn kimi_account(id: &str, model: &str, protocol: &str) -> AuthAccount {

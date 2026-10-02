@@ -478,6 +478,14 @@ async fn dispatch(shared: &SharedState, cmd: &str, args: Value) -> Result<Value,
             )
             .await,
         ),
+        "toggle_channel_primary_key" => to_json(
+            commands::channel::toggle_channel_primary_key(
+                arg(&args, "id")?,
+                arg(&args, "enabled")?,
+                state,
+            )
+            .await,
+        ),
         "delete_channel_extra_key" => {
             to_json(commands::channel::delete_channel_extra_key(arg(&args, "keyId")?, state).await)
         }

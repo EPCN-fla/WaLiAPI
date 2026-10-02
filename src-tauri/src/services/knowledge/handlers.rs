@@ -331,6 +331,12 @@ pub struct SearchQuery {
     pub search_mode: Option<String>,
     pub vector_weight: Option<f32>,
     pub keyword_weight: Option<f32>,
+    #[serde(default)]
+    pub diagnostics: bool,
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub allow_keyword_fallback: bool,
+    pub candidate_k: Option<usize>,
 }
 
 fn default_top_k() -> usize {
@@ -343,18 +349,48 @@ pub async fn search(
     access: Option<Extension<KnowledgeAccess>>,
 ) -> Response {
     if let Some(Extension(access)) = access {
+        let request_id = access.headers.get("x-request-id").cloned();
         let mut input: AskInput = serde_json::from_value(serde_json::json!({
             "question": query.q, "kb_id": query.kb_id, "top_k": query.top_k,
             "search_mode": query.search_mode.unwrap_or_else(|| "vector".into()),
-        }))
-        .expect("valid search input");
-        // 保留非有限数供权限入口校验，避免 JSON 序列化将其变成 null 后套用默认值。
+            "diagnostics": query.diagnostics, "timeout_ms": query.timeout_ms,
+            "allow_keyword_fallback": query.allow_keyword_fallback, "candidate_k": query.candidate_k,
+        })).expect("valid search input");
+        // 非有限权重必须保留到校验，不能被 JSON null 静默套用默认值。
         input.vector_weight = query.vector_weight;
         input.keyword_weight = query.keyword_weight;
-        return match knowledge_access::search(&shared, &access, input, false).await {
-            Ok(results) => Json(serde_json::json!({"data": results})).into_response(),
+        let mut response =
+            match knowledge_access::search_with_details(&shared, &access, input, false).await {
+                Ok(results) => Json(results).into_response(),
+                Err(error) => error.into_response(),
+            };
+        if let Some(request_id) = request_id {
+            response.headers_mut().insert("x-request-id", request_id);
+        }
+        return response;
+    }
+    // 管理端的无预算旧检索保持原入口；新参数复用同一通用检索与取消流程。
+    if query.timeout_ms.is_some()
+        || query.allow_keyword_fallback
+        || query.diagnostics
+        || query.candidate_k.is_some()
+    {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let mut response = match knowledge_access::run_request(
+            &request_id,
+            query.timeout_ms,
+            query.diagnostics,
+            Box::pin(search_internal(&shared, &query, &request_id)),
+        )
+        .await
+        {
+            Ok(results) => Json(results).into_response(),
             Err(error) => error.into_response(),
         };
+        response
+            .headers_mut()
+            .insert("x-request-id", request_id.parse().expect("UUID header"));
+        return response;
     }
     let results = retriever::search_query(
         &shared.state.db.pool,
@@ -378,6 +414,74 @@ pub async fn search(
     }
 }
 
+async fn search_internal(
+    shared: &SharedState,
+    query: &SearchQuery,
+    request_id: &str,
+) -> Result<SearchResponse, super::model_client::QueryError> {
+    use super::model_client::{ModelClient, QueryError};
+    if query.diagnostics {
+        return Err(QueryError::new(
+            StatusCode::BAD_REQUEST,
+            "知识库健康检测需要使用普通 API Key",
+        )
+        .at_stage("permission", "diagnostics_requires_api_key"));
+    }
+    let mode = query.search_mode.as_deref().unwrap_or("vector");
+    let vw = query.vector_weight.unwrap_or(0.7);
+    let kw = query.keyword_weight.unwrap_or(0.3);
+    knowledge_access::validate_query(&query.q, query.top_k, mode, vw, kw)?;
+    rag::validate_candidate_k(query.top_k, query.candidate_k)?;
+    let kb_id = query.kb_id.as_deref().unwrap_or("");
+    // 跨库管理员检索沿用旧 search_query：任何请求模式都回退到跨库向量检索。
+    let effective_mode = if kb_id.is_empty() { "vector" } else { mode };
+    let embedding_model = if !kb_id.is_empty() {
+        KbRepository::new(shared.state.db.pool.clone())
+            .get_kb(kb_id)
+            .await
+            .map_err(|_| QueryError::new(StatusCode::NOT_FOUND, "Knowledge base not found"))?
+            .embedding_model
+            .unwrap_or_else(|| "text-embedding-3-small".into())
+    } else {
+        "text-embedding-3-small".into()
+    };
+    let client = ModelClient::Internal {
+        pool: &shared.state.db.pool,
+        settings: &shared.state.settings,
+        kb_id,
+    };
+    let retrieved = Box::pin(rag::retrieve_with_client(
+        &client,
+        &shared.state.db.pool,
+        kb_id,
+        &query.q,
+        &embedding_model,
+        query.candidate_k.unwrap_or(query.top_k),
+        false,
+        &shared.state.settings,
+        vw,
+        kw,
+        effective_mode,
+        false,
+        query.allow_keyword_fallback,
+        false,
+    ))
+    .await?;
+    let mut data: Vec<_> = retrieved
+        .scored_results
+        .into_iter()
+        .map(|result| result.result)
+        .collect();
+    data.truncate(query.top_k);
+    Ok(SearchResponse {
+        data,
+        request_id: Some(request_id.to_string()),
+        retrieval_mode: Some(retrieved.actual_mode),
+        degradation_reason: retrieved.degradation_reason,
+        diagnostics: None,
+    })
+}
+
 // ─── RAG Ask (with history + token fallback) ──────────────────────
 
 pub async fn ask(
@@ -386,10 +490,56 @@ pub async fn ask(
     Json(input): Json<AskInput>,
 ) -> Response {
     if let Some(Extension(access)) = access {
-        return match knowledge_access::ask(&shared, &access, input, false).await {
+        let request_id = access.headers.get("x-request-id").cloned();
+        let mut response = match knowledge_access::ask(&shared, &access, input, false).await {
             Ok(answer) => Json(answer).into_response(),
             Err(error) => error.into_response(),
         };
+        if let Some(request_id) = request_id {
+            response.headers_mut().insert("x-request-id", request_id);
+        }
+        return response;
+    }
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let budget = input
+        .timeout_ms
+        .map(|ms| super::budget::Budget::new(ms, request_id.clone()));
+    let work = Box::pin(ask_internal(&shared, input));
+    let mut response = if let Some(budget) = &budget {
+        budget
+            .scope(async {
+                match tokio::time::timeout_at(budget.deadline(), work).await {
+                    Ok(response) => response,
+                    Err(_) => {
+                        budget.cancel();
+                        super::model_client::QueryError::new(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "RAG 总时间预算已耗尽",
+                        )
+                        .at_stage("rag", "rag_deadline_exceeded")
+                        .with_request_id(&request_id)
+                        .into_response()
+                    }
+                }
+            })
+            .await
+    } else {
+        work.await
+    };
+    response
+        .headers_mut()
+        .insert("x-request-id", request_id.parse().expect("UUID header"));
+    response
+}
+
+async fn ask_internal(shared: &SharedState, input: AskInput) -> Response {
+    if let Err(error) =
+        rag::validate_reasoning_request(input.reasoning_effort.as_deref(), input.deep_research)
+    {
+        return error.into_response();
+    }
+    if let Err(error) = rag::validate_candidate_k(input.top_k, input.candidate_k) {
+        return error.into_response();
     }
     if input.diagnostics {
         return super::model_client::QueryError::new(
@@ -441,7 +591,13 @@ pub async fn ask(
         let keyword_weight = input.keyword_weight.unwrap_or(0.3);
         let search_mode = input.search_mode.as_deref().unwrap_or("hybrid");
 
-        match rag::ask_with_config(
+        let client = super::model_client::ModelClient::Internal {
+            pool: &shared.state.db.pool,
+            settings: &shared.state.settings,
+            kb_id: &kb_id,
+        };
+        match rag::ask_with_client(
+            &client,
             &shared.state.db.pool,
             &kb_id,
             &input.question,
@@ -454,10 +610,17 @@ pub async fn ask(
             vector_weight,
             keyword_weight,
             search_mode,
+            false,
+            input.allow_keyword_fallback,
+            input.candidate_k,
+            input.reasoning_effort.as_deref(),
         )
         .await
         {
             Ok(answer) => Json(answer).into_response(),
+            Err(error) if input.timeout_ms.is_some() || input.allow_keyword_fallback => {
+                error.into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("RAG failed: {}", e),

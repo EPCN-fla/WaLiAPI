@@ -52,6 +52,8 @@ pub struct ChannelDto {
     pub last_probe_at: Option<String>,
     pub last_probe_ok: Option<i64>,
     pub probe_latency_ms: Option<i64>,
+    /// 主 Key 是否参与负载均衡（迁移 044）。1 = 启用，0 = 停用。
+    pub api_key_enabled: i64,
     // --- Multi-key: extra API keys for load balancing (migration 023) ---
     pub extra_keys: Vec<ChannelKeyDto>,
     /// 渠道级自定义上游请求头（敏感值原样返回给已进入管理面的前端）。
@@ -85,6 +87,8 @@ impl From<ChannelApiKey> for ChannelKeyDto {
 impl From<Channel> for ChannelDto {
     fn from(c: Channel) -> Self {
         let identity: ChannelIdentity = resolve_channel_identity(&ChannelIdentityRow::from(&c));
+        let model_mapping = c.normalized_model_mapping();
+        let model_mapping_disabled = c.normalized_model_mapping_disabled();
         ChannelDto {
             id: c.id,
             name: c.name,
@@ -97,10 +101,8 @@ impl From<Channel> for ChannelDto {
             weight: c.weight,
             config: serde_json::from_str(&c.config)
                 .unwrap_or(serde_json::Value::Object(Default::default())),
-            model_mapping: serde_json::from_str(&c.model_mapping)
-                .unwrap_or(serde_json::Value::Object(Default::default())),
-            model_mapping_disabled: serde_json::from_str(&c.model_mapping_disabled)
-                .unwrap_or(serde_json::Value::Array(Default::default())),
+            model_mapping,
+            model_mapping_disabled,
             timeout_secs: c.timeout_secs,
             protocol: identity.protocol,
             provider: identity.provider,
@@ -117,6 +119,7 @@ impl From<Channel> for ChannelDto {
             last_probe_at: c.last_probe_at,
             last_probe_ok: c.last_probe_ok,
             probe_latency_ms: c.probe_latency_ms,
+            api_key_enabled: c.api_key_enabled.unwrap_or(1),
             extra_keys: Vec::new(), // populated by to_dto_with_keys
             request_headers: serde_json::from_str::<serde_json::Value>(&c.config)
                 .ok()
@@ -282,7 +285,9 @@ pub async fn update_channel_impl(
         } else if input.clear_api_key == Some(true) {
             String::new()
         } else {
-            existing.api_key.clone()
+            // 与测试侧 resolve_draft_api_key 同规则：主 Key 停用时指纹绑定
+            // 第一个启用的从 Key，保证测试与保存指纹一致（T07 门禁不误判）。
+            channel_test::effective_probe_key(&repo, &input.id, &existing.api_key).await
         };
         let eff_override = input
             .legacy_executor_override
@@ -513,14 +518,16 @@ pub async fn test_channel_impl(
     state: &std::sync::Arc<AppState>,
 ) -> Result<TestChannelResult, String> {
     let repo = Repository::new(state.db.pool.clone());
-    let channel = repo.get_channel(id).await.map_err(|e| e.to_string())?;
+    let mut channel = repo.get_channel(id).await.map_err(|e| e.to_string())?;
+    // 主 Key 停用时走第一个启用的从 Key（与真实调度语义一致）。
+    channel.api_key =
+        channel_test::effective_probe_key(&repo, id, &channel.api_key).await;
 
     let config = ChannelConfig {
         base_url: channel.base_url.clone(),
         api_key: channel.api_key.clone(),
         models: serde_json::from_str(&channel.models).unwrap_or_default(),
-        model_mapping: serde_json::from_str(&channel.model_mapping)
-            .unwrap_or(serde_json::Value::Object(Default::default())),
+        model_mapping: channel.active_model_mapping(),
         extra: serde_json::from_str(&channel.config)
             .unwrap_or(serde_json::Value::Object(Default::default())),
         timeout_secs: channel.timeout_secs.max(1) as u64,
@@ -608,6 +615,28 @@ pub async fn toggle_channel_extra_key(
         .map_err(|e| e.to_string())
 }
 
+/// 启用/停用渠道主 Key（#1，channels.api_key）。停用后不参与负载均衡；
+/// 主 Key 与全部额外 Key 均停用时该渠道整体跳过。
+#[tauri::command]
+pub async fn toggle_channel_primary_key(
+    id: String,
+    enabled: bool,
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<(), String> {
+    toggle_channel_primary_key_impl(&id, enabled, &*state).await
+}
+
+pub async fn toggle_channel_primary_key_impl(
+    id: &str,
+    enabled: bool,
+    state: &std::sync::Arc<AppState>,
+) -> Result<(), String> {
+    let repo = Repository::new(state.db.pool.clone());
+    repo.toggle_channel_primary_key(id, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Delete a channel API key.
 #[tauri::command]
 pub async fn delete_channel_extra_key(
@@ -618,4 +647,51 @@ pub async fn delete_channel_extra_key(
     repo.delete_channel_api_key(&key_id)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn channel_fixture() -> Channel {
+        Channel {
+            id: "channel-1".into(),
+            name: "Channel".into(),
+            channel_type: "openai".into(),
+            base_url: "https://example.test/v1".into(),
+            api_key: "secret".into(),
+            models: "[]".into(),
+            status: 1,
+            priority: 0,
+            weight: 1,
+            config: "{}".into(),
+            model_mapping: json!({" alias ": " upstream "}).to_string(),
+            model_mapping_disabled: json!([[" alias ", " upstream "]]).to_string(),
+            timeout_secs: 60,
+            protocol: Some("openai".into()),
+            provider: Some("custom".into()),
+            native_base_url: Some("https://example.test/v1".into()),
+            native_endpoints: Some(json!(["chat_completions"]).to_string()),
+            preset_revision: None,
+            identity_revision: 1,
+            legacy_executor_override: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_test_at: None,
+            last_test_ok: None,
+            last_probe_at: None,
+            last_probe_ok: None,
+            probe_latency_ms: None,
+            api_key_enabled: Some(1),
+        }
+    }
+
+    #[test]
+    fn channel_dto_normalizes_historical_model_mapping_names() {
+        let dto = ChannelDto::from(channel_fixture());
+
+        assert_eq!(dto.model_mapping, json!({"alias": "upstream"}));
+        assert_eq!(dto.model_mapping_disabled, json!([["alias", "upstream"]]));
+    }
 }

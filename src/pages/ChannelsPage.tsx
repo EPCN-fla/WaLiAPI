@@ -12,6 +12,27 @@ import { ChannelTabs } from "../components/layout/ChannelTabs";
 import { writeClipboard } from "../lib/runtime";
 import { buildChannelCurl } from "../lib/curl";
 
+/** Key 启用/停用状态胶囊：主 Key 与额外 Keys 共用同一组件，保证样式永远一致。 */
+function KeyStatusPill({ enabled, loading, onToggle }: { enabled: boolean; loading: boolean; onToggle: () => void }) {
+  return (
+    <button
+      onClick={onToggle}
+      disabled={loading}
+      className="shrink-0 transition-colors disabled:opacity-50"
+      title={enabled ? "停用（不参与负载均衡）" : "启用"}
+    >
+      {loading ? (
+        <Loader2 size={11} className="animate-spin" />
+      ) : (
+        <span className={`inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-medium leading-none ${enabled ? "bg-emerald-100 text-emerald-600" : "bg-slate-200 text-slate-400"}`}>
+          <Power size={9} />
+          {enabled ? "启用" : "已停用"}
+        </span>
+      )}
+    </button>
+  );
+}
+
 export function ChannelsPage() {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [channelStats, setChannelStats] = useState<Record<string, ChannelStats>>({});
@@ -170,6 +191,49 @@ export function ChannelsPage() {
       } finally {
         setExtraKeyLoading(null);
       }
+    }
+  };
+
+  // 主 Key 是否参与调度：api_key_enabled（迁移 044，缺省 = 启用）
+  const primaryKeyEnabled = (ch: Channel) => (ch.api_key_enabled ?? 1) !== 0;
+
+  // 主 Key 启用/禁用（迁移 044 窄列更新，不触碰渠道身份）：乐观更新 + 失败回滚
+  const [primaryKeyLoading, setPrimaryKeyLoading] = useState<string | null>(null);
+  const handleTogglePrimaryKey = async (ch: Channel) => {
+    const nextEnabled = !primaryKeyEnabled(ch);
+    setPrimaryKeyLoading(ch.id);
+    setChannels(prev => prev.map(c => (c.id === ch.id ? { ...c, api_key_enabled: nextEnabled ? 1 : 0 } : c)));
+    try {
+      await channelApi.togglePrimaryKey(ch.id, nextEnabled);
+    } catch (e) {
+      setChannels(prev => prev.map(c => (c.id === ch.id ? { ...c, api_key_enabled: nextEnabled ? 0 : 1 } : c)));
+      console.error("Failed to toggle primary key:", e);
+      setActionError(`切换主 Key 状态失败: ${String(e)}`);
+    } finally {
+      setPrimaryKeyLoading(null);
+    }
+  };
+
+  // 额外 Key 启用/禁用（迁移 023 status 字段）：乐观更新 + 失败回滚
+  const [extraKeyToggleLoading, setExtraKeyToggleLoading] = useState<string | null>(null);
+  const handleSetExtraKeyStatus = async (ch: Channel, keyId: string, enable: boolean) => {
+    const next = enable ? 1 : 0;
+    const rollback = () =>
+      setChannels(prev => prev.map(c => (c.id === ch.id
+        ? { ...c, extra_keys: (c.extra_keys ?? []).map(k => (k.id === keyId ? { ...k, status: enable ? 0 : 1 } : k)) }
+        : c)));
+    setExtraKeyToggleLoading(keyId);
+    setChannels(prev => prev.map(c => (c.id === ch.id
+      ? { ...c, extra_keys: (c.extra_keys ?? []).map(k => (k.id === keyId ? { ...k, status: next } : k)) }
+      : c)));
+    try {
+      await channelApi.toggleExtraKey(keyId, next);
+    } catch (e) {
+      rollback();
+      console.error("Failed to toggle extra key status:", e);
+      setActionError(`切换 Key 状态失败: ${String(e)}`);
+    } finally {
+      setExtraKeyToggleLoading(null);
     }
   };
 
@@ -490,6 +554,11 @@ export function ChannelsPage() {
                       <div className="mb-1.5 flex items-center justify-between">
                         <span className="text-xs font-semibold text-slate-500">API Key</span>
                         <div className="flex items-center gap-1">
+                          <KeyStatusPill
+                            enabled={primaryKeyEnabled(ch)}
+                            loading={primaryKeyLoading === ch.id}
+                            onToggle={() => handleTogglePrimaryKey(ch)}
+                          />
                           <button
                             onClick={() => handleCopyKey(ch)}
                             className="rounded-md p-1 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
@@ -507,14 +576,19 @@ export function ChannelsPage() {
                           </button>
                         </div>
                       </div>
-                      <div className="flex items-center gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs font-mono text-slate-600">
+                      <div className={`flex items-center gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs font-mono text-slate-600 ${primaryKeyEnabled(ch) ? "" : "opacity-60"}`}>
                         <span className="truncate">
                           {keyVisible
                             ? (fullKeyMap[ch.id] || ch.api_key)
-                            : `${ch.api_key.slice(0, 8)}${"•".repeat(12)}`}
+                            : ch.api_key}
                         </span>
+                        {!primaryKeyEnabled(ch) && (
+                          <span className="shrink-0 rounded-full bg-slate-200 px-1.5 py-0.5 font-sans text-[10px] text-slate-400">
+                            已停用
+                          </span>
+                        )}
                         {keyVisible && fullKeyMap[ch.id] && (
-                          <span className="shrink-0 rounded-full bg-slate-200 px-1.5 py-0.5 text-[10px] text-slate-500">
+                          <span className="shrink-0 rounded-full bg-slate-200 px-1.5 py-0.5 font-sans text-[10px] text-slate-500">
                             {fullKeyMap[ch.id].length} chars
                           </span>
                         )}
@@ -537,13 +611,14 @@ export function ChannelsPage() {
                           {ch.extra_keys.map((ek, ekIdx) => {
                             const ekVisible = extraKeyVisibleMap[ek.id];
                             const ekFull = extraKeyFullMap[ek.id];
+                            const ekEnabled = ek.status === 1;
                             return (
-                            <div key={ek.id} className="flex items-center gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs font-mono text-slate-600">
+                            <div key={ek.id} className={`flex items-center gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs font-mono text-slate-600 ${ekEnabled ? "" : "opacity-60"}`}>
                               <span className="shrink-0 text-slate-400">#{ekIdx + 2}</span>
                               <span className="truncate">
                                 {ekVisible
                                   ? (ekFull || ek.api_key)
-                                  : `${ek.api_key.slice(0, 8)}${"•".repeat(12)}`}
+                                  : ek.api_key}
                               </span>
                               <button
                                 onClick={() => handleToggleExtraKey(ek.id)}
@@ -554,14 +629,16 @@ export function ChannelsPage() {
                                 {extraKeyLoading === ek.id ? <Loader2 size={11} className="animate-spin" /> : ekVisible ? <EyeOff size={11} /> : <Eye size={11} />}
                               </button>
                               <span className="ml-auto shrink-0 rounded-full bg-slate-200 px-1.5 py-0.5 text-[10px] text-slate-500">w:{ek.weight}</span>
-                              <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] ${ek.status === 1 ? "bg-emerald-100 text-emerald-600" : "bg-slate-200 text-slate-400"}`}>
-                                {ek.status === 1 ? "启用" : "禁用"}
-                              </span>
+                              <KeyStatusPill
+                                enabled={ekEnabled}
+                                loading={extraKeyToggleLoading === ek.id}
+                                onToggle={() => handleSetExtraKeyStatus(ch, ek.id, !ekEnabled)}
+                              />
                             </div>
                             );
                           })}
                         </div>
-                        <p className="mt-1 text-[11px] text-slate-400">主 Key + 额外 Keys 按权重负载均衡，失效 Key 自动降级</p>
+                        <p className="mt-1 text-[11px] text-slate-400">主 Key + 额外 Keys 按权重负载均衡，点击右侧状态可停用/启用，失效 Key 自动降级</p>
                       </div>
                     )}
 

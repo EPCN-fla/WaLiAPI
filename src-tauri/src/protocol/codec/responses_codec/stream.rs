@@ -106,7 +106,9 @@ impl ChatToResponsesStreamDecoder {
     pub fn new(context: &ConversionContext) -> Self {
         Self {
             pending: Vec::new(),
-            state: crate::protocol::responses::StreamState::default(),
+            state: crate::protocol::responses::StreamState::with_custom_tool_names(
+                &context.custom_tool_names,
+            ),
             model: context.upstream_model.clone(),
             response_id: responses_response_id(&context.request_id),
             accumulated_content: String::new(),

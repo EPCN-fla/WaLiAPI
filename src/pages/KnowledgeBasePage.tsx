@@ -3080,6 +3080,7 @@ function CreateKbModal({
         onClick={(e) => e.stopPropagation()}
       >
         <h3 className="text-lg font-semibold text-slate-900">新建 RAG</h3>
+        <p className="mt-2 text-xs text-slate-500">新建 RAG 默认向全部已有 API 密钥开放查询。创建后可在“密钥 → 知识库查询权限”中撤销授权；MCP 访问仍需开启此库的 MCP 开关。</p>
 
         <div className="mt-4 space-y-4">
           <div>

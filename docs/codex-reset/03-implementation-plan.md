@@ -1,7 +1,7 @@
 # Codex 重置卡：实现设计与落地记录
 
-**日期**：2026-10-02  
-**实现基准**：[00-architecture-decisions.md](00-architecture-decisions.md)  
+**日期**：2026-10-02
+**实现基准**：[00-architecture-decisions.md](00-architecture-decisions.md)
 **当前状态**：核心链路已落地；以 [07-implementation-review.md](07-implementation-review.md) 的复核结论为准。
 
 ## 1. 端到端链路
@@ -92,7 +92,7 @@ async fn consume_reset_credit(
 
 ## 3. 数据库设计
 
-迁移 `src-tauri/migrations/043_auth_reset_operations.sql` 已落地：
+迁移 `src-tauri/migrations/045_auth_reset_operations.sql` 已落地：
 
 ```sql
 CREATE TABLE auth_reset_operations (
