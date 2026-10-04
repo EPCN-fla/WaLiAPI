@@ -1509,29 +1509,51 @@ pub(crate) async fn route_stream_plan_with_auth_service(
 
                 let dispatched = match candidate {
                     Some(RouteCandidate::Channel { channel, identity }) => {
-                        match channel_key_slots(&channel, repo).await.into_iter().next() {
-                            Some(slot) => {
-                                dispatch_stream_executor(
-                                    endpoint,
-                                    &attempt,
-                                    &slot,
-                                    &identity,
-                                    safe_headers,
-                                    query.as_deref(),
-                                )
-                                .await
+                        // 流式 pre-commit 多 Key failover：遍历该渠道所有启用的
+                        // Key slot，pre-commit 失败（尚未向下游提交任何字节）换
+                        // 下一把 Key 重试；一旦 Connected 进入提交屏障，后续错误
+                        // 不再换 Key。CallerTerminal / CommittedStreamError 换 Key
+                        // 无意义，直接终止。
+                        let mut dispatched: Option<StreamAttemptResult> = None;
+                        let mut last_failure: Option<AttemptFailure> = None;
+                        for slot in channel_key_slots(&channel, repo).await {
+                            let result = dispatch_stream_executor(
+                                endpoint,
+                                &attempt,
+                                &slot,
+                                &identity,
+                                safe_headers,
+                                query.as_deref(),
+                            )
+                            .await;
+                            match result {
+                                StreamAttemptResult::Connected(_) => {
+                                    dispatched = Some(result);
+                                    break;
+                                }
+                                StreamAttemptResult::Failure(f) => {
+                                    if f.failure_class == FailureClass::CallerTerminal
+                                        || f.failure_class == FailureClass::CommittedStreamError
+                                    {
+                                        dispatched = Some(StreamAttemptResult::Failure(f));
+                                        break;
+                                    }
+                                    last_failure = Some(f);
+                                }
                             }
-                            None => {
-                                // 主 Key 与全部额外 Key 均被停用：该候选无可用
-                                // 凭证，按可重试失败换下一个候选渠道。
-                                StreamAttemptResult::Failure(AttemptFailure {
+                        }
+                        dispatched.unwrap_or_else(|| {
+                            // 主 Key 与全部额外 Key 均被停用：该候选无可用
+                            // 凭证，按可重试失败换下一个候选渠道。
+                            StreamAttemptResult::Failure(last_failure.unwrap_or_else(|| {
+                                AttemptFailure {
                                     failure_class: FailureClass::Retryable,
                                     message: "no enabled channel credential slot".to_string(),
                                     status_code: Some(502),
                                     retry_after: None,
-                                })
-                            }
-                        }
+                                }
+                            }))
+                        })
                     }
                     Some(RouteCandidate::AuthAccount(_)) => {
                         dispatch_auth_account_stream_executor(&attempt, &auth_service, safe_headers)
