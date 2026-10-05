@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.3.9 (2026-10-05)
+
+### Auth 账号与额度（PR #149，@jiangnuonnuo）
+
+- ✨ **Codex 账号重置卡**：账号列表新增手动重置入口与确认弹窗，支持对 Codex 账号手动触发速率额度重置（`wham/rate-limit-reset-credits`），后端完整记录重置与消耗操作流水（迁移 045），重置结果即时反馈并刷新账号额度展示
+- 🎨 **账号列表行末按钮悬浮提示**：账号列表行末操作按钮增加 tooltip 悬浮说明
+
+### 渠道与负载均衡（PR #150，@freakojc）
+
+- ✨ **流式 pre-commit 阶段多 Key failover**：流式路径此前仅取渠道随机抽中的第一把 Key，失败即放弃该渠道、备用 Key 永远轮空；现对齐非流式 `dispatch_channel_with_key_failover` 语义，pre-commit 阶段（尚未向下游提交任何字节）失败自动换下一把启用 Key 重试，全部分 Key 失败才切换下一候选渠道；多 Key 容量在流式链路下正式生效
+
+### 协议转换（PR #147，@huangkemingyyds）
+
+- 🐛 **Anthropic 内置工具兼容**：Messages → Responses 转换识别 `web_search` 等 Anthropic 内置工具并跳过，不再因无法映射而拒绝整个请求，用户自定义工具正常保留转换；`tool_choice` 强制调用被跳过的内置工具时仍返回清晰的 unsupported feature 错误
+- 🐛 **Anthropic 原生渠道地址 /v1 归一化**：渠道 base URL 缺失 `/v1` 时自动补齐并清理末尾斜杠（读取与保存渠道身份时统一归一化），修复智谱等 Anthropic 原生渠道因地址少 `/v1` 导致的 404；上游模型同步与相关集成测试约定同步更新（`GET /v1/models`）
+
+### Codex（PR #148，@huangkemingyyds）
+
+- ✨ **Codex client version 动态刷新**：Codex CLI 版本号不再写死（原 `0.156.1`），默认 `0.162.0`，每 6 小时从 npm registry 拉取最新版本并仅在更高时采用；支持 `WALIAPI_CODEX_CLIENT_VERSION` 环境变量覆盖；修复 ChatGPT 按 client_version 门控模型目录导致的模型缺失/过期问题
+
+### 前端（PR #144，@wuchubuzai2018）
+
+- 🐛 **低版本 WebKit 左侧菜单不显示修复**：Tailwind v4 断点在旧 WebKit 内核的兼容处理，附 ADR 文档说明（`docs/adr/0001`）
+- 🎨 **Codex 订阅页表格操作按钮悬浮文案优化**
+
+### 其他
+
+- 📝 **README 贡献者数据同步**：新增贡献者 wuchubuzai2018（PR #144），更新小傅哥（314 commits）、Nelson（27 commits）、xerina（9 commits，PR #149）、Jason（9 commits，PR #150）、黄科铭（5 commits，PR #147 #148）提交数与代码变更统计
+- 🔧 **版本号统一升级至 0.3.9**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
+
 ## v0.3.8 (2026-10-01)
 
 ### 渠道与负载均衡

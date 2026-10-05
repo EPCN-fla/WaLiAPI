@@ -4,7 +4,7 @@
 
 ### 本地 LLM API 网关 · 多协议接入 · 知识库 RAG · MCP 工具服务
 
-[![Version](https://img.shields.io/badge/version-0.3.8-blue.svg)](./src-tauri/tauri.conf.json)
+[![Version](https://img.shields.io/badge/version-0.3.9-blue.svg)](./src-tauri/tauri.conf.json)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)](#-使用方式)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri%202-orange.svg)](https://tauri.app)
@@ -40,22 +40,23 @@
 
 | | 贡献者 | GitHub | 提交 | 代码变更 | 主要贡献 |
 |:---:|:---|:---|:---:|:---|:---|
-| 🏆 | **小傅哥** | [@fuzhengwei](https://github.com/fuzhengwei) | 305 | `+63,787 / -7,657` | 项目创建者 · 核心架构 · 多渠道网关 · 协议转换 · 安全审计 · 知识库引擎 · Wiki 知识引擎 · MCP Server · Codex 账号切换 · API Key 独立启停与负载均衡增强 |
+| 🏆 | **小傅哥** | [@fuzhengwei](https://github.com/fuzhengwei) | 314 | `+64,000 / -7,697` | 项目创建者 · 核心架构 · 多渠道网关 · 协议转换 · 安全审计 · 知识库引擎 · Wiki 知识引擎 · MCP Server · Codex 账号切换 · API Key 独立启停与负载均衡增强 |
 | ⚡ | **xian** | [@zsxink](https://github.com/zsxink) | 140 | `+97,192 / -24,477` | Anthropic Messages 协议兼容 · 渠道协议重构（T01-T14）· codec 加固 · SSRF 防护 · SSE 帧重组 · models 接口 · Kimi Code Auth · protocol 模块结构化重构 · Auth 多格式导入 |
 | 🛠 | **chyuan** | [@chyuan-cuihongyuan](https://github.com/chyuan-cuihongyuan) | 56 | `+11,881 / -1,729` | 统一上游重试判定决策函数与真值表测试 · 渠道健康探测与候选排序 · 语义缓存 · 流式内容持久化与断线续传 · X-Request-Id / OTLP 可观测性 · 知识库增量索引、查询改写与混合检索 · 配额强化 · 401/403 下游脱敏 · StepFun 渠道预设接入（PR #127） |
 | 🚀 | **GululuCopa** | [@GululuCopa](https://github.com/GululuCopa) | 24 | `+13,087 / -475` | Grok OAuth 登录（PR #122）· Antigravity OAuth Gemini 登录（PR #121）与 v0.3.6 修复（PR #128）· Grok 与 Antigravity namespace 工具兼容修复 · 网关客户端适配（流式出站无总超时、Grok 工具白名单与加密推理约束对齐、采样字段兼容、OpenCode/OpenClaw/Hermes 配置生成修正，PR #135）· codec 响应格式与防护修复（response_format 映射、safeguards fail-open、Gemini JSON Schema / Gemini 3 工具签名兼容、function_call fc_ 前缀修复，PR #136） |
 | 🐳 | **Fla1337** | [@Fla1337](https://github.com/Fla1337) | 15 | `+4,978 / -1,143` | Web 管理面板 · Docker / headless 部署 · waliapi-web 二进制 · 多阶段镜像构建 · Web 管理面板用户设置 |
 | 🔧 | **mw** | [@maowei0427](https://github.com/maowei0427) | 10 | `+1,228 / -244` | 日志响应内容记录 · Trace ID 追踪 · 详情页体验优化 · 知识库 embedding 批次配置 |
-| 🔧 | **Nelson** | [@Zhengmingming1](https://github.com/Zhengmingming1) | 21 | `+9,371 / -903` | 知识库扫描版 PDF VLM OCR（方案A）· 中文 PDF 与检索修复 · 知识库访问授权与连接检查 · RAG 检索回归修复（管理搜索模式/权重、失败重导、索引落后回退、向量校验）· Token 配额标签澄清 · 修复 Claude 渠道协议适配 · pdfium macOS 打包路径修复 · Embeddings 配置补齐与 RAG 链路诊断（内部 Embedding 统一网关路由、分阶段诊断、API Key 健康检测，PR #140） |
-| 🐞 | **xerina** | [@jiangnuonnuo](https://github.com/jiangnuonnuo) | 4 | `+257 / -82` | Wiki Unicode 文本切片 panic 进程崩溃修复 · 新增字符边界安全切片工具（utils/text.rs）· RAG/Wiki 设置保存后状态未即时更新修复（PR #60）|
-| 🐛 | **Jason** | [@freakojc](https://github.com/freakojc) | 8 | `+2,538 / -105` | 新增「简要」日志级别，请求消息列表只留最新 3 条（PR #119）· 日志统计覆盖索引优化 · 探测日志降噪与恢复状态就地更新 · 流式日志 499 误记修复 + Token 用量恢复 · 仪表盘 cached_tokens 聚合覆盖索引消除 2 秒加载 |
+| 🔧 | **Nelson** | [@Zhengmingming1](https://github.com/Zhengmingming1) | 27 | `+16,607 / -3,177` | 知识库扫描版 PDF VLM OCR（方案A）· 中文 PDF 与检索修复 · 知识库访问授权与连接检查 · RAG 检索回归修复（管理搜索模式/权重、失败重导、索引落后回退、向量校验）· Token 配额标签澄清 · 修复 Claude 渠道协议适配 · pdfium macOS 打包路径修复 · Embeddings 配置补齐与 RAG 链路诊断（内部 Embedding 统一网关路由、分阶段诊断、API Key 健康检测，PR #140） |
+| 🐞 | **xerina** | [@jiangnuonnuo](https://github.com/jiangnuonnuo) | 9 | `+1,801 / -666` | Wiki Unicode 文本切片 panic 进程崩溃修复 · 新增字符边界安全切片工具（utils/text.rs）· RAG/Wiki 设置保存后状态未即时更新修复（PR #60）· Codex 账号重置卡与手动重置额度、重置操作流水记录（PR #149）|
+| 🐛 | **Jason** | [@freakojc](https://github.com/freakojc) | 9 | `+2,578 / -123` | 新增「简要」日志级别，请求消息列表只留最新 3 条（PR #119）· 日志统计覆盖索引优化 · 探测日志降噪与恢复状态就地更新 · 流式日志 499 误记修复 + Token 用量恢复 · 仪表盘 cached_tokens 聚合覆盖索引消除 2 秒加载 · 流式 pre-commit 阶段多 Key failover（PR #150） |
 | 🔧 | **yuanqixun** | [@yuanqixun](https://github.com/yuanqixun) | 9 | `+2,745 / -665` | 审计日志存储与加载优化 · Codex 设备码登录 · Codex 剩余额度展示 · 手动刷新 Codex 额度 · 大响应 SSE 帧兼容修复 |
+| 🩹 | **wuchubuzai2018** | [@wuchubuzai2018](https://github.com/wuchubuzai2018) | 2 | `+129 / -9` | 低版本 WebKit 左侧菜单不显示修复（Tailwind v4 断点兼容，附 ADR）· Codex 订阅页表格操作按钮悬浮文案优化（PR #144）|
 | 🐛 | **cyd** | [@cydmacro](https://github.com/cydmacro) | 2 | `+105 / -9` | Codex 工具调用参数一次性下发，修复部分客户端截断 · Codex Responses 请求 strip `prompt_cache_options` 兼容修复（PR #59）|
 | 🔧 | **cham** | [@Cham1229](https://github.com/Cham1229) | 1 | `+444 / -111` | 自定义安全规则接入运行时安全扫描管道——规则加载·白名单短路·黑名单匹配·端到端集成测试（PR #64）|
 | 🐛 | **lianggq** | [@GQingL](https://github.com/GQingL) | 1 | `+91 / -9` | 日志日期筛选修复 · macOS 渠道删除按钮修复 |
 | 🐛 | **zjx** | [@Sadsunset3](https://github.com/Sadsunset3) | 8 | `+1,058 / -134` | Anthropic 容量错误提交前识别与跨协议故障切换 · sub2api 导入兼容与账号数刷新 · Claude Code 网关鉴权初始化 · Codex Auth 写入跨平台修复 · 账号操作后滚动位置保持 |
 | 🐛 | **breezewonders** | [@breezewonders-dev](https://github.com/breezewonders-dev) | 1 | `+14 / -0` | Chat-to-Responses 转换 store 字段归一化修复 |
-| 🧩 | **黄科铭** | [@huangkemingyyds](https://github.com/huangkemingyyds) | 3 | `+1,986 / -240` | Antigravity 模型额度展示与工具调用 ID 保留 · Codex 旧会话回放与 GPT-6 模型同步修复（PR #137 #138）· 模型映射规范化与 Antigravity Responses 工具路由修复（PR #141） |
+| 🧩 | **黄科铭** | [@huangkemingyyds](https://github.com/huangkemingyyds) | 5 | `+2,317 / -283` | Antigravity 模型额度展示与工具调用 ID 保留 · Codex 旧会话回放与 GPT-6 模型同步修复（PR #137 #138）· 模型映射规范化与 Antigravity Responses 工具路由修复（PR #141）· Anthropic 内置工具兼容与渠道地址 /v1 归一化（PR #147）· Codex client version 动态刷新（PR #148） |
 
 </div>
 
@@ -681,7 +682,39 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 
 ## 📌 版本历史
 
-### v0.3.8 (2026-10-01)
+### v0.3.9 (2026-10-05)
+
+#### Auth 账号与额度（PR #149，@jiangnuonnuo）
+
+- ✨ **Codex 账号重置卡**：账号列表新增手动重置入口与确认弹窗，支持对 Codex 账号手动触发速率额度重置（`wham/rate-limit-reset-credits`），后端完整记录重置与消耗操作流水（迁移 045），重置结果即时反馈并刷新账号额度展示
+- 🎨 **账号列表行末按钮悬浮提示**：账号列表行末操作按钮增加 tooltip 悬浮说明
+
+#### 渠道与负载均衡（PR #150，@freakojc）
+
+- ✨ **流式 pre-commit 阶段多 Key failover**：流式路径此前仅取渠道随机抽中的第一把 Key，失败即放弃该渠道、备用 Key 永远轮空；现对齐非流式 failover 语义，pre-commit 阶段（尚未向下游提交任何字节）失败自动换下一把启用 Key 重试，全部分 Key 失败才切换下一候选渠道；多 Key 容量在流式链路下正式生效
+
+#### 协议转换（PR #147，@huangkemingyyds）
+
+- 🐛 **Anthropic 内置工具兼容**：Messages → Responses 转换识别 `web_search` 等 Anthropic 内置工具并跳过，不再因无法映射而拒绝整个请求，用户自定义工具正常保留转换；`tool_choice` 强制调用被跳过的内置工具时仍返回清晰的 unsupported feature 错误
+- 🐛 **Anthropic 原生渠道地址 /v1 归一化**：渠道 base URL 缺失 `/v1` 时自动补齐并清理末尾斜杠，修复智谱等 Anthropic 原生渠道因地址少 `/v1` 导致的 404；上游模型同步与相关集成测试约定同步更新（`GET /v1/models`）
+
+#### Codex（PR #148，@huangkemingyyds）
+
+- ✨ **Codex client version 动态刷新**：Codex CLI 版本号不再写死（原 `0.156.1`），默认 `0.162.0`，每 6 小时从 npm registry 拉取最新版本并仅在更高时采用；支持 `WALIAPI_CODEX_CLIENT_VERSION` 环境变量覆盖；修复 ChatGPT 按 client_version 门控模型目录导致的模型缺失/过期问题
+
+#### 前端（PR #144，@wuchubuzai2018）
+
+- 🐛 **低版本 WebKit 左侧菜单不显示修复**：Tailwind v4 断点在旧 WebKit 内核的兼容处理，附 ADR 文档说明（`docs/adr/0001`）
+- 🎨 **Codex 订阅页表格操作按钮悬浮文案优化**
+
+#### 其他
+
+- 📝 **README 贡献者数据同步**：新增贡献者 wuchubuzai2018（PR #144），更新小傅哥（314 commits）、Nelson（27 commits）、xerina（9 commits，PR #149）、Jason（9 commits，PR #150）、黄科铭（5 commits，PR #147 #148）提交数与代码变更统计
+- 🔧 **版本号统一升级至 0.3.9**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
+
+<details>
+<summary><b>v0.3.8 (2026-10-01)</b></summary>
+
 
 #### 渠道与负载均衡
 
@@ -709,6 +742,8 @@ WaLiAPI 定位为**本地 / 内网优先**的 LLM 网关。公网部署前请先
 
 - 📝 **README 贡献者数据同步**：更新小傅哥（305 commits）、Nelson（27 commits，PR #142）、黄科铭（3 commits，PR #141）提交数与代码变更统计，历史版本折叠展示
 - 🔧 **版本号统一升级至 0.3.8**（package.json / Cargo.toml / tauri.conf.json / Cargo.lock）
+
+</details>
 
 <details>
 <summary><b>v0.3.7 (2026-09-28)</b></summary>
