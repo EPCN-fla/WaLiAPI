@@ -127,11 +127,21 @@ export function UsagePage() {
     [keys, selKey],
   );
 
-  // FIX-13：示例代码与复制需要完整密钥——按需取回，选中变化即清空；
-  // 未载入时示例中的密钥为占位符，完整密钥不常驻内存/不落盘。
+  // 完整密钥按选中 Key 自动取回：代码示例直接展示真实 Key，无需手动「载入密钥」；
+  // 取回失败时示例退回掩码占位。选中变化即清空重取，完整密钥不落盘。
   const [keyValue, setKeyValue] = useState("");
   const [keyValueLoading, setKeyValueLoading] = useState(false);
-  useEffect(() => { setKeyValue(""); }, [selKey]);
+  useEffect(() => {
+    let cancelled = false;
+    setKeyValue("");
+    if (!selKey) return;
+    setKeyValueLoading(true);
+    apiKeyApi.getFull(selKey)
+      .then(full => { if (!cancelled) setKeyValue(full); })
+      .catch(e => { console.error("Failed to load full key:", e); })
+      .finally(() => { if (!cancelled) setKeyValueLoading(false); });
+    return () => { cancelled = true; };
+  }, [selKey]);
   const loadKeyValue = async (): Promise<string> => {
     if (!selKey) return "";
     if (keyValue) return keyValue;
@@ -148,7 +158,7 @@ export function UsagePage() {
       setKeyValueLoading(false);
     }
   };
-  const keyForSamples = keyValue || "sk-waliapi-****（点击「载入密钥」后填充）";
+  const keyForSamples = keyValue || "sk-waliapi-****";
 
   // Three categories: API channel models, Auth account models, mapping aliases (unified).
   // Filtered by the selected API key's allowed/denied lists.
@@ -415,13 +425,13 @@ public class AnthropicTest {
     setTestState("running"); setTestResult(""); setTestLatency(null);
     const startTime = performance.now();
     try {
-      // FIX：测试请求头必须用真实密钥。占位文案含中文全角括号，塞进 header 会触发
+      // FIX：测试请求头必须用真实密钥。掩码占位塞进 header 会触发
       // 浏览器 "String contains non ISO-8859-1 code point" 直接抛错；未载入时先取回。
       let realKey = keyValue;
       if (!realKey) realKey = await loadKeyValue();
       if (!realKey) {
         setTestState("error");
-        setTestResult("未能载入完整密钥：请先在左侧点击「载入密钥」，确认密钥有效后再测试。");
+        setTestResult("未能载入完整密钥：请确认所选密钥有效后重试。");
         return;
       }
 
@@ -640,7 +650,7 @@ public class AnthropicTest {
                   </select>
                   <ChevronDown size={14} className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
                 </div>
-                {/* FIX-13：按需载入完整密钥后才能复制/生成真实示例 */}
+                {/* 完整密钥已随选中自动载入，此处一键复制 */}
                 <button
                   onClick={async () => {
                     const full = await loadKeyValue();
@@ -648,7 +658,7 @@ public class AnthropicTest {
                   }}
                   disabled={!selKey}
                   className="action-secondary px-3 py-2.5 disabled:opacity-50"
-                  title={keyValue ? "复制完整 Key" : "载入完整 Key 后复制"}
+                  title="复制完整 Key"
                 >
                   {copied === "key" ? <Check size={16} className="text-emerald-600" /> : keyValueLoading ? <Loader2 size={16} className="animate-spin" /> : <Copy size={16} />}
                 </button>
@@ -865,6 +875,10 @@ public class AnthropicTest {
             {currentScripts[activeTab]}
           </SyntaxHighlighter>
         </div>
+
+        <p className="mt-2.5 text-xs text-slate-400">
+          建议先在上方「连接测试」中发送测试请求，验证连通后再接入到你的应用中使用。
+        </p>
       </div>
       </>
       )}
