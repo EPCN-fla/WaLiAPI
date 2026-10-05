@@ -287,15 +287,17 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_uses_models_path_and_x_api_key() {
-        // main 分支约定：Anthropic Base 自带 /v1，path 模板是 /models；
-        // 这里 mock base 是根，因此请求应为 GET /models（不再是 /v1/models）。
+        // #147 起的约定：anthropic native base 会自动补齐缺失的 /v1（修复
+        // 智谱等渠道少 /v1 导致的 404），path 模板仍是 /models；mock base
+        // 是根地址，因此请求应为 GET /v1/models。已带 /v1 的 base 不会被
+        // 二次追加。
         let m = start_mock(json!({"data": [{"id": "claude-sonnet-5"}]})).await;
         let input = draft("anthropic", &m.addr);
         let r = fetch_upstream_models(&input, "k2", 5).await.unwrap();
         assert_eq!(r.models, vec!["claude-sonnet-5"]);
         assert_eq!(r.protocol, "anthropic");
         let reqs = m.received.lock().await.clone();
-        assert!(reqs[0].0.contains("GET /models"));
+        assert!(reqs[0].0.contains("GET /v1/models"));
         assert!(reqs[0].2.contains("k2"), "should send x-api-key header");
     }
 
