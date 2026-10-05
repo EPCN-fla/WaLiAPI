@@ -952,6 +952,8 @@ mod codex_responses_anthropic {
             seen: Arc::new(Mutex::new(Vec::new())),
         };
         let app = Router::new()
+            // #147 起 anthropic native base 会自动补齐 /v1，mock 两种路径都要能应答。
+            .route("/v1/messages", post(messages))
             .route("/messages", post(messages))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1101,6 +1103,8 @@ mod codex_responses_anthropic {
             seen: Arc::new(Mutex::new(Vec::new())),
         };
         let app = Router::new()
+            // #147 起 anthropic native base 会自动补齐 /v1，mock 两种路径都要能应答。
+            .route("/v1/messages", post(messages))
             .route("/messages", post(messages))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
